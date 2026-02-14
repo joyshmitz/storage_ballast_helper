@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! sbh — Storage Ballast Helper CLI entry point.
 
 use clap::Parser;

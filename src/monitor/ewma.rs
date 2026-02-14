@@ -79,7 +79,7 @@ impl DiskRateEstimator {
                 at: observed_at,
                 inst_rate: 0.0,
             });
-            return self.fallback_estimate(0.0, threshold_free_bytes);
+            return self.fallback_estimate(free_bytes, threshold_free_bytes);
         };
 
         let dt = observed_at.duration_since(previous.at).as_secs_f64();

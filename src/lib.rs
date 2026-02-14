@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Storage Ballast Helper (sbh) — system service preventing disk-full scenarios
 //! from coding agent swarms.
 //!

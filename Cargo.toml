@@ -32,6 +32,12 @@ parking_lot = "0.12"
 crossbeam-channel = "0.5"
 # Fast byte scanning
 memchr = "2.7"
+# Pattern matching for artifact classification
+regex = "1.11"
+# Signal handling for graceful shutdown wiring
+signal-hook = "0.3"
+# Ballast generation and randomized test fixtures
+rand = "0.9"
 
 # Platform-specific
 [target.'cfg(unix)'.dependencies]

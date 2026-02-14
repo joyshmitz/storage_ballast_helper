@@ -254,6 +254,8 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
 
+For test harness conventions and structured logging registration, see `docs/testing-and-logging.md`.
+
 ## Troubleshooting
 
 ### "No candidates found, but disk is full"
