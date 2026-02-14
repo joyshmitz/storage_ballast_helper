@@ -2,8 +2,8 @@
 
 #![allow(missing_docs)]
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -149,9 +149,7 @@ impl BallastConfig {
     /// Check whether a volume is enabled for ballast (disabled via override).
     #[must_use]
     pub fn is_volume_enabled(&self, mount_path: &str) -> bool {
-        self.overrides
-            .get(mount_path)
-            .map_or(true, |o| o.enabled)
+        self.overrides.get(mount_path).map_or(true, |o| o.enabled)
     }
 }
 
@@ -485,16 +483,14 @@ impl Config {
             }
             if pred.action_horizon_minutes <= pred.imminent_danger_minutes {
                 return Err(SbhError::InvalidConfig {
-                    details:
-                        "prediction.action_horizon_minutes must be > imminent_danger_minutes"
-                            .to_string(),
+                    details: "prediction.action_horizon_minutes must be > imminent_danger_minutes"
+                        .to_string(),
                 });
             }
             if pred.imminent_danger_minutes <= pred.critical_danger_minutes {
                 return Err(SbhError::InvalidConfig {
-                    details:
-                        "prediction.imminent_danger_minutes must be > critical_danger_minutes"
-                            .to_string(),
+                    details: "prediction.imminent_danger_minutes must be > critical_danger_minutes"
+                        .to_string(),
                 });
             }
             if pred.critical_danger_minutes < 0.0 {

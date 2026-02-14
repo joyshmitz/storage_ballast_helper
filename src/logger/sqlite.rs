@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, params};
 
 use crate::core::errors::{Result, SbhError};
 
@@ -242,9 +242,7 @@ impl SqliteLogger {
     /// Check that WAL mode is active (for diagnostics).
     pub fn is_wal_mode(&self) -> bool {
         self.conn
-            .query_row("PRAGMA journal_mode", [], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
             .map(|mode| mode.eq_ignore_ascii_case("wal"))
             .unwrap_or(false)
     }

@@ -144,8 +144,9 @@ impl BallastReleaseController {
         let report = manager.replenish(Some(free_pct_check))?;
         if report.files_created > 0 {
             self.last_replenish_time = Some(Instant::now());
-            self.files_released_since_green =
-                self.files_released_since_green.saturating_sub(report.files_created);
+            self.files_released_since_green = self
+                .files_released_since_green
+                .saturating_sub(report.files_created);
             return Ok(true);
         }
 

@@ -337,8 +337,10 @@ impl JsonlWriter {
             }
             WriterState::Fallback => {
                 self.state = WriterState::Stderr;
-                let _ =
-                    writeln!(io::stderr(), "[SBH-JSONL] fallback write failed, using stderr");
+                let _ = writeln!(
+                    io::stderr(),
+                    "[SBH-JSONL] fallback write failed, using stderr"
+                );
             }
             WriterState::Stderr => {
                 self.state = WriterState::Discard;
@@ -425,10 +427,7 @@ fn open_append(path: &Path) -> Result<(File, u64)> {
         .append(true)
         .open(path)
         .map_err(|source| SbhError::io(path, source))?;
-    let size = file
-        .metadata()
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
     Ok((file, size))
 }
 

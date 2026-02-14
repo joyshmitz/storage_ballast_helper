@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
 use crate::ballast::manager::BallastManager;
 use crate::ballast::release::BallastReleaseController;
@@ -63,7 +63,8 @@ impl ThreadHealth {
     /// Record a panic. Returns false if the thread has exceeded the respawn limit.
     fn record_panic(&mut self) -> bool {
         let now = Instant::now();
-        self.panic_times.retain(|t| now.duration_since(*t) < RESPAWN_WINDOW);
+        self.panic_times
+            .retain(|t| now.duration_since(*t) < RESPAWN_WINDOW);
         self.panic_times.push(now);
         self.panic_times.len() <= MAX_RESPAWNS as usize
     }
@@ -200,20 +201,16 @@ impl MonitoringDaemon {
         )?;
 
         // 8. Initialize ballast manager.
-        let ballast_manager = BallastManager::new(
-            config.paths.ballast_dir.clone(),
-            config.ballast.clone(),
-        )?;
+        let ballast_manager =
+            BallastManager::new(config.paths.ballast_dir.clone(), config.ballast.clone())?;
 
         // 9. Release controller.
         let release_controller =
             BallastReleaseController::new(config.ballast.replenish_cooldown_minutes);
 
         // 10. Scoring engine.
-        let scoring_engine = ScoringEngine::from_config(
-            &config.scoring,
-            config.scanner.min_file_age_minutes,
-        );
+        let scoring_engine =
+            ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
 
         Ok(Self {
             config,
@@ -266,19 +263,13 @@ impl MonitoringDaemon {
         let mut scanner_health = ThreadHealth::new();
         let mut executor_health = ThreadHealth::new();
 
-        let mut scanner_join: Option<thread::JoinHandle<()>> = Some(
-            self.spawn_scanner_thread(
-                scan_rx.clone(),
-                del_tx.clone(),
-                self.logger_handle.clone(),
-            ),
-        );
-        let mut executor_join: Option<thread::JoinHandle<()>> = Some(
-            self.spawn_executor_thread(
-                del_rx.clone(),
-                self.logger_handle.clone(),
-            ),
-        );
+        let mut scanner_join: Option<thread::JoinHandle<()>> = Some(self.spawn_scanner_thread(
+            scan_rx.clone(),
+            del_tx.clone(),
+            self.logger_handle.clone(),
+        ));
+        let mut executor_join: Option<thread::JoinHandle<()>> =
+            Some(self.spawn_executor_thread(del_rx.clone(), self.logger_handle.clone()));
 
         let mut last_health_check = Instant::now();
 
@@ -336,9 +327,7 @@ impl MonitoringDaemon {
             if last_health_check.elapsed() >= THREAD_HEALTH_CHECK_INTERVAL {
                 last_health_check = Instant::now();
 
-                let scanner_dead = scanner_join
-                    .as_ref()
-                    .is_some_and(|h| h.is_finished());
+                let scanner_dead = scanner_join.as_ref().is_some_and(|h| h.is_finished());
                 if scanner_dead {
                     eprintln!("[SBH-DAEMON] scanner thread exited unexpectedly");
                     if let Some(handle) = scanner_join.take() {
@@ -359,9 +348,7 @@ impl MonitoringDaemon {
                     }
                 }
 
-                let executor_dead = executor_join
-                    .as_ref()
-                    .is_some_and(|h| h.is_finished());
+                let executor_dead = executor_join.as_ref().is_some_and(|h| h.is_finished());
                 if executor_dead {
                     eprintln!("[SBH-DAEMON] executor thread exited unexpectedly");
                     if let Some(handle) = executor_join.take() {
@@ -369,10 +356,9 @@ impl MonitoringDaemon {
                     }
                     if executor_health.record_panic() {
                         eprintln!("[SBH-DAEMON] respawning executor thread");
-                        executor_join = Some(self.spawn_executor_thread(
-                            del_rx.clone(),
-                            self.logger_handle.clone(),
-                        ));
+                        executor_join = Some(
+                            self.spawn_executor_thread(del_rx.clone(), self.logger_handle.clone()),
+                        );
                     } else {
                         self.logger_handle.send(ActivityEvent::Error {
                             code: "SBH-3900".to_string(),
@@ -392,24 +378,24 @@ impl MonitoringDaemon {
 
     // ──────────────────── pressure monitoring ────────────────────
 
-    fn check_pressure(
-        &mut self,
-    ) -> Result<crate::monitor::pid::PressureResponse> {
+    fn check_pressure(&mut self) -> Result<crate::monitor::pid::PressureResponse> {
         // Collect stats for the primary monitored path.
-        let primary_path = self.config.scanner.root_paths.first().cloned()
+        let primary_path = self
+            .config
+            .scanner
+            .root_paths
+            .first()
+            .cloned()
             .unwrap_or_else(|| PathBuf::from("/"));
         let stats = self.fs_collector.collect(&primary_path)?;
 
         // Update EWMA rate estimator.
-        let red_threshold_bytes = (stats.total_bytes as f64
-            * self.config.pressure.red_min_free_pct
-            / 100.0) as u64;
+        let red_threshold_bytes =
+            (stats.total_bytes as f64 * self.config.pressure.red_min_free_pct / 100.0) as u64;
         let now = Instant::now();
-        let rate_estimate = self.rate_estimator.update(
-            stats.free_bytes,
-            now,
-            red_threshold_bytes,
-        );
+        let rate_estimate = self
+            .rate_estimator
+            .update(stats.free_bytes, now, red_threshold_bytes);
 
         // Predicted time to red threshold.
         let predicted_seconds = if rate_estimate.seconds_to_threshold.is_finite()
@@ -425,13 +411,20 @@ impl MonitoringDaemon {
             free_bytes: stats.available_bytes,
             total_bytes: stats.total_bytes,
         };
-        let response = self.pressure_controller.update(reading, predicted_seconds, now);
+        let response = self
+            .pressure_controller
+            .update(reading, predicted_seconds, now);
 
         Ok(response)
     }
 
     fn log_pressure_change(&self, response: &crate::monitor::pid::PressureResponse) {
-        let primary_path = self.config.scanner.root_paths.first().cloned()
+        let primary_path = self
+            .config
+            .scanner
+            .root_paths
+            .first()
+            .cloned()
             .unwrap_or_else(|| PathBuf::from("/"));
         let reading = PressureReading {
             free_bytes: 0,
@@ -473,7 +466,12 @@ impl MonitoringDaemon {
         match response.level {
             PressureLevel::Green => {
                 // Maybe replenish ballast.
-                let primary_path = self.config.scanner.root_paths.first().cloned()
+                let primary_path = self
+                    .config
+                    .scanner
+                    .root_paths
+                    .first()
+                    .cloned()
                     .unwrap_or_else(|| PathBuf::from("/"));
                 let collector = &self.fs_collector;
                 let _ = self.release_controller.maybe_replenish(
@@ -498,18 +496,16 @@ impl MonitoringDaemon {
             }
             PressureLevel::Red => {
                 // Release ballast + aggressive scan + delete.
-                let _ = self.release_controller.maybe_release(
-                    &mut self.ballast_manager,
-                    response,
-                );
+                let _ = self
+                    .release_controller
+                    .maybe_release(&mut self.ballast_manager, response);
                 self.send_scan_request(scan_tx, response);
             }
             PressureLevel::Critical => {
                 // Emergency: release all ballast + delete everything safe.
-                let _ = self.release_controller.maybe_release(
-                    &mut self.ballast_manager,
-                    response,
-                );
+                let _ = self
+                    .release_controller
+                    .maybe_release(&mut self.ballast_manager, response);
                 self.send_scan_request(scan_tx, response);
 
                 self.logger_handle.send(ActivityEvent::Emergency {
@@ -595,7 +591,12 @@ impl MonitoringDaemon {
     // ──────────────────── ballast ────────────────────
 
     fn provision_ballast(&mut self) -> Result<()> {
-        let primary_path = self.config.scanner.root_paths.first().cloned()
+        let primary_path = self
+            .config
+            .scanner
+            .root_paths
+            .first()
+            .cloned()
             .unwrap_or_else(|| PathBuf::from("/"));
         let collector = &self.fs_collector;
         let report = self.ballast_manager.provision(Some(&|| {
@@ -637,8 +638,9 @@ impl MonitoringDaemon {
                         &new_config.scoring,
                         new_config.scanner.min_file_age_minutes,
                     );
-                    self.release_controller =
-                        BallastReleaseController::new(new_config.ballast.replenish_cooldown_minutes);
+                    self.release_controller = BallastReleaseController::new(
+                        new_config.ballast.replenish_cooldown_minutes,
+                    );
                     self.release_controller.reset();
 
                     self.logger_handle.send(ActivityEvent::ConfigReloaded {
@@ -712,10 +714,8 @@ impl MonitoringDaemon {
         drop(del_tx);
 
         let coordinator = ShutdownCoordinator::new();
-        let tasks: Vec<(&str, &dyn Fn() -> bool)> = vec![
-            ("scanner thread", &|| true),
-            ("executor thread", &|| true),
-        ];
+        let tasks: Vec<(&str, &dyn Fn() -> bool)> =
+            vec![("scanner thread", &|| true), ("executor thread", &|| true)];
         coordinator.execute(&tasks);
 
         // 2. Wait for worker threads (bounded by coordinator timeout).
@@ -928,7 +928,9 @@ fn executor_thread_main(
 // ──────────────────── scanning helpers ────────────────────
 
 /// Quick structural signal detection for a directory.
-fn detect_structural_signals(path: &std::path::Path) -> crate::scanner::patterns::StructuralSignals {
+fn detect_structural_signals(
+    path: &std::path::Path,
+) -> crate::scanner::patterns::StructuralSignals {
     use crate::scanner::patterns::StructuralSignals;
 
     if !path.is_dir() {
@@ -968,8 +970,10 @@ fn classify_by_name(name: &str) -> crate::scanner::patterns::ArtifactClassificat
         (ArtifactCategory::NodeModules, 0.95)
     } else if name == "__pycache__" || name.ends_with(".pyc") {
         (ArtifactCategory::PythonCache, 0.90)
-    } else if name.starts_with("pi_agent_") || name.starts_with("pi_target_")
-        || name.starts_with("pi_opus_") || name.starts_with("cass-target")
+    } else if name.starts_with("pi_agent_")
+        || name.starts_with("pi_target_")
+        || name.starts_with("pi_opus_")
+        || name.starts_with("cass-target")
     {
         (ArtifactCategory::AgentWorkspace, 0.80)
     } else {

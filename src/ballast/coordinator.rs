@@ -204,10 +204,7 @@ impl BallastPoolCoordinator {
     }
 
     /// Provision all pools (idempotent: skips existing valid files).
-    pub fn provision_all(
-        &mut self,
-        platform: &dyn Platform,
-    ) -> Result<MultiProvisionReport> {
+    pub fn provision_all(&mut self, platform: &dyn Platform) -> Result<MultiProvisionReport> {
         let mut per_volume = Vec::new();
         let mut skipped_volumes = Vec::new();
 
@@ -216,10 +213,8 @@ impl BallastPoolCoordinator {
             let free_pct = match platform.fs_stats(mount_path) {
                 Ok(stats) => stats.free_pct(),
                 Err(e) => {
-                    skipped_volumes.push((
-                        mount_path.clone(),
-                        format!("failed to get fs stats: {e}"),
-                    ));
+                    skipped_volumes
+                        .push((mount_path.clone(), format!("failed to get fs stats: {e}")));
                     continue;
                 }
             };
@@ -244,10 +239,7 @@ impl BallastPoolCoordinator {
             match pool.manager.provision(Some(&free_check)) {
                 Ok(report) => per_volume.push((mount_path.clone(), report)),
                 Err(e) => {
-                    skipped_volumes.push((
-                        mount_path.clone(),
-                        format!("provision failed: {e}"),
-                    ));
+                    skipped_volumes.push((mount_path.clone(), format!("provision failed: {e}")));
                 }
             }
         }
@@ -408,10 +400,7 @@ mod tests {
         }
     }
 
-    fn mock_platform_two_volumes(
-        dir_data: &Path,
-        dir_tmp: &Path,
-    ) -> MockPlatform {
+    fn mock_platform_two_volumes(dir_data: &Path, dir_tmp: &Path) -> MockPlatform {
         let mounts = vec![
             MountPoint {
                 path: dir_data.to_path_buf(),
@@ -564,7 +553,10 @@ mod tests {
             },
         );
 
-        let watched = vec![dir_data.path().to_path_buf(), dir_scratch.path().to_path_buf()];
+        let watched = vec![
+            dir_data.path().to_path_buf(),
+            dir_scratch.path().to_path_buf(),
+        ];
 
         let coordinator = BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
         assert_eq!(coordinator.pool_count(), 1);
@@ -578,7 +570,10 @@ mod tests {
         let dir_scratch = tempfile::tempdir().unwrap();
         let platform = mock_platform_two_volumes(dir_data.path(), dir_scratch.path());
 
-        let watched = vec![dir_data.path().to_path_buf(), dir_scratch.path().to_path_buf()];
+        let watched = vec![
+            dir_data.path().to_path_buf(),
+            dir_scratch.path().to_path_buf(),
+        ];
         let config = tiny_ballast_config();
 
         let mut coordinator =
@@ -630,7 +625,9 @@ mod tests {
         let mut coordinator =
             BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
 
-        let result = coordinator.release_for_mount(Path::new("/nonexistent"), 1).unwrap();
+        let result = coordinator
+            .release_for_mount(Path::new("/nonexistent"), 1)
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -719,7 +716,10 @@ mod tests {
         // Release all from volume A.
         coordinator.release_for_mount(dir_a.path(), 3).unwrap();
         assert_eq!(
-            coordinator.pool_for_mount(dir_a.path()).unwrap().available_count(),
+            coordinator
+                .pool_for_mount(dir_a.path())
+                .unwrap()
+                .available_count(),
             0
         );
 
@@ -730,7 +730,10 @@ mod tests {
             .expect("should have provision report");
         assert_eq!(report.files_created, 3);
         assert_eq!(
-            coordinator.pool_for_mount(dir_a.path()).unwrap().available_count(),
+            coordinator
+                .pool_for_mount(dir_a.path())
+                .unwrap()
+                .available_count(),
             3
         );
     }
@@ -767,7 +770,10 @@ mod tests {
         assert_eq!(provision_strategy("nfs"), ProvisionStrategy::Skip);
         assert_eq!(provision_strategy("nfs4"), ProvisionStrategy::Skip);
         // Unknown FS defaults to RandomData.
-        assert_eq!(provision_strategy("foobarfs"), ProvisionStrategy::RandomData);
+        assert_eq!(
+            provision_strategy("foobarfs"),
+            ProvisionStrategy::RandomData
+        );
     }
 
     #[test]

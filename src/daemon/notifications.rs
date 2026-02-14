@@ -158,10 +158,11 @@ impl NotificationEvent {
     pub fn summary(&self) -> String {
         match self {
             Self::PressureChanged {
-                from, to, mount, free_pct,
-            } => format!(
-                "Pressure {from} -> {to} on {mount} ({free_pct:.1}% free)"
-            ),
+                from,
+                to,
+                mount,
+                free_pct,
+            } => format!("Pressure {from} -> {to} on {mount} ({free_pct:.1}% free)"),
             Self::PredictiveWarning {
                 mount,
                 minutes_remaining,
@@ -283,8 +284,7 @@ pub struct FileConfig {
 
 impl Default for FileConfig {
     fn default() -> Self {
-        let home = std::env::var_os("HOME")
-            .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+        let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
         Self {
             path: home
                 .join(".local")
@@ -378,10 +378,7 @@ impl Channel for DesktopChannel {
                 "display notification \"{}\" with title \"sbh\" subtitle \"Storage Ballast Helper\"",
                 summary.replace('"', "\\\"")
             );
-            let _ = Command::new("osascript")
-                .arg("-e")
-                .arg(&script)
-                .spawn();
+            let _ = Command::new("osascript").arg("-e").arg(&script).spawn();
         }
 
         // On other platforms, desktop notifications are a no-op.
@@ -413,8 +410,7 @@ impl Channel for FileChannel {
 
     fn send(&self, event: &NotificationEvent) {
         let record = NotificationRecord {
-            ts: chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             level: event.level(),
             summary: event.summary(),
             event: event.clone(),
@@ -504,9 +500,9 @@ impl WebhookChannel {
 
         // Extract mount and free_pct from relevant events, or use defaults.
         let (mount, free_pct) = match event {
-            NotificationEvent::PressureChanged { mount, free_pct, .. } => {
-                (mount.clone(), format!("{free_pct:.1}"))
-            }
+            NotificationEvent::PressureChanged {
+                mount, free_pct, ..
+            } => (mount.clone(), format!("{free_pct:.1}")),
             NotificationEvent::PredictiveWarning { mount, .. }
             | NotificationEvent::CleanupCompleted { mount, .. }
             | NotificationEvent::BallastReleased { mount, .. } => {
@@ -845,9 +841,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notifications.jsonl");
 
-        let channel = FileChannel {
-            path: path.clone(),
-        };
+        let channel = FileChannel { path: path.clone() };
 
         let event = NotificationEvent::DaemonStarted {
             version: "0.1.0".to_string(),
@@ -874,11 +868,13 @@ mod tests {
     #[test]
     fn file_channel_creates_parent_dirs() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nested").join("dir").join("notifications.jsonl");
+        let path = dir
+            .path()
+            .join("nested")
+            .join("dir")
+            .join("notifications.jsonl");
 
-        let channel = FileChannel {
-            path: path.clone(),
-        };
+        let channel = FileChannel { path: path.clone() };
 
         let event = NotificationEvent::Error {
             code: "SBH-TEST".to_string(),
@@ -958,9 +954,7 @@ mod tests {
         let config = NotificationConfig {
             enabled: true,
             channels: vec!["file".to_string()],
-            file: FileConfig {
-                path: path.clone(),
-            },
+            file: FileConfig { path: path.clone() },
             ..Default::default()
         };
 
@@ -992,9 +986,7 @@ mod tests {
         let config = NotificationConfig {
             enabled: false,
             channels: vec!["file".to_string()],
-            file: FileConfig {
-                path: path.clone(),
-            },
+            file: FileConfig { path: path.clone() },
             ..Default::default()
         };
 

@@ -11,11 +11,11 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
 
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use rand::RngCore;
-use serde::{Deserialize, Serialize};
 
 use crate::core::config::BallastConfig;
 use crate::core::errors::{Result, SbhError};
@@ -230,9 +230,9 @@ impl BallastManager {
                     report.bytes_freed += self.config.file_size_bytes;
                 }
                 Err(e) => {
-                    report.errors.push(format!(
-                        "failed to release file {index}: {e}"
-                    ));
+                    report
+                        .errors
+                        .push(format!("failed to release file {index}: {e}"));
                 }
             }
         }
@@ -324,7 +324,11 @@ impl BallastManager {
         }
     }
 
-    fn verify_single_file(&self, path: &Path, expected_index: u32) -> std::result::Result<(), String> {
+    fn verify_single_file(
+        &self,
+        path: &Path,
+        expected_index: u32,
+    ) -> std::result::Result<(), String> {
         // Check file size.
         let meta = fs::metadata(path).map_err(|e| format!("metadata: {e}"))?;
         if meta.len() != self.config.file_size_bytes {
@@ -585,7 +589,10 @@ mod tests {
         assert_eq!(mgr.releasable_bytes(), expected);
 
         mgr.release(1).unwrap();
-        assert_eq!(mgr.releasable_bytes(), expected - small_config().file_size_bytes);
+        assert_eq!(
+            mgr.releasable_bytes(),
+            expected - small_config().file_size_bytes
+        );
     }
 
     #[test]

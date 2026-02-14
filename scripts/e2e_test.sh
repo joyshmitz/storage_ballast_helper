@@ -62,6 +62,14 @@ run_case() {
   return 0
 }
 
+tally_case() {
+  if "$@"; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+  fi
+}
+
 assert_file_contains() {
   local name="$1"
   local file="$2"
@@ -120,43 +128,43 @@ main() {
   local pass=0
   local fail=0
 
-  run_case help "Usage: sbh [OPTIONS] <COMMAND>" "${bin}" --help && ((pass+=1)) || ((fail+=1))
-  run_case version "0.1.0" "${bin}" --version && ((pass+=1)) || ((fail+=1))
-  run_case install "install: not yet implemented" "${bin}" install && ((pass+=1)) || ((fail+=1))
-  run_case uninstall "uninstall: not yet implemented" "${bin}" uninstall && ((pass+=1)) || ((fail+=1))
-  run_case status "status: not yet implemented" "${bin}" status && ((pass+=1)) || ((fail+=1))
-  run_case stats "stats: not yet implemented" "${bin}" stats && ((pass+=1)) || ((fail+=1))
-  run_case scan "scan: not yet implemented" "${bin}" scan && ((pass+=1)) || ((fail+=1))
-  run_case clean "clean: not yet implemented" "${bin}" clean && ((pass+=1)) || ((fail+=1))
-  run_case ballast "ballast: not yet implemented" "${bin}" ballast && ((pass+=1)) || ((fail+=1))
-  run_case ballast_status "ballast status: not yet implemented" "${bin}" ballast status && ((pass+=1)) || ((fail+=1))
-  run_case config "config: not yet implemented" "${bin}" config && ((pass+=1)) || ((fail+=1))
-  run_case config_show "config show: not yet implemented" "${bin}" config show && ((pass+=1)) || ((fail+=1))
-  run_case daemon "daemon: not yet implemented" "${bin}" daemon && ((pass+=1)) || ((fail+=1))
-  run_case emergency "emergency: not yet implemented" "${bin}" emergency /tmp --yes && ((pass+=1)) || ((fail+=1))
-  run_case protect "protect: not yet implemented" "${bin}" protect --list && ((pass+=1)) || ((fail+=1))
-  run_case unprotect "unprotect: not yet implemented" "${bin}" unprotect /tmp && ((pass+=1)) || ((fail+=1))
-  run_case tune "tune: not yet implemented" "${bin}" tune && ((pass+=1)) || ((fail+=1))
-  run_case check "check: not yet implemented" "${bin}" check /tmp && ((pass+=1)) || ((fail+=1))
-  run_case blame "blame: not yet implemented" "${bin}" blame && ((pass+=1)) || ((fail+=1))
-  run_case dashboard "dashboard: not yet implemented" "${bin}" dashboard && ((pass+=1)) || ((fail+=1))
-  run_case completions "sbh" "${bin}" completions bash && ((pass+=1)) || ((fail+=1))
+  tally_case run_case help "Usage: sbh [OPTIONS] <COMMAND>" "${bin}" --help
+  tally_case run_case version "0.1.0" "${bin}" --version
+  tally_case run_case install "install: not yet implemented" "${bin}" install
+  tally_case run_case uninstall "uninstall: not yet implemented" "${bin}" uninstall
+  tally_case run_case status "status: not yet implemented" "${bin}" status
+  tally_case run_case stats "stats: not yet implemented" "${bin}" stats
+  tally_case run_case scan "scan: not yet implemented" "${bin}" scan
+  tally_case run_case clean "clean: not yet implemented" "${bin}" clean
+  tally_case run_case ballast "ballast: not yet implemented" "${bin}" ballast
+  tally_case run_case ballast_status "ballast status: not yet implemented" "${bin}" ballast status
+  tally_case run_case config "config: not yet implemented" "${bin}" config
+  tally_case run_case config_show "config show: not yet implemented" "${bin}" config show
+  tally_case run_case daemon "daemon: not yet implemented" "${bin}" daemon
+  tally_case run_case emergency "emergency: not yet implemented" "${bin}" emergency /tmp --yes
+  tally_case run_case protect "protect: not yet implemented" "${bin}" protect --list
+  tally_case run_case unprotect "unprotect: not yet implemented" "${bin}" unprotect /tmp
+  tally_case run_case tune "tune: not yet implemented" "${bin}" tune
+  tally_case run_case check "check: not yet implemented" "${bin}" check /tmp
+  tally_case run_case blame "blame: not yet implemented" "${bin}" blame
+  tally_case run_case dashboard "dashboard: not yet implemented" "${bin}" dashboard
+  tally_case run_case completions "sbh" "${bin}" completions bash
 
   create_installer_fixture "${installer_fixture}"
-  run_case installer_help "Usage:" "${installer}" --help && ((pass+=1)) || ((fail+=1))
-  run_case installer_dry_run "dry-run complete (no changes applied)" "${installer}" --dry-run --dest "${installer_fixture}/bin" --no-color && ((pass+=1)) || ((fail+=1))
-  run_case installer_first_install "installed sbh to" env \
+  tally_case run_case installer_help "Usage:" "${installer}" --help
+  tally_case run_case installer_dry_run "dry-run complete (no changes applied)" "${installer}" --dry-run --dest "${installer_fixture}/bin" --no-color
+  tally_case run_case installer_first_install "installed sbh to" env \
     SBH_INSTALLER_ASSET_URL="file://${installer_fixture}/artifact.tar.xz" \
     SBH_INSTALLER_CHECKSUM_URL="file://${installer_fixture}/artifact.sha256" \
-    "${installer}" --dest "${installer_fixture}/bin" --version v0.0.0 --verify --no-color --event-log "${installer_events}" --trace-id "trace-install-1" && ((pass+=1)) || ((fail+=1))
-  run_case installer_idempotent_rerun "already up to date" env \
+    "${installer}" --dest "${installer_fixture}/bin" --version v0.0.0 --verify --no-color --event-log "${installer_events}" --trace-id "trace-install-1"
+  tally_case run_case installer_idempotent_rerun "already up to date" env \
     SBH_INSTALLER_ASSET_URL="file://${installer_fixture}/artifact.tar.xz" \
     SBH_INSTALLER_CHECKSUM_URL="file://${installer_fixture}/artifact.sha256" \
-    "${installer}" --dest "${installer_fixture}/bin" --version v0.0.0 --verify --no-color --event-log "${installer_events}" --trace-id "trace-install-2" && ((pass+=1)) || ((fail+=1))
-  assert_file_contains installer_events_trace1 "${installer_events}" '"trace_id":"trace-install-1"' && ((pass+=1)) || ((fail+=1))
-  assert_file_contains installer_events_trace2 "${installer_events}" '"trace_id":"trace-install-2"' && ((pass+=1)) || ((fail+=1))
-  assert_file_contains installer_events_download_phase "${installer_events}" '"phase":"download_artifact"' && ((pass+=1)) || ((fail+=1))
-  assert_file_contains installer_events_success "${installer_events}" '"status":"success"' && ((pass+=1)) || ((fail+=1))
+    "${installer}" --dest "${installer_fixture}/bin" --version v0.0.0 --verify --no-color --event-log "${installer_events}" --trace-id "trace-install-2"
+  tally_case assert_file_contains installer_events_trace1 "${installer_events}" '"trace_id":"trace-install-1"'
+  tally_case assert_file_contains installer_events_trace2 "${installer_events}" '"trace_id":"trace-install-2"'
+  tally_case assert_file_contains installer_events_download_phase "${installer_events}" '"phase":"download_artifact"'
+  tally_case assert_file_contains installer_events_success "${installer_events}" '"status":"success"'
 
   log "summary pass=${pass} fail=${fail}"
   log "case logs at ${CASE_DIR}"

@@ -758,9 +758,11 @@ mod tests {
         let partial = vec![contract.asset_name(), contract.checksum_name()];
         let error = validate_release_assets(&contract, &partial).unwrap_err();
         assert_eq!(error.code(), "SBH-3900");
-        assert!(error
-            .to_string()
-            .contains("missing assets [sbh-x86_64-pc-windows-msvc.zip.sigstore.json]"));
+        assert!(
+            error
+                .to_string()
+                .contains("missing assets [sbh-x86_64-pc-windows-msvc.zip.sigstore.json]")
+        );
     }
 
     #[test]
@@ -823,9 +825,11 @@ mod tests {
             outcome.signature,
             SignatureStatus::Degraded { .. }
         ));
-        assert!(outcome
-            .reason_codes
-            .contains(&String::from("sigstore_degraded")));
+        assert!(
+            outcome
+                .reason_codes
+                .contains(&String::from("sigstore_degraded"))
+        );
         assert!(!outcome.warnings.is_empty());
     }
 

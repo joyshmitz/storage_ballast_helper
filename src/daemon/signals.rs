@@ -6,8 +6,8 @@
 
 #![allow(missing_docs)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -324,10 +324,8 @@ mod tests {
     fn shutdown_coordinator_runs_tasks() {
         let coord = ShutdownCoordinator::new();
 
-        let tasks: Vec<(&str, &dyn Fn() -> bool)> = vec![
-            ("flush logs", &|| true),
-            ("close db", &|| true),
-        ];
+        let tasks: Vec<(&str, &dyn Fn() -> bool)> =
+            vec![("flush logs", &|| true), ("close db", &|| true)];
 
         let result = coord.execute(&tasks);
         assert!(result);
@@ -337,10 +335,8 @@ mod tests {
     fn shutdown_coordinator_reports_failures() {
         let coord = ShutdownCoordinator::new();
 
-        let tasks: Vec<(&str, &dyn Fn() -> bool)> = vec![
-            ("good task", &|| true),
-            ("bad task", &|| false),
-        ];
+        let tasks: Vec<(&str, &dyn Fn() -> bool)> =
+            vec![("good task", &|| true), ("bad task", &|| false)];
 
         let result = coord.execute(&tasks);
         assert!(!result);

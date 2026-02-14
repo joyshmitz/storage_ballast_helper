@@ -7,11 +7,11 @@
 #![allow(missing_docs)]
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
 use crate::core::errors::Result;
 use crate::logger::jsonl::{
@@ -146,9 +146,7 @@ pub struct DualLoggerConfig {
 impl Default for DualLoggerConfig {
     fn default() -> Self {
         Self {
-            sqlite_path: Some(PathBuf::from(
-                dirs_default_sqlite(),
-            )),
+            sqlite_path: Some(PathBuf::from(dirs_default_sqlite())),
             jsonl_config: JsonlConfig::default(),
             channel_capacity: CHANNEL_CAPACITY,
         }
@@ -167,7 +165,9 @@ fn dirs_default_sqlite() -> String {
 /// The returned handle is `Clone + Send` and can be shared across threads.
 /// The logger thread runs until `handle.shutdown()` is called or all senders
 /// are dropped.
-pub fn spawn_logger(config: DualLoggerConfig) -> Result<(ActivityLoggerHandle, thread::JoinHandle<()>)> {
+pub fn spawn_logger(
+    config: DualLoggerConfig,
+) -> Result<(ActivityLoggerHandle, thread::JoinHandle<()>)> {
     let (tx, rx) = bounded::<ActivityEvent>(config.channel_capacity);
     let dropped = Arc::new(AtomicU64::new(0));
     let dropped_clone = Arc::clone(&dropped);
@@ -249,9 +249,7 @@ fn logger_thread_main(
             if !ok {
                 sqlite_failures += 1;
                 if sqlite_failures >= 3 {
-                    eprintln!(
-                        "[SBH-DUAL] SQLite write failed {sqlite_failures} times, disabling"
-                    );
+                    eprintln!("[SBH-DUAL] SQLite write failed {sqlite_failures} times, disabling");
                     sqlite = None;
                 }
             } else {
@@ -402,11 +400,13 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
 }
 
 fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
-    let ts = chrono::Utc::now()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     match event {
-        ActivityEvent::DaemonStarted { version, config_hash } => Some(ActivityRow {
+        ActivityEvent::DaemonStarted {
+            version,
+            config_hash,
+        } => Some(ActivityRow {
             timestamp: ts,
             event_type: "daemon_start".to_string(),
             severity: "info".to_string(),
@@ -543,8 +543,7 @@ fn event_to_pressure_row(event: &ActivityEvent) -> Option<PressureRow> {
             pid_output,
             ..
         } => {
-            let ts = chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
             Some(PressureRow {
                 timestamp: ts,
                 mount_point: mount_point.clone(),

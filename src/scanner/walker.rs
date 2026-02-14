@@ -11,8 +11,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -172,14 +172,7 @@ fn walker_thread(
         match work_rx.recv_timeout(Duration::from_millis(50)) {
             Ok((dir_path, depth, root_dev)) => {
                 process_directory(
-                    &dir_path,
-                    depth,
-                    root_dev,
-                    work_tx,
-                    result_tx,
-                    in_flight,
-                    config,
-                    protection,
+                    &dir_path, depth, root_dev, work_tx, result_tx, in_flight, config, protection,
                 );
                 // Mark this work item as completed.
                 let remaining = in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -267,7 +260,9 @@ fn process_directory(
     let signals = signals_from_children(&child_names);
 
     // Emit a WalkEntry for this directory itself (the scanner scores directories).
-    if depth > 0 && let Ok(dir_meta) = fs::symlink_metadata(dir_path) {
+    if depth > 0
+        && let Ok(dir_meta) = fs::symlink_metadata(dir_path)
+    {
         let _ = result_tx.send(WalkEntry {
             path: dir_path.to_path_buf(),
             metadata: entry_metadata(&dir_meta),
@@ -655,10 +650,7 @@ mod tests {
         open.insert(PathBuf::from("/data/projects/foo/target/debug/libfoo.rlib"));
 
         assert!(is_path_open(Path::new("/data/projects/foo/target"), &open));
-        assert!(!is_path_open(
-            Path::new("/data/projects/bar/target"),
-            &open
-        ));
+        assert!(!is_path_open(Path::new("/data/projects/bar/target"), &open));
     }
 
     #[test]
@@ -690,8 +682,7 @@ mod tests {
         config.excluded_paths.clear();
 
         let pattern = format!("{}/**/production-*", tmp.path().display());
-        let protection =
-            ProtectionRegistry::new(Some(&[pattern])).unwrap();
+        let protection = ProtectionRegistry::new(Some(&[pattern])).unwrap();
         let walker = DirectoryWalker::new(config, protection);
         let entries = walker.walk().unwrap();
 

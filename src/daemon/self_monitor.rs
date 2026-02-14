@@ -10,8 +10,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -99,9 +99,9 @@ impl ThreadStatus {
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            Self::Running { name, .. }
-            | Self::Stalled { name, .. }
-            | Self::Dead { name, .. } => name,
+            Self::Running { name, .. } | Self::Stalled { name, .. } | Self::Dead { name, .. } => {
+                name
+            }
         }
     }
 
@@ -260,8 +260,7 @@ impl SelfMonitor {
             pid: std::process::id(),
             started_at: self.started_at_iso.clone(),
             uptime_seconds: self.start_time.elapsed().as_secs(),
-            last_updated: chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            last_updated: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             pressure: PressureState {
                 overall: format!("{pressure_level:?}").to_lowercase(),
                 mounts: vec![MountPressure {
@@ -317,10 +316,8 @@ impl SelfMonitor {
     /// Record a completed scan.
     pub fn record_scan(&mut self, candidates: usize, deleted: usize) {
         self.scan_count += 1;
-        self.last_scan_at = Some(
-            chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        );
+        self.last_scan_at =
+            Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
         self.last_scan_candidates = candidates;
         self.last_scan_deleted = deleted;
     }
@@ -338,10 +335,9 @@ impl SelfMonitor {
 
     /// Read the state file (for `sbh status` CLI command).
     pub fn read_state(path: &Path) -> std::result::Result<DaemonState, String> {
-        let raw = fs::read_to_string(path)
-            .map_err(|e| format!("cannot read state file: {e}"))?;
-        let state: DaemonState = serde_json::from_str(&raw)
-            .map_err(|e| format!("invalid state file: {e}"))?;
+        let raw = fs::read_to_string(path).map_err(|e| format!("cannot read state file: {e}"))?;
+        let state: DaemonState =
+            serde_json::from_str(&raw).map_err(|e| format!("invalid state file: {e}"))?;
 
         // Check staleness.
         if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&state.last_updated) {
@@ -523,9 +519,7 @@ mod tests {
         monitor.write_interval = Duration::from_millis(50);
 
         // First write always happens.
-        let rss = monitor.maybe_write_state(
-            PressureLevel::Green, 25.0, "/data", 10, 10,
-        );
+        let rss = monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 10, 10);
         assert!(path.exists());
 
         // Immediate second write is skipped (within interval).

@@ -19,11 +19,11 @@ use crate::logger::sqlite::SqliteLogger;
 
 /// The standard time windows used for aggregation.
 pub const STANDARD_WINDOWS: &[Duration] = &[
-    Duration::from_secs(10 * 60),        // 10 minutes
-    Duration::from_secs(30 * 60),        // 30 minutes
-    Duration::from_secs(60 * 60),        // 1 hour
-    Duration::from_secs(6 * 60 * 60),    // 6 hours
-    Duration::from_secs(24 * 60 * 60),   // 24 hours
+    Duration::from_secs(10 * 60),          // 10 minutes
+    Duration::from_secs(30 * 60),          // 30 minutes
+    Duration::from_secs(60 * 60),          // 1 hour
+    Duration::from_secs(6 * 60 * 60),      // 6 hours
+    Duration::from_secs(24 * 60 * 60),     // 24 hours
     Duration::from_secs(3 * 24 * 60 * 60), // 3 days
     Duration::from_secs(7 * 24 * 60 * 60), // 7 days
 ];
@@ -201,10 +201,7 @@ impl<'a> StatsEngine<'a> {
 
         let mut pattern_counts: HashMap<String, (u64, u64)> = HashMap::new();
         let rows = stmt.query_map(params![since], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
         })?;
 
         for row in rows {
@@ -391,10 +388,7 @@ impl<'a> StatsEngine<'a> {
             *counts.entry(pattern).or_insert(0) += 1;
         }
 
-        Ok(counts
-            .into_iter()
-            .max_by_key(|&(_, c)| c)
-            .map(|(p, _)| p))
+        Ok(counts.into_iter().max_by_key(|&(_, c)| c).map(|(p, _)| p))
     }
 
     fn ballast_stats(&self, since: &str) -> Result<BallastStats> {
@@ -541,10 +535,7 @@ fn timestamp_delta_secs(a: &str, b: &str) -> f64 {
 /// category names. Falls back to the directory name itself.
 fn extract_pattern(path: &str) -> String {
     let p = PathBuf::from(path);
-    let name = p
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown");
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
 
     // Match known artifact patterns.
     let lower = name.to_ascii_lowercase();
@@ -557,7 +548,10 @@ fn extract_pattern(path: &str) -> String {
     if lower.starts_with("cargo-target") || lower.starts_with("cargo_target") {
         return "cargo-target-*".to_string();
     }
-    if lower.starts_with("pi_agent") || lower.starts_with("pi_target") || lower.starts_with("pi_opus") {
+    if lower.starts_with("pi_agent")
+        || lower.starts_with("pi_target")
+        || lower.starts_with("pi_opus")
+    {
         return "pi_*".to_string();
     }
     if lower.starts_with("cass-target") {
@@ -678,9 +672,7 @@ mod tests {
         .unwrap();
 
         let engine = StatsEngine::new(&db);
-        let ws = engine
-            .window_stats(Duration::from_secs(10 * 60))
-            .unwrap();
+        let ws = engine.window_stats(Duration::from_secs(10 * 60)).unwrap();
 
         assert_eq!(ws.deletions.count, 5);
         assert_eq!(ws.deletions.total_bytes_freed, 15_000_000);
@@ -735,9 +727,7 @@ mod tests {
         .unwrap();
 
         let engine = StatsEngine::new(&db);
-        let ws = engine
-            .window_stats(Duration::from_secs(60 * 60))
-            .unwrap();
+        let ws = engine.window_stats(Duration::from_secs(60 * 60)).unwrap();
 
         assert_eq!(ws.ballast.files_released, 1);
         assert_eq!(ws.ballast.current_inventory, 2);
@@ -748,11 +738,7 @@ mod tests {
     fn pressure_stats_time_in_level() {
         let (_dir, db) = temp_db();
         // Simulate: green for 5 min, then orange for 3 min, then green for 2 min.
-        let samples = [
-            (8, "green", 25.0),
-            (3, "orange", 7.0),
-            (1, "green", 22.0),
-        ];
+        let samples = [(8, "green", 25.0), (3, "orange", 7.0), (1, "green", 22.0)];
         for &(mins_ago, level, free_pct) in &samples {
             db.log_pressure(&PressureRow {
                 timestamp: ts(mins_ago),
@@ -769,9 +755,7 @@ mod tests {
         }
 
         let engine = StatsEngine::new(&db);
-        let ws = engine
-            .window_stats(Duration::from_secs(10 * 60))
-            .unwrap();
+        let ws = engine.window_stats(Duration::from_secs(10 * 60)).unwrap();
 
         // 2 transitions: green->orange, orange->green.
         assert_eq!(ws.pressure.transitions, 2);
@@ -900,7 +884,10 @@ mod tests {
         assert_eq!(extract_pattern("/data/foo/target-bar"), "target/");
         assert_eq!(extract_pattern("/data/foo/.target_opus"), ".target*");
         assert_eq!(extract_pattern("/data/foo/_target_old"), ".target*");
-        assert_eq!(extract_pattern("/data/foo/cargo-target-baz"), "cargo-target-*");
+        assert_eq!(
+            extract_pattern("/data/foo/cargo-target-baz"),
+            "cargo-target-*"
+        );
         assert_eq!(extract_pattern("/data/foo/pi_agent_1"), "pi_*");
         assert_eq!(extract_pattern("/data/foo/node_modules"), "node_modules/");
         assert_eq!(extract_pattern("/data/foo/random_dir"), "random_dir");

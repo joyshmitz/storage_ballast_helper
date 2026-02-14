@@ -133,10 +133,7 @@ impl ProtectionRegistry {
         let path_str = path.to_string_lossy();
         for pattern in &self.config_patterns {
             if pattern.compiled.is_match(&path_str) {
-                return Some(format!(
-                    "protected by config pattern: {}",
-                    pattern.original
-                ));
+                return Some(format!("protected by config pattern: {}", pattern.original));
             }
         }
 
@@ -404,9 +401,7 @@ mod tests {
 
         assert!(reg.is_protected(Path::new("/data/projects/critical-app")));
         assert!(reg.is_protected(Path::new("/data/projects/critical-app/target")));
-        assert!(reg.is_protected(Path::new(
-            "/data/projects/critical-app/target/debug/build"
-        )));
+        assert!(reg.is_protected(Path::new("/data/projects/critical-app/target/debug/build")));
         assert!(!reg.is_protected(Path::new("/data/projects/other-app")));
     }
 
@@ -437,9 +432,10 @@ mod tests {
     #[test]
     fn unprotected_path_returns_none() {
         let reg = ProtectionRegistry::marker_only();
-        assert!(reg
-            .protection_reason(Path::new("/data/projects/foo"))
-            .is_none());
+        assert!(
+            reg.protection_reason(Path::new("/data/projects/foo"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -576,10 +572,16 @@ mod tests {
         assert_eq!(list.len(), 2);
 
         let sources: Vec<_> = list.iter().map(|e| &e.source).collect();
-        assert!(sources.iter().any(|s| matches!(s, ProtectionSource::MarkerFile)));
-        assert!(sources
-            .iter()
-            .any(|s| matches!(s, ProtectionSource::ConfigPattern(_))));
+        assert!(
+            sources
+                .iter()
+                .any(|s| matches!(s, ProtectionSource::MarkerFile))
+        );
+        assert!(
+            sources
+                .iter()
+                .any(|s| matches!(s, ProtectionSource::ConfigPattern(_)))
+        );
     }
 
     #[test]

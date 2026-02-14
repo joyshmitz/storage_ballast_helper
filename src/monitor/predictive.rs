@@ -102,7 +102,9 @@ impl PredictiveAction {
             Self::Clear => 0,
             Self::EarlyWarning { .. } => 1,
             Self::PreemptiveCleanup { .. } => 2,
-            Self::ImminentDanger { critical: false, .. } => 3,
+            Self::ImminentDanger {
+                critical: false, ..
+            } => 3,
             Self::ImminentDanger { critical: true, .. } => 4,
         }
     }
@@ -114,7 +116,9 @@ impl PredictiveAction {
             Self::Clear => "predictive_clear",
             Self::EarlyWarning { .. } => "predictive_warning",
             Self::PreemptiveCleanup { .. } => "predictive_cleanup",
-            Self::ImminentDanger { critical: false, .. } => "predictive_imminent",
+            Self::ImminentDanger {
+                critical: false, ..
+            } => "predictive_imminent",
             Self::ImminentDanger { critical: true, .. } => "predictive_critical",
         }
     }
@@ -512,38 +516,52 @@ mod tests {
 
     #[test]
     fn severity_ordering() {
-        assert!(PredictiveAction::Clear.severity() < PredictiveAction::EarlyWarning {
-            mount: PathBuf::from("/"),
-            minutes_remaining: 50.0,
-            confidence: 0.9,
-            rate_bytes_per_second: 100.0,
-            trend: Trend::Stable,
-        }.severity());
+        assert!(
+            PredictiveAction::Clear.severity()
+                < PredictiveAction::EarlyWarning {
+                    mount: PathBuf::from("/"),
+                    minutes_remaining: 50.0,
+                    confidence: 0.9,
+                    rate_bytes_per_second: 100.0,
+                    trend: Trend::Stable,
+                }
+                .severity()
+        );
 
-        assert!(PredictiveAction::EarlyWarning {
-            mount: PathBuf::from("/"),
-            minutes_remaining: 50.0,
-            confidence: 0.9,
-            rate_bytes_per_second: 100.0,
-            trend: Trend::Stable,
-        }.severity() < PredictiveAction::PreemptiveCleanup {
-            mount: PathBuf::from("/"),
-            minutes_remaining: 20.0,
-            confidence: 0.9,
-            rate_bytes_per_second: 100.0,
-            recommended_min_score: 0.5,
-            recommended_free_target_pct: 20.0,
-        }.severity());
+        assert!(
+            PredictiveAction::EarlyWarning {
+                mount: PathBuf::from("/"),
+                minutes_remaining: 50.0,
+                confidence: 0.9,
+                rate_bytes_per_second: 100.0,
+                trend: Trend::Stable,
+            }
+            .severity()
+                < PredictiveAction::PreemptiveCleanup {
+                    mount: PathBuf::from("/"),
+                    minutes_remaining: 20.0,
+                    confidence: 0.9,
+                    rate_bytes_per_second: 100.0,
+                    recommended_min_score: 0.5,
+                    recommended_free_target_pct: 20.0,
+                }
+                .severity()
+        );
 
-        assert!(PredictiveAction::ImminentDanger {
-            mount: PathBuf::from("/"),
-            minutes_remaining: 4.0,
-            critical: false,
-        }.severity() < PredictiveAction::ImminentDanger {
-            mount: PathBuf::from("/"),
-            minutes_remaining: 1.0,
-            critical: true,
-        }.severity());
+        assert!(
+            PredictiveAction::ImminentDanger {
+                mount: PathBuf::from("/"),
+                minutes_remaining: 4.0,
+                critical: false,
+            }
+            .severity()
+                < PredictiveAction::ImminentDanger {
+                    mount: PathBuf::from("/"),
+                    minutes_remaining: 1.0,
+                    critical: true,
+                }
+                .severity()
+        );
     }
 
     #[test]
@@ -587,57 +605,69 @@ mod tests {
     #[test]
     fn should_cleanup_logic() {
         assert!(!PredictiveAction::Clear.should_cleanup());
-        assert!(!PredictiveAction::EarlyWarning {
-            mount: PathBuf::from("/"),
-            minutes_remaining: 50.0,
-            confidence: 0.9,
-            rate_bytes_per_second: 100.0,
-            trend: Trend::Stable,
-        }
-        .should_cleanup());
-        assert!(PredictiveAction::PreemptiveCleanup {
-            mount: PathBuf::from("/"),
-            minutes_remaining: 20.0,
-            confidence: 0.9,
-            rate_bytes_per_second: 100.0,
-            recommended_min_score: 0.5,
-            recommended_free_target_pct: 20.0,
-        }
-        .should_cleanup());
-        assert!(PredictiveAction::ImminentDanger {
-            mount: PathBuf::from("/"),
-            minutes_remaining: 4.0,
-            critical: false,
-        }
-        .should_cleanup());
+        assert!(
+            !PredictiveAction::EarlyWarning {
+                mount: PathBuf::from("/"),
+                minutes_remaining: 50.0,
+                confidence: 0.9,
+                rate_bytes_per_second: 100.0,
+                trend: Trend::Stable,
+            }
+            .should_cleanup()
+        );
+        assert!(
+            PredictiveAction::PreemptiveCleanup {
+                mount: PathBuf::from("/"),
+                minutes_remaining: 20.0,
+                confidence: 0.9,
+                rate_bytes_per_second: 100.0,
+                recommended_min_score: 0.5,
+                recommended_free_target_pct: 20.0,
+            }
+            .should_cleanup()
+        );
+        assert!(
+            PredictiveAction::ImminentDanger {
+                mount: PathBuf::from("/"),
+                minutes_remaining: 4.0,
+                critical: false,
+            }
+            .should_cleanup()
+        );
     }
 
     #[test]
     fn should_release_ballast_logic() {
         assert!(!PredictiveAction::Clear.should_release_ballast());
-        assert!(!PredictiveAction::EarlyWarning {
-            mount: PathBuf::from("/"),
-            minutes_remaining: 50.0,
-            confidence: 0.9,
-            rate_bytes_per_second: 100.0,
-            trend: Trend::Stable,
-        }
-        .should_release_ballast());
-        assert!(!PredictiveAction::PreemptiveCleanup {
-            mount: PathBuf::from("/"),
-            minutes_remaining: 20.0,
-            confidence: 0.9,
-            rate_bytes_per_second: 100.0,
-            recommended_min_score: 0.5,
-            recommended_free_target_pct: 20.0,
-        }
-        .should_release_ballast());
-        assert!(PredictiveAction::ImminentDanger {
-            mount: PathBuf::from("/"),
-            minutes_remaining: 4.0,
-            critical: false,
-        }
-        .should_release_ballast());
+        assert!(
+            !PredictiveAction::EarlyWarning {
+                mount: PathBuf::from("/"),
+                minutes_remaining: 50.0,
+                confidence: 0.9,
+                rate_bytes_per_second: 100.0,
+                trend: Trend::Stable,
+            }
+            .should_release_ballast()
+        );
+        assert!(
+            !PredictiveAction::PreemptiveCleanup {
+                mount: PathBuf::from("/"),
+                minutes_remaining: 20.0,
+                confidence: 0.9,
+                rate_bytes_per_second: 100.0,
+                recommended_min_score: 0.5,
+                recommended_free_target_pct: 20.0,
+            }
+            .should_release_ballast()
+        );
+        assert!(
+            PredictiveAction::ImminentDanger {
+                mount: PathBuf::from("/"),
+                minutes_remaining: 4.0,
+                critical: false,
+            }
+            .should_release_ballast()
+        );
     }
 
     #[test]
@@ -645,13 +675,11 @@ mod tests {
         let policy = default_policy();
 
         // Near action horizon (30 min) — gentle.
-        let gentle_est =
-            make_estimate(100_000.0, 29.0 * 60.0, 0.90, Trend::Stable, false);
+        let gentle_est = make_estimate(100_000.0, 29.0 * 60.0, 0.90, Trend::Stable, false);
         let gentle = policy.evaluate(&gentle_est, 50.0, PathBuf::from("/data"));
 
         // Near imminent (6 min) — aggressive.
-        let aggressive_est =
-            make_estimate(100_000.0, 6.0 * 60.0, 0.90, Trend::Stable, false);
+        let aggressive_est = make_estimate(100_000.0, 6.0 * 60.0, 0.90, Trend::Stable, false);
         let aggressive = policy.evaluate(&aggressive_est, 50.0, PathBuf::from("/data"));
 
         match (&gentle, &aggressive) {
@@ -670,7 +698,9 @@ mod tests {
                     "gentle ({gentle_score}) should have higher min_score than aggressive ({aggressive_score})"
                 );
             }
-            _ => panic!("both should be PreemptiveCleanup: gentle={gentle:?}, aggressive={aggressive:?}"),
+            _ => panic!(
+                "both should be PreemptiveCleanup: gentle={gentle:?}, aggressive={aggressive:?}"
+            ),
         }
     }
 
@@ -721,7 +751,10 @@ mod tests {
         let est3 = make_estimate(100_000.0, 2.5 * 60.0, 0.90, Trend::Stable, false);
         assert!(matches!(
             policy.evaluate(&est3, 80.0, PathBuf::from("/data")),
-            PredictiveAction::ImminentDanger { critical: false, .. }
+            PredictiveAction::ImminentDanger {
+                critical: false,
+                ..
+            }
         ));
 
         // 1.5 min: below custom 2-min critical threshold.

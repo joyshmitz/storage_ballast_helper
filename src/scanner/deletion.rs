@@ -163,10 +163,7 @@ impl DeletionExecutor {
         };
 
         let mut consecutive_failures: u32 = 0;
-        let limit = plan
-            .candidates
-            .len()
-            .min(self.config.max_batch_size);
+        let limit = plan.candidates.len().min(self.config.max_batch_size);
 
         for candidate in plan.candidates.iter().take(limit) {
             // Circuit breaker check.
@@ -261,7 +258,11 @@ impl DeletionExecutor {
 
         // 2. Parent directory is writable.
         if let Some(parent) = path.parent() {
-            if parent.metadata().map(|m| m.permissions().readonly()).unwrap_or(true) {
+            if parent
+                .metadata()
+                .map(|m| m.permissions().readonly())
+                .unwrap_or(true)
+            {
                 return Err(SkipReason::NotWritable);
             }
         }
@@ -291,10 +292,7 @@ impl DeletionExecutor {
         // Post-deletion verification: path should be gone.
         if path.exists() {
             return Err(SbhError::Runtime {
-                details: format!(
-                    "path still exists after deletion: {}",
-                    path.display()
-                ),
+                details: format!("path still exists after deletion: {}", path.display()),
             });
         }
 
@@ -600,9 +598,7 @@ mod tests {
 
         assert_eq!(report.items_deleted, 3);
         // 7 files should remain.
-        let remaining = fs::read_dir(dir.path())
-            .unwrap()
-            .count();
+        let remaining = fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(remaining, 7);
     }
 
@@ -621,10 +617,13 @@ mod tests {
 
         // Pressure check: resolved after first deletion.
         let call_count = std::sync::atomic::AtomicU32::new(0);
-        let report = executor.execute(&plan, Some(&|| {
-            let count = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            count >= 1 // Resolved after first
-        }));
+        let report = executor.execute(
+            &plan,
+            Some(&|| {
+                let count = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                count >= 1 // Resolved after first
+            }),
+        );
 
         // Should delete 1, then stop.
         assert_eq!(report.items_deleted, 1);
