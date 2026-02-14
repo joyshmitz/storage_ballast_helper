@@ -97,6 +97,8 @@ enum Command {
     Dashboard(DashboardArgs),
     /// Generate shell completions.
     Completions(CompletionsArgs),
+    /// Post-install setup: PATH, completions, and verification.
+    Setup(SetupArgs),
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -404,6 +406,31 @@ struct CompletionsArgs {
     shell: CompletionShell,
 }
 
+#[derive(Debug, Clone, Args)]
+struct SetupArgs {
+    /// Add sbh to shell PATH (appends to profile if not already present).
+    #[arg(long)]
+    path: bool,
+    /// Install shell completion scripts for the given shell(s).
+    #[arg(long, value_enum, value_delimiter = ',')]
+    completions: Vec<CompletionShell>,
+    /// Run post-install verification (sbh --version check).
+    #[arg(long)]
+    verify: bool,
+    /// Run all setup steps (PATH + completions + verify).
+    #[arg(long)]
+    all: bool,
+    /// Shell profile to modify for PATH setup (auto-detected if omitted).
+    #[arg(long, value_name = "PATH")]
+    profile: Option<PathBuf>,
+    /// Directory containing the sbh binary (auto-detected if omitted).
+    #[arg(long, value_name = "DIR")]
+    bin_dir: Option<PathBuf>,
+    /// Print what would be done without making changes.
+    #[arg(long)]
+    dry_run: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputMode {
     Human,
@@ -477,6 +504,7 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
             generate(args.shell, &mut command, binary_name, &mut io::stdout());
             Ok(())
         }
+        Command::Setup(args) => run_setup(cli, args),
     }
 }
 
@@ -3875,6 +3903,510 @@ fn resolve_output_mode(json_flag: bool, env_mode: Option<&str>, stdout_is_tty: b
     }
 }
 
+// ---------------------------------------------------------------------------
+// Setup command: PATH, completions, verification
+// ---------------------------------------------------------------------------
+
+fn run_setup(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
+    let mode = output_mode(cli);
+    let do_path = args.path || args.all;
+    let do_completions = !args.completions.is_empty() || args.all;
+    let do_verify = args.verify || args.all;
+
+    if !do_path && !do_completions && !do_verify {
+        return Err(CliError::User(
+            "specify at least one setup step: --path, --completions <shell>, --verify, or --all"
+                .to_string(),
+        ));
+    }
+
+    let bin_dir = resolve_bin_dir(args)?;
+    let mut results: Vec<SetupStepResult> = Vec::new();
+
+    // PATH setup.
+    if do_path {
+        let result = setup_path(&bin_dir, args, mode);
+        results.push(result);
+    }
+
+    // Completions install.
+    if do_completions {
+        let shells = if args.all {
+            detect_available_shells()
+        } else {
+            args.completions.clone()
+        };
+        for shell in &shells {
+            let result = setup_completions(*shell, &bin_dir, args.dry_run, mode);
+            results.push(result);
+        }
+    }
+
+    // Verification.
+    if do_verify {
+        let result = setup_verify(&bin_dir, mode);
+        results.push(result);
+    }
+
+    // Output results.
+    let all_ok = results.iter().all(|r| r.success);
+    if mode == OutputMode::Json {
+        let output = json!({
+            "command": "setup",
+            "success": all_ok,
+            "dry_run": args.dry_run,
+            "bin_dir": bin_dir.to_string_lossy(),
+            "steps": results,
+        });
+        write_json_line(&output)?;
+    } else {
+        println!();
+        if all_ok {
+            println!("Setup complete. All steps succeeded.");
+        } else {
+            let failed: Vec<&str> = results
+                .iter()
+                .filter(|r| !r.success)
+                .map(|r| r.step.as_str())
+                .collect();
+            println!("Setup completed with errors in: {}", failed.join(", "));
+        }
+    }
+
+    if all_ok {
+        Ok(())
+    } else {
+        Err(CliError::Partial("some setup steps failed".to_string()))
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SetupStepResult {
+    step: String,
+    success: bool,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remediation: Option<String>,
+}
+
+fn resolve_bin_dir(args: &SetupArgs) -> Result<PathBuf, CliError> {
+    if let Some(dir) = &args.bin_dir {
+        return Ok(dir.clone());
+    }
+
+    // Auto-detect from current executable path.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            return Ok(parent.to_path_buf());
+        }
+    }
+
+    // Fallback to ~/.local/bin on Unix.
+    #[cfg(unix)]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return Ok(PathBuf::from(home).join(".local/bin"));
+        }
+    }
+
+    Err(CliError::Runtime(
+        "cannot determine binary directory; use --bin-dir to specify".to_string(),
+    ))
+}
+
+fn setup_path(bin_dir: &Path, args: &SetupArgs, mode: OutputMode) -> SetupStepResult {
+    let profile_path = match &args.profile {
+        Some(p) => p.clone(),
+        None => detect_shell_profile(),
+    };
+
+    if mode == OutputMode::Human {
+        println!("PATH setup: checking {}", profile_path.display());
+    }
+
+    // Check if already in PATH.
+    if let Ok(path_var) = std::env::var("PATH") {
+        let bin_str = bin_dir.to_string_lossy();
+        let already_in_path = path_var
+            .split(':')
+            .any(|entry| entry.trim_end_matches('/') == bin_str.trim_end_matches('/'));
+        if already_in_path {
+            if mode == OutputMode::Human {
+                println!("  {} is already in PATH", bin_dir.display());
+            }
+            return SetupStepResult {
+                step: "path".to_string(),
+                success: true,
+                message: format!("{} is already in PATH", bin_dir.display()),
+                remediation: None,
+            };
+        }
+    }
+
+    let export_line = format!(
+        "\n# Added by sbh setup\nexport PATH=\"{}:$PATH\"\n",
+        bin_dir.display()
+    );
+
+    if args.dry_run {
+        if mode == OutputMode::Human {
+            println!(
+                "  Would append to {}: {}",
+                profile_path.display(),
+                export_line.trim()
+            );
+        }
+        return SetupStepResult {
+            step: "path".to_string(),
+            success: true,
+            message: format!(
+                "dry-run: would append PATH entry to {}",
+                profile_path.display()
+            ),
+            remediation: None,
+        };
+    }
+
+    // Check if the profile already contains this exact line (idempotent).
+    if let Ok(contents) = std::fs::read_to_string(&profile_path) {
+        if contents.contains(&format!("export PATH=\"{}:$PATH\"", bin_dir.display())) {
+            if mode == OutputMode::Human {
+                println!("  PATH entry already present in {}", profile_path.display());
+            }
+            return SetupStepResult {
+                step: "path".to_string(),
+                success: true,
+                message: format!("PATH entry already present in {}", profile_path.display()),
+                remediation: None,
+            };
+        }
+    }
+
+    // Back up existing profile.
+    let backup_path = profile_path.with_extension("sbh-backup");
+    if profile_path.exists() {
+        if let Err(e) = std::fs::copy(&profile_path, &backup_path) {
+            return SetupStepResult {
+                step: "path".to_string(),
+                success: false,
+                message: format!("failed to back up {}: {e}", profile_path.display()),
+                remediation: Some(format!(
+                    "Manually add to your shell profile:\n  {}",
+                    export_line.trim()
+                )),
+            };
+        }
+        if mode == OutputMode::Human {
+            println!(
+                "  Backed up {} to {}",
+                profile_path.display(),
+                backup_path.display()
+            );
+        }
+    }
+
+    // Append PATH entry.
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&profile_path)
+    {
+        Ok(mut file) => {
+            if let Err(e) = write!(file, "{export_line}") {
+                return SetupStepResult {
+                    step: "path".to_string(),
+                    success: false,
+                    message: format!("failed to write to {}: {e}", profile_path.display()),
+                    remediation: Some(format!(
+                        "Manually add to your shell profile:\n  {}",
+                        export_line.trim()
+                    )),
+                };
+            }
+            if mode == OutputMode::Human {
+                println!(
+                    "  Added {} to PATH in {}",
+                    bin_dir.display(),
+                    profile_path.display()
+                );
+                println!(
+                    "  Run `source {}` or open a new shell to activate",
+                    profile_path.display()
+                );
+            }
+            SetupStepResult {
+                step: "path".to_string(),
+                success: true,
+                message: format!(
+                    "added {} to PATH in {}",
+                    bin_dir.display(),
+                    profile_path.display()
+                ),
+                remediation: None,
+            }
+        }
+        Err(e) => SetupStepResult {
+            step: "path".to_string(),
+            success: false,
+            message: format!("cannot open {}: {e}", profile_path.display()),
+            remediation: Some(format!(
+                "Manually add to your shell profile:\n  {}",
+                export_line.trim()
+            )),
+        },
+    }
+}
+
+fn setup_completions(
+    shell: CompletionShell,
+    _bin_dir: &Path,
+    dry_run: bool,
+    mode: OutputMode,
+) -> SetupStepResult {
+    let step_name = format!("completions-{shell:?}");
+
+    let completion_dir = match shell_completion_dir(shell) {
+        Some(dir) => dir,
+        None => {
+            return SetupStepResult {
+                step: step_name,
+                success: false,
+                message: format!("cannot determine completion directory for {shell:?}"),
+                remediation: Some(format!(
+                    "Generate completions manually:\n  sbh completions {shell:?} > <completion-dir>/sbh",
+                )),
+            };
+        }
+    };
+
+    let completion_file = match shell {
+        CompletionShell::Bash => completion_dir.join("sbh"),
+        CompletionShell::Zsh => completion_dir.join("_sbh"),
+        CompletionShell::Fish => completion_dir.join("sbh.fish"),
+        _ => completion_dir.join("sbh"),
+    };
+
+    if mode == OutputMode::Human {
+        println!(
+            "Completions ({shell:?}): target {}",
+            completion_file.display()
+        );
+    }
+
+    if dry_run {
+        if mode == OutputMode::Human {
+            println!(
+                "  Would write completion script to {}",
+                completion_file.display()
+            );
+        }
+        return SetupStepResult {
+            step: step_name,
+            success: true,
+            message: format!("dry-run: would write to {}", completion_file.display()),
+            remediation: None,
+        };
+    }
+
+    // Generate completion script.
+    let mut command = Cli::command();
+    let binary_name = command.get_name().to_string();
+    let mut buf = Vec::new();
+    generate(shell, &mut command, binary_name, &mut buf);
+
+    // Create directory if needed.
+    if let Some(parent) = completion_file.parent() {
+        if !parent.exists() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return SetupStepResult {
+                    step: step_name,
+                    success: false,
+                    message: format!(
+                        "cannot create completion directory {}: {e}",
+                        parent.display()
+                    ),
+                    remediation: Some(format!(
+                        "Generate completions manually:\n  sbh completions {shell:?} > {}",
+                        completion_file.display()
+                    )),
+                };
+            }
+        }
+    }
+
+    match std::fs::write(&completion_file, &buf) {
+        Ok(()) => {
+            if mode == OutputMode::Human {
+                println!(
+                    "  Installed completion script to {}",
+                    completion_file.display()
+                );
+            }
+            SetupStepResult {
+                step: step_name,
+                success: true,
+                message: format!(
+                    "installed completion script to {}",
+                    completion_file.display()
+                ),
+                remediation: None,
+            }
+        }
+        Err(e) => SetupStepResult {
+            step: step_name,
+            success: false,
+            message: format!(
+                "cannot write completion script to {}: {e}",
+                completion_file.display()
+            ),
+            remediation: Some(format!(
+                "Generate completions manually:\n  sbh completions {shell:?} > {}",
+                completion_file.display()
+            )),
+        },
+    }
+}
+
+fn setup_verify(bin_dir: &Path, mode: OutputMode) -> SetupStepResult {
+    let binary = bin_dir.join("sbh");
+
+    if mode == OutputMode::Human {
+        println!("Verification: checking sbh binary");
+    }
+
+    // Check binary exists.
+    if !binary.exists() {
+        // Try with .exe on Windows.
+        let binary_exe = bin_dir.join("sbh.exe");
+        if !binary_exe.exists() {
+            return SetupStepResult {
+                step: "verify".to_string(),
+                success: false,
+                message: format!("sbh binary not found at {}", binary.display()),
+                remediation: Some(format!(
+                    "Ensure sbh is installed at {} or specify --bin-dir",
+                    bin_dir.display()
+                )),
+            };
+        }
+    }
+
+    // Try running sbh --version.
+    match std::process::Command::new(&binary)
+        .arg("--version")
+        .output()
+    {
+        Ok(output) => {
+            if output.status.success() {
+                let version_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if mode == OutputMode::Human {
+                    println!("  Binary OK: {version_str}");
+                }
+                SetupStepResult {
+                    step: "verify".to_string(),
+                    success: true,
+                    message: format!("binary verified: {version_str}"),
+                    remediation: None,
+                }
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                SetupStepResult {
+                    step: "verify".to_string(),
+                    success: false,
+                    message: format!(
+                        "sbh --version exited with code {}: {stderr}",
+                        output.status.code().unwrap_or(-1)
+                    ),
+                    remediation: Some(
+                        "The binary may be corrupted. Re-run the installer.".to_string(),
+                    ),
+                }
+            }
+        }
+        Err(e) => SetupStepResult {
+            step: "verify".to_string(),
+            success: false,
+            message: format!("failed to execute sbh: {e}"),
+            remediation: Some(format!(
+                "Ensure sbh is executable and at {}",
+                binary.display()
+            )),
+        },
+    }
+}
+
+fn detect_shell_profile() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/root"));
+    let home = PathBuf::from(home);
+
+    // Check current SHELL env to pick the right profile.
+    let shell = std::env::var("SHELL").unwrap_or_default();
+
+    if shell.ends_with("/zsh") {
+        let zdotdir = std::env::var("ZDOTDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home.clone());
+        return zdotdir.join(".zshrc");
+    }
+
+    if shell.ends_with("/fish") {
+        return home.join(".config/fish/config.fish");
+    }
+
+    // Default to bash: prefer .bashrc (interactive), fall back to .bash_profile.
+    let bashrc = home.join(".bashrc");
+    if bashrc.exists() {
+        return bashrc;
+    }
+    home.join(".bash_profile")
+}
+
+fn detect_available_shells() -> Vec<CompletionShell> {
+    let mut shells = Vec::new();
+
+    // Always include bash as fallback.
+    shells.push(CompletionShell::Bash);
+
+    if std::process::Command::new("zsh")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        shells.push(CompletionShell::Zsh);
+    }
+
+    if std::process::Command::new("fish")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        shells.push(CompletionShell::Fish);
+    }
+
+    shells
+}
+
+fn shell_completion_dir(shell: CompletionShell) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let home = PathBuf::from(home);
+
+    match shell {
+        CompletionShell::Bash => {
+            // User completions in ~/.local/share/bash-completion/completions/.
+            Some(home.join(".local/share/bash-completion/completions"))
+        }
+        CompletionShell::Zsh => {
+            // User completions in ~/.local/share/zsh/site-functions/ or first fpath entry.
+            Some(home.join(".local/share/zsh/site-functions"))
+        }
+        CompletionShell::Fish => {
+            // User completions in ~/.config/fish/completions/.
+            Some(home.join(".config/fish/completions"))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4128,6 +4660,32 @@ mod tests {
     }
 
     #[test]
+    fn setup_command_parses_with_flags() {
+        let cases = [
+            vec!["sbh", "setup", "--all"],
+            vec!["sbh", "setup", "--path"],
+            vec!["sbh", "setup", "--verify"],
+            vec!["sbh", "setup", "--completions", "bash"],
+            vec!["sbh", "setup", "--completions", "bash,zsh,fish"],
+            vec!["sbh", "setup", "--path", "--verify", "--dry-run"],
+            vec![
+                "sbh",
+                "setup",
+                "--all",
+                "--profile",
+                "/home/user/.bashrc",
+                "--bin-dir",
+                "/usr/local/bin",
+                "--dry-run",
+            ],
+        ];
+        for case in cases {
+            let parsed = Cli::try_parse_from(case.clone());
+            assert!(parsed.is_ok(), "failed to parse setup case: {case:?}");
+        }
+    }
+
+    #[test]
     fn help_includes_new_command_surface() {
         let mut cmd = Cli::command();
         let help = cmd.render_long_help().to_string();
@@ -4140,6 +4698,7 @@ mod tests {
             "blame",
             "dashboard",
             "completions",
+            "setup",
         ] {
             assert!(
                 help.contains(keyword),
