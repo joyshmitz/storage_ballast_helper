@@ -16,8 +16,9 @@ use crate::core::update_cache::{CachedUpdateMetadata, UpdateMetadataCache};
 
 use super::{
     HostSpecifier, IntegrityDecision, ReleaseArtifactContract, ReleaseChannel, ReleaseLocator,
-    VerificationMode, resolve_bundle_artifact_contract, resolve_updater_artifact_contract,
-    sigstore_policy_and_probe_for_bundle, verify_artifact_supply_chain,
+    SigstorePolicy, VerificationMode, resolve_bundle_artifact_contract,
+    resolve_updater_artifact_contract, sigstore_policy_and_probe_for_bundle,
+    verify_artifact_supply_chain,
 };
 
 // ---------------------------------------------------------------------------
@@ -665,8 +666,11 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
             return report;
         }
     };
-    let (sigstore_policy, sigstore_probe) =
-        sigstore_policy_and_probe_for_bundle(&archive_path, target.bundle_sigstore_path.as_deref());
+    let (sigstore_policy, sigstore_probe) = if verification_mode == VerificationMode::Enforce {
+        sigstore_policy_and_probe_for_bundle(&archive_path, target.bundle_sigstore_path.as_deref())
+    } else {
+        (SigstorePolicy::Disabled, None)
+    };
 
     match verify_artifact_supply_chain(
         &archive_path,
@@ -1531,6 +1535,53 @@ mod tests {
                         .as_deref()
                         .is_some_and(|err| err.contains("sigstore_required_"))),
             "report should include required sigstore integrity denial"
+        );
+    }
+
+    #[test]
+    fn run_update_sequence_no_verify_skips_sigstore_probe_for_offline_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = HostSpecifier::detect().unwrap();
+        let contract =
+            resolve_updater_artifact_contract(host, ReleaseChannel::Stable, Some("9.9.9")).unwrap();
+        let manifest_path = write_offline_bundle_manifest_with_sigstore(
+            tmp.path(),
+            &contract,
+            "9.9.9",
+            b"offline-update-archive",
+            Some(b"{\"invalid\":true}\n"),
+        );
+
+        let opts = UpdateOptions {
+            check_only: false,
+            pinned_version: None,
+            force: true,
+            install_dir: tmp.path().join("bin"),
+            no_verify: true,
+            dry_run: false,
+            max_backups: 5,
+            metadata_cache_file: tmp.path().join("update-cache.json"),
+            metadata_cache_ttl: Duration::from_secs(60),
+            refresh_cache: false,
+            notices_enabled: true,
+            offline_bundle_manifest: Some(manifest_path),
+        };
+
+        let report = run_update_sequence(&opts);
+        assert!(
+            report
+                .steps
+                .iter()
+                .any(|step| step.description == "Integrity verification passed"),
+            "--no-verify should bypass sigstore/checksum enforcement"
+        );
+        assert!(
+            !report
+                .steps
+                .iter()
+                .filter_map(|step| step.error.as_deref())
+                .any(|err| err.contains("sigstore_required_")),
+            "--no-verify path should not surface required sigstore failures"
         );
     }
 
