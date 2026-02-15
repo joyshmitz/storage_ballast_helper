@@ -2923,15 +2923,18 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 "command": "status",
                 "version": version,
                 "daemon_running": daemon_running,
-                "config_path": config.paths.config_file.to_string_lossy(),
-                "pressure": {
-                    "mounts": mounts_json,
-                    "overall": overall_level,
-                },
+            "config_path": config.paths.config_file.to_string_lossy(),
+            "pressure": {
+                "mounts": mounts_json,
+                "overall": overall_level,
+            },
                 "ballast": {
                     "file_count": config.ballast.file_count,
                     "file_size_bytes": config.ballast.file_size_bytes,
-                    "total_pool_bytes": config.ballast.file_count as u64 * config.ballast.file_size_bytes,
+                    "total_pool_bytes": ballast_total_pool_bytes(
+                        config.ballast.file_count,
+                        config.ballast.file_size_bytes,
+                    ),
                 },
                 "recent_hour": recent,
             });
@@ -2966,6 +2969,13 @@ fn pressure_severity(level: &str) -> u8 {
         "critical" => 4,
         _ => 0,
     }
+}
+
+fn ballast_total_pool_bytes(file_count: usize, file_size_bytes: u64) -> u64 {
+    u64::try_from(file_count)
+        .ok()
+        .and_then(|count| count.checked_mul(file_size_bytes))
+        .unwrap_or(u64::MAX)
 }
 
 fn run_protect(cli: &Cli, args: &ProtectArgs) -> Result<(), CliError> {
@@ -5011,6 +5021,16 @@ mod tests {
             LIVE_REFRESH_MIN_MS
         );
         assert_eq!(normalize_refresh_ms(2_500), 2_500);
+    }
+
+    #[test]
+    fn ballast_total_pool_bytes_returns_product_for_normal_values() {
+        assert_eq!(ballast_total_pool_bytes(3, 1024), 3072);
+    }
+
+    #[test]
+    fn ballast_total_pool_bytes_saturates_on_overflow() {
+        assert_eq!(ballast_total_pool_bytes(usize::MAX, u64::MAX), u64::MAX);
     }
 
     #[test]

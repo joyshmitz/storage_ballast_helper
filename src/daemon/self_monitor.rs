@@ -87,6 +87,9 @@ pub struct Counters {
     pub deletions: u64,
     pub bytes_freed: u64,
     pub errors: u64,
+    /// Log events silently dropped due to channel back-pressure.
+    #[serde(default)]
+    pub dropped_log_events: u64,
 }
 
 // ──────────────────── health tracking ────────────────────
@@ -262,6 +265,7 @@ impl SelfMonitor {
         mount_path: &str,
         ballast_available: usize,
         ballast_total: usize,
+        dropped_log_events: u64,
     ) -> u64 {
         let now = Instant::now();
         if let Some(last) = self.last_write
@@ -312,6 +316,7 @@ impl SelfMonitor {
                 deletions: self.deletions_total,
                 bytes_freed: self.bytes_freed_total,
                 errors: self.errors_total,
+                dropped_log_events,
             },
             memory_rss_bytes: rss,
         };
@@ -544,6 +549,7 @@ mod tests {
                 deletions: 312,
                 bytes_freed: 467_800_000_000,
                 errors: 2,
+                dropped_log_events: 0,
             },
             memory_rss_bytes: 44_040_192,
         };
@@ -591,6 +597,7 @@ mod tests {
                 deletions: 0,
                 bytes_freed: 0,
                 errors: 0,
+                dropped_log_events: 0,
             },
             memory_rss_bytes: 0,
         };
@@ -640,6 +647,7 @@ mod tests {
                 deletions: 0,
                 bytes_freed: 0,
                 errors: 0,
+                dropped_log_events: 0,
             },
             memory_rss_bytes: 0,
         };
@@ -661,19 +669,19 @@ mod tests {
         monitor.write_interval = Duration::from_millis(50);
 
         // First write always happens.
-        let _rss = monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 10, 10);
+        let _rss = monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 10, 10, 0);
         assert!(path.exists());
 
         // Immediate second write is skipped (within interval).
         let content_before = fs::read_to_string(&path).unwrap();
-        monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 10, 10);
+        monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 10, 10, 0);
         let content_after = fs::read_to_string(&path).unwrap();
         // Content should be identical (no rewrite).
         assert_eq!(content_before, content_after);
 
         // After interval, write happens again.
         std::thread::sleep(Duration::from_millis(60));
-        monitor.maybe_write_state(PressureLevel::Yellow, 12.0, "/data", 8, 10);
+        monitor.maybe_write_state(PressureLevel::Yellow, 12.0, "/data", 8, 10, 0);
         let updated = fs::read_to_string(&path).unwrap();
         assert!(updated.contains("yellow"));
     }
@@ -688,7 +696,7 @@ mod tests {
         monitor.bytes_freed_total = 1_000_000;
         monitor.record_scan(5, 3, Duration::from_millis(200));
 
-        monitor.maybe_write_state(PressureLevel::Green, 30.0, "/data", 10, 10);
+        monitor.maybe_write_state(PressureLevel::Green, 30.0, "/data", 10, 10, 0);
 
         let state = SelfMonitor::read_state(&path).unwrap();
         assert_eq!(state.counters.scans, 43);

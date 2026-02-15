@@ -119,13 +119,11 @@ impl ProtectionRegistry {
         if let Some(marker_dir) = self.find_marker_ancestor(path) {
             let metadata = read_marker_metadata(&marker_dir.join(MARKER_FILENAME));
             return Some(match metadata {
-                Some(meta) if meta.reason.is_some() => {
-                    format!(
-                        "protected by {} marker: {}",
-                        MARKER_FILENAME,
-                        meta.reason.as_ref().unwrap()
-                    )
-                }
+                Some(meta) if meta.reason.is_some() => format!(
+                    "protected by {} marker: {}",
+                    MARKER_FILENAME,
+                    meta.reason.as_deref().unwrap_or_default()
+                ),
                 _ => format!("protected by {MARKER_FILENAME} in {}", marker_dir.display()),
             });
         }

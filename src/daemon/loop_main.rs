@@ -24,7 +24,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use crate::ballast::manager::BallastManager;
 use crate::ballast::release::BallastReleaseController;
 use crate::core::config::Config;
-use crate::core::errors::Result;
+use crate::core::errors::{Result, SbhError};
 use crate::daemon::self_monitor::{SelfMonitor, ThreadHeartbeat};
 use crate::daemon::signals::{ShutdownCoordinator, SignalHandler, WatchdogHeartbeat};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, spawn_logger};
@@ -290,12 +290,12 @@ impl MonitoringDaemon {
             del_tx.clone(),
             self.logger_handle.clone(),
             Arc::clone(&self.scanner_heartbeat),
-        ));
+        )?);
         let mut executor_join: Option<thread::JoinHandle<()>> = Some(self.spawn_executor_thread(
             del_rx.clone(),
             self.logger_handle.clone(),
             Arc::clone(&self.executor_heartbeat),
-        ));
+        )?);
 
         let mut last_health_check = Instant::now();
 
@@ -355,6 +355,7 @@ impl MonitoringDaemon {
                 let mount_str = primary_path.to_string_lossy();
                 let ballast_available = self.ballast_manager.available_count();
                 let ballast_total = self.ballast_manager.inventory().len();
+                let dropped_log_events = self.logger_handle.dropped_events();
 
                 self.self_monitor.maybe_write_state(
                     response.level,
@@ -362,6 +363,7 @@ impl MonitoringDaemon {
                     &mount_str,
                     ballast_available,
                     ballast_total,
+                    dropped_log_events,
                 );
             }
 
@@ -385,12 +387,22 @@ impl MonitoringDaemon {
                     if scanner_health.record_panic() {
                         eprintln!("[SBH-DAEMON] respawning scanner thread");
                         self.scanner_heartbeat = ThreadHeartbeat::new("sbh-scanner");
-                        scanner_join = Some(self.spawn_scanner_thread(
+                        match self.spawn_scanner_thread(
                             scan_rx.clone(),
                             del_tx.clone(),
                             self.logger_handle.clone(),
                             Arc::clone(&self.scanner_heartbeat),
-                        ));
+                        ) {
+                            Ok(handle) => scanner_join = Some(handle),
+                            Err(err) => {
+                                self.logger_handle.send(ActivityEvent::Error {
+                                    code: err.code().to_string(),
+                                    message: format!("failed to respawn scanner thread: {err}"),
+                                });
+                                eprintln!("[SBH-DAEMON] scanner respawn failed: {err}");
+                                break;
+                            }
+                        }
                     } else {
                         self.logger_handle.send(ActivityEvent::Error {
                             code: "SBH-3900".to_string(),
@@ -410,11 +422,21 @@ impl MonitoringDaemon {
                     if executor_health.record_panic() {
                         eprintln!("[SBH-DAEMON] respawning executor thread");
                         self.executor_heartbeat = ThreadHeartbeat::new("sbh-executor");
-                        executor_join = Some(self.spawn_executor_thread(
+                        match self.spawn_executor_thread(
                             del_rx.clone(),
                             self.logger_handle.clone(),
                             Arc::clone(&self.executor_heartbeat),
-                        ));
+                        ) {
+                            Ok(handle) => executor_join = Some(handle),
+                            Err(err) => {
+                                self.logger_handle.send(ActivityEvent::Error {
+                                    code: err.code().to_string(),
+                                    message: format!("failed to respawn executor thread: {err}"),
+                                });
+                                eprintln!("[SBH-DAEMON] executor respawn failed: {err}");
+                                break;
+                            }
+                        }
                     } else {
                         self.logger_handle.send(ActivityEvent::Error {
                             code: "SBH-3900".to_string(),
@@ -768,7 +790,7 @@ impl MonitoringDaemon {
         del_tx: Sender<DeletionBatch>,
         logger: ActivityLoggerHandle,
         heartbeat: Arc<ThreadHeartbeat>,
-    ) -> thread::JoinHandle<()> {
+    ) -> Result<thread::JoinHandle<()>> {
         let scoring_config = self.config.scoring.clone();
         let min_file_age = self.config.scanner.min_file_age_minutes;
 
@@ -784,7 +806,9 @@ impl MonitoringDaemon {
                     &heartbeat,
                 );
             })
-            .expect("failed to spawn scanner thread")
+            .map_err(|source| SbhError::Runtime {
+                details: format!("failed to spawn scanner thread: {source}"),
+            })
     }
 
     fn spawn_executor_thread(
@@ -792,7 +816,7 @@ impl MonitoringDaemon {
         del_rx: Receiver<DeletionBatch>,
         logger: ActivityLoggerHandle,
         heartbeat: Arc<ThreadHeartbeat>,
-    ) -> thread::JoinHandle<()> {
+    ) -> Result<thread::JoinHandle<()>> {
         let dry_run = self.config.scanner.dry_run;
         let max_batch = self.config.scanner.max_delete_batch;
         let min_score = self.config.scoring.min_score;
@@ -802,7 +826,9 @@ impl MonitoringDaemon {
             .spawn(move || {
                 executor_thread_main(&del_rx, &logger, dry_run, max_batch, min_score, &heartbeat);
             })
-            .expect("failed to spawn executor thread")
+            .map_err(|source| SbhError::Runtime {
+                details: format!("failed to spawn executor thread: {source}"),
+            })
     }
 
     // ──────────────────── shutdown ────────────────────
