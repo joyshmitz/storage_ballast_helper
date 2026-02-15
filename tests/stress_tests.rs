@@ -22,9 +22,7 @@ use storage_ballast_helper::monitor::ewma::DiskRateEstimator;
 use storage_ballast_helper::monitor::guardrails::{
     AdaptiveGuard, CalibrationObservation, GuardStatus, GuardrailConfig,
 };
-use storage_ballast_helper::monitor::pid::{
-    PidPressureController, PressureLevel, PressureReading,
-};
+use storage_ballast_helper::monitor::pid::{PidPressureController, PressureLevel, PressureReading};
 use storage_ballast_helper::scanner::decision_record::ActionRecord;
 use storage_ballast_helper::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, StructuralSignals,
@@ -226,7 +224,11 @@ fn stress_sustained_low_pressure() {
     let mut free = target_free;
     for i in 0..200 {
         // Jitter ±500MB.
-        let jitter = if i % 3 == 0 { 500_000_000i64 } else { -300_000_000 };
+        let jitter = if i % 3 == 0 {
+            500_000_000i64
+        } else {
+            -300_000_000
+        };
         free = (free as i64 + jitter).max(0) as u64;
         free = free.min(total);
 
@@ -269,7 +271,10 @@ fn stress_sustained_low_pressure() {
     );
 
     report.metric("avg_urgency", format!("{avg_urgency:.3}"));
-    report.metric("urgency_range", format!("{urgency_min:.3}..{urgency_max:.3}"));
+    report.metric(
+        "urgency_range",
+        format!("{urgency_min:.3}..{urgency_max:.3}"),
+    );
     report.metric(
         "level_distribution",
         format!(
@@ -425,10 +430,7 @@ fn stress_recovery_under_write_pressure() {
     );
 
     // After injecting 200 GB free space, the system should de-escalate.
-    let post_recovery: Vec<_> = levels
-        .iter()
-        .skip(recovery_start_tick.unwrap())
-        .collect();
+    let post_recovery: Vec<_> = levels.iter().skip(recovery_start_tick.unwrap()).collect();
     let has_any_deescalation = post_recovery.iter().any(|l| {
         matches!(
             l,
@@ -517,7 +519,11 @@ fn stress_thread_health_overload() {
 
     // Record scan and deletion metrics under pressure.
     for i in 0..100 {
-        monitor.record_scan(50 + i, i.min(10), Duration::from_millis(100 + i as u64 * 10));
+        monitor.record_scan(
+            50 + i,
+            i.min(10),
+            Duration::from_millis(100 + i as u64 * 10),
+        );
         if i % 5 == 0 {
             monitor.record_deletions(2, 5_000_000_000);
         }
@@ -526,7 +532,10 @@ fn stress_thread_health_overload() {
         }
     }
 
-    report.metric("avg_scan_duration_ms", monitor.avg_scan_duration().as_millis());
+    report.metric(
+        "avg_scan_duration_ms",
+        monitor.avg_scan_duration().as_millis(),
+    );
     report.metric("total_scans", 100);
     report.metric("total_errors", monitor.errors_total);
     report.steps = 100;
@@ -578,9 +587,7 @@ fn stress_decision_plane_drift() {
     assert_eq!(engine.mode(), ActiveMode::Enforce);
 
     // Phase 2: Evaluate candidates in enforce — should approve some.
-    let candidates: Vec<CandidateInput> = (0..20)
-        .map(|i| make_candidate(i, 48, 5))
-        .collect();
+    let candidates: Vec<CandidateInput> = (0..20).map(|i| make_candidate(i, 48, 5)).collect();
     let scored = scoring.score_batch(&candidates, 0.6);
     let decision_pre = engine.evaluate(&scored, Some(&guard.diagnostics()));
     let pre_approved = decision_pre.approved_for_deletion.len();
@@ -621,10 +628,7 @@ fn stress_decision_plane_drift() {
     }
     report.steps += drift_steps;
 
-    assert!(
-        guard_fail_at.is_some(),
-        "guard should transition to Fail"
-    );
+    assert!(guard_fail_at.is_some(), "guard should transition to Fail");
     assert_eq!(
         engine.mode(),
         ActiveMode::FallbackSafe,
@@ -785,9 +789,7 @@ fn stress_multi_agent_swarm() {
             let age_hours = (artifact_idx as u64 + 1) * 6;
             let size_gib = 1 + (artifact_idx as u64 % 5);
             let mut candidate = make_candidate(agent_idx * 100 + artifact_idx, age_hours, size_gib);
-            candidate.path = PathBuf::from(format!(
-                "/data/p{agent_idx}/{name}_{artifact_idx}"
-            ));
+            candidate.path = PathBuf::from(format!("/data/p{agent_idx}/{name}_{artifact_idx}"));
             candidate.classification.pattern_name = format!("{name}*");
 
             // Some agents have .git (should be vetoed via excluded flag).
@@ -812,14 +814,8 @@ fn stress_multi_agent_swarm() {
 
     // Count vetoed candidates.
     let vetoed: Vec<_> = scored.iter().filter(|s| s.vetoed).collect();
-    let open_vetoed: Vec<_> = all_candidates
-        .iter()
-        .filter(|c| c.is_open)
-        .collect();
-    let git_excluded: Vec<_> = all_candidates
-        .iter()
-        .filter(|c| c.excluded)
-        .collect();
+    let open_vetoed: Vec<_> = all_candidates.iter().filter(|c| c.is_open).collect();
+    let git_excluded: Vec<_> = all_candidates.iter().filter(|c| c.excluded).collect();
 
     report.metric("vetoed_count", vetoed.len());
     report.metric("open_file_candidates", open_vetoed.len());
@@ -908,9 +904,15 @@ fn stress_ewma_convergence() {
         free = free.saturating_sub(1_000_000_000); // 1 GB/tick
         let t = start + tick * i as u32;
         let est = ewma.update(free, t, threshold);
-        if est.bytes_per_second.is_nan() { nan_count += 1; }
-        if est.bytes_per_second.is_infinite() { inf_count += 1; }
-        if est.seconds_to_exhaustion < 0.0 { negative_tte_count += 1; }
+        if est.bytes_per_second.is_nan() {
+            nan_count += 1;
+        }
+        if est.bytes_per_second.is_infinite() {
+            inf_count += 1;
+        }
+        if est.seconds_to_exhaustion < 0.0 {
+            negative_tte_count += 1;
+        }
     }
 
     // Phase 2: Sudden burst (50 ticks at 10x rate).
@@ -918,8 +920,12 @@ fn stress_ewma_convergence() {
         free = free.saturating_sub(10_000_000_000); // 10 GB/tick
         let t = start + tick * i as u32;
         let est = ewma.update(free, t, threshold);
-        if est.bytes_per_second.is_nan() { nan_count += 1; }
-        if est.bytes_per_second.is_infinite() { inf_count += 1; }
+        if est.bytes_per_second.is_nan() {
+            nan_count += 1;
+        }
+        if est.bytes_per_second.is_infinite() {
+            inf_count += 1;
+        }
     }
 
     // Phase 3: Recovery — free space increases (cleanup, 100 ticks).
@@ -927,20 +933,32 @@ fn stress_ewma_convergence() {
         free = free.saturating_add(2_000_000_000).min(total); // 2 GB/tick recovered
         let t = start + tick * i as u32;
         let est = ewma.update(free, t, threshold);
-        if est.bytes_per_second.is_nan() { nan_count += 1; }
-        if est.bytes_per_second.is_infinite() { inf_count += 1; }
+        if est.bytes_per_second.is_nan() {
+            nan_count += 1;
+        }
+        if est.bytes_per_second.is_infinite() {
+            inf_count += 1;
+        }
         // During recovery, trend should eventually become Recovering or Stable.
     }
 
     // Phase 4: Plateau (100 ticks, stable).
     for i in 250..350 {
         // Tiny jitter.
-        let jitter: i64 = if i % 2 == 0 { 100_000_000 } else { -100_000_000 };
+        let jitter: i64 = if i % 2 == 0 {
+            100_000_000
+        } else {
+            -100_000_000
+        };
         free = (free as i64 + jitter).max(0) as u64;
         let t = start + tick * i as u32;
         let est = ewma.update(free, t, threshold);
-        if est.bytes_per_second.is_nan() { nan_count += 1; }
-        if est.bytes_per_second.is_infinite() { inf_count += 1; }
+        if est.bytes_per_second.is_nan() {
+            nan_count += 1;
+        }
+        if est.bytes_per_second.is_infinite() {
+            inf_count += 1;
+        }
     }
 
     // Phase 5: Another fill (100 ticks, moderate).
@@ -948,8 +966,12 @@ fn stress_ewma_convergence() {
         free = free.saturating_sub(500_000_000); // 500 MB/tick
         let t = start + tick * i as u32;
         let est = ewma.update(free, t, threshold);
-        if est.bytes_per_second.is_nan() { nan_count += 1; }
-        if est.bytes_per_second.is_infinite() { inf_count += 1; }
+        if est.bytes_per_second.is_nan() {
+            nan_count += 1;
+        }
+        if est.bytes_per_second.is_infinite() {
+            inf_count += 1;
+        }
     }
 
     report.steps = 450;
@@ -1154,12 +1176,12 @@ fn stress_full_pipeline() {
     for i in 0..500 {
         // Simulate varied pressure phases.
         let consumption = match i {
-            0..=99 => 500_000_000,    // moderate: 500 MB/tick
+            0..=99 => 500_000_000,      // moderate: 500 MB/tick
             100..=149 => 5_000_000_000, // burst: 5 GB/tick
-            150..=249 => 0,            // plateau + cleanup
+            150..=249 => 0,             // plateau + cleanup
             250..=349 => 1_000_000_000, // moderate
             350..=399 => 3_000_000_000, // heavy
-            _ => 200_000_000,          // light
+            _ => 200_000_000,           // light
         };
 
         // Apply cleanup at certain intervals.
@@ -1201,9 +1223,8 @@ fn stress_full_pipeline() {
 
         // Score candidates when urgency is high enough.
         if response.urgency > 0.3 {
-            let candidates: Vec<CandidateInput> = (0..5)
-                .map(|j| make_candidate(i * 5 + j, 24, 2))
-                .collect();
+            let candidates: Vec<CandidateInput> =
+                (0..5).map(|j| make_candidate(i * 5 + j, 24, 2)).collect();
             let scored = scoring.score_batch(&candidates, response.urgency);
             let decision = engine.evaluate(&scored, Some(&diag));
             total_approved += decision.approved_for_deletion.len();
@@ -1236,10 +1257,7 @@ fn stress_full_pipeline() {
     report.metric("final_free_bytes", free);
     report.metric("guard_status", format!("{:?}", guard.status()));
     report.metric("ewma_samples", ewma.sample_count());
-    report.metric(
-        "transition_log_entries",
-        engine.transition_log().len(),
-    );
+    report.metric("transition_log_entries", engine.transition_log().len());
 
     // Sanity: pipeline should complete without panic or infinite loop.
     assert!(report.steps >= 100, "pipeline should run many ticks");

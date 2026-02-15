@@ -459,6 +459,18 @@ struct UpdateArgs {
     /// Print what would be done without making changes.
     #[arg(long)]
     dry_run: bool,
+    /// Roll back to the most recent backup (or a specific backup by ID).
+    #[arg(long, value_name = "BACKUP_ID")]
+    rollback: Option<Option<String>>,
+    /// List available backup snapshots.
+    #[arg(long)]
+    list_backups: bool,
+    /// Prune old backups, keeping only the N most recent.
+    #[arg(long, value_name = "N")]
+    prune: Option<usize>,
+    /// Maximum number of backups to retain (default: 5).
+    #[arg(long, default_value_t = 5, value_name = "N")]
+    max_backups: usize,
 }
 
 impl Default for UpdateArgs {
@@ -471,6 +483,10 @@ impl Default for UpdateArgs {
             user: false,
             no_verify: false,
             dry_run: false,
+            rollback: None,
+            list_backups: false,
+            prune: None,
+            max_backups: 5,
         }
     }
 }
@@ -4165,14 +4181,15 @@ fn resolve_output_mode(json_flag: bool, env_mode: Option<&str>, stdout_is_tty: b
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Update command
 // ---------------------------------------------------------------------------
 
 fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<(), CliError> {
     use storage_ballast_helper::cli::update::{
-        UpdateOptions, default_install_dir, format_update_report, run_update_sequence,
+        BackupStore, UpdateOptions, default_install_dir, format_backup_list,
+        format_prune_result, format_rollback_result, format_update_report,
+        run_update_sequence,
     };
 
     let install_dir = if args.system {
@@ -4181,6 +4198,61 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<(), CliError> {
         default_install_dir(false)
     };
 
+    let store = BackupStore::open_default();
+
+    // Handle --list-backups.
+    if args.list_backups {
+        let inventory = store.inventory();
+        match output_mode(cli) {
+            OutputMode::Human => print!("{}", format_backup_list(&inventory)),
+            OutputMode::Json => {
+                let payload = serde_json::to_value(&inventory)?;
+                write_json_line(&payload)?;
+            }
+        }
+        return Ok(());
+    }
+
+    // Handle --rollback.
+    if let Some(ref rollback_arg) = args.rollback {
+        let snap_id = rollback_arg.as_deref();
+        let install_path = install_dir.join("sbh");
+        match store.rollback(&install_path, snap_id) {
+            Ok(result) => {
+                match output_mode(cli) {
+                    OutputMode::Human => print!("{}", format_rollback_result(&result)),
+                    OutputMode::Json => {
+                        let payload = serde_json::to_value(&result)?;
+                        write_json_line(&payload)?;
+                    }
+                }
+                if result.success {
+                    return Ok(());
+                }
+                return Err(CliError::Runtime("rollback failed".to_string()));
+            }
+            Err(e) => return Err(CliError::Runtime(e)),
+        }
+    }
+
+    // Handle --prune.
+    if let Some(keep) = args.prune {
+        match store.prune(keep) {
+            Ok(result) => {
+                match output_mode(cli) {
+                    OutputMode::Human => print!("{}", format_prune_result(&result)),
+                    OutputMode::Json => {
+                        let payload = serde_json::to_value(&result)?;
+                        write_json_line(&payload)?;
+                    }
+                }
+                return Ok(());
+            }
+            Err(e) => return Err(CliError::Runtime(e)),
+        }
+    }
+
+    // Normal update flow.
     let opts = UpdateOptions {
         check_only: args.check,
         pinned_version: args.version.clone(),
@@ -4188,6 +4260,7 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<(), CliError> {
         install_dir,
         no_verify: args.no_verify,
         dry_run: args.dry_run,
+        max_backups: args.max_backups,
     };
 
     let report = run_update_sequence(&opts);
@@ -5026,8 +5099,18 @@ mod tests {
             vec!["sbh", "update", "--system"],
             vec!["sbh", "update", "--user"],
             vec![
-                "sbh", "update", "--version", "v1.0.0", "--dry-run", "--user",
+                "sbh",
+                "update",
+                "--version",
+                "v1.0.0",
+                "--dry-run",
+                "--user",
             ],
+            vec!["sbh", "update", "--list-backups"],
+            vec!["sbh", "update", "--rollback"],
+            vec!["sbh", "update", "--rollback", "1000000-v0.1.0"],
+            vec!["sbh", "update", "--prune", "3"],
+            vec!["sbh", "update", "--max-backups", "10"],
         ];
         for case in cases {
             let parsed = Cli::try_parse_from(case.clone());
@@ -5050,5 +5133,9 @@ mod tests {
         assert!(!args.system);
         assert!(!args.user);
         assert!(args.version.is_none());
+        assert!(args.rollback.is_none());
+        assert!(!args.list_backups);
+        assert!(args.prune.is_none());
+        assert_eq!(args.max_backups, 5);
     }
 }

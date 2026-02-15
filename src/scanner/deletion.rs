@@ -183,7 +183,9 @@ impl DeletionExecutor {
             }
 
             // Pressure check: if pressure has resolved, stop deleting.
-            if let Some(check) = pressure_check && check() {
+            if let Some(check) = pressure_check
+                && check()
+            {
                 break;
             }
 
@@ -256,10 +258,11 @@ impl DeletionExecutor {
         }
 
         // 2. Parent directory is writable.
-        if let Some(parent) = path.parent() && parent
-            .metadata()
-            .map(|m| m.permissions().readonly())
-            .unwrap_or(true)
+        if let Some(parent) = path.parent()
+            && parent
+                .metadata()
+                .map(|m| m.permissions().readonly())
+                .unwrap_or(true)
         {
             return Err(SkipReason::NotWritable);
         }
@@ -355,7 +358,9 @@ fn is_path_open_linux(target: &Path) -> bool {
     };
 
     let proc = Path::new("/proc");
-    let Ok(entries) = fs::read_dir(proc) else { return false };
+    let Ok(entries) = fs::read_dir(proc) else {
+        return false;
+    };
 
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -366,7 +371,9 @@ fn is_path_open_linux(target: &Path) -> bool {
         }
 
         let fd_dir = entry.path().join("fd");
-        let Ok(fds) = fs::read_dir(&fd_dir) else { continue };
+        let Ok(fds) = fs::read_dir(&fd_dir) else {
+            continue;
+        };
 
         for fd_entry in fds.flatten() {
             if let Ok(link_target) = fs::read_link(fd_entry.path()) {

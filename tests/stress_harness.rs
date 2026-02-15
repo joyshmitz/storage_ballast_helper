@@ -33,7 +33,9 @@ use storage_ballast_helper::monitor::pid::{PidPressureController, PressureLevel,
 use storage_ballast_helper::monitor::predictive::{PredictiveAction, PredictiveConfig};
 use storage_ballast_helper::monitor::voi_scheduler::{VoiConfig, VoiScheduler};
 use storage_ballast_helper::scanner::merkle::{IndexHealth, MerkleScanIndex, ScanBudget};
-use storage_ballast_helper::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
+use storage_ballast_helper::scanner::patterns::{
+    ArtifactCategory, ArtifactClassification, StructuralSignals,
+};
 use storage_ballast_helper::scanner::scoring::{CandidateInput, ScoringEngine};
 use storage_ballast_helper::scanner::walker::{EntryMetadata, WalkEntry};
 
@@ -53,7 +55,10 @@ impl SeededRng {
 
     fn next_u64(&mut self) -> u64 {
         // LCG with Knuth parameters.
-        self.state = self.state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
         self.state
     }
 
@@ -179,14 +184,12 @@ fn make_ewma() -> DiskRateEstimator {
 }
 
 fn make_predictive() -> storage_ballast_helper::monitor::predictive::PredictiveActionPolicy {
-    storage_ballast_helper::monitor::predictive::PredictiveActionPolicy::new(
-        PredictiveConfig {
-            enabled: true,
-            min_confidence: 0.3,
-            min_samples: 2,
-            ..PredictiveConfig::default()
-        },
-    )
+    storage_ballast_helper::monitor::predictive::PredictiveActionPolicy::new(PredictiveConfig {
+        enabled: true,
+        min_confidence: 0.3,
+        min_samples: 2,
+        ..PredictiveConfig::default()
+    })
 }
 
 fn make_guard() -> AdaptiveGuard {
@@ -276,7 +279,11 @@ fn run_scenario_a(seed: u64, iterations: usize) -> ScenarioResult {
         let burst_ticks = 8 + (rng.next_u64() % 5) as usize;
 
         let series = SyntheticTimeSeries::burst(
-            initial_free, normal_rate, burst_rate, normal_ticks, burst_ticks,
+            initial_free,
+            normal_rate,
+            burst_rate,
+            normal_ticks,
+            burst_ticks,
         );
 
         let mut pid = make_pid();
@@ -319,7 +326,11 @@ fn run_scenario_a(seed: u64, iterations: usize) -> ScenarioResult {
                 }
             }
 
-            if matches!(action, PredictiveAction::PreemptiveCleanup { .. } | PredictiveAction::ImminentDanger { .. }) {
+            if matches!(
+                action,
+                PredictiveAction::PreemptiveCleanup { .. }
+                    | PredictiveAction::ImminentDanger { .. }
+            ) {
                 hit_preemptive = true;
             }
         }
@@ -334,9 +345,7 @@ fn run_scenario_a(seed: u64, iterations: usize) -> ScenarioResult {
         }
 
         if max_urgency < 0.7 {
-            failures.push(format!(
-                "iter {iter}: max urgency {max_urgency:.3} < 0.7"
-            ));
+            failures.push(format!("iter {iter}: max urgency {max_urgency:.3} < 0.7"));
         }
 
         if !hit_preemptive {
@@ -408,7 +417,12 @@ fn run_scenario_b(seed: u64, iterations: usize) -> ScenarioResult {
         let mut policy_transitions = 0usize;
         let prev_mode = policy.mode();
 
-        let combined: Vec<u64> = plateau.values.iter().chain(drop.values.iter()).copied().collect();
+        let combined: Vec<u64> = plateau
+            .values
+            .iter()
+            .chain(drop.values.iter())
+            .copied()
+            .collect();
 
         for (tick, &free_bytes) in combined.iter().enumerate() {
             let now = t0 + Duration::from_secs(tick as u64);
@@ -442,10 +456,7 @@ fn run_scenario_b(seed: u64, iterations: usize) -> ScenarioResult {
 
         // Assert: PID level stabilizes during plateau (no oscillation).
         let plateau_levels = &levels[10..plateau_ticks.min(levels.len())];
-        let oscillations = plateau_levels
-            .windows(2)
-            .filter(|w| w[0] != w[1])
-            .count();
+        let oscillations = plateau_levels.windows(2).filter(|w| w[0] != w[1]).count();
         if oscillations > 3 {
             failures.push(format!(
                 "iter {iter}: too many oscillations during plateau ({oscillations})"
@@ -502,7 +513,11 @@ fn run_scenario_b(seed: u64, iterations: usize) -> ScenarioResult {
         reclaim_efficiencies.push(avg_urgency);
         mode_transitions_counts.push(policy_transitions as f64);
         guard_changes.push(0.0);
-        fallback_counts.push(if policy.mode() == ActiveMode::FallbackSafe { 1.0 } else { 0.0 });
+        fallback_counts.push(if policy.mode() == ActiveMode::FallbackSafe {
+            1.0
+        } else {
+            0.0
+        });
     }
 
     let passed = failures.is_empty();
@@ -592,9 +607,7 @@ fn run_scenario_c(seed: u64, iterations: usize) -> ScenarioResult {
         }
 
         if max_urgency < 0.99 {
-            failures.push(format!(
-                "iter {iter}: max urgency {max_urgency:.3} < 0.99"
-            ));
+            failures.push(format!("iter {iter}: max urgency {max_urgency:.3} < 0.99"));
         }
 
         if !hit_imminent {
@@ -696,8 +709,10 @@ fn run_scenario_d(seed: u64, iterations: usize) -> ScenarioResult {
             // Consumption phase.
             if tick < consume_ticks {
                 consume_max_urgency = consume_max_urgency.max(pid_response.urgency);
-                if matches!(pid_response.level, PressureLevel::Orange | PressureLevel::Red | PressureLevel::Critical)
-                    && detection_tick.is_none()
+                if matches!(
+                    pid_response.level,
+                    PressureLevel::Orange | PressureLevel::Red | PressureLevel::Critical
+                ) && detection_tick.is_none()
                 {
                     detection_tick = Some(tick);
                 }
@@ -754,16 +769,18 @@ fn run_scenario_d(seed: u64, iterations: usize) -> ScenarioResult {
         }
 
         if policy.mode() == ActiveMode::FallbackSafe {
-            failures.push(format!(
-                "iter {iter}: policy unexpectedly in FallbackSafe"
-            ));
+            failures.push(format!("iter {iter}: policy unexpectedly in FallbackSafe"));
         }
 
         detection_latencies.push(detection_tick.unwrap_or(consume_ticks) as f64);
         reclaim_efficiencies.push(consume_max_urgency);
         mode_transitions_counts.push(policy_transitions as f64);
         guard_changes.push(0.0);
-        fallback_counts.push(if policy.mode() == ActiveMode::FallbackSafe { 1.0 } else { 0.0 });
+        fallback_counts.push(if policy.mode() == ActiveMode::FallbackSafe {
+            1.0
+        } else {
+            0.0
+        });
     }
 
     let passed = failures.is_empty();
@@ -870,7 +887,8 @@ fn run_scenario_e(seed: u64, iterations: usize) -> ScenarioResult {
         }
 
         // EWMA rate should converge toward ~100 MB/s.
-        let final_rates: Vec<f64> = rate_estimates[rate_estimates.len().saturating_sub(5)..].to_vec();
+        let final_rates: Vec<f64> =
+            rate_estimates[rate_estimates.len().saturating_sub(5)..].to_vec();
         let avg_rate = if final_rates.is_empty() {
             0.0
         } else {
@@ -1021,9 +1039,7 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
         }
 
         if !entered_fallback {
-            failures.push(format!(
-                "iter {iter}: policy never entered FallbackSafe"
-            ));
+            failures.push(format!("iter {iter}: policy never entered FallbackSafe"));
         }
 
         // Check transition_log has fallback entry.
@@ -1038,9 +1054,7 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
         if recovered_from_fallback {
             let has_recover_entry = log.iter().any(|e| e.transition == "recover");
             if !has_recover_entry {
-                failures.push(format!(
-                    "iter {iter}: transition_log missing recover entry"
-                ));
+                failures.push(format!("iter {iter}: transition_log missing recover entry"));
             }
         }
 
@@ -1243,9 +1257,16 @@ fn run_scenario_h(seed: u64, iterations: usize) -> ScenarioResult {
 
         // Reclaim rates: heavy=10GB, moderate=1GB, light=10MB.
         let reclaim_rates: Vec<u64> = vec![
-            10_000_000_000, 10_000_000_000, 10_000_000_000, // heavy
-            1_000_000_000, 1_000_000_000, 1_000_000_000, 1_000_000_000, // moderate
-            10_000_000, 10_000_000, 10_000_000, // light
+            10_000_000_000,
+            10_000_000_000,
+            10_000_000_000, // heavy
+            1_000_000_000,
+            1_000_000_000,
+            1_000_000_000,
+            1_000_000_000, // moderate
+            10_000_000,
+            10_000_000,
+            10_000_000, // light
         ];
 
         let mut voi = VoiScheduler::new(VoiConfig {
@@ -1319,7 +1340,10 @@ fn run_scenario_h(seed: u64, iterations: usize) -> ScenarioResult {
 
             // Feed results back.
             for entry in &plan.paths {
-                let idx = agent_paths.iter().position(|p| p == &entry.path).unwrap_or(0);
+                let idx = agent_paths
+                    .iter()
+                    .position(|p| p == &entry.path)
+                    .unwrap_or(0);
                 let reclaim = reclaim_rates[idx] + rng.range_u64(0, reclaim_rates[idx] / 10);
                 voi.record_scan_result(
                     &entry.path,
@@ -1388,7 +1412,8 @@ fn run_scenario_h(seed: u64, iterations: usize) -> ScenarioResult {
 
         // Test round-robin: with fallback active, visits all paths.
         if fallback_voi.is_fallback_active() {
-            let mut rr_visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+            let mut rr_visited: std::collections::HashSet<PathBuf> =
+                std::collections::HashSet::new();
             for round in 0..10 {
                 let plan = fallback_voi.schedule(now + Duration::from_secs(100 + round));
                 for entry in &plan.paths {
@@ -1407,7 +1432,11 @@ fn run_scenario_h(seed: u64, iterations: usize) -> ScenarioResult {
         reclaim_efficiencies.push(total_light_explored as f64);
         mode_transitions_counts.push(0.0);
         guard_changes.push(0.0);
-        fallback_counts.push(if fallback_voi.is_fallback_active() { 1.0 } else { 0.0 });
+        fallback_counts.push(if fallback_voi.is_fallback_active() {
+            1.0
+        } else {
+            0.0
+        });
     }
 
     let passed = failures.is_empty();
@@ -1429,7 +1458,11 @@ fn run_scenario_h(seed: u64, iterations: usize) -> ScenarioResult {
 
 // ──────────────────── determinism verification ────────────────────
 
-fn verify_determinism(name: &str, seed: u64, run_fn: impl Fn(u64, usize) -> ScenarioResult) -> Vec<String> {
+fn verify_determinism(
+    name: &str,
+    seed: u64,
+    run_fn: impl Fn(u64, usize) -> ScenarioResult,
+) -> Vec<String> {
     let iters = 5;
     let r1 = run_fn(seed, iters);
     let r2 = run_fn(seed, iters);
@@ -1459,7 +1492,11 @@ fn stress_a_rapid_fill_burst() {
 
     // Determinism check.
     let mismatches = verify_determinism("A", DEFAULT_SEED, run_scenario_a);
-    assert!(mismatches.is_empty(), "Determinism failed: {:?}", mismatches);
+    assert!(
+        mismatches.is_empty(),
+        "Determinism failed: {:?}",
+        mismatches
+    );
 }
 
 #[test]
@@ -1473,7 +1510,11 @@ fn stress_b_sustained_low_free() {
     );
 
     let mismatches = verify_determinism("B", DEFAULT_SEED, run_scenario_b);
-    assert!(mismatches.is_empty(), "Determinism failed: {:?}", mismatches);
+    assert!(
+        mismatches.is_empty(),
+        "Determinism failed: {:?}",
+        mismatches
+    );
 }
 
 #[test]
@@ -1487,7 +1528,11 @@ fn stress_c_flash_fill() {
     );
 
     let mismatches = verify_determinism("C", DEFAULT_SEED, run_scenario_c);
-    assert!(mismatches.is_empty(), "Determinism failed: {:?}", mismatches);
+    assert!(
+        mismatches.is_empty(),
+        "Determinism failed: {:?}",
+        mismatches
+    );
 }
 
 #[test]
@@ -1501,7 +1546,11 @@ fn stress_d_recovery_under_pressure() {
     );
 
     let mismatches = verify_determinism("D", DEFAULT_SEED, run_scenario_d);
-    assert!(mismatches.is_empty(), "Determinism failed: {:?}", mismatches);
+    assert!(
+        mismatches.is_empty(),
+        "Determinism failed: {:?}",
+        mismatches
+    );
 }
 
 #[test]
@@ -1515,7 +1564,11 @@ fn stress_e_irregular_sampling() {
     );
 
     let mismatches = verify_determinism("E", DEFAULT_SEED, run_scenario_e);
-    assert!(mismatches.is_empty(), "Determinism failed: {:?}", mismatches);
+    assert!(
+        mismatches.is_empty(),
+        "Determinism failed: {:?}",
+        mismatches
+    );
 }
 
 #[test]
@@ -1529,7 +1582,11 @@ fn stress_f_decision_plane_drift() {
     );
 
     let mismatches = verify_determinism("F", DEFAULT_SEED, run_scenario_f);
-    assert!(mismatches.is_empty(), "Determinism failed: {:?}", mismatches);
+    assert!(
+        mismatches.is_empty(),
+        "Determinism failed: {:?}",
+        mismatches
+    );
 }
 
 #[test]

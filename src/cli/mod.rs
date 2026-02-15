@@ -12,12 +12,14 @@ pub mod update;
 pub mod wizard;
 
 use std::fmt;
+use std::fs;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::Component;
+use std::path::{Path, PathBuf};
 
 use crate::core::errors::{Result, SbhError};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Canonical GitHub repository for release artifacts.
@@ -54,6 +56,54 @@ pub enum ReleaseLocator {
     Latest,
     /// Use a specific release tag.
     Tag(String),
+}
+
+/// Offline bundle manifest describing local release artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfflineBundleManifest {
+    /// Manifest schema version.
+    pub version: String,
+    /// Repository this bundle belongs to.
+    pub repository: String,
+    /// Release tag contained by the bundle.
+    pub release_tag: String,
+    /// Artifact set keyed by target triple.
+    pub artifacts: Vec<OfflineBundleArtifact>,
+}
+
+impl OfflineBundleManifest {
+    /// Parse bundle manifest from JSON.
+    ///
+    /// # Errors
+    /// Returns an error when JSON parsing fails.
+    pub fn from_json(json: &str) -> std::result::Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    /// Read and parse bundle manifest from a local file.
+    ///
+    /// # Errors
+    /// Returns an error when the manifest cannot be read or parsed.
+    pub fn from_path(path: &Path) -> Result<Self> {
+        let raw = fs::read_to_string(path).map_err(|e| SbhError::io(path, e))?;
+        Self::from_json(&raw).map_err(|e| SbhError::InvalidConfig {
+            details: format!("invalid offline bundle manifest at {}: {e}", path.display()),
+        })
+    }
+}
+
+/// Artifact row inside [`OfflineBundleManifest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfflineBundleArtifact {
+    /// Target triple this artifact serves.
+    pub target: String,
+    /// Relative or absolute path to the archive file.
+    pub archive: String,
+    /// Relative or absolute path to the checksum file.
+    pub checksum: String,
+    /// Optional relative or absolute path to sigstore bundle JSON.
+    #[serde(default)]
+    pub sigstore_bundle: Option<String>,
 }
 
 /// Runtime host operating system.
@@ -119,6 +169,15 @@ pub struct ReleaseArtifactContract {
     pub binary_name: &'static str,
     pub locator: ReleaseLocator,
     pub target: ArtifactTarget,
+}
+
+/// Resolved local bundle artifact paths for a host-specific contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleArtifactResolution {
+    pub contract: ReleaseArtifactContract,
+    pub archive_path: PathBuf,
+    pub checksum_path: PathBuf,
+    pub sigstore_bundle_path: Option<PathBuf>,
 }
 
 /// Whether integrity verification is enforced or explicitly bypassed.
@@ -281,6 +340,73 @@ pub fn resolve_updater_artifact_contract(
     pinned_version: Option<&str>,
 ) -> Result<ReleaseArtifactContract> {
     resolve_release_artifact_contract(host, channel, pinned_version)
+}
+
+/// Resolve installer/updater contract from a local offline bundle manifest.
+///
+/// # Errors
+/// Returns an error when manifest schema/content is invalid, the target triple
+/// is missing from the bundle, or required local files are absent.
+pub fn resolve_bundle_artifact_contract(
+    host: HostSpecifier,
+    bundle_manifest_path: &Path,
+) -> Result<BundleArtifactResolution> {
+    let manifest = OfflineBundleManifest::from_path(bundle_manifest_path)?;
+
+    if manifest.repository != RELEASE_REPOSITORY {
+        return Err(SbhError::InvalidConfig {
+            details: format!(
+                "bundle repository mismatch: expected '{RELEASE_REPOSITORY}', got '{}'",
+                manifest.repository
+            ),
+        });
+    }
+
+    let target = resolve_artifact_target(host)?;
+    let locator = ReleaseLocator::Tag(normalize_version(&manifest.release_tag)?);
+    let contract = ReleaseArtifactContract {
+        repository: RELEASE_REPOSITORY,
+        binary_name: RELEASE_BINARY_NAME,
+        locator,
+        target,
+    };
+
+    let artifact = manifest
+        .artifacts
+        .iter()
+        .find(|candidate| candidate.target == contract.target.triple)
+        .ok_or_else(|| SbhError::InvalidConfig {
+            details: format!(
+                "bundle manifest missing target '{}' for this host",
+                contract.target.triple
+            ),
+        })?;
+
+    validate_bundle_artifact_names(&contract, artifact)?;
+
+    let manifest_root = bundle_manifest_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let archive_path = resolve_bundle_path(manifest_root, &artifact.archive)?;
+    let checksum_path = resolve_bundle_path(manifest_root, &artifact.checksum)?;
+    let sigstore_bundle_path = artifact
+        .sigstore_bundle
+        .as_ref()
+        .map(|path| resolve_bundle_path(manifest_root, path))
+        .transpose()?;
+
+    ensure_local_file_exists(&archive_path, "bundle archive")?;
+    ensure_local_file_exists(&checksum_path, "bundle checksum")?;
+    if let Some(sigstore_path) = &sigstore_bundle_path {
+        ensure_local_file_exists(sigstore_path, "bundle sigstore")?;
+    }
+
+    Ok(BundleArtifactResolution {
+        contract,
+        archive_path,
+        checksum_path,
+        sigstore_bundle_path,
+    })
 }
 
 /// Validate that release assets satisfy the canonical installer/update contract.
@@ -469,6 +595,80 @@ fn resolve_release_artifact_contract(
     })
 }
 
+fn validate_bundle_artifact_names(
+    contract: &ReleaseArtifactContract,
+    artifact: &OfflineBundleArtifact,
+) -> Result<()> {
+    let expected_archive = contract.asset_name();
+    let archive_name = bundle_path_file_name(&artifact.archive);
+    if archive_name != Some(expected_archive.as_str()) {
+        return Err(SbhError::InvalidConfig {
+            details: format!(
+                "bundle archive mismatch for target '{}': expected '{}', got '{}'",
+                contract.target.triple, expected_archive, artifact.archive
+            ),
+        });
+    }
+
+    let expected_checksum = contract.checksum_name();
+    let checksum_name = bundle_path_file_name(&artifact.checksum);
+    if checksum_name != Some(expected_checksum.as_str()) {
+        return Err(SbhError::InvalidConfig {
+            details: format!(
+                "bundle checksum mismatch for target '{}': expected '{}', got '{}'",
+                contract.target.triple, expected_checksum, artifact.checksum
+            ),
+        });
+    }
+
+    if let Some(sigstore_bundle) = &artifact.sigstore_bundle {
+        let expected_sigstore = contract.sigstore_bundle_name();
+        let sigstore_name = bundle_path_file_name(sigstore_bundle);
+        if sigstore_name != Some(expected_sigstore.as_str()) {
+            return Err(SbhError::InvalidConfig {
+                details: format!(
+                    "bundle sigstore mismatch for target '{}': expected '{}', got '{}'",
+                    contract.target.triple, expected_sigstore, sigstore_bundle
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn bundle_path_file_name(path: &str) -> Option<&str> {
+    Path::new(path).file_name().and_then(|name| name.to_str())
+}
+
+fn resolve_bundle_path(manifest_root: &Path, path: &str) -> Result<PathBuf> {
+    let candidate = PathBuf::from(path);
+    if candidate
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(SbhError::InvalidConfig {
+            details: format!("bundle path cannot contain '..': {path}"),
+        });
+    }
+
+    if candidate.is_absolute() {
+        Ok(candidate)
+    } else {
+        Ok(manifest_root.join(candidate))
+    }
+}
+
+fn ensure_local_file_exists(path: &Path, label: &str) -> Result<()> {
+    if path.is_file() {
+        return Ok(());
+    }
+
+    Err(SbhError::Runtime {
+        details: format!("{label} file not found: {}", path.display()),
+    })
+}
+
 fn resolve_artifact_target(host: HostSpecifier) -> Result<ArtifactTarget> {
     match (host.os, host.arch, host.abi) {
         (HostOs::Linux, HostArch::X86_64, HostAbi::Gnu) => Ok(ArtifactTarget {
@@ -618,7 +818,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
     #[test]
     fn parses_aliases_for_os_arch_and_abi() {
@@ -971,10 +1171,215 @@ mod tests {
     fn ci_release_targets_have_no_duplicates() {
         let mut seen = std::collections::HashSet::new();
         for target in CI_RELEASE_TARGETS {
-            assert!(
-                seen.insert(target),
-                "duplicate CI target: {target}"
-            );
+            assert!(seen.insert(target), "duplicate CI target: {target}");
         }
+    }
+
+    #[test]
+    fn resolves_bundle_contract_for_current_target() {
+        let tmp = TempDir::new().unwrap();
+        let host = HostSpecifier {
+            os: HostOs::Linux,
+            arch: HostArch::X86_64,
+            abi: HostAbi::Gnu,
+        };
+
+        let expected =
+            resolve_installer_artifact_contract(host, ReleaseChannel::Stable, Some("0.9.1"))
+                .unwrap();
+        let archive = expected.asset_name();
+        let checksum = expected.checksum_name();
+        let sigstore = expected.sigstore_bundle_name();
+
+        std::fs::write(tmp.path().join(&archive), b"archive").unwrap();
+        std::fs::write(tmp.path().join(&checksum), b"checksum").unwrap();
+        std::fs::write(tmp.path().join(&sigstore), b"{}").unwrap();
+
+        let manifest = OfflineBundleManifest {
+            version: "1".to_string(),
+            repository: RELEASE_REPOSITORY.to_string(),
+            release_tag: "0.9.1".to_string(),
+            artifacts: vec![OfflineBundleArtifact {
+                target: expected.target.triple.to_string(),
+                archive: archive.clone(),
+                checksum: checksum.clone(),
+                sigstore_bundle: Some(sigstore.clone()),
+            }],
+        };
+        let manifest_path = tmp.path().join("bundle-manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let resolved = resolve_bundle_artifact_contract(host, &manifest_path).unwrap();
+        assert_eq!(resolved.contract.target, expected.target);
+        assert_eq!(
+            resolved.contract.locator,
+            ReleaseLocator::Tag(String::from("v0.9.1"))
+        );
+        assert_eq!(resolved.archive_path, tmp.path().join(&archive));
+        assert_eq!(resolved.checksum_path, tmp.path().join(&checksum));
+        assert_eq!(
+            resolved.sigstore_bundle_path,
+            Some(tmp.path().join(&sigstore))
+        );
+    }
+
+    #[test]
+    fn bundle_contract_rejects_mismatched_archive_name() {
+        let tmp = TempDir::new().unwrap();
+        let host = HostSpecifier {
+            os: HostOs::Linux,
+            arch: HostArch::X86_64,
+            abi: HostAbi::Gnu,
+        };
+        let expected =
+            resolve_installer_artifact_contract(host, ReleaseChannel::Stable, Some("0.9.1"))
+                .unwrap();
+
+        let manifest = OfflineBundleManifest {
+            version: "1".to_string(),
+            repository: RELEASE_REPOSITORY.to_string(),
+            release_tag: "0.9.1".to_string(),
+            artifacts: vec![OfflineBundleArtifact {
+                target: expected.target.triple.to_string(),
+                archive: "wrong.tar.xz".to_string(),
+                checksum: expected.checksum_name(),
+                sigstore_bundle: None,
+            }],
+        };
+        let manifest_path = tmp.path().join("bundle-manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let err = resolve_bundle_artifact_contract(host, &manifest_path).unwrap_err();
+        assert_eq!(err.code(), "SBH-1001");
+        assert!(err.to_string().contains("bundle archive mismatch"));
+    }
+
+    #[test]
+    fn bundle_contract_requires_existing_files() {
+        let tmp = TempDir::new().unwrap();
+        let host = HostSpecifier {
+            os: HostOs::Linux,
+            arch: HostArch::X86_64,
+            abi: HostAbi::Gnu,
+        };
+        let expected =
+            resolve_installer_artifact_contract(host, ReleaseChannel::Stable, Some("0.9.1"))
+                .unwrap();
+        let archive = expected.asset_name();
+        let checksum = expected.checksum_name();
+
+        // Only archive exists; checksum is intentionally missing.
+        std::fs::write(tmp.path().join(&archive), b"archive").unwrap();
+
+        let manifest = OfflineBundleManifest {
+            version: "1".to_string(),
+            repository: RELEASE_REPOSITORY.to_string(),
+            release_tag: "0.9.1".to_string(),
+            artifacts: vec![OfflineBundleArtifact {
+                target: expected.target.triple.to_string(),
+                archive,
+                checksum,
+                sigstore_bundle: None,
+            }],
+        };
+        let manifest_path = tmp.path().join("bundle-manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let err = resolve_bundle_artifact_contract(host, &manifest_path).unwrap_err();
+        assert_eq!(err.code(), "SBH-3900");
+        assert!(err.to_string().contains("bundle checksum"));
+    }
+
+    #[test]
+    fn bundle_contract_accepts_nested_relative_paths() {
+        let tmp = TempDir::new().unwrap();
+        let host = HostSpecifier {
+            os: HostOs::Linux,
+            arch: HostArch::X86_64,
+            abi: HostAbi::Gnu,
+        };
+        let expected =
+            resolve_installer_artifact_contract(host, ReleaseChannel::Stable, Some("0.9.1"))
+                .unwrap();
+        let archive_name = expected.asset_name();
+        let checksum_name = expected.checksum_name();
+
+        let archive_rel = format!("artifacts/{archive_name}");
+        let checksum_rel = format!("checksums/{checksum_name}");
+        let archive_path = tmp.path().join(&archive_rel);
+        let checksum_path = tmp.path().join(&checksum_rel);
+        std::fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(checksum_path.parent().unwrap()).unwrap();
+        std::fs::write(&archive_path, b"archive").unwrap();
+        std::fs::write(&checksum_path, b"checksum").unwrap();
+
+        let manifest = OfflineBundleManifest {
+            version: "1".to_string(),
+            repository: RELEASE_REPOSITORY.to_string(),
+            release_tag: "0.9.1".to_string(),
+            artifacts: vec![OfflineBundleArtifact {
+                target: expected.target.triple.to_string(),
+                archive: archive_rel,
+                checksum: checksum_rel,
+                sigstore_bundle: None,
+            }],
+        };
+        let manifest_path = tmp.path().join("bundle-manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let resolved = resolve_bundle_artifact_contract(host, &manifest_path).unwrap();
+        assert_eq!(resolved.archive_path, archive_path);
+        assert_eq!(resolved.checksum_path, checksum_path);
+    }
+
+    #[test]
+    fn bundle_contract_rejects_parent_dir_escape() {
+        let tmp = TempDir::new().unwrap();
+        let host = HostSpecifier {
+            os: HostOs::Linux,
+            arch: HostArch::X86_64,
+            abi: HostAbi::Gnu,
+        };
+        let expected =
+            resolve_installer_artifact_contract(host, ReleaseChannel::Stable, Some("0.9.1"))
+                .unwrap();
+
+        let manifest = OfflineBundleManifest {
+            version: "1".to_string(),
+            repository: RELEASE_REPOSITORY.to_string(),
+            release_tag: "0.9.1".to_string(),
+            artifacts: vec![OfflineBundleArtifact {
+                target: expected.target.triple.to_string(),
+                archive: format!("../{}", expected.asset_name()),
+                checksum: expected.checksum_name(),
+                sigstore_bundle: None,
+            }],
+        };
+        let manifest_path = tmp.path().join("bundle-manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let err = resolve_bundle_artifact_contract(host, &manifest_path).unwrap_err();
+        assert_eq!(err.code(), "SBH-1001");
+        assert!(err.to_string().contains("cannot contain '..'"));
     }
 }

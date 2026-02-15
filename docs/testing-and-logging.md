@@ -48,14 +48,24 @@ Every new module should emit logs with these baseline fields:
 - Machine-readable logs: JSONL and/or SQLite activity records
 - Integration tests should assert on both behavioral outcomes and log artifacts when practical
 
+### Installer/Updater Diagnostics (Required)
+
+Installer/update flows should emit phase-level records that include:
+
+- `command`: `install|update|bootstrap|uninstall`
+- `phase`: deterministic step label (`resolve_contract`, `verify_integrity`, `backup_create`, `rollback_apply`, etc.)
+- `decision`: `allow|deny|bypass|retry|rollback`
+- `reason_codes`: stable reason list for failures/overrides
+- `target_version` and `current_version` when applicable
+
 ## Verification Commands
 
 ```bash
 cargo fmt --check
-cargo check --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo test --test integration_tests
+rch exec "cargo check --all-targets"
+rch exec "cargo clippy --all-targets -- -D warnings"
+rch exec "cargo test --lib"
+rch exec "cargo test --test integration_tests"
 ./scripts/e2e_test.sh
 ```
 

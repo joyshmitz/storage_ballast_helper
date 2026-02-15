@@ -98,6 +98,83 @@ All flags below are contract-level and must be kept stable unless the parity mat
 | Update rollback safety | backup-first mandatory | none | backup ID, retention decision, rollback viability |
 | Destructive uninstall behaviors | off by default | `--purge` only | preflight summary + final mutation report |
 
+## Operator Runbook (Install/Update/Rollback)
+
+This runbook is the default operational sequence for humans and agents.
+
+### 1. Preflight
+
+1. Validate config and environment before mutation:
+   - `sbh config validate`
+   - `sbh status --json`
+2. Confirm intended scope:
+   - user install/update path: `--user`
+   - system install/update path: `--system`
+3. Prefer machine-readable execution in automation:
+   - add `--json` to install/update/bootstrap/uninstall operations
+
+### 2. Update Decision Path
+
+1. Check first (non-mutating):
+   - `sbh update --check --json`
+2. Apply only when check output is acceptable:
+   - `sbh update --json`
+3. For pinned rollouts:
+   - `sbh update --pin <version> --json`
+
+### 3. Recovery Path
+
+1. On failed update, inspect rollback inventory:
+   - `sbh update --list-versions --json`
+2. Roll back to latest known-good state:
+   - `sbh update --rollback --json`
+3. Roll back to a specific restore point when required:
+   - `sbh update --rollback <version-or-backup-id> --json`
+4. Apply retention policy after incident stabilization:
+   - `sbh update --prune <N> --json`
+
+### 4. Post-Change Verification
+
+1. Verify binary and service health:
+   - `sbh version --verbose`
+   - `sbh status --json`
+2. Confirm observability records exist for the operation:
+   - trace-level install/update events (per `bd-2j5.18`)
+   - phase-level success/failure markers
+   - explicit reason codes for policy overrides or bypasses
+
+## Failure Playbooks
+
+| Symptom | Likely Cause | Immediate Action | Required Evidence |
+| --- | --- | --- | --- |
+| Update check is slow or flaky | metadata cache expired, network/API instability | re-run with refresh path and capture JSON output | request metadata source, cache state, trace id |
+| Update apply failed after download | checksum/signature/policy rejection | do not force install; inspect verification outcome and reason codes | checksum status, signature status, decision reason |
+| New binary fails after apply | incompatible artifact or partial install | execute rollback path immediately | rollback target, backup id, restore result |
+| Rollback unavailable | backup creation or retention gap | stop further mutation; collect backup inventory and retention settings | backup inventory, max-retention policy, failure event |
+| Service healthy but behavior regressed | config drift or integration mutation | run bootstrap/integration diff checks and restore from backup-first artifacts | changed files list, backup path, remediation action |
+
+## Security Model (Operator View)
+
+### Trust Boundaries
+
+- Release artifacts are trusted only after integrity checks pass.
+- Checksums are mandatory by default.
+- Signature verification policy is explicit and logged.
+- `--no-verify` is an emergency/debug bypass path, never a default.
+
+### Safety Invariants
+
+1. Backup-first mutation for update/rollback-capable paths.
+2. Deterministic artifact resolution by host/target contract.
+3. Structured decision logging for every allow/deny/bypass decision.
+4. No silent downgrade of integrity policy.
+
+### Incident Expectations
+
+- Any bypass or integrity failure must leave a machine-readable trail with stable reason codes.
+- Rollback actions must be traceable to a concrete backup/version identifier.
+- Operator-facing output and JSON output must describe the same decision outcome.
+
 ## Linked Gaps and Dependency Assertions
 
 - This matrix maps every identified parity gap to at least one child bead in epic `bd-2j5`.

@@ -398,6 +398,8 @@ pub struct FetchOptions {
     pub required_only: bool,
     /// Offline mode: fail fast if any required asset is missing.
     pub offline: bool,
+    /// Optional offline bundle root for local artifact hydration.
+    pub bundle_root: Option<PathBuf>,
 }
 
 /// Full fetch/prefetch summary.
@@ -452,15 +454,66 @@ pub fn fetch_assets(
             CacheStatus::Partial { .. } | CacheStatus::Missing => {}
         }
 
+        if let Some(bundle_root) = opts.bundle_root.as_deref() {
+            match restore_from_bundle(entry, cache, bundle_root) {
+                Ok(BundleRestoreOutcome::Copied { source, bytes }) => {
+                    total_bytes += bytes;
+                    results.push(FetchResult {
+                        name: entry.name.clone(),
+                        version: entry.version.clone(),
+                        status: FetchStatus::Downloaded,
+                        path: cache.asset_path(entry),
+                        message: format!(
+                            "restored from bundle {} ({bytes} bytes)",
+                            source.display()
+                        ),
+                    });
+                    continue;
+                }
+                Ok(BundleRestoreOutcome::IntegrityFailed { source, actual }) => {
+                    results.push(FetchResult {
+                        name: entry.name.clone(),
+                        version: entry.version.clone(),
+                        status: FetchStatus::IntegrityFailed,
+                        path: cache.asset_path(entry),
+                        message: format!(
+                            "bundle integrity check failed for {}: expected {} got {}",
+                            source.display(),
+                            entry.sha256,
+                            actual
+                        ),
+                    });
+                    continue;
+                }
+                Ok(BundleRestoreOutcome::NotFound) => {}
+                Err(e) => {
+                    results.push(FetchResult {
+                        name: entry.name.clone(),
+                        version: entry.version.clone(),
+                        status: FetchStatus::Failed,
+                        path: cache.asset_path(entry),
+                        message: format!("bundle restore failed: {e}"),
+                    });
+                    continue;
+                }
+            }
+        }
+
         // Offline mode: fail fast.
         if opts.offline {
+            let bundle_hint = opts
+                .bundle_root
+                .as_deref()
+                .map_or_else(String::new, |root| {
+                    format!(" and not present in bundle {}", root.display())
+                });
             results.push(FetchResult {
                 name: entry.name.clone(),
                 version: entry.version.clone(),
                 status: FetchStatus::Failed,
                 path: cache.asset_path(entry),
                 message: format!(
-                    "offline mode: asset not in cache. Download manually:\n  curl -Lo {} {}",
+                    "offline mode: asset not in cache{bundle_hint}. Download manually:\n  curl -Lo {} {}",
                     cache.asset_path(entry).display(),
                     entry.url
                 ),
@@ -524,6 +577,53 @@ pub fn fetch_assets(
         failed_count,
         total_bytes_downloaded: total_bytes,
     }
+}
+
+#[derive(Debug)]
+enum BundleRestoreOutcome {
+    Copied { source: PathBuf, bytes: u64 },
+    IntegrityFailed { source: PathBuf, actual: String },
+    NotFound,
+}
+
+fn restore_from_bundle(
+    entry: &AssetEntry,
+    cache: &AssetCache,
+    bundle_root: &Path,
+) -> io::Result<BundleRestoreOutcome> {
+    let Some(source) = resolve_bundle_source(entry, bundle_root) else {
+        return Ok(BundleRestoreOutcome::NotFound);
+    };
+
+    let actual = compute_sha256(&source)?;
+    if actual != entry.sha256 {
+        return Ok(BundleRestoreOutcome::IntegrityFailed { source, actual });
+    }
+
+    let target = cache.asset_path(entry);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = fs::copy(&source, &target)?;
+    Ok(BundleRestoreOutcome::Copied { source, bytes })
+}
+
+fn resolve_bundle_source(entry: &AssetEntry, bundle_root: &Path) -> Option<PathBuf> {
+    let filename = url_filename(&entry.url);
+    let nested = bundle_root
+        .join(&entry.name)
+        .join(&entry.version)
+        .join(&filename);
+    if nested.is_file() {
+        return Some(nested);
+    }
+
+    let flat = bundle_root.join(filename);
+    if flat.is_file() {
+        return Some(flat);
+    }
+
+    None
 }
 
 /// Download an asset and verify its integrity.
@@ -634,13 +734,38 @@ fn url_filename(url: &str) -> String {
 /// Check manifest readiness for offline operation.
 #[must_use]
 pub fn offline_readiness(manifest: &AssetManifest, cache: &AssetCache) -> OfflineReport {
+    offline_readiness_with_bundle(manifest, cache, None)
+}
+
+/// Check manifest readiness for offline operation with optional bundle fallback.
+#[must_use]
+pub fn offline_readiness_with_bundle(
+    manifest: &AssetManifest,
+    cache: &AssetCache,
+    bundle_root: Option<&Path>,
+) -> OfflineReport {
     let mut missing_required = Vec::new();
     let mut missing_optional = Vec::new();
     let mut corrupt = Vec::new();
 
     for entry in &manifest.assets {
-        match cache.is_cached(entry) {
-            CacheStatus::Valid => {}
+        let cache_status = cache.is_cached(entry);
+        if matches!(cache_status, CacheStatus::Valid) {
+            continue;
+        }
+
+        if let Some(root) = bundle_root {
+            match bundle_cache_status(entry, root) {
+                CacheStatus::Valid => continue,
+                CacheStatus::Corrupt { .. } => {
+                    corrupt.push(entry.name.clone());
+                    continue;
+                }
+                CacheStatus::Missing | CacheStatus::Partial { .. } => {}
+            }
+        }
+
+        match cache_status {
             CacheStatus::Missing | CacheStatus::Partial { .. } => {
                 if entry.required {
                     missing_required.push(entry.name.clone());
@@ -648,9 +773,8 @@ pub fn offline_readiness(manifest: &AssetManifest, cache: &AssetCache) -> Offlin
                     missing_optional.push(entry.name.clone());
                 }
             }
-            CacheStatus::Corrupt { .. } => {
-                corrupt.push(entry.name.clone());
-            }
+            CacheStatus::Corrupt { .. } => corrupt.push(entry.name.clone()),
+            CacheStatus::Valid => {}
         }
     }
 
@@ -661,6 +785,24 @@ pub fn offline_readiness(manifest: &AssetManifest, cache: &AssetCache) -> Offlin
         missing_required,
         missing_optional,
         corrupt,
+    }
+}
+
+fn bundle_cache_status(entry: &AssetEntry, bundle_root: &Path) -> CacheStatus {
+    let Some(source) = resolve_bundle_source(entry, bundle_root) else {
+        return CacheStatus::Missing;
+    };
+
+    match compute_sha256(&source) {
+        Ok(hash) if hash == entry.sha256 => CacheStatus::Valid,
+        Ok(hash) => CacheStatus::Corrupt {
+            expected: entry.sha256.clone(),
+            actual: hash,
+        },
+        Err(_) => CacheStatus::Corrupt {
+            expected: entry.sha256.clone(),
+            actual: String::new(),
+        },
     }
 }
 
@@ -994,6 +1136,134 @@ mod tests {
     }
 
     #[test]
+    fn fetch_offline_restores_from_bundle() {
+        let cache_tmp = TempDir::new().unwrap();
+        let bundle_tmp = TempDir::new().unwrap();
+        let cache = AssetCache::new(cache_tmp.path().to_path_buf());
+
+        let bytes = b"bundle-asset";
+        let sha256 = sha256_of(bytes);
+        let entry = AssetEntry {
+            name: "scoring-model".to_string(),
+            version: "2.0.0".to_string(),
+            sha256,
+            url: "https://example.com/scoring-model-2.0.0.bin".to_string(),
+            mirrors: vec![],
+            size_bytes: bytes.len() as u64,
+            required: true,
+            description: String::new(),
+        };
+        let filename = url_filename(&entry.url);
+        let bundle_path = bundle_tmp
+            .path()
+            .join(&entry.name)
+            .join(&entry.version)
+            .join(filename);
+        fs::create_dir_all(bundle_path.parent().unwrap()).unwrap();
+        fs::write(&bundle_path, bytes).unwrap();
+
+        let manifest = AssetManifest {
+            version: "1.0.0".to_string(),
+            assets: vec![entry.clone()],
+        };
+        let opts = FetchOptions {
+            offline: true,
+            bundle_root: Some(bundle_tmp.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let summary = fetch_assets(&manifest, &cache, &opts);
+        assert_eq!(summary.failed_count, 0);
+        assert_eq!(summary.downloaded_count, 1);
+        assert_eq!(summary.results[0].status, FetchStatus::Downloaded);
+        assert!(summary.results[0].message.contains("restored from bundle"));
+        assert_eq!(fs::read(cache.asset_path(&entry)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn fetch_offline_restores_from_flat_bundle_layout() {
+        let cache_tmp = TempDir::new().unwrap();
+        let bundle_tmp = TempDir::new().unwrap();
+        let cache = AssetCache::new(cache_tmp.path().to_path_buf());
+
+        let bytes = b"flat-bundle-asset";
+        let sha256 = sha256_of(bytes);
+        let entry = AssetEntry {
+            name: "scoring-model".to_string(),
+            version: "2.0.0".to_string(),
+            sha256,
+            url: "https://example.com/scoring-model-2.0.0.bin".to_string(),
+            mirrors: vec![],
+            size_bytes: bytes.len() as u64,
+            required: true,
+            description: String::new(),
+        };
+        let filename = url_filename(&entry.url);
+        fs::write(bundle_tmp.path().join(filename), bytes).unwrap();
+
+        let manifest = AssetManifest {
+            version: "1.0.0".to_string(),
+            assets: vec![entry.clone()],
+        };
+        let opts = FetchOptions {
+            offline: true,
+            bundle_root: Some(bundle_tmp.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let summary = fetch_assets(&manifest, &cache, &opts);
+        assert_eq!(summary.failed_count, 0);
+        assert_eq!(summary.downloaded_count, 1);
+        assert_eq!(summary.results[0].status, FetchStatus::Downloaded);
+        assert_eq!(fs::read(cache.asset_path(&entry)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn fetch_bundle_integrity_mismatch_reports_failure() {
+        let cache_tmp = TempDir::new().unwrap();
+        let bundle_tmp = TempDir::new().unwrap();
+        let cache = AssetCache::new(cache_tmp.path().to_path_buf());
+
+        let entry = AssetEntry {
+            name: "scoring-model".to_string(),
+            version: "2.0.0".to_string(),
+            sha256: sha256_of(b"expected"),
+            url: "https://example.com/scoring-model-2.0.0.bin".to_string(),
+            mirrors: vec![],
+            size_bytes: 8,
+            required: true,
+            description: String::new(),
+        };
+        let filename = url_filename(&entry.url);
+        let bundle_path = bundle_tmp
+            .path()
+            .join(&entry.name)
+            .join(&entry.version)
+            .join(filename);
+        fs::create_dir_all(bundle_path.parent().unwrap()).unwrap();
+        fs::write(&bundle_path, b"actual").unwrap();
+
+        let manifest = AssetManifest {
+            version: "1.0.0".to_string(),
+            assets: vec![entry],
+        };
+        let opts = FetchOptions {
+            offline: true,
+            bundle_root: Some(bundle_tmp.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let summary = fetch_assets(&manifest, &cache, &opts);
+        assert_eq!(summary.failed_count, 1);
+        assert_eq!(summary.results[0].status, FetchStatus::IntegrityFailed);
+        assert!(
+            summary.results[0]
+                .message
+                .contains("bundle integrity check failed")
+        );
+    }
+
+    #[test]
     fn fetch_skips_optional_with_required_only() {
         let tmp = TempDir::new().unwrap();
         let cache = AssetCache::new(tmp.path().to_path_buf());
@@ -1105,6 +1375,109 @@ mod tests {
     }
 
     #[test]
+    fn offline_readiness_accepts_valid_bundle_asset() {
+        let cache_tmp = TempDir::new().unwrap();
+        let bundle_tmp = TempDir::new().unwrap();
+        let cache = AssetCache::new(cache_tmp.path().to_path_buf());
+
+        let bytes = b"bundle-model";
+        let entry = AssetEntry {
+            name: "model".to_string(),
+            version: "1.0.0".to_string(),
+            sha256: sha256_of(bytes),
+            url: "https://example.com/model.bin".to_string(),
+            mirrors: vec![],
+            size_bytes: bytes.len() as u64,
+            required: true,
+            description: String::new(),
+        };
+        let filename = url_filename(&entry.url);
+        let bundle_path = bundle_tmp
+            .path()
+            .join(&entry.name)
+            .join(&entry.version)
+            .join(filename);
+        fs::create_dir_all(bundle_path.parent().unwrap()).unwrap();
+        fs::write(&bundle_path, bytes).unwrap();
+
+        let manifest = AssetManifest {
+            version: "1.0.0".to_string(),
+            assets: vec![entry],
+        };
+
+        let report = offline_readiness_with_bundle(&manifest, &cache, Some(bundle_tmp.path()));
+        assert!(report.ready);
+        assert!(report.missing_required.is_empty());
+        assert!(report.corrupt.is_empty());
+    }
+
+    #[test]
+    fn offline_readiness_accepts_flat_bundle_asset() {
+        let cache_tmp = TempDir::new().unwrap();
+        let bundle_tmp = TempDir::new().unwrap();
+        let cache = AssetCache::new(cache_tmp.path().to_path_buf());
+
+        let bytes = b"flat-bundle-model";
+        let entry = AssetEntry {
+            name: "model".to_string(),
+            version: "1.0.0".to_string(),
+            sha256: sha256_of(bytes),
+            url: "https://example.com/model.bin".to_string(),
+            mirrors: vec![],
+            size_bytes: bytes.len() as u64,
+            required: true,
+            description: String::new(),
+        };
+        let filename = url_filename(&entry.url);
+        fs::write(bundle_tmp.path().join(filename), bytes).unwrap();
+
+        let manifest = AssetManifest {
+            version: "1.0.0".to_string(),
+            assets: vec![entry],
+        };
+
+        let report = offline_readiness_with_bundle(&manifest, &cache, Some(bundle_tmp.path()));
+        assert!(report.ready);
+        assert!(report.missing_required.is_empty());
+        assert!(report.corrupt.is_empty());
+    }
+
+    #[test]
+    fn offline_readiness_marks_corrupt_bundle_asset() {
+        let cache_tmp = TempDir::new().unwrap();
+        let bundle_tmp = TempDir::new().unwrap();
+        let cache = AssetCache::new(cache_tmp.path().to_path_buf());
+
+        let entry = AssetEntry {
+            name: "model".to_string(),
+            version: "1.0.0".to_string(),
+            sha256: sha256_of(b"expected"),
+            url: "https://example.com/model.bin".to_string(),
+            mirrors: vec![],
+            size_bytes: 8,
+            required: true,
+            description: String::new(),
+        };
+        let filename = url_filename(&entry.url);
+        let bundle_path = bundle_tmp
+            .path()
+            .join(&entry.name)
+            .join(&entry.version)
+            .join(filename);
+        fs::create_dir_all(bundle_path.parent().unwrap()).unwrap();
+        fs::write(&bundle_path, b"actual").unwrap();
+
+        let manifest = AssetManifest {
+            version: "1.0.0".to_string(),
+            assets: vec![entry],
+        };
+
+        let report = offline_readiness_with_bundle(&manifest, &cache, Some(bundle_tmp.path()));
+        assert!(!report.ready);
+        assert!(report.corrupt.contains(&"model".to_string()));
+    }
+
+    #[test]
     fn url_filename_extraction() {
         assert_eq!(
             url_filename("https://example.com/path/model.bin"),
@@ -1147,6 +1520,12 @@ mod tests {
             hash,
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
+    }
+
+    fn sha256_of(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hex_encode(&hasher.finalize())
     }
 
     #[test]

@@ -153,7 +153,9 @@ impl ArtifactPatternRegistry {
         }
 
         let structural = structural_score(best.category, signals);
-        let combined = 0.70f64.mul_add(best.name_confidence, 0.30 * structural).clamp(0.0, 1.0);
+        let combined = 0.70f64
+            .mul_add(best.name_confidence, 0.30 * structural)
+            .clamp(0.0, 1.0);
 
         ArtifactClassification {
             structural_confidence: structural,

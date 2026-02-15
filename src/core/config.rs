@@ -22,6 +22,7 @@ pub struct Config {
     pub scanner: ScannerConfig,
     pub scoring: ScoringConfig,
     pub ballast: BallastConfig,
+    pub update: UpdateConfig,
     pub telemetry: TelemetryConfig,
     pub paths: PathsConfig,
     pub notifications: NotificationConfig,
@@ -164,6 +165,17 @@ pub struct TelemetryConfig {
     pub ewma_min_samples: u64,
 }
 
+/// Update-check behavior, cache policy, and opt-out controls.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct UpdateConfig {
+    pub enabled: bool,
+    pub metadata_cache_ttl_seconds: u64,
+    pub metadata_cache_file: PathBuf,
+    pub background_refresh: bool,
+    pub notices_enabled: bool,
+}
+
 /// Filesystem paths used by sbh.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -182,6 +194,7 @@ impl Default for Config {
             scanner: ScannerConfig::default(),
             scoring: ScoringConfig::default(),
             ballast: BallastConfig::default(),
+            update: UpdateConfig::default(),
             telemetry: TelemetryConfig::default(),
             paths: PathsConfig::default(),
             notifications: NotificationConfig::default(),
@@ -280,6 +293,20 @@ impl Default for TelemetryConfig {
             ewma_min_alpha: 0.10,
             ewma_max_alpha: 0.75,
             ewma_min_samples: 3,
+        }
+    }
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        let home_dir = env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+        let data_dir = home_dir.join(".local").join("share").join("sbh");
+        Self {
+            enabled: true,
+            metadata_cache_ttl_seconds: 30 * 60,
+            metadata_cache_file: data_dir.join("update-metadata.json"),
+            background_refresh: true,
+            notices_enabled: true,
         }
     }
 }
@@ -459,6 +486,46 @@ impl Config {
             &mut self.telemetry.ewma_min_samples,
         )?;
 
+        // update
+        self.apply_update_env_overrides_from(env_var)?;
+
+        Ok(())
+    }
+
+    fn apply_update_env_overrides_from<F>(&mut self, mut lookup: F) -> Result<()>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        if let Some(raw) = lookup("SBH_UPDATE_ENABLED") {
+            self.update.enabled = parse_env_bool("SBH_UPDATE_ENABLED", &raw)?;
+        }
+
+        if let Some(raw) = lookup("SBH_UPDATE_METADATA_CACHE_TTL_SECONDS") {
+            self.update.metadata_cache_ttl_seconds =
+                parse_env_u64("SBH_UPDATE_METADATA_CACHE_TTL_SECONDS", &raw)?;
+        }
+
+        if let Some(raw) = lookup("SBH_UPDATE_METADATA_CACHE_FILE") {
+            self.update.metadata_cache_file = PathBuf::from(raw);
+        }
+
+        if let Some(raw) = lookup("SBH_UPDATE_BACKGROUND_REFRESH") {
+            self.update.background_refresh = parse_env_bool("SBH_UPDATE_BACKGROUND_REFRESH", &raw)?;
+        }
+
+        if let Some(raw) = lookup("SBH_UPDATE_NOTICES_ENABLED") {
+            self.update.notices_enabled = parse_env_bool("SBH_UPDATE_NOTICES_ENABLED", &raw)?;
+        }
+
+        // Global opt-out: disables checks, background refresh, and update notices.
+        if let Some(raw) = lookup("SBH_UPDATE_OPT_OUT") {
+            if parse_env_bool("SBH_UPDATE_OPT_OUT", &raw)? {
+                self.update.enabled = false;
+                self.update.background_refresh = false;
+                self.update.notices_enabled = false;
+            }
+        }
+
         Ok(())
     }
 
@@ -542,6 +609,19 @@ impl Config {
             });
         }
 
+        if self.update.metadata_cache_ttl_seconds == 0 {
+            return Err(SbhError::InvalidConfig {
+                details: "update.metadata_cache_ttl_seconds must be > 0".to_string(),
+            });
+        }
+
+        if !self.update.enabled && self.update.background_refresh {
+            return Err(SbhError::InvalidConfig {
+                details: "update.background_refresh cannot be true when update.enabled=false"
+                    .to_string(),
+            });
+        }
+
         Ok(())
     }
 }
@@ -593,18 +673,37 @@ fn set_env_usize(name: &str, slot: &mut usize) -> Result<()> {
 
 fn set_env_bool(name: &str, slot: &mut bool) -> Result<()> {
     if let Some(raw) = env_var(name) {
-        *slot = raw.parse::<bool>().map_err(|error| SbhError::ConfigParse {
-            context: "env",
-            details: format!("{name}={raw:?}: {error}"),
-        })?;
+        *slot = parse_env_bool(name, &raw)?;
     }
     Ok(())
+}
+
+fn parse_env_u64(name: &str, raw: &str) -> Result<u64> {
+    raw.parse::<u64>().map_err(|error| SbhError::ConfigParse {
+        context: "env",
+        details: format!("{name}={raw:?}: {error}"),
+    })
+}
+
+fn parse_env_bool(name: &str, raw: &str) -> Result<bool> {
+    raw.parse::<bool>().map_err(|error| SbhError::ConfigParse {
+        context: "env",
+        details: format!("{name}={raw:?}: {error}"),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Config, SbhError};
+    use std::collections::HashMap;
     use std::path::Path;
+
+    fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect()
+    }
 
     #[test]
     fn default_config_is_valid() {
@@ -661,6 +760,94 @@ mod tests {
             .validate()
             .expect_err("expected ballast validation error");
         assert!(err.to_string().contains("ballast"));
+    }
+
+    #[test]
+    fn update_zero_cache_ttl_rejected() {
+        let mut cfg = Config::default();
+        cfg.update.metadata_cache_ttl_seconds = 0;
+        let err = cfg
+            .validate()
+            .expect_err("expected update ttl validation error");
+        assert!(err.to_string().contains("metadata_cache_ttl_seconds"));
+    }
+
+    #[test]
+    fn update_disabled_disallows_background_refresh() {
+        let mut cfg = Config::default();
+        cfg.update.enabled = false;
+        cfg.update.background_refresh = true;
+        let err = cfg
+            .validate()
+            .expect_err("expected update background refresh validation error");
+        assert!(err.to_string().contains("background_refresh"));
+    }
+
+    #[test]
+    fn update_default_cache_file_name_is_stable() {
+        let cfg = Config::default();
+        assert!(
+            cfg.update
+                .metadata_cache_file
+                .to_string_lossy()
+                .ends_with("update-metadata.json")
+        );
+    }
+
+    #[test]
+    fn update_env_opt_out_disables_all_update_controls() {
+        let mut cfg = Config::default();
+        let overrides = vars(&[
+            ("SBH_UPDATE_ENABLED", "true"),
+            ("SBH_UPDATE_BACKGROUND_REFRESH", "true"),
+            ("SBH_UPDATE_NOTICES_ENABLED", "true"),
+            ("SBH_UPDATE_OPT_OUT", "true"),
+        ]);
+
+        cfg.apply_update_env_overrides_from(|name| overrides.get(name).cloned())
+            .expect("update env overrides should parse");
+
+        assert!(!cfg.update.enabled);
+        assert!(!cfg.update.background_refresh);
+        assert!(!cfg.update.notices_enabled);
+    }
+
+    #[test]
+    fn update_env_cache_fields_override_defaults() {
+        let mut cfg = Config::default();
+        let overrides = vars(&[
+            ("SBH_UPDATE_METADATA_CACHE_TTL_SECONDS", "7200"),
+            (
+                "SBH_UPDATE_METADATA_CACHE_FILE",
+                "/tmp/sbh/custom-update-metadata.json",
+            ),
+        ]);
+
+        cfg.apply_update_env_overrides_from(|name| overrides.get(name).cloned())
+            .expect("update env overrides should parse");
+
+        assert_eq!(cfg.update.metadata_cache_ttl_seconds, 7_200);
+        assert_eq!(
+            cfg.update.metadata_cache_file,
+            std::path::PathBuf::from("/tmp/sbh/custom-update-metadata.json")
+        );
+    }
+
+    #[test]
+    fn update_env_invalid_boolean_rejected() {
+        let mut cfg = Config::default();
+        let overrides = vars(&[("SBH_UPDATE_NOTICES_ENABLED", "yes-please")]);
+
+        let err = cfg
+            .apply_update_env_overrides_from(|name| overrides.get(name).cloned())
+            .expect_err("invalid bool should fail");
+        match err {
+            SbhError::ConfigParse { context, details } => {
+                assert_eq!(context, "env");
+                assert!(details.contains("SBH_UPDATE_NOTICES_ENABLED"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

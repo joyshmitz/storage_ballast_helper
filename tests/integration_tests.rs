@@ -7,10 +7,13 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
 use storage_ballast_helper::ballast::manager::BallastManager;
 use storage_ballast_helper::core::config::{BallastConfig, Config, ScoringConfig};
 use storage_ballast_helper::daemon::notifications::{NotificationEvent, NotificationManager};
-use storage_ballast_helper::daemon::policy::{ActiveMode, FallbackReason, PolicyConfig, PolicyEngine};
+use storage_ballast_helper::daemon::policy::{
+    ActiveMode, FallbackReason, PolicyConfig, PolicyEngine,
+};
 use storage_ballast_helper::monitor::ewma::DiskRateEstimator;
 use storage_ballast_helper::monitor::guardrails::{
     AdaptiveGuard, CalibrationObservation, GuardDiagnostics, GuardStatus, GuardrailConfig,
@@ -26,8 +29,8 @@ use storage_ballast_helper::scanner::patterns::{
 };
 use storage_ballast_helper::scanner::protection::ProtectionRegistry;
 use storage_ballast_helper::scanner::scoring::{
-    CandidacyScore, CandidateInput, DecisionAction, DecisionOutcome, EvidenceLedger,
-    EvidenceTerm, ScoreFactors, ScoringEngine,
+    CandidacyScore, CandidateInput, DecisionAction, DecisionOutcome, EvidenceLedger, EvidenceTerm,
+    ScoreFactors, ScoringEngine,
 };
 use storage_ballast_helper::scanner::walker::{DirectoryWalker, WalkerConfig};
 
@@ -128,6 +131,178 @@ fn completions_command_generates_shell_script() {
     assert!(
         result.stdout.contains("sbh"),
         "expected completion script contents; log: {}",
+        result.log_path.display()
+    );
+}
+
+#[test]
+fn update_check_with_pinned_future_version_reports_available_json() {
+    let result = common::run_cli_case(
+        "update_check_with_pinned_future_version_reports_available_json",
+        &["update", "--check", "--version", "v99.99.99", "--json"],
+    );
+    assert!(
+        result.status.success(),
+        "expected success; log: {}",
+        result.log_path.display()
+    );
+
+    let payload: Value = serde_json::from_str(result.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "expected JSON output, parse failed: {err}; stdout={:?}; log={}",
+            result.stdout,
+            result.log_path.display()
+        )
+    });
+
+    assert_eq!(
+        payload["check_only"],
+        true,
+        "log: {}",
+        result.log_path.display()
+    );
+    assert_eq!(
+        payload["update_available"],
+        true,
+        "log: {}",
+        result.log_path.display()
+    );
+    assert_eq!(
+        payload["target_version"],
+        "v99.99.99",
+        "log: {}",
+        result.log_path.display()
+    );
+    assert_eq!(
+        payload["success"],
+        true,
+        "log: {}",
+        result.log_path.display()
+    );
+}
+
+#[test]
+fn update_check_with_current_version_reports_up_to_date_json() {
+    let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let result = common::run_cli_case(
+        "update_check_with_current_version_reports_up_to_date_json",
+        &["update", "--check", "--version", &current, "--json"],
+    );
+    assert!(
+        result.status.success(),
+        "expected success; log: {}",
+        result.log_path.display()
+    );
+
+    let payload: Value = serde_json::from_str(result.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "expected JSON output, parse failed: {err}; stdout={:?}; log={}",
+            result.stdout,
+            result.log_path.display()
+        )
+    });
+
+    assert_eq!(
+        payload["check_only"],
+        true,
+        "log: {}",
+        result.log_path.display()
+    );
+    assert_eq!(
+        payload["target_version"],
+        current,
+        "log: {}",
+        result.log_path.display()
+    );
+    assert_eq!(
+        payload["update_available"],
+        false,
+        "log: {}",
+        result.log_path.display()
+    );
+    assert_eq!(
+        payload["success"],
+        true,
+        "log: {}",
+        result.log_path.display()
+    );
+}
+
+#[test]
+fn update_dry_run_with_pinned_version_emits_plan_steps_json() {
+    let result = common::run_cli_case(
+        "update_dry_run_with_pinned_version_emits_plan_steps_json",
+        &["update", "--version", "v99.99.99", "--dry-run", "--json"],
+    );
+    assert!(
+        result.status.success(),
+        "expected success; log: {}",
+        result.log_path.display()
+    );
+
+    let payload: Value = serde_json::from_str(result.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "expected JSON output, parse failed: {err}; stdout={:?}; log={}",
+            result.stdout,
+            result.log_path.display()
+        )
+    });
+
+    assert_eq!(
+        payload["dry_run"],
+        true,
+        "log: {}",
+        result.log_path.display()
+    );
+    assert_eq!(
+        payload["update_available"],
+        true,
+        "log: {}",
+        result.log_path.display()
+    );
+    assert_eq!(
+        payload["applied"],
+        false,
+        "log: {}",
+        result.log_path.display()
+    );
+    assert_eq!(
+        payload["success"],
+        true,
+        "log: {}",
+        result.log_path.display()
+    );
+
+    let steps = payload["steps"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected steps array; log: {}", result.log_path.display()));
+    let has_plan_step = steps.iter().any(|step| {
+        step.get("description")
+            .and_then(Value::as_str)
+            .is_some_and(|desc| desc.contains("Would download"))
+    });
+    assert!(
+        has_plan_step,
+        "expected dry-run plan step; log: {}",
+        result.log_path.display()
+    );
+}
+
+#[test]
+fn update_system_and_user_flags_conflict_in_cli_integration() {
+    let result = common::run_cli_case(
+        "update_system_and_user_flags_conflict_in_cli_integration",
+        &["update", "--system", "--user"],
+    );
+    assert!(
+        !result.status.success(),
+        "expected failure; log: {}",
+        result.log_path.display()
+    );
+    assert!(
+        result.stderr.contains("cannot be used with") || result.stderr.contains("conflicts with"),
+        "expected clap conflict error; stderr={:?}; log={}",
+        result.stderr,
         result.log_path.display()
     );
 }
@@ -927,9 +1102,7 @@ fn e2e_scenario_3_calibration_drift_fallback() {
     }
 
     // Phase 4: Evaluate — should be in fallback.
-    let candidates = vec![
-        e2e_candidate("/data/projects/drift/target", 5, 96, 0.9),
-    ];
+    let candidates = vec![e2e_candidate("/data/projects/drift/target", 5, 96, 0.9)];
     let scored = scoring.score_batch(&candidates, 0.9);
     let diag = guard.diagnostics();
     let decision = policy.evaluate(&scored, Some(&diag));
@@ -944,10 +1117,7 @@ fn e2e_scenario_3_calibration_drift_fallback() {
 
     // Verify the fallback reason is traceable.
     let reason = policy.fallback_reason();
-    assert!(
-        reason.is_some(),
-        "fallback reason must be recorded"
-    );
+    assert!(reason.is_some(), "fallback reason must be recorded");
 }
 
 // ── Scenario 4: Index corruption causing full-scan fallback ─────────────
@@ -1019,9 +1189,7 @@ fn e2e_scenario_5_fault_injection_safe_degradation() {
     policy.enter_fallback(FallbackReason::KillSwitch);
 
     // Evaluate — must block all actions.
-    let candidates = vec![
-        e2e_candidate("/data/projects/fault/target", 5, 96, 0.9),
-    ];
+    let candidates = vec![e2e_candidate("/data/projects/fault/target", 5, 96, 0.9)];
     let scored = scoring.score_batch(&candidates, 1.0);
     let diag = guard.diagnostics();
     let decision = policy.evaluate(&scored, Some(&diag));
@@ -1092,9 +1260,7 @@ fn e2e_scenario_6_progressive_recovery() {
     );
 
     // Verify that evaluate works normally post-recovery.
-    let candidates = vec![
-        e2e_candidate("/data/projects/recovery/target", 3, 72, 0.85),
-    ];
+    let candidates = vec![e2e_candidate("/data/projects/recovery/target", 3, 72, 0.85)];
     let scored = scoring.score_batch(&candidates, 0.5);
     let decision = policy.evaluate(&scored, None);
 

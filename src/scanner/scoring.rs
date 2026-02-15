@@ -132,19 +132,18 @@ impl ScoringEngine {
             pressure_multiplier: pressure_multiplier(urgency),
         };
 
-        let base = self
-            .weights
-            .structure
-            .mul_add(factors.structure, self.weights.size.mul_add(
+        let base = self.weights.structure.mul_add(
+            factors.structure,
+            self.weights.size.mul_add(
                 factors.size,
                 self.weights.age.mul_add(
                     factors.age,
-                    self.weights.location.mul_add(
-                        factors.location,
-                        self.weights.name * factors.name,
-                    ),
+                    self.weights
+                        .location
+                        .mul_add(factors.location, self.weights.name * factors.name),
                 ),
-            ));
+            ),
+        );
         let total = (base * factors.pressure_multiplier).clamp(0.0, 3.0);
 
         let posterior_abandoned =
@@ -292,10 +291,9 @@ fn factor_location(path: &Path) -> f64 {
 }
 
 fn factor_name(path: &Path, classification: &ArtifactClassification) -> f64 {
-    let name = path.file_name().map_or_else(
-        String::new,
-        |value| value.to_string_lossy().to_lowercase(),
-    );
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |value| value.to_string_lossy().to_lowercase());
     let mut score = classification.combined_confidence;
     if name.contains("tmp") || name.contains("temp") || name.contains("cache") {
         score += 0.10;
@@ -390,7 +388,9 @@ fn posterior_from_score(total_score: f64, confidence: f64) -> f64 {
 
 fn calibration_score(classification_confidence: f64, factors: ScoreFactors) -> f64 {
     let spread = (factors.location - factors.structure).abs();
-    0.75f64.mul_add(classification_confidence, 0.25 * (1.0 - spread)).clamp(0.0, 1.0)
+    0.75f64
+        .mul_add(classification_confidence, 0.25 * (1.0 - spread))
+        .clamp(0.0, 1.0)
 }
 
 fn decide_action(

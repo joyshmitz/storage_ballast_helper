@@ -172,6 +172,14 @@ sbh dashboard
 | `sbh config show|set|validate|diff|reset` | Manage effective config |
 | `sbh install` / `sbh uninstall` | Install/remove service integration |
 
+## Operator Docs
+
+- Installer/update parity contract and security policy: `docs/installer-dx-parity-matrix.md`
+- Testing + log registration guide: `docs/testing-and-logging.md`
+
+For installer/update changes, use the parity matrix as the source of truth for
+flag semantics, integrity policy, rollback expectations, and release-gate tests.
+
 ## Configuration Example
 
 ```toml
@@ -249,21 +257,22 @@ EWMA Forecaster --> PID Controller --> Action Planner
 ## Testing
 
 ```bash
-# Unit and property tests
-cargo test
+# Unit tests
+rch exec "cargo test --lib"
 
 # Integration tests
-cargo test --test integration_tests
+rch exec "cargo test --test integration_tests"
 
 # End-to-end scripts with detailed logs
 ./scripts/e2e_test.sh
 
 # Stress scenarios
-cargo test --test stress_tests -- --nocapture
+rch exec "cargo test --test stress_tests -- --nocapture"
 
 # Quality gates
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+rch exec "cargo check --all-targets"
+rch exec "cargo clippy --all-targets -- -D warnings"
 ```
 
 For test harness conventions and structured logging registration, see `docs/testing-and-logging.md`.

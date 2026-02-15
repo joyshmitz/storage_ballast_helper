@@ -588,11 +588,7 @@ pub fn format_summary_human(summary: &BootstrapSummary) -> String {
             IntegrationStatus::Failed => "[FAIL]",
             IntegrationStatus::DryRun => "[PLAN]",
         };
-        let _ = writeln!(
-            out,
-            "  {status_label} {}: {}",
-            result.tool, result.message
-        );
+        let _ = writeln!(out, "  {status_label} {}: {}", result.tool, result.message);
         if let Some(backup) = &result.backup_path {
             let _ = writeln!(out, "         backup: {}", backup.display());
             let _ = writeln!(

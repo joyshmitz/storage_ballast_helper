@@ -58,7 +58,12 @@ impl SeededRng {
     }
 }
 
-fn make_candidate(rng: &mut SeededRng, idx: usize, age_hours: u64, size_gib: u64) -> CandidateInput {
+fn make_candidate(
+    rng: &mut SeededRng,
+    idx: usize,
+    age_hours: u64,
+    size_gib: u64,
+) -> CandidateInput {
     let suffix = rng.next_u64() % 1000;
     let conf = 0.5 + rng.next_f64() * 0.45;
     CandidateInput {
@@ -232,15 +237,21 @@ fn e2e_burst_growth_shadow_mode() {
         candidates_scored: scored_1.len(),
         approved_count: decision_1.approved_for_deletion.len(),
         decision_ids: decision_1.records.iter().map(|r| r.decision_id).collect(),
-        trace_ids: decision_1.records.iter().map(|r| r.trace_id.clone()).collect(),
+        trace_ids: decision_1
+            .records
+            .iter()
+            .map(|r| r.trace_id.clone())
+            .collect(),
         assertions: Vec::new(),
     };
     assert_eq!(engine.mode(), ActiveMode::Observe);
     step.assertions.push("mode stays Observe".to_string());
     assert_eq!(decision_1.approved_for_deletion.len(), 0);
-    step.assertions.push("zero approved deletions in observe".to_string());
+    step.assertions
+        .push("zero approved deletions in observe".to_string());
     assert!(decision_1.hypothetical_deletes > 0 || decision_1.hypothetical_keeps > 0);
-    step.assertions.push("hypothetical tracking active".to_string());
+    step.assertions
+        .push("hypothetical tracking active".to_string());
     trace.steps.push(step);
 
     // Step 2: Burst pressure — urgency jumps to 0.9, many large candidates.
@@ -258,27 +269,36 @@ fn e2e_burst_growth_shadow_mode() {
         candidates_scored: scored_burst.len(),
         approved_count: decision_2.approved_for_deletion.len(),
         decision_ids: decision_2.records.iter().map(|r| r.decision_id).collect(),
-        trace_ids: decision_2.records.iter().map(|r| r.trace_id.clone()).collect(),
+        trace_ids: decision_2
+            .records
+            .iter()
+            .map(|r| r.trace_id.clone())
+            .collect(),
         assertions: Vec::new(),
     };
     assert_eq!(engine.mode(), ActiveMode::Observe);
-    step.assertions.push("mode still Observe despite high urgency".to_string());
+    step.assertions
+        .push("mode still Observe despite high urgency".to_string());
     assert_eq!(decision_2.approved_for_deletion.len(), 0);
-    step.assertions.push("still zero approved deletions (shadow only)".to_string());
+    step.assertions
+        .push("still zero approved deletions (shadow only)".to_string());
     // Verify decision records contain correct policy mode.
     for record in &decision_2.records {
         assert_eq!(record.policy_mode, PolicyMode::Shadow);
     }
-    step.assertions.push("all records tagged Shadow policy mode".to_string());
+    step.assertions
+        .push("all records tagged Shadow policy mode".to_string());
     // Verify trace IDs are unique.
-    let unique_ids: std::collections::HashSet<_> = decision_2.records.iter().map(|r| &r.trace_id).collect();
+    let unique_ids: std::collections::HashSet<_> =
+        decision_2.records.iter().map(|r| &r.trace_id).collect();
     assert_eq!(unique_ids.len(), decision_2.records.len());
     step.assertions.push("all trace_ids are unique".to_string());
     // Verify decision IDs are monotonically increasing.
     for window in decision_2.records.windows(2) {
         assert!(window[1].decision_id > window[0].decision_id);
     }
-    step.assertions.push("decision_ids monotonically increasing".to_string());
+    step.assertions
+        .push("decision_ids monotonically increasing".to_string());
     trace.steps.push(step);
 
     // Step 3: Verify explainability — all records should format at all levels.
@@ -364,7 +384,11 @@ fn e2e_canary_bounded_impact() {
         candidates_scored: scored.len(),
         approved_count: decision.approved_for_deletion.len(),
         decision_ids: decision.records.iter().map(|r| r.decision_id).collect(),
-        trace_ids: decision.records.iter().map(|r| r.trace_id.clone()).collect(),
+        trace_ids: decision
+            .records
+            .iter()
+            .map(|r| r.trace_id.clone())
+            .collect(),
         assertions: Vec::new(),
     };
     // Canary budget: at most 3 deletions.
@@ -381,7 +405,8 @@ fn e2e_canary_bounded_impact() {
         assert_eq!(record.action, ActionRecord::Delete);
         assert!(record.total_score > 0.0);
     }
-    step.assertions.push("all approved paths have complete evidence records".to_string());
+    step.assertions
+        .push("all approved paths have complete evidence records".to_string());
     trace.steps.push(step);
 
     // Step 3: Exhaust budget with another batch.
@@ -399,18 +424,27 @@ fn e2e_canary_bounded_impact() {
         candidates_scored: scored2.len(),
         approved_count: decision2.approved_for_deletion.len(),
         decision_ids: decision2.records.iter().map(|r| r.decision_id).collect(),
-        trace_ids: decision2.records.iter().map(|r| r.trace_id.clone()).collect(),
+        trace_ids: decision2
+            .records
+            .iter()
+            .map(|r| r.trace_id.clone())
+            .collect(),
         assertions: Vec::new(),
     };
     // After exhausting the budget, engine should have entered fallback.
     if decision2.budget_exhausted {
         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
-        step.assertions.push("budget exhausted → FallbackSafe".to_string());
+        step.assertions
+            .push("budget exhausted → FallbackSafe".to_string());
     } else {
         // If budget not exhausted, verify remaining approvals are still bounded.
-        let total_approved = decision.approved_for_deletion.len() + decision2.approved_for_deletion.len();
+        let total_approved =
+            decision.approved_for_deletion.len() + decision2.approved_for_deletion.len();
         assert!(total_approved <= 3);
-        step.assertions.push(format!("total approved {} ≤ 3 across batches", total_approved));
+        step.assertions.push(format!(
+            "total approved {} ≤ 3 across batches",
+            total_approved
+        ));
     }
     trace.steps.push(step);
 
@@ -515,7 +549,10 @@ fn e2e_calibration_drift_fallback() {
     assert!(diag.e_process_alarm);
     step_assertions.push("e-process alarm triggered".to_string());
     assert!(diag.median_rate_error > 0.30);
-    step_assertions.push(format!("median_rate_error={:.3} > 0.30", diag.median_rate_error));
+    step_assertions.push(format!(
+        "median_rate_error={:.3} > 0.30",
+        diag.median_rate_error
+    ));
     trace.steps.push(StepTrace {
         label: "inject_calibration_drift".to_string(),
         mode_before: ActiveMode::Enforce,
@@ -566,11 +603,16 @@ fn e2e_calibration_drift_fallback() {
         candidates_scored: scored.len(),
         approved_count: decision.approved_for_deletion.len(),
         decision_ids: decision.records.iter().map(|r| r.decision_id).collect(),
-        trace_ids: decision.records.iter().map(|r| r.trace_id.clone()).collect(),
+        trace_ids: decision
+            .records
+            .iter()
+            .map(|r| r.trace_id.clone())
+            .collect(),
         assertions: Vec::new(),
     };
     assert_eq!(decision.approved_for_deletion.len(), 0);
-    step.assertions.push("zero deletions in FallbackSafe".to_string());
+    step.assertions
+        .push("zero deletions in FallbackSafe".to_string());
     trace.steps.push(step);
 
     eprintln!("{}", trace.emit_report());
@@ -634,7 +676,11 @@ fn e2e_stale_index_safe_fallback() {
         candidates_scored: scored.len(),
         approved_count: decision.approved_for_deletion.len(),
         decision_ids: decision.records.iter().map(|r| r.decision_id).collect(),
-        trace_ids: decision.records.iter().map(|r| r.trace_id.clone()).collect(),
+        trace_ids: decision
+            .records
+            .iter()
+            .map(|r| r.trace_id.clone())
+            .collect(),
         assertions: Vec::new(),
     };
     // With Unknown guard in Canary, adaptive actions should be blocked.
@@ -673,7 +719,11 @@ fn e2e_stale_index_safe_fallback() {
         candidates_scored: scored2.len(),
         approved_count: 0,
         decision_ids: decision2.records.iter().map(|r| r.decision_id).collect(),
-        trace_ids: decision2.records.iter().map(|r| r.trace_id.clone()).collect(),
+        trace_ids: decision2
+            .records
+            .iter()
+            .map(|r| r.trace_id.clone())
+            .collect(),
         assertions: vec!["zero deletions in FallbackSafe (kill switch)".to_string()],
     });
 
@@ -731,7 +781,11 @@ fn e2e_io_fault_safe_degradation() {
         candidates_scored: scored.len(),
         approved_count: pre_approved,
         decision_ids: decision_pre.records.iter().map(|r| r.decision_id).collect(),
-        trace_ids: decision_pre.records.iter().map(|r| r.trace_id.clone()).collect(),
+        trace_ids: decision_pre
+            .records
+            .iter()
+            .map(|r| r.trace_id.clone())
+            .collect(),
         assertions: vec![format!("enforce approved {} deletions", pre_approved)],
     });
 
@@ -762,8 +816,16 @@ fn e2e_io_fault_safe_degradation() {
         guard_status: GuardStatus::Pass,
         candidates_scored: scored2.len(),
         approved_count: 0,
-        decision_ids: decision_post.records.iter().map(|r| r.decision_id).collect(),
-        trace_ids: decision_post.records.iter().map(|r| r.trace_id.clone()).collect(),
+        decision_ids: decision_post
+            .records
+            .iter()
+            .map(|r| r.decision_id)
+            .collect(),
+        trace_ids: decision_post
+            .records
+            .iter()
+            .map(|r| r.trace_id.clone())
+            .collect(),
         assertions: vec!["zero deletions after serialization failure".to_string()],
     });
 
@@ -844,10 +906,7 @@ fn e2e_progressive_recovery() {
             approved_count: 0,
             decision_ids: Vec::new(),
             trace_ids: Vec::new(),
-            assertions: vec![format!(
-                "still FallbackSafe ({}/3 clean windows)",
-                i + 1
-            )],
+            assertions: vec![format!("still FallbackSafe ({}/3 clean windows)", i + 1)],
         });
     }
 
@@ -891,7 +950,11 @@ fn e2e_progressive_recovery() {
             candidates_scored: scored.len(),
             approved_count: decision.approved_for_deletion.len(),
             decision_ids: decision.records.iter().map(|r| r.decision_id).collect(),
-            trace_ids: decision.records.iter().map(|r| r.trace_id.clone()).collect(),
+            trace_ids: decision
+                .records
+                .iter()
+                .map(|r| r.trace_id.clone())
+                .collect(),
             assertions: vec![format!(
                 "post-recovery: {} deletions approved in Enforce",
                 decision.approved_for_deletion.len()

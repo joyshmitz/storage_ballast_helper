@@ -275,7 +275,9 @@ fn candidate_binary_paths() -> Vec<PathBuf> {
     paths.push(PathBuf::from("/usr/local/bin/sbh"));
     paths.push(PathBuf::from("/usr/bin/sbh"));
     // Current executable location.
-    if let Ok(exe) = std::env::current_exe() && !paths.contains(&exe) {
+    if let Ok(exe) = std::env::current_exe()
+        && !paths.contains(&exe)
+    {
         paths.push(exe);
     }
     paths
@@ -632,7 +634,9 @@ fn check_profile_health(
     }
 
     // Check if the referenced directory in the PATH entry actually contains sbh.
-    if let Some(line) = sbh_lines.first() && let Some(dir) = extract_path_dir_from_export(line) {
+    if let Some(line) = sbh_lines.first()
+        && let Some(dir) = extract_path_dir_from_export(line)
+    {
         let binary = PathBuf::from(&dir).join("sbh");
         if !binary.exists() {
             return (
@@ -652,11 +656,15 @@ fn check_profile_health(
 fn extract_path_dir_from_export(line: &str) -> Option<String> {
     // Matches patterns like: export PATH="/some/path:$PATH"
     let trimmed = line.trim();
-    if let Some(after_eq) = trimmed.strip_prefix("export PATH=\"") && let Some(colon_pos) = after_eq.find(':') {
+    if let Some(after_eq) = trimmed.strip_prefix("export PATH=\"")
+        && let Some(colon_pos) = after_eq.find(':')
+    {
         return Some(after_eq[..colon_pos].to_string());
     }
     // Also handle: export PATH='/some/path:$PATH'
-    if let Some(after_eq) = trimmed.strip_prefix("export PATH='") && let Some(colon_pos) = after_eq.find(':') {
+    if let Some(after_eq) = trimmed.strip_prefix("export PATH='")
+        && let Some(colon_pos) = after_eq.find(':')
+    {
         return Some(after_eq[..colon_pos].to_string());
     }
     None
@@ -702,7 +710,9 @@ fn check_launchd_health(path: &Path) -> (bool, Option<MigrationReason>, Option<S
                     // Search subsequent lines for first <string>...</string>.
                     for subsequent in &lines[i + 1..] {
                         let trimmed = subsequent.trim();
-                        if let Some(rest) = trimmed.strip_prefix("<string>") && let Some(binary) = rest.strip_suffix("</string>") {
+                        if let Some(rest) = trimmed.strip_prefix("<string>")
+                            && let Some(binary) = rest.strip_suffix("</string>")
+                        {
                             if !Path::new(binary).exists() {
                                 return (
                                     false,
@@ -932,7 +942,9 @@ fn plan_actions(footprints: &[Footprint], opts: &MigrateOptions) -> Vec<Migratio
                 });
             }
             (FootprintKind::BackupFile, Some(MigrationReason::StaleBackupFile)) => {
-                if opts.cleanup_backups_older_than > 0 && is_older_than(&fp.path, opts.cleanup_backups_older_than) {
+                if opts.cleanup_backups_older_than > 0
+                    && is_older_than(&fp.path, opts.cleanup_backups_older_than)
+                {
                     actions.push(MigrationAction {
                         kind: ActionKind::CleanupBackup,
                         reason: MigrationReason::StaleBackupFile,
@@ -1146,12 +1158,7 @@ pub fn format_report_human(report: &MigrationReport) -> String {
         out.push_str("Footprints:\n");
         for fp in &report.footprints {
             let status = if fp.healthy { "OK" } else { "ISSUE" };
-            let _ = writeln!(
-                out,
-                "  [{status}] {}: {}",
-                fp.kind,
-                fp.path.display()
-            );
+            let _ = writeln!(out, "  [{status}] {}: {}", fp.kind, fp.path.display());
             if let Some(detail) = &fp.detail {
                 let _ = writeln!(out, "        {detail}");
             }

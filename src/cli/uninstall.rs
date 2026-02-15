@@ -351,7 +351,9 @@ pub fn plan_uninstall(opts: &UninstallOptions) -> UninstallReport {
 
     // -- Binary (always removed).
     for bin in &paths.binaries {
-        if let Some(ref explicit) = opts.binary_path && bin != explicit {
+        if let Some(ref explicit) = opts.binary_path
+            && bin != explicit
+        {
             continue;
         }
         actions.push(RemovalAction {
@@ -421,7 +423,9 @@ pub fn plan_uninstall(opts: &UninstallOptions) -> UninstallReport {
     }
 
     // -- Config file.
-    if let Some(ref cfg) = paths.config_file && cfg.exists() {
+    if let Some(ref cfg) = paths.config_file
+        && cfg.exists()
+    {
         match opts.mode {
             CleanupMode::KeepConfig | CleanupMode::Conservative => {
                 kept.push(KeptItem {
@@ -452,7 +456,9 @@ pub fn plan_uninstall(opts: &UninstallOptions) -> UninstallReport {
         (&paths.jsonl_log, RemovalCategory::JsonlLog),
     ];
     for (path_opt, category) in &data_files {
-        if let Some(path) = path_opt && path.exists() {
+        if let Some(path) = path_opt
+            && path.exists()
+        {
             match opts.mode {
                 CleanupMode::KeepData | CleanupMode::Conservative => {
                     kept.push(KeptItem {
@@ -478,7 +484,9 @@ pub fn plan_uninstall(opts: &UninstallOptions) -> UninstallReport {
     }
 
     // -- Asset cache.
-    if let Some(ref cache) = paths.asset_cache && cache.exists() {
+    if let Some(ref cache) = paths.asset_cache
+        && cache.exists()
+    {
         match opts.mode {
             CleanupMode::KeepAssets | CleanupMode::Conservative => {
                 kept.push(KeptItem {
@@ -503,7 +511,10 @@ pub fn plan_uninstall(opts: &UninstallOptions) -> UninstallReport {
     }
 
     // -- Data directory cleanup (only if all data files removed).
-    if let Some(ref data_dir) = paths.data_dir && data_dir.exists() && opts.mode == CleanupMode::Purge {
+    if let Some(ref data_dir) = paths.data_dir
+        && data_dir.exists()
+        && opts.mode == CleanupMode::Purge
+    {
         actions.push(RemovalAction {
             category: RemovalCategory::DataDirectory,
             path: data_dir.clone(),
