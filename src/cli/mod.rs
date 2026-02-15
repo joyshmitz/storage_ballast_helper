@@ -1,7 +1,9 @@
 //! CLI contracts shared by installer and updater command paths.
 #![allow(missing_docs)]
 
+pub mod assets;
 pub mod bootstrap;
+pub mod from_source;
 pub mod integrations;
 
 use std::fmt;

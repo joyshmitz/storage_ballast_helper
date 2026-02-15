@@ -125,6 +125,15 @@ struct InstallArgs {
     /// Install in user service scope.
     #[arg(long)]
     user: bool,
+    /// Build and install from source (requires cargo + git).
+    #[arg(long)]
+    from_source: bool,
+    /// Git tag or version to build when using --from-source. Defaults to HEAD.
+    #[arg(long, requires = "from_source", value_name = "TAG")]
+    tag: Option<String>,
+    /// Installation prefix for the binary (--from-source). Defaults to ~/.local.
+    #[arg(long, requires = "from_source", value_name = "PATH")]
+    prefix: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -532,8 +541,75 @@ fn config_command_label(args: &ConfigArgs) -> &'static str {
 }
 
 fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
-    if !args.systemd && !args.launchd {
-        return Err(CliError::User("specify --systemd or --launchd".to_string()));
+    if !args.from_source && !args.systemd && !args.launchd {
+        return Err(CliError::User(
+            "specify --systemd, --launchd, or --from-source".to_string(),
+        ));
+    }
+
+    // -- from-source build ----------------------------------------------------
+    if args.from_source {
+        use storage_ballast_helper::cli::from_source::{
+            self, SourceCheckout, SourceInstallConfig,
+            all_prerequisites_met, format_prerequisite_failures, format_result_human,
+        };
+
+        let checkout = match &args.tag {
+            Some(tag) => {
+                let normalized = if tag.starts_with('v') {
+                    tag.clone()
+                } else {
+                    format!("v{tag}")
+                };
+                SourceCheckout::Tag(normalized)
+            }
+            None => SourceCheckout::Head,
+        };
+
+        let config = SourceInstallConfig::new(checkout, args.prefix.clone());
+
+        // Pre-flight prerequisite check with early exit and remediation.
+        let prereqs = from_source::check_prerequisites();
+        if !all_prerequisites_met(&prereqs) {
+            match output_mode(cli) {
+                OutputMode::Human => {
+                    eprint!("{}", format_prerequisite_failures(&prereqs));
+                }
+                OutputMode::Json => {
+                    let payload = serde_json::to_value(&prereqs)?;
+                    write_json_line(&payload)?;
+                }
+            }
+            return Err(CliError::User(
+                "missing prerequisites for --from-source build".to_string(),
+            ));
+        }
+
+        let result = from_source::install_from_source(&config);
+
+        match output_mode(cli) {
+            OutputMode::Human => {
+                print!("{}", format_result_human(&result));
+            }
+            OutputMode::Json => {
+                let payload = serde_json::to_value(&result)?;
+                write_json_line(&payload)?;
+            }
+        }
+
+        if !result.success {
+            return Err(CliError::Runtime(
+                result
+                    .error
+                    .unwrap_or_else(|| "from-source build failed".to_string()),
+            ));
+        }
+
+        // If no service flags were specified, we're done after the binary install.
+        if !args.systemd && !args.launchd {
+            return Ok(());
+        }
+        // Otherwise, fall through to service installation below.
     }
 
     if args.launchd {
