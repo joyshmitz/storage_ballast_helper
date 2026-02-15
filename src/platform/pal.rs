@@ -327,13 +327,35 @@ fn is_ram_fs(fs_type: &str) -> bool {
     matches!(fs_type, "tmpfs" | "ramfs" | "devtmpfs")
 }
 
+/// Decode octal escape sequences (`\NNN`) used by the Linux kernel in
+/// `/proc/mounts` and `/etc/mtab` for special characters in paths.
 fn unescape_mount_field(raw: &str) -> String {
-    raw.replace("\\040", " ")
+    let mut result = String::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let a = bytes[i + 1];
+            let b = bytes[i + 2];
+            let c = bytes[i + 3];
+            if a.is_ascii_digit() && b.is_ascii_digit() && c.is_ascii_digit() {
+                let val = (a - b'0') * 64 + (b - b'0') * 8 + (c - b'0');
+                result.push(char::from(val));
+                i += 4;
+                continue;
+            }
+        }
+        result.push(char::from(bytes[i]));
+        i += 1;
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MountPoint, find_mount, is_ram_fs, parse_meminfo, parse_proc_mounts};
+    use super::{
+        MountPoint, find_mount, is_ram_fs, parse_meminfo, parse_proc_mounts, unescape_mount_field,
+    };
     use std::path::Path;
 
     #[test]
@@ -386,5 +408,18 @@ mod tests {
         assert!(is_ram_fs("tmpfs"));
         assert!(is_ram_fs("ramfs"));
         assert!(!is_ram_fs("ext4"));
+    }
+
+    #[test]
+    fn unescape_mount_field_handles_all_octal_sequences() {
+        // \040 = space, \011 = tab, \134 = backslash, \012 = newline
+        assert_eq!(unescape_mount_field("/mnt/my\\040dir"), "/mnt/my dir");
+        assert_eq!(unescape_mount_field("/mnt/a\\011b"), "/mnt/a\tb");
+        assert_eq!(unescape_mount_field("/mnt/a\\134b"), "/mnt/a\\b");
+        assert_eq!(unescape_mount_field("/mnt/a\\012b"), "/mnt/a\nb");
+        // No escapes passes through.
+        assert_eq!(unescape_mount_field("/mnt/simple"), "/mnt/simple");
+        // Trailing backslash without enough digits passes through.
+        assert_eq!(unescape_mount_field("/mnt/a\\04"), "/mnt/a\\04");
     }
 }
