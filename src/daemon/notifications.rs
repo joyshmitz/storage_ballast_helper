@@ -511,11 +511,18 @@ impl WebhookChannel {
             _ => ("N/A".to_string(), "N/A".to_string()),
         };
 
+        // JSON-escape values to prevent injection in webhook payloads.
+        let esc = |s: &str| {
+            s.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+        };
+
         self.template
-            .replace("${SUMMARY}", &summary)
-            .replace("${LEVEL}", &level)
-            .replace("${MOUNT}", &mount)
-            .replace("${FREE_PCT}", &free_pct)
+            .replace("${SUMMARY}", &esc(&summary))
+            .replace("${LEVEL}", &esc(&level))
+            .replace("${MOUNT}", &esc(&mount))
+            .replace("${FREE_PCT}", &esc(&free_pct))
     }
 }
 

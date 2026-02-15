@@ -102,11 +102,11 @@ impl ScoringEngine {
     pub fn from_config(scoring: &ScoringConfig, min_file_age_minutes: u64) -> Self {
         Self {
             weights: ScoringWeights {
-                location: scoring.location_weight,
-                name: scoring.name_weight,
-                age: scoring.age_weight,
-                size: scoring.size_weight,
-                structure: scoring.structure_weight,
+                location: scoring.location_weight.max(0.0),
+                name: scoring.name_weight.max(0.0),
+                age: scoring.age_weight.max(0.0),
+                size: scoring.size_weight.max(0.0),
+                structure: scoring.structure_weight.max(0.0),
             },
             min_file_age: Duration::from_secs(min_file_age_minutes.saturating_mul(60)),
             min_score: scoring.min_score,
@@ -269,7 +269,7 @@ impl ScoringEngine {
                 posterior_abandoned: 0.0,
                 expected_loss_keep: 0.0,
                 expected_loss_delete: self.false_positive_loss,
-                calibration_score: 1.0,
+                calibration_score: 0.0,
                 fallback_active: true,
             },
             ledger: EvidenceLedger {

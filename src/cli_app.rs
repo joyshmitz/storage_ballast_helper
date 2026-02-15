@@ -1190,10 +1190,7 @@ fn run_stats(cli: &Cli, args: &StatsArgs) -> Result<(), CliError> {
         if deletions.is_empty() {
             println!("  (none)");
         } else {
-            println!(
-                "  {:>10}  {:>6}  {:<40}  When",
-                "Size", "Score", "Path"
-            );
+            println!("  {:>10}  {:>6}  {:<40}  When", "Size", "Score", "Path");
             println!("  {}", "-".repeat(75));
             for d in &deletions {
                 println!(
@@ -1396,9 +1393,7 @@ fn print_pressure_bar(label: &str, pct: f64) {
     let bar_width = 30;
     let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
     let bar: String = "#".repeat(filled.min(bar_width));
-    println!(
-        "    {label:<9} {pct:>5.1}% |{bar:<bar_width$}|"
-    );
+    println!("    {label:<9} {pct:>5.1}% |{bar:<bar_width$}|");
 }
 
 /// Information about a running process for blame attribution.
@@ -2405,7 +2400,7 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
                     );
                     println!(
                         "  Missing: {} files",
-                        config.ballast.file_count - inventory.len()
+                        config.ballast.file_count.saturating_sub(inventory.len())
                     );
 
                     if !inventory.is_empty() {
@@ -2456,7 +2451,7 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
                         "available_count": available,
                         "releasable_bytes": releasable,
                         "missing_count":
-                            config.ballast.file_count - inventory.len(),
+                            config.ballast.file_count.saturating_sub(inventory.len()),
                         "files": files,
                     });
                     write_json_line(&payload)?;
@@ -3328,8 +3323,26 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                 emit_clean_report_json(&plan, &report, dir_count, scan_elapsed, protected_count)?;
             }
         }
+    } else if !io::stdout().is_terminal() && !args.yes {
+        // Non-TTY without --yes: refuse to delete silently.
+        match output_mode(cli) {
+            OutputMode::Human => {
+                eprintln!("sbh: refusing to delete in non-interactive mode without --yes");
+            }
+            OutputMode::Json => {
+                let payload = json!({
+                    "command": "clean",
+                    "error": "non_interactive_without_yes",
+                    "candidates_count": plan.estimated_items,
+                });
+                write_json_line(&payload)?;
+            }
+        }
+        return Err(CliError::User(
+            "pass --yes to confirm deletion in non-interactive mode".to_string(),
+        ));
     } else if args.yes || !io::stdout().is_terminal() {
-        // Automatic mode: no confirmation.
+        // Automatic mode: confirmed via --yes.
         let pressure_check = build_pressure_check(args.target_free, &root_paths);
         let report = executor.execute(
             &plan,
@@ -3468,16 +3481,23 @@ fn run_interactive_clean(
         };
 
         if action == 'y' {
-            match delete_single_candidate(candidate) {
-                Ok(()) => {
-                    items_deleted += 1;
-                    bytes_freed += candidate.size_bytes;
-                    if !delete_all {
-                        println!("    Deleted.");
+            // Re-check if path is still in use before deleting.
+            let fresh_open_files = collect_open_files();
+            if is_path_open(&candidate.path, &fresh_open_files) {
+                eprintln!("    Skipped (now in use): {}", candidate.path.display());
+                items_skipped += 1;
+            } else {
+                match delete_single_candidate(candidate) {
+                    Ok(()) => {
+                        items_deleted += 1;
+                        bytes_freed += candidate.size_bytes;
+                        if !delete_all {
+                            println!("    Deleted.");
+                        }
                     }
-                }
-                Err(e) => {
-                    eprintln!("    Failed to delete {}: {e}", candidate.path.display());
+                    Err(e) => {
+                        eprintln!("    Failed to delete {}: {e}", candidate.path.display());
+                    }
                 }
             }
         } else {
@@ -3614,39 +3634,39 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
         .map_err(|e| CliError::Runtime(e.to_string()))?;
 
     let free_pct = stats.free_pct();
-    let default_config = Config::default();
+    let config = Config::load(cli.config.as_deref()).unwrap_or_default();
     let threshold_pct = args
         .target_free
-        .unwrap_or(default_config.pressure.yellow_min_free_pct);
+        .unwrap_or(config.pressure.yellow_min_free_pct);
 
     // Check 1: absolute free space requirement.
     if let Some(need_bytes) = args.need
         && stats.available_bytes < need_bytes
     {
         match output_mode(cli) {
-                OutputMode::Human => {
-                    eprintln!(
-                        "sbh: {} has {} free but {} required. Run: sbh emergency {}",
-                        stats.mount_point.display(),
-                        format_bytes(stats.available_bytes),
-                        format_bytes(need_bytes),
-                        check_path.display(),
-                    );
-                }
-                OutputMode::Json => {
-                    let payload = json!({
-                        "command": "check",
-                        "status": "critical",
-                        "path": check_path.to_string_lossy(),
-                        "mount_point": stats.mount_point.to_string_lossy(),
-                        "free_bytes": stats.available_bytes,
-                        "need_bytes": need_bytes,
-                        "free_pct": free_pct,
-                        "exit_code": 2,
-                    });
-                    write_json_line(&payload)?;
-                }
+            OutputMode::Human => {
+                eprintln!(
+                    "sbh: {} has {} free but {} required. Run: sbh emergency {}",
+                    stats.mount_point.display(),
+                    format_bytes(stats.available_bytes),
+                    format_bytes(need_bytes),
+                    check_path.display(),
+                );
             }
+            OutputMode::Json => {
+                let payload = json!({
+                    "command": "check",
+                    "status": "critical",
+                    "path": check_path.to_string_lossy(),
+                    "mount_point": stats.mount_point.to_string_lossy(),
+                    "free_bytes": stats.available_bytes,
+                    "need_bytes": need_bytes,
+                    "free_pct": free_pct,
+                    "exit_code": 2,
+                });
+                write_json_line(&payload)?;
+            }
+        }
         return Err(CliError::Runtime("insufficient disk space".to_string()));
     }
 
@@ -3680,9 +3700,26 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
         return Err(CliError::Runtime("disk space below threshold".to_string()));
     }
 
+    // Check 2.5: warn if state.json is stale (daemon may not be running).
+    if let Ok(meta) = std::fs::metadata(&config.paths.state_file)
+        && let Ok(modified) = meta.modified()
+    {
+        let age = SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        let stale_threshold_secs = (config.pressure.poll_interval_ms / 1000).max(1) * 2;
+        let stale_threshold = std::time::Duration::from_secs(stale_threshold_secs);
+        if age > stale_threshold && output_mode(cli) == OutputMode::Human {
+            eprintln!(
+                "sbh: warning: state.json is {:.0}s old (daemon may not be running)",
+                age.as_secs_f64(),
+            );
+        }
+    }
+
     // Check 3: prediction from daemon state.json (if available and --predict requested).
     if let Some(predict_minutes) = args.predict {
-        match read_daemon_prediction(&default_config.paths.state_file, &stats.mount_point) {
+        match read_daemon_prediction(&config.paths.state_file, &stats.mount_point) {
             Some(rate_bps) if rate_bps > 0.0 => {
                 // Positive rate means filling; estimate time to threshold.
                 let bytes_until_threshold = stats
@@ -4058,13 +4095,13 @@ fn format_bytes(bytes: u64) -> String {
     const TIB: u64 = 1024 * GIB;
 
     if bytes >= TIB {
-        format!("{:.1} TB", bytes as f64 / TIB as f64)
+        format!("{:.1} TiB", bytes as f64 / TIB as f64)
     } else if bytes >= GIB {
-        format!("{:.1} GB", bytes as f64 / GIB as f64)
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
     } else if bytes >= MIB {
-        format!("{:.1} MB", bytes as f64 / MIB as f64)
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
     } else if bytes >= KIB {
-        format!("{:.1} KB", bytes as f64 / KIB as f64)
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
     } else {
         format!("{bytes} B")
     }
@@ -4088,7 +4125,13 @@ fn truncate_path(path: &std::path::Path, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        format!("...{}", &s[s.len() - (max_len - 3)..])
+        let tail_len = max_len.saturating_sub(3);
+        // Find the nearest char boundary from the right.
+        let mut start = s.len().saturating_sub(tail_len);
+        while start < s.len() && !s.is_char_boundary(start) {
+            start += 1;
+        }
+        format!("...{}", &s[start..])
     }
 }
 

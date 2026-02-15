@@ -203,6 +203,9 @@ fn logger_thread_main(
     jsonl_config: JsonlConfig,
     dropped: Arc<AtomicU64>,
 ) {
+    #[cfg(feature = "sqlite")]
+    const SQLITE_RECOVERY_INTERVAL: u32 = 50;
+
     // Open backends.
     #[cfg(feature = "sqlite")]
     let sqlite_recovery_path = sqlite_path.clone();
@@ -222,8 +225,6 @@ fn logger_thread_main(
     let mut sqlite_failures: u32 = 0;
     #[cfg(feature = "sqlite")]
     let mut sqlite_disabled_cycles: u32 = 0;
-    #[cfg(feature = "sqlite")]
-    const SQLITE_RECOVERY_INTERVAL: u32 = 50;
 
     // Process events until Shutdown or channel disconnect.
     let mut last_reported_drops: u64 = 0;
@@ -278,12 +279,12 @@ fn logger_thread_main(
                 sqlite_disabled_cycles += 1;
                 if sqlite_disabled_cycles >= SQLITE_RECOVERY_INTERVAL {
                     sqlite_disabled_cycles = 0;
-                    if let Some(ref p) = sqlite_recovery_path {
-                        if let Ok(db) = SqliteLogger::open(p) {
-                            eprintln!("[SBH-DUAL] SQLite recovered at {}", p.display());
-                            sqlite = Some(db);
-                            sqlite_failures = 0;
-                        }
+                    if let Some(ref p) = sqlite_recovery_path
+                        && let Ok(db) = SqliteLogger::open(p)
+                    {
+                        eprintln!("[SBH-DUAL] SQLite recovered at {}", p.display());
+                        sqlite = Some(db);
+                        sqlite_failures = 0;
                     }
                 }
             }

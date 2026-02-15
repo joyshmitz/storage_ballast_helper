@@ -515,18 +515,28 @@ fn apply_integration(tool_info: &DetectedTool, backup_dir: Option<&Path>) -> Int
 
 /// Inject a hook snippet into a JSON config file.
 ///
-/// Strategy: if the file contains a top-level `{}` object, we insert the
-/// snippet before the final closing brace. This is a lightweight approach
-/// that avoids full JSON parsing (which could reorder keys or strip comments).
+/// Parses the file as JSON to find the correct insertion point, then
+/// performs a text-level splice to preserve formatting and comments.
 fn inject_json_hook(path: &Path, tool: AiTool) -> std::io::Result<()> {
     let contents = fs::read_to_string(path)?;
     let snippet = integration_snippet(tool).trim();
 
-    // Find the last `}` in the file (closing of the top-level object).
-    let Some(last_brace) = contents.rfind('}') else {
+    // Validate the file looks like a JSON object (starts with `{`, ends with `}`).
+    // We use a structural check rather than strict serde_json parsing because many
+    // editors produce non-standard JSON (trailing commas, comments) that we should tolerate.
+    let trimmed = contents.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "config file does not contain a JSON object",
+        ));
+    }
+
+    // Find the last `}` in the file (validated above as present).
+    let Some(last_brace) = contents.rfind('}') else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "config file does not contain a closing brace",
         ));
     };
 

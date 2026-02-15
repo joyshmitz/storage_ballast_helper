@@ -59,6 +59,7 @@ enum MatchKind {
     Exact(&'static str),
     Prefix(&'static str),
     Suffix(&'static str),
+    #[allow(dead_code)]
     Contains(&'static str),
 }
 
@@ -352,15 +353,51 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
             category: ArtifactCategory::PythonCache,
         },
         ArtifactPattern {
-            name: "generic-cache",
-            kind: MatchKind::Contains("cache"),
+            name: "generic-cache-prefix",
+            kind: MatchKind::Prefix("cache"),
             confidence: 0.60,
             category: ArtifactCategory::CacheDir,
         },
         ArtifactPattern {
-            name: "generic-temp",
-            kind: MatchKind::Contains("tmp"),
+            name: "generic-cache-suffix",
+            kind: MatchKind::Suffix("-cache"),
+            confidence: 0.60,
+            category: ArtifactCategory::CacheDir,
+        },
+        ArtifactPattern {
+            name: "generic-cache-underscore",
+            kind: MatchKind::Suffix("_cache"),
+            confidence: 0.60,
+            category: ArtifactCategory::CacheDir,
+        },
+        ArtifactPattern {
+            name: "dot-cache",
+            kind: MatchKind::Prefix(".cache"),
+            confidence: 0.62,
+            category: ArtifactCategory::CacheDir,
+        },
+        ArtifactPattern {
+            name: "generic-tmp-prefix",
+            kind: MatchKind::Prefix("tmp"),
             confidence: 0.58,
+            category: ArtifactCategory::TempDir,
+        },
+        ArtifactPattern {
+            name: "generic-tmp-suffix",
+            kind: MatchKind::Suffix("-tmp"),
+            confidence: 0.58,
+            category: ArtifactCategory::TempDir,
+        },
+        ArtifactPattern {
+            name: "generic-tmp-underscore",
+            kind: MatchKind::Suffix("_tmp"),
+            confidence: 0.58,
+            category: ArtifactCategory::TempDir,
+        },
+        ArtifactPattern {
+            name: "dot-tmp",
+            kind: MatchKind::Prefix(".tmp"),
+            confidence: 0.60,
             category: ArtifactCategory::TempDir,
         },
     ]

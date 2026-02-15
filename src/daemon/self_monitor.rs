@@ -343,9 +343,9 @@ impl SelfMonitor {
         if self.scan_count == 0 {
             return Duration::ZERO;
         }
-        #[allow(clippy::cast_possible_truncation)]
-        let count = self.scan_count as u32;
-        self.scan_duration_total / count
+        let total_nanos = self.scan_duration_total.as_nanos();
+        let avg_nanos = total_nanos / u128::from(self.scan_count);
+        Duration::from_nanos(u64::try_from(avg_nanos).unwrap_or(u64::MAX))
     }
 
     /// Build a health snapshot from current state plus thread heartbeats.
@@ -435,7 +435,12 @@ fn write_state_atomic(path: &Path, state: &DaemonState) -> std::io::Result<()> {
     }
 
     let json = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
-    fs::write(&tmp_path, json)?;
+    {
+        use std::io::Write;
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+    }
     fs::rename(&tmp_path, path)?;
 
     Ok(())

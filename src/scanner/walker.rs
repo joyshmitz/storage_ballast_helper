@@ -205,7 +205,7 @@ fn process_directory(
 ) {
     // Check for .sbh-protect marker before reading directory.
     let marker_path = dir_path.join(protection::MARKER_FILENAME);
-    if marker_path.exists() {
+    if fs::symlink_metadata(&marker_path).is_ok() {
         protection.write().register_marker(dir_path);
         return; // Skip entire protected subtree.
     }

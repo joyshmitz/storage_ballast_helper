@@ -257,10 +257,25 @@ impl ProtectionRegistry {
     }
 
     fn matches_config_pattern(&self, path: &Path) -> bool {
-        let path_str = normalize_path_for_matching(path);
-        self.config_patterns
-            .iter()
-            .any(|pat| pat.compiled.is_match(&path_str))
+        if self.config_patterns.is_empty() {
+            return false;
+        }
+        // Check the path itself and all its ancestor prefixes so that
+        // a pattern protecting "/data/projects/production-app" also
+        // protects "/data/projects/production-app/target/debug".
+        let mut current = Some(path);
+        while let Some(p) = current {
+            let p_str = normalize_path_for_matching(p);
+            if self
+                .config_patterns
+                .iter()
+                .any(|pat| pat.compiled.is_match(&p_str))
+            {
+                return true;
+            }
+            current = p.parent();
+        }
+        false
     }
 }
 
@@ -596,7 +611,8 @@ mod tests {
 
         assert!(reg.is_protected(Path::new("/tmp/cargo-target-abc")));
         assert!(reg.is_protected(Path::new("/tmp/cargo-target-xyz123")));
-        assert!(!reg.is_protected(Path::new("/tmp/cargo-target-abc/sub")));
+        // Subtree protection: children of a matched pattern are also protected.
+        assert!(reg.is_protected(Path::new("/tmp/cargo-target-abc/sub")));
         assert!(!reg.is_protected(Path::new("/tmp/other")));
     }
 

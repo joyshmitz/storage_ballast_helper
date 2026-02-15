@@ -346,9 +346,13 @@ fn is_path_open(target: &Path) -> bool {
 
 #[cfg(target_os = "linux")]
 fn is_path_open_linux(target: &Path) -> bool {
-    let Ok(target_canon) = target.canonicalize() else {
+    use std::os::unix::fs::MetadataExt;
+
+    // Collect inode+device pairs for the target and its immediate children.
+    let target_ids = collect_inode_set(target);
+    if target_ids.is_empty() {
         return false;
-    };
+    }
 
     let proc = Path::new("/proc");
     let Ok(entries) = fs::read_dir(proc) else {
@@ -358,7 +362,6 @@ fn is_path_open_linux(target: &Path) -> bool {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        // Only numeric directories (PIDs).
         if !name_str.chars().all(|c| c.is_ascii_digit()) {
             continue;
         }
@@ -369,10 +372,11 @@ fn is_path_open_linux(target: &Path) -> bool {
         };
 
         for fd_entry in fds.flatten() {
-            if let Ok(link_target) = fs::read_link(fd_entry.path())
-                && fd_link_matches_target(&target_canon, &link_target)
-            {
-                return true;
+            if let Ok(meta) = fd_entry.path().metadata() {
+                let key = (meta.dev(), meta.ino());
+                if target_ids.contains(&key) {
+                    return true;
+                }
             }
         }
     }
@@ -380,25 +384,22 @@ fn is_path_open_linux(target: &Path) -> bool {
     false
 }
 
+/// Collect (device, inode) pairs for target path and its direct children.
 #[cfg(target_os = "linux")]
-fn fd_link_matches_target(target_canon: &Path, fd_link: &Path) -> bool {
-    let Some(link_path) = normalize_fd_link_path(fd_link) else {
-        return false;
-    };
-    link_path == target_canon || link_path.starts_with(target_canon)
-}
-
-#[cfg(target_os = "linux")]
-fn normalize_fd_link_path(fd_link: &Path) -> Option<PathBuf> {
-    let raw = fd_link.to_string_lossy();
-    let trimmed = raw
-        .strip_suffix(" (deleted)")
-        .unwrap_or_else(|| raw.as_ref());
-    if !trimmed.starts_with('/') {
-        return None;
+fn collect_inode_set(target: &Path) -> std::collections::HashSet<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut ids = std::collections::HashSet::new();
+    if let Ok(meta) = fs::metadata(target) {
+        ids.insert((meta.dev(), meta.ino()));
     }
-    let path = Path::new(trimmed);
-    Some(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+    if let Ok(entries) = fs::read_dir(target) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                ids.insert((meta.dev(), meta.ino()));
+            }
+        }
+    }
+    ids
 }
 
 // ──────────────────── conversions ────────────────────
@@ -692,29 +693,5 @@ mod tests {
         let report = executor.execute(&plan, None);
         assert_eq!(report.items_deleted, 1);
         assert_eq!(report.items_skipped, 1);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn fd_link_matching_requires_component_boundary() {
-        let target = Path::new("/tmp/sbh-target");
-        assert!(super::fd_link_matches_target(
-            target,
-            Path::new("/tmp/sbh-target/build/output.o")
-        ));
-        assert!(!super::fd_link_matches_target(
-            target,
-            Path::new("/tmp/sbh-target-2/build/output.o")
-        ));
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn fd_link_matching_accepts_deleted_suffix() {
-        let target = Path::new("/tmp/sbh-target");
-        assert!(super::fd_link_matches_target(
-            target,
-            Path::new("/tmp/sbh-target/build/output.o (deleted)")
-        ));
     }
 }

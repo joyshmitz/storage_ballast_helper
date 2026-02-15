@@ -80,6 +80,9 @@ pub struct ScanRequest {
     pub urgency: f64,
     pub pressure_level: PressureLevel,
     pub max_delete_batch: usize,
+    /// When config is reloaded, this carries the updated scoring config
+    /// so the scanner thread can rebuild its scoring engine.
+    pub scoring_config_update: Option<(crate::core::config::ScoringConfig, u64)>,
 }
 
 /// Scored candidates ready for deletion.
@@ -498,10 +501,6 @@ impl MonitoringDaemon {
             .first()
             .cloned()
             .unwrap_or_else(|| PathBuf::from("/"));
-        let reading = PressureReading {
-            free_bytes: 0,
-            total_bytes: 0,
-        };
         // Best-effort: collect fresh stats for the log entry.
         let (free_pct, mount, total, free) =
             if let Ok(stats) = self.fs_collector.collect(&primary_path) {
@@ -513,7 +512,7 @@ impl MonitoringDaemon {
                     stats.free_bytes as i64,
                 )
             } else {
-                (reading.free_pct(), "/".to_string(), 0, 0)
+                (0.0, "/".to_string(), 0, 0)
             };
 
         self.logger_handle.send(ActivityEvent::PressureChanged {
@@ -581,12 +580,19 @@ impl MonitoringDaemon {
                     .maybe_release(&mut self.ballast_manager, response);
                 self.send_scan_request(scan_tx, response);
 
+                let actual_free_pct = self
+                    .config
+                    .scanner
+                    .root_paths
+                    .first()
+                    .and_then(|p| self.fs_collector.collect(p).ok())
+                    .map_or(0.0, |s| s.free_pct());
                 self.logger_handle.send(ActivityEvent::Emergency {
                     details: format!(
                         "critical pressure: urgency={:.2}, releasing all ballast",
                         response.urgency
                     ),
-                    free_pct: 0.0,
+                    free_pct: actual_free_pct,
                 });
             }
         }
@@ -602,6 +608,7 @@ impl MonitoringDaemon {
             urgency: response.urgency,
             pressure_level: response.level,
             max_delete_batch: response.max_delete_batch,
+            scoring_config_update: None,
         };
 
         // Latest-wins: if the channel is full, drop old events.
@@ -621,6 +628,7 @@ impl MonitoringDaemon {
             urgency: response.urgency.max(0.5), // at least moderate urgency for forced scans
             pressure_level: response.level,
             max_delete_batch: response.max_delete_batch,
+            scoring_config_update: None,
         };
         // For forced scans, block briefly to ensure delivery.
         let _ = scan_tx.send_timeout(request, Duration::from_millis(100));
@@ -714,6 +722,15 @@ impl MonitoringDaemon {
                         new_config.ballast.replenish_cooldown_minutes,
                     );
                     self.release_controller.reset();
+
+                    // Propagate pressure thresholds to PID controller.
+                    self.pressure_controller
+                        .set_target_free_pct(new_config.pressure.yellow_min_free_pct);
+                    if new_config.pressure.prediction.enabled {
+                        self.pressure_controller.set_action_horizon_minutes(
+                            new_config.pressure.prediction.action_horizon_minutes,
+                        );
+                    }
 
                     self.logger_handle.send(ActivityEvent::ConfigReloaded {
                         details: format!("config hash: {old_hash} -> {new_hash}"),
@@ -836,9 +853,13 @@ fn scanner_thread_main(
     min_file_age: u64,
     heartbeat: &Arc<ThreadHeartbeat>,
 ) {
-    let engine = ScoringEngine::from_config(scoring_config, min_file_age);
+    let mut engine = ScoringEngine::from_config(scoring_config, min_file_age);
 
     while let Ok(request) = scan_rx.recv() {
+        // Rebuild scoring engine if config was updated.
+        if let Some((ref new_cfg, new_min_age)) = request.scoring_config_update {
+            engine = ScoringEngine::from_config(new_cfg, new_min_age);
+        }
         heartbeat.beat();
         let scan_start = Instant::now();
         let mut candidates_found: usize = 0;
@@ -1110,6 +1131,7 @@ mod tests {
             urgency: 0.7,
             pressure_level: PressureLevel::Orange,
             max_delete_batch: 10,
+            scoring_config_update: None,
         };
         assert_eq!(request.paths.len(), 2);
         assert_eq!(request.urgency.to_bits(), 0.7_f64.to_bits());
@@ -1206,6 +1228,7 @@ mod tests {
             urgency: 0.5,
             pressure_level: PressureLevel::Orange,
             max_delete_batch: 10,
+            scoring_config_update: None,
         };
         scan_tx.send(request).unwrap();
         let received = scan_rx.recv().unwrap();
@@ -1233,6 +1256,7 @@ mod tests {
                 urgency: 0.1,
                 pressure_level: PressureLevel::Green,
                 max_delete_batch: 5,
+                scoring_config_update: None,
             })
             .unwrap();
         }
@@ -1243,6 +1267,7 @@ mod tests {
             urgency: 0.9,
             pressure_level: PressureLevel::Critical,
             max_delete_batch: 40,
+            scoring_config_update: None,
         });
         assert!(matches!(result, Err(TrySendError::Full(_))));
     }

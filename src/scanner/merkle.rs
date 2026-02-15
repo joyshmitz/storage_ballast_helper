@@ -249,9 +249,12 @@ impl MerkleScanIndex {
         }
 
         // Build Merkle nodes bottom-up (BTreeMap iteration is sorted, but we
-        // need reverse depth order). Collect entries with their depths first.
-        let mut entries_by_depth: Vec<(&PathBuf, usize)> =
-            entries.iter().map(|e| (&e.path, e.depth)).collect();
+        // need reverse depth order). Use path component count for depth to stay
+        // consistent with update_entries() and remove_paths().
+        let mut entries_by_depth: Vec<(&PathBuf, usize)> = entries
+            .iter()
+            .map(|e| (&e.path, e.path.components().count().saturating_sub(1)))
+            .collect();
         // Process deepest first so children are hashed before parents.
         entries_by_depth.sort_by(|a, b| b.1.cmp(&a.1));
 
@@ -352,6 +355,17 @@ impl MerkleScanIndex {
             .filter(|p| !fresh_snapshots.contains_key(*p))
             .cloned()
             .collect();
+
+        // Update snapshots for paths that were processed (changed + new),
+        // so the index stays consistent with health state.
+        for path in changed.iter().chain(new_paths.iter()) {
+            if let Some(snap) = fresh_snapshots.get(path) {
+                self.snapshots.insert(path.clone(), snap.clone());
+            }
+        }
+        for path in &removed {
+            self.snapshots.remove(path);
+        }
 
         let health = if budget_exhausted {
             IndexHealth::Degraded
@@ -624,8 +638,13 @@ impl MerkleScanIndex {
             });
         }
 
+        // Convert u128 nanos to Duration safely via secs+subsec to avoid u64 truncation.
+        let nanos = checkpoint.built_at_nanos;
         let built_at = UNIX_EPOCH
-            + Duration::from_nanos(u64::try_from(checkpoint.built_at_nanos).unwrap_or(0));
+            + Duration::new(
+                (nanos / 1_000_000_000) as u64,
+                (nanos % 1_000_000_000) as u32,
+            );
 
         Ok(Self {
             nodes: checkpoint.nodes,

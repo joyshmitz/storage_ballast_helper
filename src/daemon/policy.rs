@@ -522,6 +522,9 @@ impl PolicyEngine {
         to: ActiveMode,
         reason: Option<String>,
     ) {
+        if self.transition_log.len() >= 1000 {
+            self.transition_log.drain(..1);
+        }
         self.transition_log.push(TransitionEntry {
             transition: kind.to_string(),
             from: from.to_string(),

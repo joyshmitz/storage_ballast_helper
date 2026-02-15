@@ -378,6 +378,16 @@ fn create_build_dir() -> std::io::Result<PathBuf> {
 }
 
 fn run_git_clone(url: &str, dest: &Path, checkout: &SourceCheckout) -> Result<(), String> {
+    // If destination already exists, remove it and reclone for a clean state.
+    if dest.exists() {
+        std::fs::remove_dir_all(dest).map_err(|e| {
+            format!(
+                "failed to remove existing directory {}: {e}",
+                dest.display()
+            )
+        })?;
+    }
+
     let mut args = vec!["clone", "--depth", "1"];
 
     // For a specific tag, use --branch to fetch only that tag.

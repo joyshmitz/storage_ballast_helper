@@ -3,10 +3,8 @@
 #![allow(missing_docs)]
 
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -133,8 +131,9 @@ impl BallastConfig {
     /// Resolve effective file_count for a given mount point, applying overrides.
     #[must_use]
     pub fn effective_file_count(&self, mount_path: &str) -> usize {
+        let key = mount_path.strip_suffix('/').unwrap_or(mount_path);
         self.overrides
-            .get(mount_path)
+            .get(key)
             .and_then(|o| o.file_count)
             .unwrap_or(self.file_count)
     }
@@ -142,8 +141,9 @@ impl BallastConfig {
     /// Resolve effective file_size_bytes for a given mount point, applying overrides.
     #[must_use]
     pub fn effective_file_size_bytes(&self, mount_path: &str) -> u64 {
+        let key = mount_path.strip_suffix('/').unwrap_or(mount_path);
         self.overrides
-            .get(mount_path)
+            .get(key)
             .and_then(|o| o.file_size_bytes)
             .unwrap_or(self.file_size_bytes)
     }
@@ -151,7 +151,8 @@ impl BallastConfig {
     /// Check whether a volume is enabled for ballast (disabled via override).
     #[must_use]
     pub fn is_volume_enabled(&self, mount_path: &str) -> bool {
-        self.overrides.get(mount_path).is_none_or(|o| o.enabled)
+        let key = mount_path.strip_suffix('/').unwrap_or(mount_path);
+        self.overrides.get(key).is_none_or(|o| o.enabled)
     }
 }
 
@@ -285,7 +286,15 @@ impl Default for TelemetryConfig {
 
 impl Default for UpdateConfig {
     fn default() -> Self {
-        let home_dir = env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+        let home_dir = env::var_os("HOME").map_or_else(
+            || {
+                eprintln!(
+                    "[SBH-CONFIG] WARNING: HOME not set, falling back to /tmp for update paths"
+                );
+                PathBuf::from("/tmp")
+            },
+            PathBuf::from,
+        );
         let data_dir = home_dir.join(".local").join("share").join("sbh");
         Self {
             enabled: true,
@@ -299,7 +308,15 @@ impl Default for UpdateConfig {
 
 impl Default for PathsConfig {
     fn default() -> Self {
-        let home_dir = env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+        let home_dir = env::var_os("HOME").map_or_else(
+            || {
+                eprintln!(
+                    "[SBH-CONFIG] WARNING: HOME not set, falling back to /tmp for data paths"
+                );
+                PathBuf::from("/tmp")
+            },
+            PathBuf::from,
+        );
         let cfg = home_dir.join(".config").join("sbh").join("config.toml");
         let data = home_dir.join(".local").join("share").join("sbh");
         Self {
@@ -341,17 +358,23 @@ impl Config {
 
         cfg.paths.config_file = path_buf;
         cfg.apply_env_overrides()?;
+        cfg.normalize_paths();
         cfg.validate()?;
         Ok(cfg)
     }
 
     /// Deterministic hash of the effective config for logging/telemetry.
+    ///
+    /// Uses FNV-1a for cross-process-stable hashing (M11: no `DefaultHasher`
+    /// whose seed may vary across Rust releases).
     pub fn stable_hash(&self) -> Result<String> {
-        #[allow(clippy::collection_is_never_read)]
         let canonical = serde_json::to_string(self)?;
-        let mut hasher = DefaultHasher::new();
-        canonical.hash(&mut hasher);
-        Ok(format!("{:016x}", hasher.finish()))
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in canonical.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        Ok(format!("{hash:016x}"))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -517,7 +540,45 @@ impl Config {
         Ok(())
     }
 
+    /// Normalize paths for consistent comparison (M27).
+    fn normalize_paths(&mut self) {
+        // Strip trailing slashes from ballast override keys.
+        let normalized: HashMap<String, BallastVolumeOverride> = self
+            .ballast
+            .overrides
+            .drain()
+            .map(|(k, v)| {
+                let key = k.strip_suffix('/').unwrap_or(&k).to_string();
+                (key, v)
+            })
+            .collect();
+        self.ballast.overrides = normalized;
+
+        // Strip trailing slashes from scanner root_paths.
+        for path in &mut self.scanner.root_paths {
+            let s = path.to_string_lossy();
+            if s.len() > 1 && s.ends_with('/') {
+                *path = PathBuf::from(s.strip_suffix('/').unwrap());
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn validate(&self) -> Result<()> {
+        // I31: Thresholds must be in 0.0..=100.0.
+        for (name, val) in [
+            ("green_min_free_pct", self.pressure.green_min_free_pct),
+            ("yellow_min_free_pct", self.pressure.yellow_min_free_pct),
+            ("orange_min_free_pct", self.pressure.orange_min_free_pct),
+            ("red_min_free_pct", self.pressure.red_min_free_pct),
+        ] {
+            if !(0.0..=100.0).contains(&val) {
+                return Err(SbhError::InvalidConfig {
+                    details: format!("pressure.{name} must be in [0, 100], got {val}"),
+                });
+            }
+        }
+
         if !(self.pressure.green_min_free_pct > self.pressure.yellow_min_free_pct
             && self.pressure.yellow_min_free_pct > self.pressure.orange_min_free_pct
             && self.pressure.orange_min_free_pct > self.pressure.red_min_free_pct)
@@ -569,6 +630,39 @@ impl Config {
 
         validate_prob("scoring.min_score", self.scoring.min_score)?;
         validate_prob("scoring.calibration_floor", self.scoring.calibration_floor)?;
+
+        // I35: min_score must be <= calibration_floor.
+        if self.scoring.min_score > self.scoring.calibration_floor {
+            return Err(SbhError::InvalidConfig {
+                details: format!(
+                    "scoring.min_score ({}) must be <= scoring.calibration_floor ({})",
+                    self.scoring.min_score, self.scoring.calibration_floor
+                ),
+            });
+        }
+
+        // I32: Individual scoring weights must be non-negative.
+        for (name, val) in [
+            ("location_weight", self.scoring.location_weight),
+            ("name_weight", self.scoring.name_weight),
+            ("age_weight", self.scoring.age_weight),
+            ("size_weight", self.scoring.size_weight),
+            ("structure_weight", self.scoring.structure_weight),
+        ] {
+            if val < 0.0 {
+                return Err(SbhError::InvalidConfig {
+                    details: format!("scoring.{name} must be >= 0.0, got {val}"),
+                });
+            }
+        }
+
+        // M13: Loss values must be non-negative.
+        if self.scoring.false_positive_loss < 0.0 || self.scoring.false_negative_loss < 0.0 {
+            return Err(SbhError::InvalidConfig {
+                details: "scoring.false_positive_loss and false_negative_loss must be >= 0.0"
+                    .to_string(),
+            });
+        }
 
         let sum = self.scoring.location_weight
             + self.scoring.name_weight

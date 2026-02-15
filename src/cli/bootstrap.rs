@@ -1082,16 +1082,25 @@ fn apply_update_service_path(
     };
     let exe_str = current_exe.to_string_lossy().to_string();
 
+    // Track whether we are inside the ProgramArguments array to scope
+    // <string> replacements to only that section.
+    let mut in_program_args = false;
     let updated: Vec<String> = contents
         .lines()
         .map(|line| {
             let trimmed = line.trim();
             if trimmed.starts_with("ExecStart=") {
                 format!("ExecStart={exe_str} daemon run")
-            } else if trimmed.starts_with("<string>") && trimmed.ends_with("</string>") {
-                // Launchd: this is a simplification; only replace the first
-                // string element after ProgramArguments.
-                // We check if it looks like a binary path.
+            } else if trimmed == "<key>ProgramArguments</key>" {
+                in_program_args = true;
+                line.to_string()
+            } else if in_program_args && trimmed == "</array>" {
+                in_program_args = false;
+                line.to_string()
+            } else if in_program_args
+                && trimmed.starts_with("<string>")
+                && trimmed.ends_with("</string>")
+            {
                 let inner = &trimmed[8..trimmed.len() - 9];
                 if inner.contains("sbh") || inner.starts_with('/') {
                     format!("        <string>{exe_str}</string>")
