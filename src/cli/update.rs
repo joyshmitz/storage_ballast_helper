@@ -1205,9 +1205,9 @@ mod tests {
             format!("{checksum_hex}  {archive_name}\n"),
         )
         .unwrap();
-        let sigstore_bundle = sigstore_bundle_contents.and_then(|contents| {
+        let sigstore_bundle = sigstore_bundle_contents.map(|contents| {
             std::fs::write(root.join(&sigstore_name), contents).unwrap();
-            Some(sigstore_name)
+            sigstore_name
         });
 
         let manifest = OfflineBundleManifest {
