@@ -439,11 +439,17 @@ fn open_append(path: &Path) -> Result<(File, u64)> {
             source,
         })?;
     }
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|source| SbhError::io(path, source))?;
+    let file = {
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        opts.open(path)
+            .map_err(|source| SbhError::io(path, source))?
+    };
     let size = file.metadata().map(|m| m.len()).unwrap_or(0);
     Ok((file, size))
 }

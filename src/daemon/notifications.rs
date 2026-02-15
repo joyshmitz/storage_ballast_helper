@@ -425,10 +425,16 @@ impl Channel for FileChannel {
             let _ = fs::create_dir_all(parent);
         }
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path);
+        let file = {
+            let mut opts = OpenOptions::new();
+            opts.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o600);
+            }
+            opts.open(&self.path)
+        };
 
         if let Ok(mut f) = file {
             let _ = writeln!(f, "{json}");
