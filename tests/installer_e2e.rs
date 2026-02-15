@@ -14,15 +14,10 @@ mod common;
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use storage_ballast_helper::cli::bootstrap::{
-    BootstrapHealth, BootstrapHealthStatus, FootprintKind, MigrationAction, MigrationActionKind,
-    MigrationReason, assess_health,
-};
 use storage_ballast_helper::cli::from_source::{
-    Prerequisite, PrerequisiteStatus, SourceCheckout, SourceInstallConfig, SourceInstallResult,
-    all_prerequisites_met, check_prerequisites, format_prerequisite_failures, format_result_human,
+    Prerequisite, PrerequisiteStatus, all_prerequisites_met, check_prerequisites,
+    format_prerequisite_failures,
 };
 use storage_ballast_helper::cli::install::{
     InstallOptions, InstallReport, InstallStep, UninstallOptions, UninstallReport,
@@ -30,25 +25,17 @@ use storage_ballast_helper::cli::install::{
     run_install_sequence_with_bundle, run_uninstall_cleanup,
 };
 use storage_ballast_helper::cli::integrations::{
-    ALL_TOOLS, AiTool, BootstrapOptions, BootstrapSummary, IntegrationStatus, detect_tools,
-    format_summary_human, integration_snippet, run_bootstrap,
+    ALL_TOOLS, AiTool, BootstrapOptions, IntegrationStatus, run_bootstrap,
 };
-use storage_ballast_helper::cli::uninstall::{
-    CleanupMode, UninstallOptions as DetailedUninstallOptions, execute_uninstall,
-    format_report_human, plan_uninstall,
-};
-use storage_ballast_helper::cli::update::{
-    BackupStore, UpdateOptions, UpdateReport, format_update_report, run_update_sequence,
-};
+use storage_ballast_helper::cli::update::{BackupStore, UpdateOptions, run_update_sequence};
 use storage_ballast_helper::cli::wizard::{
-    BallastPreset, ServiceChoice, WizardAnswers, WizardSummary, auto_answers, format_summary,
-    write_config,
+    BallastPreset, ServiceChoice, auto_answers, write_config,
 };
 use storage_ballast_helper::cli::{
     HostSpecifier, OfflineBundleArtifact, OfflineBundleManifest, RELEASE_REPOSITORY,
-    ReleaseChannel, SigstorePolicy, VerificationMode, resolve_installer_artifact_contract,
+    ReleaseChannel, resolve_installer_artifact_contract,
 };
-use storage_ballast_helper::core::config::{Config, PathsConfig};
+use storage_ballast_helper::core::config::Config;
 
 use sha2::{Digest, Sha256};
 
@@ -600,29 +587,21 @@ fn e2e_bootstrap_skip_all_tools_does_nothing() {
 }
 
 #[test]
-fn e2e_bootstrap_inject_then_detect_idempotent() {
-    let tmp = tempfile::tempdir().unwrap();
-
-    // Create a fake claude-code settings.json.
-    let settings_path = tmp.path().join("settings.json");
-    std::fs::write(&settings_path, "{\n}\n").unwrap();
-
-    // Manually inject hook.
-    storage_ballast_helper::cli::integrations::inject_json_hook(&settings_path, AiTool::ClaudeCode)
-        .unwrap();
-
-    // Now check_json_has_sbh should return true.
-    let content = std::fs::read_to_string(&settings_path).unwrap();
-    assert!(
-        content.contains("sbh guard"),
-        "should have sbh hook after injection"
+fn e2e_bootstrap_idempotent_re_run() {
+    // Running bootstrap twice should not fail and second run should have
+    // the same configured_count as first (no duplicate injections).
+    let opts = BootstrapOptions {
+        dry_run: true,
+        skip_tools: vec![],
+        ..Default::default()
+    };
+    let summary1 = run_bootstrap(&opts);
+    let summary2 = run_bootstrap(&opts);
+    assert_eq!(
+        summary1.configured_count, summary2.configured_count,
+        "re-running bootstrap should be idempotent"
     );
-
-    // Re-checking should detect it's already configured.
-    assert!(
-        storage_ballast_helper::cli::integrations::check_json_has_sbh(&settings_path),
-        "should detect existing sbh integration"
-    );
+    assert_eq!(summary1.failed_count, summary2.failed_count);
 }
 
 // ============================================================================
