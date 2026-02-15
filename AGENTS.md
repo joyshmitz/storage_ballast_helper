@@ -202,7 +202,7 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 1. **Ballast files** — pre-allocated sacrificial space released under pressure
 2. **Artifact scanner** — multi-factor scoring to find and delete stale build artifacts
-3. **Special location monitor** — surveillance of /tmp, /dev/shm, and other volatile paths
+3. **Special location monitor** — surveillance of /tmp, /data/tmp, and other volatile paths
 
 ### Design Principles
 
@@ -266,7 +266,7 @@ src/
     ewma.rs           # Exponentially weighted moving average rate estimator
     pid.rs            # PID pressure controller
     predictive.rs     # Predictive action pipeline with early warning
-    special_locations.rs  # /tmp, /dev/shm, swap monitoring
+    special_locations.rs  # /tmp, /data/tmp, swap monitoring
     voi_scheduler.rs  # Value-of-Information scan budget allocator
 
   scanner/
