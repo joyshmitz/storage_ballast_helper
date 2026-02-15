@@ -693,6 +693,16 @@ impl Config {
             });
         }
 
+        // Ballast files need a 4096-byte header; anything smaller is unusable.
+        if self.ballast.file_size_bytes < 4096 {
+            return Err(SbhError::InvalidConfig {
+                details: format!(
+                    "ballast.file_size_bytes ({}) must be >= 4096 (header size)",
+                    self.ballast.file_size_bytes,
+                ),
+            });
+        }
+
         if self.update.metadata_cache_ttl_seconds == 0 {
             return Err(SbhError::InvalidConfig {
                 details: "update.metadata_cache_ttl_seconds must be > 0".to_string(),
@@ -1046,6 +1056,18 @@ mod tests {
             "/home/*/projects".to_string(),
         ];
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn ballast_file_size_below_header_rejected() {
+        let mut cfg = Config::default();
+        cfg.ballast.file_size_bytes = 2048; // below 4096 header size
+        let err = cfg.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("4096"),
+            "error should mention header size: {msg}"
+        );
     }
 
     #[test]
