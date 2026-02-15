@@ -142,7 +142,7 @@ impl PidPressureController {
             .max(1e-6);
 
         let error = self.target_free_pct - free_pct;
-        self.integral = (self.integral + error * dt).clamp(-self.integral_cap, self.integral_cap);
+        self.integral = error.mul_add(dt, self.integral).clamp(-self.integral_cap, self.integral_cap);
         let derivative = (error - self.last_error) / dt;
         self.last_error = error;
         self.last_update = Some(now);

@@ -94,14 +94,16 @@ impl DiskRateEstimator {
             .mul_add(burstiness, self.base_alpha)
             .clamp(self.min_alpha, self.max_alpha);
 
-        self.ewma_rate = ewma(alpha, self.ewma_rate, inst_rate);
-        let inst_accel = (inst_rate - previous.inst_rate) / dt;
-        self.ewma_accel = ewma(alpha, self.ewma_accel, inst_accel);
+        // Compute residual BEFORE updating ewma_rate so it measures
+        // prediction error of the previous estimate.
         self.residual_ewma = ewma(
             alpha,
             self.residual_ewma,
             (inst_rate - self.ewma_rate).abs(),
         );
+        self.ewma_rate = ewma(alpha, self.ewma_rate, inst_rate);
+        let inst_accel = (inst_rate - previous.inst_rate) / dt;
+        self.ewma_accel = ewma(alpha, self.ewma_accel, inst_accel);
 
         self.samples = self.samples.saturating_add(1);
         self.last = Some(SampleState {
@@ -131,6 +133,11 @@ impl DiskRateEstimator {
         }
     }
 
+    /// Number of rate samples collected (excludes the initial seed sample).
+    ///
+    /// The first call to `update()` stores the seed value but does not
+    /// increment the counter because no rate can be computed from a single
+    /// observation. Subsequent calls each add one sample.
     #[must_use]
     pub fn sample_count(&self) -> u64 {
         self.samples
@@ -200,10 +207,9 @@ fn project_time(rate: f64, accel: f64, distance_bytes: f64) -> f64 {
     }
 
     let discriminant = rate.mul_add(rate, 2.0 * accel * distance_bytes);
-    if discriminant.is_sign_negative() {
-        return distance_bytes / rate;
-    }
-    let root = discriminant.sqrt();
+    // Use absolute value of discriminant so decelerating scenarios still
+    // produce a quadratic correction instead of falling back to linear.
+    let root = discriminant.abs().sqrt();
     let numerator = -rate + root;
     if accel.abs() < 1e-9 || numerator <= 0.0 {
         return distance_bytes / rate;

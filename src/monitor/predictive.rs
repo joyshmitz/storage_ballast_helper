@@ -188,6 +188,18 @@ impl PredictiveActionPolicy {
         current_free_pct: f64,
         mount: PathBuf,
     ) -> PredictiveAction {
+        self.evaluate_with_samples(estimate, current_free_pct, mount, None)
+    }
+
+    /// Evaluate with an explicit sample count for min_samples gating.
+    #[must_use]
+    pub fn evaluate_with_samples(
+        &self,
+        estimate: &RateEstimate,
+        current_free_pct: f64,
+        mount: PathBuf,
+        sample_count: Option<u64>,
+    ) -> PredictiveAction {
         if !self.config.enabled {
             return PredictiveAction::Clear;
         }
@@ -197,6 +209,13 @@ impl PredictiveActionPolicy {
             return PredictiveAction::Clear;
         }
         if estimate.confidence < self.config.min_confidence {
+            return PredictiveAction::Clear;
+        }
+
+        // Sample count gating: require minimum samples before acting.
+        if let Some(count) = sample_count
+            && count < self.config.min_samples
+        {
             return PredictiveAction::Clear;
         }
 
@@ -264,8 +283,8 @@ impl PredictiveActionPolicy {
             };
             let recommended_min_score = lerp(0.60, 0.30, progress);
             let recommended_free_target_pct = lerp(
-                current_free_pct.max(15.0),
-                current_free_pct.max(25.0),
+                current_free_pct.min(15.0),
+                current_free_pct.min(25.0),
                 progress,
             );
 
