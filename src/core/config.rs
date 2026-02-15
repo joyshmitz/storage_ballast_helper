@@ -706,6 +706,11 @@ impl Config {
             });
         }
 
+        // Validate protected_paths glob patterns are compilable.
+        for pattern in &self.scanner.protected_paths {
+            crate::scanner::protection::validate_glob_pattern(pattern)?;
+        }
+
         Ok(())
     }
 }
@@ -1031,6 +1036,16 @@ mod tests {
         cfg.pressure.prediction.action_horizon_minutes = 30.0;
         let err = cfg.validate().expect_err("expected prediction error");
         assert!(err.to_string().contains("warning_horizon"));
+    }
+
+    #[test]
+    fn valid_protected_paths_accepted() {
+        let mut cfg = Config::default();
+        cfg.scanner.protected_paths = vec![
+            "/data/important/**".to_string(),
+            "/home/*/projects".to_string(),
+        ];
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

@@ -321,6 +321,13 @@ fn read_marker_metadata(marker_path: &Path) -> Option<ProtectionMetadata> {
     serde_json::from_str(trimmed).ok()
 }
 
+/// Validate that a glob pattern can be compiled.
+///
+/// Returns `Ok(())` if the pattern is valid, or an error describing why it is not.
+pub fn validate_glob_pattern(pattern: &str) -> Result<()> {
+    glob_to_regex(pattern).map(|_| ())
+}
+
 /// Convert a shell-style glob pattern to a regex.
 ///
 /// Supports:
