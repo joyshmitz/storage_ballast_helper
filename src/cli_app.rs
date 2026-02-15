@@ -134,6 +134,12 @@ struct InstallArgs {
     /// Installation prefix for the binary (--from-source). Defaults to ~/.local.
     #[arg(long, requires = "from_source", value_name = "PATH")]
     prefix: Option<PathBuf>,
+    /// Run guided first-run setup wizard.
+    #[arg(long)]
+    wizard: bool,
+    /// Non-interactive mode: apply smart defaults without prompts.
+    #[arg(long, conflicts_with = "wizard")]
+    auto: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -541,9 +547,54 @@ fn config_command_label(args: &ConfigArgs) -> &'static str {
 }
 
 fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
+    // -- wizard / auto mode ---------------------------------------------------
+    if args.wizard || args.auto {
+        use storage_ballast_helper::cli::wizard::{
+            self, WizardSummary, auto_answers, format_summary, run_interactive, write_config,
+        };
+
+        let answers = if args.auto {
+            auto_answers()
+        } else {
+            let stdin = io::stdin();
+            let mut reader = stdin.lock();
+            let mut writer = io::stderr();
+            run_interactive(&mut reader, &mut writer)
+                .map_err(|e| CliError::User(format!("wizard cancelled: {e}")))?
+        };
+
+        let config_path = answers
+            .to_config()
+            .paths
+            .config_file
+            .clone();
+
+        let config_written = write_config(&answers, &config_path)
+            .map_err(|e| CliError::Runtime(format!("failed to write config: {e}")))?;
+
+        let summary = WizardSummary {
+            answers,
+            config_path: config_written,
+            config_written: true,
+            warnings: vec![],
+        };
+
+        match output_mode(cli) {
+            OutputMode::Human => {
+                print!("{}", format_summary(&summary));
+            }
+            OutputMode::Json => {
+                let payload = serde_json::to_value(&summary)?;
+                write_json_line(&payload)?;
+            }
+        }
+
+        return Ok(());
+    }
+
     if !args.from_source && !args.systemd && !args.launchd {
         return Err(CliError::User(
-            "specify --systemd, --launchd, or --from-source".to_string(),
+            "specify --systemd, --launchd, --from-source, --wizard, or --auto".to_string(),
         ));
     }
 

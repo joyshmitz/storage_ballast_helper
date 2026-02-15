@@ -5,6 +5,8 @@ pub mod assets;
 pub mod bootstrap;
 pub mod from_source;
 pub mod integrations;
+pub mod uninstall;
+pub mod wizard;
 
 use std::fmt;
 use std::fs::File;

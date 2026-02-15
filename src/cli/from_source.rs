@@ -5,7 +5,7 @@
 //! to install sbh by building from source. Prerequisites are validated upfront
 //! with actionable remediation messages for each missing tool.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -77,9 +77,9 @@ pub fn all_prerequisites_met(statuses: &[PrerequisiteStatus]) -> bool {
 pub fn format_prerequisite_failures(statuses: &[PrerequisiteStatus]) -> String {
     let mut out = String::from("Missing prerequisites for --from-source build:\n\n");
     for status in statuses.iter().filter(|s| !s.available) {
-        out.push_str(&format!("  {} — not found\n", status.prerequisite));
-        if let Some(ref fix) = status.remediation {
-            out.push_str(&format!("    Fix: {fix}\n"));
+        let _ = writeln!(out, "  {} — not found", status.prerequisite);
+        if let Some(fix) = &status.remediation {
+            let _ = writeln!(out, "    Fix: {fix}");
         }
         out.push('\n');
     }
@@ -213,11 +213,10 @@ impl SourceInstallConfig {
 }
 
 fn default_install_root() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".local")
-    } else {
-        PathBuf::from("/usr/local")
-    }
+    std::env::var_os("HOME").map_or_else(
+        || PathBuf::from("/usr/local"),
+        |home| PathBuf::from(home).join(".local"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -248,15 +247,15 @@ pub fn format_result_human(result: &SourceInstallResult) -> String {
 
     if result.success {
         out.push_str("From-source install completed successfully.\n\n");
-        if let Some(ref path) = result.binary_path {
-            out.push_str(&format!("  Binary: {}\n", path.display()));
+        if let Some(path) = &result.binary_path {
+            let _ = writeln!(out, "  Binary: {}", path.display());
         }
-        out.push_str(&format!("  Source: {}\n", result.checkout));
-        out.push_str(&format!("  Profile: {}\n", result.build_profile));
+        let _ = writeln!(out, "  Source: {}", result.checkout);
+        let _ = writeln!(out, "  Profile: {}", result.build_profile);
     } else {
         out.push_str("From-source install failed.\n\n");
-        if let Some(ref err) = result.error {
-            out.push_str(&format!("  Error: {err}\n"));
+        if let Some(err) = &result.error {
+            let _ = writeln!(out, "  Error: {err}");
         }
     }
 
@@ -265,7 +264,7 @@ pub fn format_result_human(result: &SourceInstallResult) -> String {
     for status in &result.prerequisites {
         let icon = if status.available { "OK" } else { "MISSING" };
         let ver = status.version.as_deref().unwrap_or("n/a");
-        out.push_str(&format!("    [{icon}] {} ({})\n", status.prerequisite, ver));
+        let _ = writeln!(out, "    [{icon}] {} ({ver})", status.prerequisite);
     }
 
     out
