@@ -26,6 +26,7 @@ rusqlite = { version = "0.33", features = ["bundled"] }
 thiserror = "2.0"
 # Terminal output
 colored = "3.0"
+crossterm = "0.28"
 # Timestamps
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # Concurrency (no tokio — std threads + channels)

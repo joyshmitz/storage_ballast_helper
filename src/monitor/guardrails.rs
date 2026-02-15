@@ -333,7 +333,7 @@ impl AdaptiveGuard {
         errors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median_error = if errors.len() % 2 == 0 {
             let mid = errors.len() / 2;
-            (errors[mid - 1] + errors[mid]) / 2.0
+            f64::midpoint(errors[mid - 1], errors[mid])
         } else {
             errors[errors.len() / 2]
         };
@@ -383,11 +383,20 @@ pub fn gate_action(guard: &AdaptiveGuard, is_high_impact: bool) -> ActionDecisio
 #[serde(rename_all = "snake_case")]
 pub enum ActionDecision {
     /// Action is allowed to proceed.
-    Allow { reason: &'static str },
+    Allow {
+        /// Human-readable explanation.
+        reason: &'static str,
+    },
     /// Action is blocked; use conservative fallback.
-    Fallback { reason: &'static str },
+    Fallback {
+        /// Human-readable explanation.
+        reason: &'static str,
+    },
     /// Action is blocked entirely.
-    Block { reason: &'static str },
+    Block {
+        /// Human-readable explanation.
+        reason: &'static str,
+    },
 }
 
 impl ActionDecision {
