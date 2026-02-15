@@ -525,7 +525,6 @@ enum OutputMode {
 
 /// CLI error type with explicit exit-code mapping.
 #[derive(Debug, Error)]
-#[allow(dead_code)] // scaffolding: runtime command implementations will construct all variants
 pub enum CliError {
     /// Invalid user input at runtime.
     #[error("{0}")]
@@ -535,6 +534,7 @@ pub enum CliError {
     Runtime(String),
     /// Internal bug or invariant violation.
     #[error("{0}")]
+    #[allow(dead_code)] // scaffolding for invariant-violation error paths
     Internal(String),
     /// Operation partially succeeded.
     #[error("{0}")]
@@ -1693,10 +1693,10 @@ impl std::fmt::Display for TuningCategory {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // High is scaffolding for PID-tuning recommendations
 enum TuningRisk {
     Low,
     Medium,
+    #[allow(dead_code)] // scaffolding for PID-tuning recommendations
     High,
 }
 
