@@ -188,7 +188,12 @@ impl PredictiveActionPolicy {
         current_free_pct: f64,
         mount: PathBuf,
     ) -> PredictiveAction {
-        self.evaluate_with_samples(estimate, current_free_pct, mount, None)
+        self.evaluate_with_samples(
+            estimate,
+            current_free_pct,
+            mount,
+            Some(estimate.sample_count),
+        )
     }
 
     /// Evaluate with an explicit sample count for min_samples gating.
@@ -282,11 +287,10 @@ impl PredictiveActionPolicy {
                 1.0
             };
             let recommended_min_score = lerp(0.60, 0.30, progress);
-            let recommended_free_target_pct = lerp(
-                current_free_pct.min(15.0),
-                current_free_pct.min(25.0),
-                progress,
-            );
+            // Keep target recommendation policy-driven (15%..25%) instead of
+            // collapsing to very low values under severe pressure.
+            let _ = current_free_pct;
+            let recommended_free_target_pct = lerp(15.0, 25.0, progress);
 
             PredictiveAction::PreemptiveCleanup {
                 mount,
@@ -337,6 +341,7 @@ mod tests {
             acceleration: 0.0,
             seconds_to_exhaustion,
             seconds_to_threshold: seconds_to_exhaustion * 0.8,
+            sample_count: 10,
             confidence,
             trend,
             alpha_used: 0.3,
@@ -720,6 +725,27 @@ mod tests {
             _ => panic!(
                 "both should be PreemptiveCleanup: gentle={gentle:?}, aggressive={aggressive:?}"
             ),
+        }
+    }
+
+    #[test]
+    fn low_current_free_still_recommends_reasonable_target_floor() {
+        let policy = default_policy();
+        // 20 minutes: within action horizon but above imminent danger.
+        let est = make_estimate(250_000_000.0, 20.0 * 60.0, 0.90, Trend::Accelerating, false);
+
+        let action = policy.evaluate(&est, 4.0, PathBuf::from("/data"));
+        match action {
+            PredictiveAction::PreemptiveCleanup {
+                recommended_free_target_pct,
+                ..
+            } => {
+                assert!(
+                    recommended_free_target_pct >= 15.0,
+                    "target should keep policy floor, got {recommended_free_target_pct}"
+                );
+            }
+            other => panic!("expected PreemptiveCleanup, got {other:?}"),
         }
     }
 

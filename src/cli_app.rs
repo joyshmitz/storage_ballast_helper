@@ -2664,7 +2664,20 @@ fn run_status(cli: &Cli, _args: &StatusArgs) -> Result<(), CliError> {
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
 
-    let daemon_running = daemon_state.is_some();
+    // I26: Check file modification time to detect stale state from a crashed daemon.
+    let daemon_running = daemon_state.is_some() && {
+        let stale_threshold_secs = (config.pressure.poll_interval_ms / 1000).max(1) * 2;
+        let stale_threshold = std::time::Duration::from_secs(stale_threshold_secs);
+        std::fs::metadata(&config.paths.state_file)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .is_some_and(|modified| {
+                SystemTime::now()
+                    .duration_since(modified)
+                    .unwrap_or_default()
+                    <= stale_threshold
+            })
+    };
 
     // Open SQLite database for recent activity (optional).
     let db_stats = if config.paths.sqlite_db.exists() {

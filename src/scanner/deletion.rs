@@ -384,18 +384,44 @@ fn is_path_open_linux(target: &Path) -> bool {
     false
 }
 
-/// Collect (device, inode) pairs for target path and its direct children.
+/// Collect (device, inode) pairs for target path and its descendants.
 #[cfg(target_os = "linux")]
 fn collect_inode_set(target: &Path) -> std::collections::HashSet<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
+
+    const MAX_INODE_SCAN_ENTRIES: usize = 20_000;
+
     let mut ids = std::collections::HashSet::new();
-    if let Ok(meta) = fs::metadata(target) {
-        ids.insert((meta.dev(), meta.ino()));
-    }
-    if let Ok(entries) = fs::read_dir(target) {
+    let mut visited_dirs = std::collections::HashSet::new();
+    let mut stack = vec![target.to_path_buf()];
+
+    while let Some(path) = stack.pop() {
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        let key = (meta.dev(), meta.ino());
+        ids.insert(key);
+
+        if ids.len() >= MAX_INODE_SCAN_ENTRIES {
+            break;
+        }
+
+        if !meta.is_dir() {
+            continue;
+        }
+
+        // Avoid symlink/directory cycles and redundant rescans.
+        if !visited_dirs.insert(key) {
+            continue;
+        }
+
+        let Ok(entries) = fs::read_dir(&path) else {
+            continue;
+        };
         for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                ids.insert((meta.dev(), meta.ino()));
+            stack.push(entry.path());
+            if stack.len() + ids.len() >= MAX_INODE_SCAN_ENTRIES {
+                break;
             }
         }
     }
@@ -693,5 +719,22 @@ mod tests {
         let report = executor.execute(&plan, None);
         assert_eq!(report.items_deleted, 1);
         assert_eq!(report.items_skipped, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nested_open_file_is_detected_for_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a").join("b").join("c");
+        fs::create_dir_all(&nested).unwrap();
+        let file_path = nested.join("in_use.bin");
+        fs::write(&file_path, "payload").unwrap();
+
+        let handle = fs::File::open(&file_path).unwrap();
+        assert!(
+            is_path_open(dir.path()),
+            "open file in nested subtree should mark parent as open"
+        );
+        drop(handle);
     }
 }

@@ -21,6 +21,7 @@ pub struct RateEstimate {
     pub acceleration: f64,
     pub seconds_to_exhaustion: f64,
     pub seconds_to_threshold: f64,
+    pub sample_count: u64,
     pub confidence: f64,
     pub trend: Trend,
     pub alpha_used: f64,
@@ -126,6 +127,7 @@ impl DiskRateEstimator {
             acceleration: self.ewma_accel,
             seconds_to_exhaustion,
             seconds_to_threshold,
+            sample_count: self.samples,
             confidence,
             trend,
             alpha_used: alpha,
@@ -169,6 +171,7 @@ impl DiskRateEstimator {
             } else {
                 f64::INFINITY
             },
+            sample_count: self.samples,
             confidence: self.compute_confidence(),
             trend: classify_trend(self.ewma_rate, self.ewma_accel),
             alpha_used: self.base_alpha,

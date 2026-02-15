@@ -187,7 +187,7 @@ impl MonitoringDaemon {
         );
 
         // 6. PID pressure controller.
-        let pressure_controller = PidPressureController::new(
+        let mut pressure_controller = PidPressureController::new(
             0.25,  // kp
             0.08,  // ki
             0.02,  // kd
@@ -200,6 +200,10 @@ impl MonitoringDaemon {
             config.pressure.red_min_free_pct,
             Duration::from_millis(config.pressure.poll_interval_ms),
         );
+        if config.pressure.prediction.enabled {
+            pressure_controller
+                .set_action_horizon_minutes(config.pressure.prediction.action_horizon_minutes);
+        }
 
         // 7. Discover special locations.
         let special_locations = SpecialLocationRegistry::discover(
@@ -560,10 +564,18 @@ impl MonitoringDaemon {
             PressureLevel::Yellow => {
                 // Increase scan frequency (handled by PID interval).
                 // Light scanning.
+                if response.release_ballast_files > 0 {
+                    let _ = self
+                        .release_controller
+                        .maybe_release(&mut self.ballast_manager, response);
+                }
                 self.send_scan_request(scan_tx, response);
             }
             PressureLevel::Orange => {
-                // Start scanning + gentle cleanup.
+                // Start scanning + gentle cleanup + early ballast release.
+                let _ = self
+                    .release_controller
+                    .maybe_release(&mut self.ballast_manager, response);
                 self.send_scan_request(scan_tx, response);
             }
             PressureLevel::Red => {
