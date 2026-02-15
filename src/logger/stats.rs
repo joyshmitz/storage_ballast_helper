@@ -100,14 +100,17 @@ impl Default for PressureStats {
 }
 
 /// Pressure severity levels, ordered from least to most severe.
+/// Explicit discriminants ensure `Unknown` sorts below `Green`
+/// so it never accidentally registers as worst-level-reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
 pub enum PressureLevel {
-    Green,
-    Yellow,
-    Orange,
-    Red,
-    Critical,
-    Unknown,
+    Unknown = 0,
+    Green = 1,
+    Yellow = 2,
+    Orange = 3,
+    Red = 4,
+    Critical = 5,
 }
 
 impl PressureLevel {
@@ -233,7 +236,7 @@ impl<'a> StatsEngine<'a> {
             "SELECT path, size_bytes, score, timestamp FROM activity_log
              WHERE event_type = 'artifact_delete' AND success = 1
                AND timestamp >= ?1 AND path IS NOT NULL
-             ORDER BY size_bytes DESC LIMIT ?2",
+             ORDER BY COALESCE(size_bytes, 0) DESC LIMIT ?2",
         )?;
 
         let details = stmt
@@ -361,15 +364,15 @@ impl<'a> StatsEngine<'a> {
         )?;
 
         Ok(DeletionStats {
-            count: count as u64,
-            total_bytes_freed: total as u64,
+            count: count.max(0) as u64,
+            total_bytes_freed: total.max(0) as u64,
             avg_size: avg_size as u64,
             median_size,
             largest_deletion: largest,
             most_common_category: most_common,
             avg_score,
             avg_age_hours: 0.0, // Age at deletion not stored in current schema
-            failures: failures as u64,
+            failures: failures.max(0) as u64,
         })
     }
 
@@ -478,6 +481,13 @@ impl<'a> StatsEngine<'a> {
         // Count the last sample's level too for worst.
         if prev_level > worst {
             worst = prev_level;
+        }
+
+        // Account for time from last sample to now (M7).
+        let now_str = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let last_dt = timestamp_delta_secs(&samples[samples.len() - 1].0, &now_str);
+        if last_dt > 0.0 {
+            *level_time.entry(prev_level).or_insert(0.0) += last_dt;
         }
 
         let total_time: f64 = level_time.values().sum();
