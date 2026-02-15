@@ -128,7 +128,11 @@ impl ActivityLoggerHandle {
 
     /// Request graceful shutdown and wait for the logger thread to finish.
     pub fn shutdown(&self) {
-        let _ = self.tx.send(ActivityEvent::Shutdown);
+        if self.tx.try_send(ActivityEvent::Shutdown).is_err() {
+            // Channel full or disconnected — brief drain then retry.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let _ = self.tx.try_send(ActivityEvent::Shutdown);
+        }
     }
 }
 
@@ -201,6 +205,8 @@ fn logger_thread_main(
 ) {
     // Open backends.
     #[cfg(feature = "sqlite")]
+    let sqlite_recovery_path = sqlite_path.clone();
+    #[cfg(feature = "sqlite")]
     let mut sqlite = sqlite_path.and_then(|p| match SqliteLogger::open(&p) {
         Ok(db) => Some(db),
         Err(e) => {
@@ -214,12 +220,19 @@ fn logger_thread_main(
     let mut jsonl = JsonlWriter::open(jsonl_config);
     #[cfg(feature = "sqlite")]
     let mut sqlite_failures: u32 = 0;
+    #[cfg(feature = "sqlite")]
+    let mut sqlite_disabled_cycles: u32 = 0;
+    #[cfg(feature = "sqlite")]
+    const SQLITE_RECOVERY_INTERVAL: u32 = 50;
 
     // Process events until Shutdown or channel disconnect.
+    let mut last_reported_drops: u64 = 0;
     while let Ok(event) = rx.recv() {
-        // Report dropped events periodically.
-        let d = dropped.swap(0, Ordering::Relaxed);
+        // Report dropped events periodically (M8: delta, not zeroing).
+        let total_dropped = dropped.load(Ordering::Relaxed);
+        let d = total_dropped.saturating_sub(last_reported_drops);
         if d > 0 {
+            last_reported_drops = total_dropped;
             let mut warn = LogEntry::new(EventType::Error, Severity::Warning);
             warn.details = Some(format!("{d} log events dropped due to back-pressure"));
             jsonl.write_entry(&warn);
@@ -258,6 +271,19 @@ fn logger_thread_main(
                             "[SBH-DUAL] SQLite write failed {sqlite_failures} times, disabling"
                         );
                         sqlite = None;
+                    }
+                }
+            } else {
+                // Recovery attempt: periodically try to re-open SQLite (I5).
+                sqlite_disabled_cycles += 1;
+                if sqlite_disabled_cycles >= SQLITE_RECOVERY_INTERVAL {
+                    sqlite_disabled_cycles = 0;
+                    if let Some(ref p) = sqlite_recovery_path {
+                        if let Ok(db) = SqliteLogger::open(p) {
+                            eprintln!("[SBH-DUAL] SQLite recovered at {}", p.display());
+                            sqlite = Some(db);
+                            sqlite_failures = 0;
+                        }
                     }
                 }
             }
@@ -444,12 +470,12 @@ fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
             event_type: "artifact_delete".to_string(),
             severity: "info".to_string(),
             path: Some(path.clone()),
-            size_bytes: Some(*size_bytes as i64),
+            size_bytes: Some(i64::try_from(*size_bytes).unwrap_or(i64::MAX)),
             score: Some(*score),
             score_factors: serde_json::to_string(factors).ok(),
             pressure_level: Some(pressure.clone()),
             free_pct: Some(*free_pct),
-            duration_ms: Some(*duration_ms as i64),
+            duration_ms: Some(i64::try_from(*duration_ms).unwrap_or(i64::MAX)),
             success: 1,
             error_code: None,
             error_message: None,
@@ -485,7 +511,7 @@ fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
             event_type: "ballast_release".to_string(),
             severity: "info".to_string(),
             path: Some(path.clone()),
-            size_bytes: Some(*size_bytes as i64),
+            size_bytes: Some(i64::try_from(*size_bytes).unwrap_or(i64::MAX)),
             score: None,
             score_factors: None,
             pressure_level: Some(pressure.clone()),
@@ -510,7 +536,7 @@ fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
             score_factors: None,
             pressure_level: None,
             free_pct: None,
-            duration_ms: Some(*duration_ms as i64),
+            duration_ms: Some(i64::try_from(*duration_ms).unwrap_or(i64::MAX)),
             success: 1,
             error_code: None,
             error_message: None,
@@ -533,6 +559,54 @@ fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
             error_code: Some(code.clone()),
             error_message: Some(message.clone()),
             details: None,
+        }),
+        ActivityEvent::BallastReplenished { path, size_bytes } => Some(ActivityRow {
+            timestamp: ts,
+            event_type: "ballast_replenish".to_string(),
+            severity: "info".to_string(),
+            path: Some(path.clone()),
+            size_bytes: Some(i64::try_from(*size_bytes).unwrap_or(i64::MAX)),
+            score: None,
+            score_factors: None,
+            pressure_level: None,
+            free_pct: None,
+            duration_ms: None,
+            success: 1,
+            error_code: None,
+            error_message: None,
+            details: None,
+        }),
+        ActivityEvent::BallastProvisioned { path, size_bytes } => Some(ActivityRow {
+            timestamp: ts,
+            event_type: "ballast_provision".to_string(),
+            severity: "info".to_string(),
+            path: Some(path.clone()),
+            size_bytes: Some(i64::try_from(*size_bytes).unwrap_or(i64::MAX)),
+            score: None,
+            score_factors: None,
+            pressure_level: None,
+            free_pct: None,
+            duration_ms: None,
+            success: 1,
+            error_code: None,
+            error_message: None,
+            details: None,
+        }),
+        ActivityEvent::Emergency { details, free_pct } => Some(ActivityRow {
+            timestamp: ts,
+            event_type: "emergency".to_string(),
+            severity: "critical".to_string(),
+            path: None,
+            size_bytes: None,
+            score: None,
+            score_factors: None,
+            pressure_level: None,
+            free_pct: Some(*free_pct),
+            duration_ms: None,
+            success: 1,
+            error_code: None,
+            error_message: None,
+            details: Some(details.clone()),
         }),
         // Events that only need JSONL logging (pressure goes to pressure_history table).
         _ => None,
