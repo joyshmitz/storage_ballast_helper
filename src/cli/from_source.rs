@@ -383,7 +383,7 @@ fn run_git_clone(url: &str, dest: &Path, checkout: &SourceCheckout) -> Result<()
 
     // For a specific tag, use --branch to fetch only that tag.
     let tag_string;
-    if let SourceCheckout::Tag(ref tag) = checkout {
+    if let SourceCheckout::Tag(tag) = checkout {
         tag_string = tag.clone();
         args.push("--branch");
         args.push(&tag_string);

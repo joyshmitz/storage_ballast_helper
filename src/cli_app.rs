@@ -550,8 +550,8 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     // -- from-source build ----------------------------------------------------
     if args.from_source {
         use storage_ballast_helper::cli::from_source::{
-            self, SourceCheckout, SourceInstallConfig,
-            all_prerequisites_met, format_prerequisite_failures, format_result_human,
+            self, SourceCheckout, SourceInstallConfig, all_prerequisites_met,
+            format_prerequisite_failures, format_result_human,
         };
 
         let checkout = match &args.tag {
