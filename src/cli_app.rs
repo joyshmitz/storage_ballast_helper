@@ -562,7 +562,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     // -- wizard / auto mode ---------------------------------------------------
     if args.wizard || args.auto {
         use storage_ballast_helper::cli::wizard::{
-            self, WizardSummary, auto_answers, format_summary, run_interactive, write_config,
+            WizardSummary, auto_answers, format_summary, run_interactive, write_config,
         };
 
         let answers = if args.auto {

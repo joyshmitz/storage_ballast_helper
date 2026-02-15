@@ -25,6 +25,7 @@ use crate::ballast::manager::BallastManager;
 use crate::ballast::release::BallastReleaseController;
 use crate::core::config::Config;
 use crate::core::errors::Result;
+use crate::daemon::self_monitor::{SelfMonitor, ThreadHeartbeat};
 use crate::daemon::signals::{ShutdownCoordinator, SignalHandler, WatchdogHeartbeat};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, spawn_logger};
 use crate::logger::jsonl::JsonlConfig;
@@ -133,6 +134,9 @@ pub struct MonitoringDaemon {
     start_time: Instant,
     last_pressure_level: PressureLevel,
     last_special_scan: HashMap<PathBuf, Instant>,
+    self_monitor: SelfMonitor,
+    scanner_heartbeat: Arc<ThreadHeartbeat>,
+    executor_heartbeat: Arc<ThreadHeartbeat>,
 }
 
 impl MonitoringDaemon {
@@ -212,6 +216,13 @@ impl MonitoringDaemon {
         let scoring_engine =
             ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
 
+        // 11. Self-monitor (writes state.json for CLI, tracks health).
+        let self_monitor = SelfMonitor::new(config.paths.state_file.clone());
+
+        // 12. Thread heartbeats for worker health detection.
+        let scanner_heartbeat = ThreadHeartbeat::new("sbh-scanner");
+        let executor_heartbeat = ThreadHeartbeat::new("sbh-executor");
+
         Ok(Self {
             config,
             platform,
@@ -229,6 +240,9 @@ impl MonitoringDaemon {
             start_time,
             last_pressure_level: PressureLevel::Green,
             last_special_scan: HashMap::new(),
+            self_monitor,
+            scanner_heartbeat,
+            executor_heartbeat,
         })
     }
 
@@ -259,7 +273,7 @@ impl MonitoringDaemon {
         let (scan_tx, scan_rx) = bounded::<ScanRequest>(SCANNER_CHANNEL_CAP);
         let (del_tx, del_rx) = bounded::<DeletionBatch>(EXECUTOR_CHANNEL_CAP);
 
-        // Spawn worker threads.
+        // Spawn worker threads with heartbeats.
         let mut scanner_health = ThreadHealth::new();
         let mut executor_health = ThreadHealth::new();
 
@@ -267,9 +281,15 @@ impl MonitoringDaemon {
             scan_rx.clone(),
             del_tx.clone(),
             self.logger_handle.clone(),
+            Arc::clone(&self.scanner_heartbeat),
         ));
-        let mut executor_join: Option<thread::JoinHandle<()>> =
-            Some(self.spawn_executor_thread(del_rx.clone(), self.logger_handle.clone()));
+        let mut executor_join: Option<thread::JoinHandle<()>> = Some(
+            self.spawn_executor_thread(
+                del_rx.clone(),
+                self.logger_handle.clone(),
+                Arc::clone(&self.executor_heartbeat),
+            ),
+        );
 
         let mut last_health_check = Instant::now();
 
@@ -318,6 +338,33 @@ impl MonitoringDaemon {
                 response.level, response.urgency
             ));
 
+            // 7b. Self-monitoring: write state file + check RSS.
+            {
+                let primary_path = self
+                    .config
+                    .scanner
+                    .root_paths
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| PathBuf::from("/"));
+                let free_pct = self
+                    .fs_collector
+                    .collect(&primary_path)
+                    .map(|s| s.free_pct())
+                    .unwrap_or(0.0);
+                let mount_str = primary_path.to_string_lossy();
+                let ballast_available = self.ballast_manager.available_count();
+                let ballast_total = self.ballast_manager.inventory().len();
+
+                self.self_monitor.maybe_write_state(
+                    response.level,
+                    free_pct,
+                    &mount_str,
+                    ballast_available,
+                    ballast_total,
+                );
+            }
+
             // 8. Forced scan signal (SIGUSR1).
             if self.signal_handler.should_scan() {
                 self.trigger_forced_scan(&scan_tx, &response);
@@ -335,10 +382,12 @@ impl MonitoringDaemon {
                     }
                     if scanner_health.record_panic() {
                         eprintln!("[SBH-DAEMON] respawning scanner thread");
+                        self.scanner_heartbeat = ThreadHeartbeat::new("sbh-scanner");
                         scanner_join = Some(self.spawn_scanner_thread(
                             scan_rx.clone(),
                             del_tx.clone(),
                             self.logger_handle.clone(),
+                            Arc::clone(&self.scanner_heartbeat),
                         ));
                     } else {
                         self.logger_handle.send(ActivityEvent::Error {
@@ -356,9 +405,12 @@ impl MonitoringDaemon {
                     }
                     if executor_health.record_panic() {
                         eprintln!("[SBH-DAEMON] respawning executor thread");
-                        executor_join = Some(
-                            self.spawn_executor_thread(del_rx.clone(), self.logger_handle.clone()),
-                        );
+                        self.executor_heartbeat = ThreadHeartbeat::new("sbh-executor");
+                        executor_join = Some(self.spawn_executor_thread(
+                            del_rx.clone(),
+                            self.logger_handle.clone(),
+                            Arc::clone(&self.executor_heartbeat),
+                        ));
                     } else {
                         self.logger_handle.send(ActivityEvent::Error {
                             code: "SBH-3900".to_string(),
@@ -669,6 +721,7 @@ impl MonitoringDaemon {
         scan_rx: Receiver<ScanRequest>,
         del_tx: Sender<DeletionBatch>,
         logger: ActivityLoggerHandle,
+        heartbeat: Arc<ThreadHeartbeat>,
     ) -> thread::JoinHandle<()> {
         let scoring_config = self.config.scoring.clone();
         let min_file_age = self.config.scanner.min_file_age_minutes;
@@ -676,7 +729,7 @@ impl MonitoringDaemon {
         thread::Builder::new()
             .name("sbh-scanner".to_string())
             .spawn(move || {
-                scanner_thread_main(scan_rx, del_tx, logger, scoring_config, min_file_age);
+                scanner_thread_main(scan_rx, del_tx, logger, scoring_config, min_file_age, heartbeat);
             })
             .expect("failed to spawn scanner thread")
     }
@@ -685,6 +738,7 @@ impl MonitoringDaemon {
         &self,
         del_rx: Receiver<DeletionBatch>,
         logger: ActivityLoggerHandle,
+        heartbeat: Arc<ThreadHeartbeat>,
     ) -> thread::JoinHandle<()> {
         let dry_run = self.config.scanner.dry_run;
         let max_batch = self.config.scanner.max_delete_batch;
@@ -693,7 +747,7 @@ impl MonitoringDaemon {
         thread::Builder::new()
             .name("sbh-executor".to_string())
             .spawn(move || {
-                executor_thread_main(del_rx, logger, dry_run, max_batch, min_score);
+                executor_thread_main(del_rx, logger, dry_run, max_batch, min_score, heartbeat);
             })
             .expect("failed to spawn executor thread")
     }
@@ -756,10 +810,12 @@ fn scanner_thread_main(
     logger: ActivityLoggerHandle,
     scoring_config: crate::core::config::ScoringConfig,
     min_file_age: u64,
+    heartbeat: Arc<ThreadHeartbeat>,
 ) {
     let engine = ScoringEngine::from_config(&scoring_config, min_file_age);
 
     while let Ok(request) = scan_rx.recv() {
+        heartbeat.beat();
         let scan_start = Instant::now();
         let mut candidates_found: usize = 0;
         let mut paths_scanned: usize = 0;
@@ -884,6 +940,7 @@ fn executor_thread_main(
     dry_run: bool,
     max_batch_size: usize,
     min_score: f64,
+    heartbeat: Arc<ThreadHeartbeat>,
 ) {
     let executor = DeletionExecutor::new(
         DeletionConfig {
@@ -897,6 +954,7 @@ fn executor_thread_main(
     );
 
     while let Ok(batch) = del_rx.recv() {
+        heartbeat.beat();
         let plan = executor.plan(batch.candidates);
 
         if plan.candidates.is_empty() {

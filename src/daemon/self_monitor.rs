@@ -92,6 +92,7 @@ pub enum ThreadStatus {
     Dead {
         name: String,
         died_at: Instant,
+        error: String,
     },
 }
 
@@ -175,10 +176,12 @@ pub struct DaemonHealth {
     pub uptime: Duration,
     pub memory_rss_bytes: u64,
     pub scan_count: u64,
+    pub avg_scan_duration: Duration,
     pub last_scan_at: Option<Instant>,
     pub deletions_total: u64,
     pub bytes_freed_total: u64,
     pub errors_total: u64,
+    pub thread_status: Vec<ThreadStatus>,
     pub last_pressure_level: PressureLevel,
 }
 
@@ -201,6 +204,8 @@ pub struct SelfMonitor {
     pub deletions_total: u64,
     pub bytes_freed_total: u64,
     pub errors_total: u64,
+    /// Cumulative scan duration for averaging.
+    scan_duration_total: Duration,
 }
 
 impl SelfMonitor {
@@ -222,6 +227,7 @@ impl SelfMonitor {
             deletions_total: 0,
             bytes_freed_total: 0,
             errors_total: 0,
+            scan_duration_total: Duration::ZERO,
         }
     }
 
@@ -313,13 +319,50 @@ impl SelfMonitor {
         )
     }
 
-    /// Record a completed scan.
-    pub fn record_scan(&mut self, candidates: usize, deleted: usize) {
+    /// Record a completed scan with its duration.
+    pub fn record_scan(&mut self, candidates: usize, deleted: usize, duration: Duration) {
         self.scan_count += 1;
+        self.scan_duration_total += duration;
         self.last_scan_at =
             Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
         self.last_scan_candidates = candidates;
         self.last_scan_deleted = deleted;
+    }
+
+    /// Average scan duration across all recorded scans.
+    #[must_use]
+    pub fn avg_scan_duration(&self) -> Duration {
+        if self.scan_count == 0 {
+            return Duration::ZERO;
+        }
+        self.scan_duration_total / self.scan_count as u32
+    }
+
+    /// Build a health snapshot from current state plus thread heartbeats.
+    #[must_use]
+    pub fn health_snapshot(
+        &self,
+        heartbeats: &[Arc<ThreadHeartbeat>],
+        stall_threshold: Duration,
+        pressure_level: PressureLevel,
+    ) -> DaemonHealth {
+        DaemonHealth {
+            uptime: self.start_time.elapsed(),
+            memory_rss_bytes: read_rss_bytes(),
+            scan_count: self.scan_count,
+            avg_scan_duration: self.avg_scan_duration(),
+            last_scan_at: self.last_scan_at.as_ref().and_then(|ts| {
+                chrono::DateTime::parse_from_rfc3339(ts).ok().map(|_| Instant::now())
+            }),
+            deletions_total: self.deletions_total,
+            bytes_freed_total: self.bytes_freed_total,
+            errors_total: self.errors_total,
+            thread_status: heartbeats
+                .iter()
+                .map(|hb| hb.status(stall_threshold))
+                .collect(),
+            last_pressure_level: pressure_level,
+        }
     }
 
     /// Record deletion results.
@@ -519,7 +562,7 @@ mod tests {
         monitor.write_interval = Duration::from_millis(50);
 
         // First write always happens.
-        let rss = monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 10, 10);
+        let _rss = monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 10, 10);
         assert!(path.exists());
 
         // Immediate second write is skipped (within interval).
@@ -544,12 +587,12 @@ mod tests {
         monitor.scan_count = 42;
         monitor.deletions_total = 7;
         monitor.bytes_freed_total = 1_000_000;
-        monitor.record_scan(5, 3);
+        monitor.record_scan(5, 3, Duration::from_millis(200));
 
         monitor.maybe_write_state(PressureLevel::Green, 30.0, "/data", 10, 10);
 
         let state = SelfMonitor::read_state(&path).unwrap();
-        assert_eq!(state.counters.scans, 42);
+        assert_eq!(state.counters.scans, 43);
         assert_eq!(state.counters.deletions, 7);
         assert!(state.last_scan.at.is_some());
         assert_eq!(state.last_scan.candidates, 5);
@@ -561,14 +604,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut monitor = SelfMonitor::new(dir.path().join("state.json"));
 
-        monitor.record_scan(10, 3);
+        monitor.record_scan(10, 3, Duration::from_millis(100));
         assert_eq!(monitor.scan_count, 1);
         assert_eq!(monitor.last_scan_candidates, 10);
         assert_eq!(monitor.last_scan_deleted, 3);
 
-        monitor.record_scan(5, 2);
+        monitor.record_scan(5, 2, Duration::from_millis(300));
         assert_eq!(monitor.scan_count, 2);
         assert_eq!(monitor.last_scan_candidates, 5);
+
+        // Average scan duration: (100ms + 300ms) / 2 = 200ms.
+        let avg = monitor.avg_scan_duration();
+        assert_eq!(avg, Duration::from_millis(200));
 
         monitor.record_deletions(3, 5000);
         monitor.record_deletions(2, 3000);
@@ -603,8 +650,9 @@ mod tests {
         assert!(status.is_healthy());
         assert_eq!(status.name(), "test-thread");
 
-        // With 0ms threshold, everything is "stalled".
-        let status = hb.status(Duration::ZERO);
+        // With a sub-millisecond threshold after a brief sleep, the heartbeat is stale.
+        std::thread::sleep(Duration::from_millis(2));
+        let status = hb.status(Duration::from_millis(1));
         assert!(!status.is_healthy());
     }
 
@@ -619,6 +667,71 @@ mod tests {
         // Should still be healthy with reasonable threshold.
         let status = hb.status(Duration::from_secs(60));
         assert!(status.is_healthy());
+    }
+
+    #[test]
+    fn avg_scan_duration_zero_when_no_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let monitor = SelfMonitor::new(dir.path().join("state.json"));
+        assert_eq!(monitor.avg_scan_duration(), Duration::ZERO);
+    }
+
+    #[test]
+    fn health_snapshot_includes_thread_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut monitor = SelfMonitor::new(dir.path().join("state.json"));
+        monitor.record_scan(10, 2, Duration::from_millis(150));
+        monitor.record_deletions(2, 5000);
+
+        let hb1 = ThreadHeartbeat::new("scanner");
+        let hb2 = ThreadHeartbeat::new("executor");
+        hb1.beat();
+        hb2.beat();
+
+        let health = monitor.health_snapshot(
+            &[Arc::clone(&hb1), Arc::clone(&hb2)],
+            Duration::from_secs(60),
+            PressureLevel::Green,
+        );
+
+        assert_eq!(health.scan_count, 1);
+        assert_eq!(health.avg_scan_duration, Duration::from_millis(150));
+        assert_eq!(health.deletions_total, 2);
+        assert_eq!(health.bytes_freed_total, 5000);
+        assert_eq!(health.thread_status.len(), 2);
+        assert!(health.thread_status.iter().all(|t| t.is_healthy()));
+        assert!(matches!(health.last_pressure_level, PressureLevel::Green));
+    }
+
+    #[test]
+    fn health_snapshot_detects_stalled_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let monitor = SelfMonitor::new(dir.path().join("state.json"));
+
+        let hb = ThreadHeartbeat::new("stalled-worker");
+        // Don't beat — with 1ms threshold after sleeping, it's stale.
+        std::thread::sleep(Duration::from_millis(5));
+
+        let health = monitor.health_snapshot(
+            &[Arc::clone(&hb)],
+            Duration::from_millis(1),
+            PressureLevel::Yellow,
+        );
+
+        assert_eq!(health.thread_status.len(), 1);
+        assert!(!health.thread_status[0].is_healthy());
+        assert_eq!(health.thread_status[0].name(), "stalled-worker");
+    }
+
+    #[test]
+    fn dead_thread_status_carries_error() {
+        let status = ThreadStatus::Dead {
+            name: "worker".to_string(),
+            died_at: Instant::now(),
+            error: "panicked at division by zero".to_string(),
+        };
+        assert!(!status.is_healthy());
+        assert_eq!(status.name(), "worker");
     }
 
     #[cfg(target_os = "linux")]
