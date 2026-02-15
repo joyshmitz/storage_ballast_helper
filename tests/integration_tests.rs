@@ -856,7 +856,7 @@ fn ballast_lifecycle() {
         ..BallastConfig::default()
     };
 
-    let mut manager = BallastManager::new(ballast_dir.clone(), config).expect("create manager");
+    let mut manager = BallastManager::new(ballast_dir, config).expect("create manager");
 
     // Provision.
     let prov = manager.provision(None).expect("provision");
@@ -914,8 +914,7 @@ fn walker_discovers_entries_in_tree() {
     // Directory "a" should be discovered.
     assert!(
         paths.iter().any(|p| p.ends_with("/a")),
-        "should discover directory 'a' in {:?}",
-        paths
+        "should discover directory 'a' in {paths:?}",
     );
 }
 
@@ -1113,7 +1112,7 @@ fn config_toml_roundtrip() {
     let tmpdir = tempfile::tempdir().expect("create temp dir");
     let config_path = tmpdir.path().join("sbh-test.toml");
 
-    let toml_content = r#"
+    let toml_content = r"
 [pressure]
 green_min_free_pct = 25.0
 yellow_min_free_pct = 18.0
@@ -1129,13 +1128,13 @@ dry_run = true
 [ballast]
 file_count = 5
 file_size_bytes = 536870912
-"#;
+";
 
     std::fs::write(&config_path, toml_content).expect("write toml");
     let cfg = Config::load(Some(&config_path)).expect("load config");
 
-    assert_eq!(cfg.pressure.green_min_free_pct, 25.0);
-    assert_eq!(cfg.pressure.yellow_min_free_pct, 18.0);
+    assert!((cfg.pressure.green_min_free_pct - 25.0).abs() < f64::EPSILON);
+    assert!((cfg.pressure.yellow_min_free_pct - 18.0).abs() < f64::EPSILON);
     assert_eq!(cfg.scanner.max_depth, 8);
     assert!(cfg.scanner.dry_run);
     assert_eq!(cfg.ballast.file_count, 5);
@@ -1200,8 +1199,7 @@ fn walker_skips_protected_directories() {
     // The file inside protected/ should not appear in results.
     assert!(
         !paths.iter().any(|p| p.contains("secret.txt")),
-        "protected directory contents should be skipped: {:?}",
-        paths
+        "protected directory contents should be skipped: {paths:?}",
     );
 }
 
@@ -1307,22 +1305,29 @@ fn e2e_candidate(path: &str, size_gb: u64, age_hours: u64, confidence: f64) -> C
 
 fn e2e_good_observations(count: usize) -> Vec<CalibrationObservation> {
     (0..count)
-        .map(|i| CalibrationObservation {
-            predicted_rate: 1000.0 + (i as f64 * 10.0),
-            actual_rate: 1050.0 + (i as f64 * 10.0),
-            predicted_tte: 90.0 + (i as f64),
-            actual_tte: 85.0 + (i as f64),
+        .map(|i| {
+            let idx = f64::from(u32::try_from(i).expect("index fits in u32"));
+            CalibrationObservation {
+                predicted_rate: idx.mul_add(10.0, 1000.0),
+                actual_rate: idx.mul_add(10.0, 1050.0),
+                predicted_tte: 90.0 + idx,
+                actual_tte: 85.0 + idx,
+            }
         })
         .collect()
 }
 
 fn e2e_bad_observations(count: usize, error_factor: f64) -> Vec<CalibrationObservation> {
     (0..count)
-        .map(|i| CalibrationObservation {
-            predicted_rate: 1000.0 + (i as f64 * 10.0),
-            actual_rate: (1000.0 + (i as f64 * 10.0)) * error_factor,
-            predicted_tte: 100.0,
-            actual_tte: 30.0,
+        .map(|i| {
+            let idx = f64::from(u32::try_from(i).expect("index fits in u32"));
+            let predicted_rate = idx.mul_add(10.0, 1000.0);
+            CalibrationObservation {
+                predicted_rate,
+                actual_rate: predicted_rate * error_factor,
+                predicted_tte: 100.0,
+                actual_tte: 30.0,
+            }
         })
         .collect()
 }
@@ -1414,12 +1419,12 @@ fn e2e_scenario_1_burst_growth_shadow_safe() {
     }
 
     // Phase 2: Score a burst of high-confidence candidates.
-    let candidates: Vec<CandidateInput> = (0..10)
+    let candidates: Vec<CandidateInput> = (0_u64..10)
         .map(|i| {
             e2e_candidate(
                 &format!("/data/projects/agent_{i}/.target_opus"),
-                2 + i as u64,
-                48 + i as u64 * 12,
+                2 + i,
+                48 + i * 12,
                 0.9,
             )
         })
@@ -1481,15 +1486,8 @@ fn e2e_scenario_2_canary_bounded_impact() {
     assert_eq!(policy.mode(), ActiveMode::Canary);
 
     // Score candidates.
-    let candidates: Vec<CandidateInput> = (0..8)
-        .map(|i| {
-            e2e_candidate(
-                &format!("/data/projects/proj_{i}/target"),
-                1 + i as u64,
-                72,
-                0.85,
-            )
-        })
+    let candidates: Vec<CandidateInput> = (0_u64..8)
+        .map(|i| e2e_candidate(&format!("/data/projects/proj_{i}/target"), 1 + i, 72, 0.85))
         .collect();
 
     let scored = scoring.score_batch(&candidates, 0.7);
@@ -1697,8 +1695,7 @@ fn e2e_scenario_6_progressive_recovery() {
     assert_eq!(
         mode,
         ActiveMode::Enforce,
-        "after recovery should return to pre-fallback mode (enforce), got {:?}",
-        mode
+        "after recovery should return to pre-fallback mode (enforce), got {mode:?}",
     );
 
     // Fallback reason should be cleared after recovery.

@@ -208,7 +208,7 @@ impl DeletionExecutor {
             if self.config.dry_run {
                 report.items_deleted += 1;
                 report.bytes_freed += candidate.size_bytes;
-                self.log_dry_run(candidate);
+                Self::log_dry_run(candidate);
                 continue;
             }
 
@@ -320,15 +320,9 @@ impl DeletionExecutor {
         });
     }
 
-    fn log_dry_run(&self, candidate: &CandidacyScore) {
-        self.log_event(ActivityEvent::ScanCompleted {
-            paths_scanned: 0,
-            candidates_found: 1,
-            duration_ms: 0,
-        });
-        // In dry-run, log as an informational scan event rather than an actual delete.
-        // The ArtifactDeleted event is reserved for real deletions.
-        let _ = candidate; // Details already logged via the scan event.
+    fn log_dry_run(_candidate: &CandidacyScore) {
+        // Dry-run candidates are displayed at the CLI level; no audit event is
+        // emitted to avoid polluting the stats engine (ScanCompleted counts, etc.).
     }
 }
 
@@ -352,9 +346,8 @@ fn is_path_open(target: &Path) -> bool {
 
 #[cfg(target_os = "linux")]
 fn is_path_open_linux(target: &Path) -> bool {
-    let target_str = match target.canonicalize() {
-        Ok(p) => p.to_string_lossy().to_string(),
-        Err(_) => return false,
+    let Ok(target_canon) = target.canonicalize() else {
+        return false;
     };
 
     let proc = Path::new("/proc");
@@ -376,16 +369,36 @@ fn is_path_open_linux(target: &Path) -> bool {
         };
 
         for fd_entry in fds.flatten() {
-            if let Ok(link_target) = fs::read_link(fd_entry.path()) {
-                let link_str = link_target.to_string_lossy();
-                if link_str.starts_with(&target_str) {
-                    return true;
-                }
+            if let Ok(link_target) = fs::read_link(fd_entry.path())
+                && fd_link_matches_target(&target_canon, &link_target)
+            {
+                return true;
             }
         }
     }
 
     false
+}
+
+#[cfg(target_os = "linux")]
+fn fd_link_matches_target(target_canon: &Path, fd_link: &Path) -> bool {
+    let Some(link_path) = normalize_fd_link_path(fd_link) else {
+        return false;
+    };
+    link_path == target_canon || link_path.starts_with(target_canon)
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_fd_link_path(fd_link: &Path) -> Option<PathBuf> {
+    let raw = fd_link.to_string_lossy();
+    let trimmed = raw
+        .strip_suffix(" (deleted)")
+        .unwrap_or_else(|| raw.as_ref());
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let path = Path::new(trimmed);
+    Some(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
 }
 
 // ──────────────────── conversions ────────────────────
@@ -679,5 +692,29 @@ mod tests {
         let report = executor.execute(&plan, None);
         assert_eq!(report.items_deleted, 1);
         assert_eq!(report.items_skipped, 1);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fd_link_matching_requires_component_boundary() {
+        let target = Path::new("/tmp/sbh-target");
+        assert!(super::fd_link_matches_target(
+            target,
+            Path::new("/tmp/sbh-target/build/output.o")
+        ));
+        assert!(!super::fd_link_matches_target(
+            target,
+            Path::new("/tmp/sbh-target-2/build/output.o")
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fd_link_matching_accepts_deleted_suffix() {
+        let target = Path::new("/tmp/sbh-target");
+        assert!(super::fd_link_matches_target(
+            target,
+            Path::new("/tmp/sbh-target/build/output.o (deleted)")
+        ));
     }
 }

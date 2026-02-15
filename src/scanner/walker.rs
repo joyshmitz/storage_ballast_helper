@@ -594,8 +594,8 @@ mod tests {
         let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
         let entries = walker.walk().unwrap();
 
-        let paths: Vec<_> = entries.iter().map(|e| e.path.clone()).collect();
-        assert!(paths.contains(&tmp.path().join("empty")));
+        let empty_dir = tmp.path().join("empty");
+        assert!(entries.iter().map(|e| &e.path).any(|p| p == &empty_dir));
     }
 
     #[test]
@@ -668,6 +668,7 @@ mod tests {
         let prot = walker.protection().read();
         assert!(prot.is_protected(&protected));
         assert!(prot.is_protected(&protected.join("subdir")));
+        drop(prot);
     }
 
     #[test]

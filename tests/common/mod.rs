@@ -10,6 +10,7 @@
 // Not every test binary uses every item; suppress dead-code warnings for the shared module.
 #![allow(dead_code)]
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -85,11 +86,11 @@ fn run_cli_case_with_env_inner(
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
     let mut log_content = String::new();
-    log_content.push_str(&format!("case={case_name}\n"));
-    log_content.push_str(&format!("bin={}\n", bin_path.display()));
-    log_content.push_str(&format!("args={args:?}\n"));
-    log_content.push_str(&format!("env_overrides={env_overrides:?}\n"));
-    log_content.push_str(&format!("status={}\n", output.status));
+    let _ = writeln!(log_content, "case={case_name}");
+    let _ = writeln!(log_content, "bin={}", bin_path.display());
+    let _ = writeln!(log_content, "args={args:?}");
+    let _ = writeln!(log_content, "env_overrides={env_overrides:?}");
+    let _ = writeln!(log_content, "status={}", output.status);
     log_content.push_str("----- stdout -----\n");
     log_content.push_str(&stdout);
     log_content.push('\n');

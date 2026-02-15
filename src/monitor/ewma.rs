@@ -275,12 +275,9 @@ mod tests {
         let _ = estimator.update(100_000, t0, 10_000);
 
         let mut prev_conf = 0.0;
-        for i in 1..=10 {
-            let reading = estimator.update(
-                100_000 - i * 1_000,
-                t0 + Duration::from_secs(i as u64),
-                10_000,
-            );
+        for i in 1_u64..=10 {
+            let reading =
+                estimator.update(100_000 - i * 1_000, t0 + Duration::from_secs(i), 10_000);
             // Confidence should generally increase (monotonic for steady input).
             if i >= 3 {
                 assert!(
@@ -307,12 +304,9 @@ mod tests {
         // Feed steady 1000 bytes/sec consumption.
         // EWMA needs several samples to converge; acceleration drops below
         // threshold after ~8 steady samples.
-        for i in 1..=15 {
-            let reading = estimator.update(
-                100_000 - i * 1_000,
-                t0 + Duration::from_secs(i as u64),
-                10_000,
-            );
+        for i in 1_u64..=15 {
+            let reading =
+                estimator.update(100_000 - i * 1_000, t0 + Duration::from_secs(i), 10_000);
             if i >= 10 {
                 assert_eq!(
                     reading.trend,

@@ -117,11 +117,10 @@ impl AssetCache {
     /// Path where an asset would be cached.
     #[must_use]
     pub fn asset_path(&self, entry: &AssetEntry) -> PathBuf {
-        let filename = url_filename(&entry.url);
-        self.root
-            .join(&entry.name)
-            .join(&entry.version)
-            .join(filename)
+        let filename = safe_cache_component(&url_filename(&entry.url));
+        let safe_name = safe_cache_component(&entry.name);
+        let safe_version = safe_cache_component(&entry.version);
+        self.root.join(safe_name).join(safe_version).join(filename)
     }
 
     /// Path for the partial/in-progress download.
@@ -198,7 +197,10 @@ impl AssetCache {
         let valid_dirs: std::collections::HashSet<PathBuf> = manifest
             .assets
             .iter()
-            .map(|a| PathBuf::from(&a.name).join(&a.version))
+            .map(|a| {
+                PathBuf::from(safe_cache_component(&a.name))
+                    .join(safe_cache_component(&a.version))
+            })
             .collect();
 
         if !self.root.exists() {
@@ -926,6 +928,23 @@ fn url_filename(url: &str) -> String {
         .to_string()
 }
 
+fn safe_cache_component(raw: &str) -> String {
+    let mut sanitized = String::with_capacity(raw.len().max(1));
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        "_".to_string()
+    } else {
+        sanitized
+    }
+}
+
 /// Canonical manifest location inside an offline bundle root.
 #[must_use]
 pub fn bundle_manifest_path(bundle_root: &Path) -> PathBuf {
@@ -1378,7 +1397,7 @@ mod tests {
         // Intentionally unsorted input to validate deterministic output order.
         let manifest = AssetManifest {
             version: "1.0.0".to_string(),
-            assets: vec![zeta.clone(), alpha.clone()],
+            assets: vec![zeta, alpha],
         };
 
         let report = build_offline_bundle(&manifest, &cache, bundle_tmp.path()).unwrap();
@@ -1533,10 +1552,11 @@ mod tests {
             .join(filename);
         fs::create_dir_all(bundle_path.parent().unwrap()).unwrap();
         fs::write(&bundle_path, bytes).unwrap();
+        let expected_cache_path = cache.asset_path(&entry);
 
         let manifest = AssetManifest {
             version: "1.0.0".to_string(),
-            assets: vec![entry.clone()],
+            assets: vec![entry],
         };
         let opts = FetchOptions {
             offline: true,
@@ -1549,7 +1569,7 @@ mod tests {
         assert_eq!(summary.downloaded_count, 1);
         assert_eq!(summary.results[0].status, FetchStatus::Downloaded);
         assert!(summary.results[0].message.contains("restored from bundle"));
-        assert_eq!(fs::read(cache.asset_path(&entry)).unwrap(), bytes);
+        assert_eq!(fs::read(expected_cache_path).unwrap(), bytes);
     }
 
     #[test]
@@ -1994,6 +2014,69 @@ mod tests {
             "model.bin"
         );
         assert_eq!(url_filename("model.bin"), "model.bin");
+    }
+
+    #[test]
+    fn asset_path_sanitizes_manifest_path_components() {
+        let tmp = TempDir::new().unwrap();
+        let cache = AssetCache::new(tmp.path().to_path_buf());
+        let entry = AssetEntry {
+            name: "../outside".to_string(),
+            version: "..".to_string(),
+            sha256: sha256_of(b""),
+            url: "https://example.com/evil.bin".to_string(),
+            mirrors: vec![],
+            size_bytes: 0,
+            required: true,
+            description: String::new(),
+        };
+
+        let path = cache.asset_path(&entry);
+        assert!(
+            path.starts_with(tmp.path()),
+            "asset path must remain under cache root"
+        );
+
+        let rel = path.strip_prefix(tmp.path()).unwrap();
+        assert_eq!(rel.components().count(), 3);
+        assert!(!rel.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }));
+    }
+
+    #[test]
+    fn cleanup_stale_respects_sanitized_manifest_components() {
+        let tmp = TempDir::new().unwrap();
+        let cache = AssetCache::new(tmp.path().to_path_buf());
+
+        let entry = AssetEntry {
+            name: "../outside".to_string(),
+            version: "..".to_string(),
+            sha256: sha256_of(b"cached"),
+            url: "https://example.com/model.bin".to_string(),
+            mirrors: vec![],
+            size_bytes: 6,
+            required: true,
+            description: String::new(),
+        };
+
+        let cached_path = cache.asset_path(&entry);
+        fs::create_dir_all(cached_path.parent().unwrap()).unwrap();
+        fs::write(&cached_path, b"cached").unwrap();
+
+        let manifest = AssetManifest {
+            version: "1.0.0".to_string(),
+            assets: vec![entry],
+        };
+
+        let report = cache.cleanup_stale(&manifest).unwrap();
+        assert_eq!(report.removed_count, 0);
+        assert!(cached_path.exists());
     }
 
     #[test]

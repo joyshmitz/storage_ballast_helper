@@ -18,8 +18,7 @@ use storage_ballast_helper::scanner::walker::{DirectoryWalker, WalkerConfig};
 fn main() {
     let scan_root = std::env::args()
         .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
 
     println!("Scanning: {}", scan_root.display());
 
@@ -46,7 +45,7 @@ fn main() {
     let mut candidates: Vec<CandidateInput> = Vec::new();
     for entry in &entries {
         if entry.metadata.is_dir {
-            let classification = registry.classify(&entry.path, entry.structural_signals.clone());
+            let classification = registry.classify(&entry.path, entry.structural_signals);
             let age = now
                 .duration_since(entry.metadata.modified)
                 .unwrap_or_default();
@@ -55,7 +54,7 @@ fn main() {
                 size_bytes: entry.metadata.size_bytes,
                 age,
                 classification,
-                signals: entry.structural_signals.clone(),
+                signals: entry.structural_signals,
                 is_open: entry.is_open,
                 excluded: false,
             });

@@ -640,8 +640,7 @@ mod tests {
         join.join().unwrap();
 
         let contents = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
-        let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), 3);
+        assert_eq!(contents.lines().count(), 3);
 
         // Check SQLite too.
         #[cfg(feature = "sqlite")]
@@ -674,8 +673,7 @@ mod tests {
         join.join().unwrap();
 
         let contents = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
-        let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(contents.lines().count(), 2);
     }
 
     #[test]

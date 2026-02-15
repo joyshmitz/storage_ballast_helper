@@ -17,8 +17,7 @@ use storage_ballast_helper::platform::pal::detect_platform;
 fn main() {
     let monitor_path = std::env::args()
         .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"));
+        .map_or_else(|| PathBuf::from("/"), PathBuf::from);
 
     println!("Monitoring: {}", monitor_path.display());
 
@@ -47,8 +46,14 @@ fn main() {
     for i in 0..5 {
         let stats = collector.collect(&monitor_path).expect("collect fs stats");
         let now = Instant::now();
-        let threshold_bytes =
-            (stats.total_bytes as f64 * config.pressure.red_min_free_pct / 100.0) as u64;
+        let red_pct = config.pressure.red_min_free_pct.clamp(0.0, 100.0);
+        let red_basis_points = format!("{:.0}", red_pct * 100.0)
+            .parse::<u64>()
+            .unwrap_or(500);
+        let threshold_bytes = stats
+            .total_bytes
+            .saturating_mul(red_basis_points)
+            .saturating_div(10_000);
         let estimate = estimator.update(stats.free_bytes, now, threshold_bytes);
 
         let reading = PressureReading {

@@ -770,7 +770,7 @@ mod tests {
         );
         assert_eq!(record.size_bytes, 3_500_000_000);
         assert_eq!(record.age_secs, 5 * 3600);
-        assert_eq!(record.total_score, 2.15);
+        assert_eq!(record.total_score.to_bits(), 2.15_f64.to_bits());
         assert_eq!(record.action, ActionRecord::Delete);
         assert_eq!(record.policy_mode, PolicyMode::Shadow);
         assert!(!record.vetoed);
@@ -794,7 +794,7 @@ mod tests {
         assert!(record.vetoed);
         assert_eq!(record.veto_reason.as_deref(), Some("path contains .git"));
         assert_eq!(record.action, ActionRecord::Keep);
-        assert_eq!(record.total_score, 0.0);
+        assert_eq!(record.total_score.to_bits(), 0.0_f64.to_bits());
         assert!(record.factor_contributions.is_empty());
     }
 
@@ -894,8 +894,11 @@ mod tests {
         assert_eq!(parsed.decision_id, record.decision_id);
         assert_eq!(parsed.path, record.path);
         assert_eq!(parsed.action, record.action);
-        assert_eq!(parsed.total_score, record.total_score);
-        assert_eq!(parsed.posterior_abandoned, record.posterior_abandoned);
+        assert_eq!(parsed.total_score.to_bits(), record.total_score.to_bits());
+        assert_eq!(
+            parsed.posterior_abandoned.to_bits(),
+            record.posterior_abandoned.to_bits()
+        );
         assert_eq!(parsed.factor_contributions.len(), 5);
     }
 
@@ -1069,9 +1072,12 @@ mod tests {
         // Roundtrip through JSON.
         let json = record.to_json_compact();
         let parsed: DecisionRecord = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.total_score, record.total_score);
+        assert_eq!(parsed.total_score.to_bits(), record.total_score.to_bits());
         assert_eq!(parsed.action, record.action);
-        assert_eq!(parsed.posterior_abandoned, record.posterior_abandoned);
+        assert_eq!(
+            parsed.posterior_abandoned.to_bits(),
+            record.posterior_abandoned.to_bits()
+        );
 
         // Explain at all levels.
         for level in [

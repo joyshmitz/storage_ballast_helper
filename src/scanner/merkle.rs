@@ -309,17 +309,14 @@ impl MerkleScanIndex {
             .collect();
 
         for (path, fresh_snap) in &fresh_snapshots {
-            if budget_exhausted {
-                deferred.push(path.clone());
-                continue;
-            }
-
             match self.snapshots.get(path) {
                 None => {
                     // New path not in previous index.
-                    new_paths.push(path.clone());
-                    if !budget.try_consume() {
+                    if budget.try_consume() {
+                        new_paths.push(path.clone());
+                    } else {
                         budget_exhausted = true;
+                        deferred.push(path.clone());
                     }
                 }
                 Some(old_snap) => {
@@ -452,9 +449,72 @@ impl MerkleScanIndex {
 
     /// Remove paths from the index that no longer exist.
     pub fn remove_paths(&mut self, paths: &[PathBuf]) {
+        let mut ancestors_to_refresh = Vec::new();
         for path in paths {
             self.nodes.remove(path);
             self.snapshots.remove(path);
+            let mut current = path.parent();
+            while let Some(parent) = current {
+                if self
+                    .root_paths
+                    .iter()
+                    .any(|root| parent.starts_with(root) || root.starts_with(parent))
+                {
+                    ancestors_to_refresh.push(parent.to_path_buf());
+                }
+                if self.root_paths.iter().any(|root| root == parent) {
+                    break;
+                }
+                current = parent.parent();
+            }
+        }
+
+        if ancestors_to_refresh.is_empty() {
+            return;
+        }
+
+        let mut children_map: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+        for path in self.snapshots.keys() {
+            if let Some(parent) = path.parent() {
+                children_map
+                    .entry(parent.to_path_buf())
+                    .or_default()
+                    .push(path.clone());
+            }
+        }
+        for children in children_map.values_mut() {
+            children.sort();
+        }
+
+        ancestors_to_refresh.sort();
+        ancestors_to_refresh.dedup();
+        ancestors_to_refresh.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+
+        for path in ancestors_to_refresh {
+            let has_snapshot = self.snapshots.contains_key(&path);
+            let has_children = children_map.contains_key(&path);
+            if !has_snapshot && !has_children {
+                self.nodes.remove(&path);
+                continue;
+            }
+
+            let metadata_hash = self
+                .snapshots
+                .get(&path)
+                .map_or(ZERO_HASH, EntrySnapshot::metadata_hash);
+            let children = children_map.get(&path).cloned().unwrap_or_default();
+            let depth = path.components().count().saturating_sub(1);
+            let subtree_hash = compute_subtree_hash(metadata_hash, &children, &self.nodes);
+
+            self.nodes.insert(
+                path,
+                MerkleNode {
+                    metadata_hash,
+                    subtree_hash,
+                    depth,
+                    children,
+                },
+            );
         }
     }
 
@@ -802,6 +862,29 @@ mod tests {
     }
 
     #[test]
+    fn diff_defers_new_paths_when_budget_exhausted() {
+        let original = vec![make_entry("/data/target", 4096, 1000, 1)];
+        let roots = vec![PathBuf::from("/data")];
+
+        let mut index = MerkleScanIndex::new();
+        index.build_from_entries(&original, &roots);
+
+        let fresh = vec![
+            make_entry("/data/target", 4096, 1000, 1),
+            make_entry("/data/target/new_a", 4096, 3000, 2),
+            make_entry("/data/target/new_b", 4096, 3001, 2),
+        ];
+
+        // Only one new-path update allowed.
+        let mut budget = ScanBudget::new(1, 0);
+        let diff = index.diff(&fresh, &mut budget);
+
+        assert!(diff.budget_exhausted);
+        assert_eq!(diff.new_paths.len(), 1);
+        assert_eq!(diff.deferred_paths.len(), 1);
+    }
+
+    #[test]
     fn diff_detects_removed_path() {
         let original = vec![
             make_entry("/data/target", 4096, 1000, 1),
@@ -849,6 +932,33 @@ mod tests {
         assert!(diff.budget_exhausted);
         assert_eq!(diff.deferred_paths.len(), 2);
         assert_eq!(diff.health, IndexHealth::Degraded);
+    }
+
+    #[test]
+    fn diff_budget_exhaustion_does_not_defer_unchanged_paths() {
+        let original = vec![
+            make_entry("/data/a", 4096, 1000, 1),
+            make_entry("/data/b", 4096, 1000, 1),
+            make_entry("/data/c", 4096, 1000, 1),
+        ];
+        let roots = vec![PathBuf::from("/data")];
+
+        let mut index = MerkleScanIndex::new();
+        index.build_from_entries(&original, &roots);
+
+        let fresh = vec![
+            make_entry("/data/a", 4096, 2000, 1),
+            make_entry("/data/b", 4096, 2000, 1),
+            make_entry("/data/c", 4096, 1000, 1),
+        ];
+
+        let mut budget = ScanBudget::new(1, 0);
+        let diff = index.diff(&fresh, &mut budget);
+
+        assert!(diff.budget_exhausted);
+        assert_eq!(diff.changed_paths.len(), 1);
+        assert_eq!(diff.deferred_paths, vec![PathBuf::from("/data/b")]);
+        assert_eq!(diff.unchanged_count, 1);
     }
 
     #[test]
@@ -1019,6 +1129,25 @@ mod tests {
         assert_eq!(index.entry_count(), 1);
         assert!(index.subtree_hash(Path::new("/data/a")).is_none());
         assert!(index.subtree_hash(Path::new("/data/b")).is_some());
+    }
+
+    #[test]
+    fn remove_paths_rehashes_ancestors_after_child_removal() {
+        let entries = vec![
+            make_entry("/data/parent", 4096, 1000, 1),
+            make_entry("/data/parent/a", 4096, 1000, 2),
+            make_entry("/data/parent/b", 4096, 1000, 2),
+        ];
+        let roots = vec![PathBuf::from("/data")];
+
+        let mut index = MerkleScanIndex::new();
+        index.build_from_entries(&entries, &roots);
+        let before = index.subtree_hash(Path::new("/data/parent")).unwrap();
+
+        index.remove_paths(&[PathBuf::from("/data/parent/b")]);
+
+        let after = index.subtree_hash(Path::new("/data/parent")).unwrap();
+        assert_ne!(before, after);
     }
 
     #[test]

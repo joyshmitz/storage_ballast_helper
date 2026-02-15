@@ -636,15 +636,21 @@ mod tests {
     fn deletion_stats_computed_correctly() {
         let (_dir, db) = temp_db();
         // Insert 5 successful deletions in the last 5 minutes.
-        let sizes = [1_000_000i64, 2_000_000, 3_000_000, 4_000_000, 5_000_000];
-        for (i, &size) in sizes.iter().enumerate() {
+        let samples = [
+            (1_i64, 1_000_000_i64, 0.80_f64),
+            (2, 2_000_000, 0.82),
+            (3, 3_000_000, 0.84),
+            (4, 4_000_000, 0.86),
+            (5, 5_000_000, 0.88),
+        ];
+        for &(minutes_ago, size, score) in &samples {
             db.log_activity(&ActivityRow {
-                timestamp: ts(i as i64 + 1),
+                timestamp: ts(minutes_ago),
                 event_type: "artifact_delete".to_string(),
                 severity: "info".to_string(),
-                path: Some(format!("/data/p{i}/.target_opus")),
+                path: Some(format!("/data/p{minutes_ago}/.target_opus")),
                 size_bytes: Some(size),
-                score: Some(0.8 + (i as f64) * 0.02),
+                score: Some(score),
                 score_factors: None,
                 pressure_level: Some("orange".to_string()),
                 free_pct: Some(8.0),
@@ -742,13 +748,17 @@ mod tests {
     fn pressure_stats_time_in_level() {
         let (_dir, db) = temp_db();
         // Simulate: green for 5 min, then orange for 3 min, then green for 2 min.
-        let samples = [(8, "green", 25.0), (3, "orange", 7.0), (1, "green", 22.0)];
-        for &(mins_ago, level, free_pct) in &samples {
+        let samples = [
+            (8_i64, "green", 25.0_f64, 125_000_000_000_i64),
+            (3, "orange", 7.0, 35_000_000_000),
+            (1, "green", 22.0, 110_000_000_000),
+        ];
+        for &(mins_ago, level, free_pct, free_bytes) in &samples {
             db.log_pressure(&PressureRow {
                 timestamp: ts(mins_ago),
                 mount_point: "/data".to_string(),
                 total_bytes: 500_000_000_000,
-                free_bytes: (500_000_000_000.0 * free_pct / 100.0) as i64,
+                free_bytes,
                 free_pct,
                 rate_bytes_per_sec: None,
                 pressure_level: level.to_string(),
@@ -787,9 +797,9 @@ mod tests {
             "/data/p5/target",
             "/data/p6/cargo-target-foo",
         ];
-        for (i, path) in paths.iter().enumerate() {
+        for (minutes_ago, path) in (1_i64..).zip(paths.iter()) {
             db.log_activity(&ActivityRow {
-                timestamp: ts(i as i64 + 1),
+                timestamp: ts(minutes_ago),
                 event_type: "artifact_delete".to_string(),
                 severity: "info".to_string(),
                 path: Some(path.to_string()),
@@ -824,13 +834,13 @@ mod tests {
     #[test]
     fn top_deletions_by_size() {
         let (_dir, db) = temp_db();
-        for i in 0..5 {
+        for i in 0_i64..5_i64 {
             db.log_activity(&ActivityRow {
                 timestamp: ts(i + 1),
                 event_type: "artifact_delete".to_string(),
                 severity: "info".to_string(),
                 path: Some(format!("/data/p{i}/target")),
-                size_bytes: Some(1_000_000 * (i as i64 + 1)),
+                size_bytes: Some(1_000_000 * (i + 1)),
                 score: Some(0.8),
                 score_factors: None,
                 pressure_level: None,
@@ -878,8 +888,8 @@ mod tests {
         assert_eq!(window_label(Duration::from_secs(3600)), "1 hour");
         assert_eq!(window_label(Duration::from_secs(21600)), "6 hours");
         assert_eq!(window_label(Duration::from_secs(86400)), "1 day");
-        assert_eq!(window_label(Duration::from_secs(259200)), "3 days");
-        assert_eq!(window_label(Duration::from_secs(604800)), "7 days");
+        assert_eq!(window_label(Duration::from_secs(259_200)), "3 days");
+        assert_eq!(window_label(Duration::from_secs(604_800)), "7 days");
     }
 
     #[test]

@@ -362,15 +362,16 @@ impl JsonlWriter {
             _ => return,
         };
 
-        // Shift existing rotations: .5→delete, .4→.5, .3→.4, …, .1→.2, current→.1
+        // Delete the oldest rotation first, then shift: .4→.5, .3→.4, …, .1→.2.
+        // Deleting before shifting prevents silent overwrite of the oldest file.
+        let oldest = rotated_name(base, self.config.max_rotated_files);
+        let _ = fs::remove_file(&oldest);
+
         for i in (1..self.config.max_rotated_files).rev() {
             let from = rotated_name(base, i);
             let to = rotated_name(base, i + 1);
             let _ = rename(&from, &to);
         }
-        // Delete the oldest if it exceeds max.
-        let oldest = rotated_name(base, self.config.max_rotated_files);
-        let _ = fs::remove_file(&oldest);
 
         // Rename current → .1
         let _ = rename(base, rotated_name(base, 1));

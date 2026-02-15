@@ -372,7 +372,9 @@ mod tests {
     fn watchdog_fires_after_interval() {
         let mut wd = WatchdogHeartbeat {
             interval: Duration::from_millis(1),
-            last_beat: Instant::now() - Duration::from_secs(1),
+            last_beat: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("1s subtraction should be representable"),
             enabled: true,
         };
         // Interval has elapsed, should fire (sd_notify is no-op without NOTIFY_SOCKET).

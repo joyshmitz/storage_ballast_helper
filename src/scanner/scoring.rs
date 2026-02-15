@@ -148,11 +148,18 @@ impl ScoringEngine {
 
         let posterior_abandoned =
             posterior_from_score(total, input.classification.combined_confidence);
-        let expected_loss_keep = posterior_abandoned * self.false_negative_loss;
-        let expected_loss_delete = (1.0 - posterior_abandoned) * self.false_positive_loss;
+        let base_expected_loss_keep = posterior_abandoned * self.false_negative_loss;
+        let base_expected_loss_delete = (1.0 - posterior_abandoned) * self.false_positive_loss;
         let calibration = calibration_score(input.classification.combined_confidence, factors);
         let fallback_active = calibration < self.calibration_floor;
         let uncertainty = epistemic_uncertainty(posterior_abandoned, calibration);
+        let (expected_loss_keep, expected_loss_delete) = uncertainty_adjusted_losses(
+            base_expected_loss_keep,
+            base_expected_loss_delete,
+            posterior_abandoned,
+            calibration,
+            uncertainty,
+        );
 
         let action = decide_action(
             total,
@@ -168,6 +175,8 @@ impl ScoringEngine {
             factors,
             self.weights,
             posterior_abandoned,
+            base_expected_loss_keep,
+            base_expected_loss_delete,
             expected_loss_keep,
             expected_loss_delete,
             calibration,
@@ -397,6 +406,28 @@ fn calibration_score(classification_confidence: f64, factors: ScoreFactors) -> f
         .clamp(0.0, 1.0)
 }
 
+fn uncertainty_adjusted_losses(
+    base_keep_loss: f64,
+    base_delete_loss: f64,
+    posterior_abandoned: f64,
+    calibration: f64,
+    uncertainty: f64,
+) -> (f64, f64) {
+    let posterior = posterior_abandoned.clamp(0.0, 1.0);
+    let calibration_penalty = 1.0 - calibration.clamp(0.0, 1.0);
+    let uncertainty = uncertainty.clamp(0.0, 1.0);
+
+    let uncertainty_discount = 0.5f64.mul_add(-uncertainty, 1.0);
+    let keep_multiplier = (posterior * uncertainty_discount).mul_add(0.80, 1.0);
+    let delete_slope = 0.90f64.mul_add(calibration_penalty, 0.90).max(0.90);
+    let delete_multiplier = uncertainty.mul_add(delete_slope, 1.0);
+
+    (
+        base_keep_loss * keep_multiplier,
+        base_delete_loss * delete_multiplier,
+    )
+}
+
 fn decide_action(
     total_score: f64,
     min_score: f64,
@@ -411,13 +442,13 @@ fn decide_action(
     }
     let uncertainty = epistemic_uncertainty(posterior_abandoned, calibration);
     let decision_margin = (keep_loss - delete_loss).abs();
-    let review_band = (1.0 - calibration).mul_add(1.5, 4.0f64.mul_add(uncertainty, 1.5));
+    let review_band = (1.0 - calibration).mul_add(2.0, 5.0f64.mul_add(uncertainty, 1.0));
     if decision_margin <= review_band {
         DecisionAction::Review
     } else if delete_loss < keep_loss {
         let min_delete_posterior =
-            0.55f64.mul_add(1.0, (1.0 - calibration).mul_add(0.25, 0.15 * uncertainty));
-        if posterior_abandoned >= min_delete_posterior.clamp(0.55, 0.90) {
+            (1.0 - calibration.clamp(0.0, 1.0)).mul_add(0.20, 0.20f64.mul_add(uncertainty, 0.60));
+        if posterior_abandoned >= min_delete_posterior.clamp(0.60, 0.95) {
             DecisionAction::Delete
         } else {
             DecisionAction::Review
@@ -441,6 +472,8 @@ fn build_ledger(
     factors: ScoreFactors,
     weights: ScoringWeights,
     posterior_abandoned: f64,
+    base_expected_loss_keep: f64,
+    base_expected_loss_delete: f64,
     expected_loss_keep: f64,
     expected_loss_delete: f64,
     calibration: f64,
@@ -484,11 +517,24 @@ fn build_ledger(
             value: factors.pressure_multiplier,
             contribution: factors.pressure_multiplier,
         },
+        EvidenceTerm {
+            name: "calibration",
+            weight: 1.0,
+            value: calibration,
+            contribution: calibration,
+        },
+        EvidenceTerm {
+            name: "uncertainty",
+            weight: 1.0,
+            value: uncertainty,
+            contribution: uncertainty,
+        },
     ];
     let decision_margin = expected_loss_keep - expected_loss_delete;
     let summary = format!(
         "posterior_abandoned={posterior_abandoned:.3}; keep_loss={expected_loss_keep:.2}; \
-delete_loss={expected_loss_delete:.2}; loss_margin={decision_margin:.2}; \
+delete_loss={expected_loss_delete:.2}; base_keep_loss={base_expected_loss_keep:.2}; \
+base_delete_loss={base_expected_loss_delete:.2}; loss_margin={decision_margin:.2}; \
 uncertainty={uncertainty:.3}; calibration={calibration:.3}; action={action:?}"
     );
     EvidenceLedger { terms, summary }
@@ -668,5 +714,14 @@ mod tests {
     fn decision_boundary_allows_delete_when_margin_and_confidence_are_strong() {
         let action = super::decide_action(1.6, 0.45, 28.0, 4.0, 0.93, 0.90, false);
         assert_eq!(action, DecisionAction::Delete);
+    }
+
+    #[test]
+    fn uncertainty_adjustment_penalizes_delete_loss_more_than_keep_loss() {
+        let (keep_loss, delete_loss) =
+            super::uncertainty_adjusted_losses(24.0, 10.0, 0.80, 0.50, 0.90);
+        assert!(keep_loss > 24.0);
+        assert!(delete_loss > 10.0);
+        assert!(delete_loss - 10.0 > keep_loss - 24.0);
     }
 }

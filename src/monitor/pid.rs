@@ -365,7 +365,7 @@ mod tests {
             free_bytes: 100,
             total_bytes: 0,
         };
-        assert_eq!(reading.free_pct(), 0.0);
+        assert!(reading.free_pct().abs() < f64::EPSILON);
     }
 
     #[test]

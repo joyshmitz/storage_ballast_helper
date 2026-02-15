@@ -147,19 +147,19 @@ impl ThreadHeartbeat {
 
         #[allow(clippy::cast_possible_truncation)]
         let threshold_ms = stall_threshold.as_millis() as u64;
+        let approx_instant = Instant::now()
+            .checked_sub(Duration::from_millis(elapsed_ms))
+            .unwrap_or_else(Instant::now);
+
         if elapsed_ms > threshold_ms {
             ThreadStatus::Stalled {
                 name: self.name.clone(),
-                stalled_since: Instant::now()
-                    .checked_sub(Duration::from_millis(elapsed_ms))
-                    .unwrap(),
+                stalled_since: approx_instant,
             }
         } else {
             ThreadStatus::Running {
                 name: self.name.clone(),
-                last_heartbeat: Instant::now()
-                    .checked_sub(Duration::from_millis(elapsed_ms))
-                    .unwrap(),
+                last_heartbeat: approx_instant,
             }
         }
     }
@@ -361,11 +361,10 @@ impl SelfMonitor {
             memory_rss_bytes: read_rss_bytes(),
             scan_count: self.scan_count,
             avg_scan_duration: self.avg_scan_duration(),
-            last_scan_at: self.last_scan_at.as_ref().and_then(|ts| {
-                chrono::DateTime::parse_from_rfc3339(ts)
-                    .ok()
-                    .map(|_| Instant::now())
-            }),
+            last_scan_at: self
+                .last_scan_at
+                .as_deref()
+                .and_then(parse_last_scan_instant),
             deletions_total: self.deletions_total,
             bytes_freed_total: self.bytes_freed_total,
             errors_total: self.errors_total,
@@ -407,6 +406,17 @@ impl SelfMonitor {
 
         Ok(state)
     }
+}
+
+fn parse_last_scan_instant(timestamp: &str) -> Option<Instant> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(timestamp).ok()?;
+    let now = chrono::Utc::now();
+    let age = now.signed_duration_since(parsed.with_timezone(&chrono::Utc));
+    if age <= chrono::Duration::zero() {
+        return Some(Instant::now());
+    }
+    let age_std = age.to_std().ok()?;
+    Some(Instant::now().checked_sub(age_std).unwrap_or_else(Instant::now))
 }
 
 // ──────────────────── atomic state file write ────────────────────
@@ -483,7 +493,7 @@ mod tests {
                     path: "/data".to_string(),
                     free_pct: 23.4,
                     level: "green".to_string(),
-                    rate_bps: Some(-12400000.0),
+                    rate_bps: Some(-12_400_000.0),
                 }],
             },
             ballast: BallastState {
@@ -709,7 +719,7 @@ mod tests {
         assert_eq!(health.deletions_total, 2);
         assert_eq!(health.bytes_freed_total, 5000);
         assert_eq!(health.thread_status.len(), 2);
-        assert!(health.thread_status.iter().all(|t| t.is_healthy()));
+        assert!(health.thread_status.iter().all(ThreadStatus::is_healthy));
         assert!(matches!(health.last_pressure_level, PressureLevel::Green));
     }
 
@@ -731,6 +741,23 @@ mod tests {
         assert_eq!(health.thread_status.len(), 1);
         assert!(!health.thread_status[0].is_healthy());
         assert_eq!(health.thread_status[0].name(), "stalled-worker");
+    }
+
+    #[test]
+    fn health_snapshot_restores_last_scan_age_from_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut monitor = SelfMonitor::new(dir.path().join("state.json"));
+        monitor.last_scan_at = Some(
+            (chrono::Utc::now() - chrono::Duration::seconds(120))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+
+        let health = monitor.health_snapshot(&[], Duration::from_secs(60), PressureLevel::Green);
+        let elapsed = health
+            .last_scan_at
+            .expect("last_scan_at should parse")
+            .elapsed();
+        assert!(elapsed >= Duration::from_secs(100));
     }
 
     #[test]

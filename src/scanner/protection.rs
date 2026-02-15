@@ -130,7 +130,7 @@ impl ProtectionRegistry {
         }
 
         // Check config patterns.
-        let path_str = path.to_string_lossy();
+        let path_str = normalize_path_for_matching(path);
         for pattern in &self.config_patterns {
             if pattern.compiled.is_match(&path_str) {
                 return Some(format!("protected by config pattern: {}", pattern.original));
@@ -143,7 +143,7 @@ impl ProtectionRegistry {
     /// Walk `root` (non-recursively for each directory level) to discover
     /// `.sbh-protect` marker files. Returns the number of new markers found.
     ///
-    /// This performs a breadth-first traversal up to `max_depth` levels.
+    /// This performs a depth-first traversal up to `max_depth` levels.
     /// Protected directories are recorded but NOT descended into further
     /// (we already know the entire subtree is protected).
     pub fn discover_markers(&mut self, root: &Path, max_depth: usize) -> Result<usize> {
@@ -257,7 +257,7 @@ impl ProtectionRegistry {
     }
 
     fn matches_config_pattern(&self, path: &Path) -> bool {
-        let path_str = path.to_string_lossy();
+        let path_str = normalize_path_for_matching(path);
         self.config_patterns
             .iter()
             .any(|pat| pat.compiled.is_match(&path_str))
@@ -311,10 +311,11 @@ fn read_marker_metadata(marker_path: &Path) -> Option<ProtectionMetadata> {
 /// - `*`  → matches anything except `/`
 /// - `?`  → matches a single character except `/`
 fn glob_to_regex(pattern: &str) -> Result<Regex> {
+    let normalized_pattern = pattern.replace('\\', "/");
     let mut regex_str = String::with_capacity(pattern.len() * 2);
     regex_str.push('^');
 
-    let chars: Vec<char> = pattern.chars().collect();
+    let chars: Vec<char> = normalized_pattern.chars().collect();
     let mut i = 0;
 
     while i < chars.len() {
@@ -353,6 +354,10 @@ fn glob_to_regex(pattern: &str) -> Result<Regex> {
     Regex::new(&regex_str).map_err(|err| SbhError::InvalidConfig {
         details: format!("invalid glob pattern {pattern:?}: {err}"),
     })
+}
+
+fn normalize_path_for_matching(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 #[cfg(test)]
@@ -614,6 +619,15 @@ mod tests {
         assert!(reg.is_protected(Path::new("/tmp/build-1")));
         assert!(!reg.is_protected(Path::new("/tmp/build-AB")));
         assert!(!reg.is_protected(Path::new("/tmp/build-")));
+    }
+
+    #[test]
+    fn glob_matches_windows_style_paths_after_normalization() {
+        let patterns = vec![r"C:\Users\*\critical-builds".to_string()];
+        let reg = ProtectionRegistry::new(Some(&patterns)).unwrap();
+
+        assert!(reg.is_protected(Path::new(r"C:\Users\alice\critical-builds")));
+        assert!(!reg.is_protected(Path::new(r"C:\Users\alice\other-builds")));
     }
 
     #[test]

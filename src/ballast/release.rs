@@ -196,6 +196,12 @@ mod tests {
         }
     }
 
+    fn one_hour_ago() -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_secs(3_600))
+            .expect("current instant must support one-hour subtraction in tests")
+    }
+
     #[test]
     fn no_release_when_green() {
         let ctrl = BallastReleaseController::new(30);
@@ -269,7 +275,7 @@ mod tests {
         assert!(!replenished);
 
         // Set green_since to the past to satisfy cooldown.
-        ctrl.green_since = Some(Instant::now() - Duration::from_secs(3600));
+        ctrl.green_since = Some(one_hour_ago());
         ctrl.last_replenish_time = None;
 
         let replenished = ctrl
@@ -289,7 +295,7 @@ mod tests {
         let response = test_response(PressureLevel::Critical, 1.0, 5);
         ctrl.maybe_release(&mut mgr, &response).unwrap();
 
-        ctrl.green_since = Some(Instant::now() - Duration::from_secs(3600));
+        ctrl.green_since = Some(one_hour_ago());
 
         // Replenish one file.
         ctrl.maybe_replenish(&mut mgr, PressureLevel::Green, &|| 50.0)

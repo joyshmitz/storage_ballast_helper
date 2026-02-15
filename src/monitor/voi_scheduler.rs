@@ -149,6 +149,9 @@ impl PathStats {
         }
         let actual = self.last_actual_reclaim as f64;
         let forecast = self.forecast_reclaim;
+        if !actual.is_finite() || !forecast.is_finite() {
+            return None;
+        }
         if actual.abs() < 1.0 && forecast.abs() < 1.0 {
             return Some(0.0); // both near zero
         }

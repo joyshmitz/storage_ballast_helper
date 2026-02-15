@@ -110,15 +110,14 @@ impl FsStatsCollector {
     }
 
     fn cache_hit(&self, mount_path: &Path) -> Option<FsStats> {
-        let result = {
-            let cache = self.cache.read();
-            let entry = cache.get(mount_path)?;
-            if entry.collected_at.elapsed() > self.cache_ttl {
-                return None;
-            }
-            entry.stats.clone()
-        };
-        Some(result)
+        let cache = self.cache.read();
+        let entry = cache.get(mount_path)?;
+        if entry.collected_at.elapsed() > self.cache_ttl {
+            return None;
+        }
+        let stats = entry.stats.clone();
+        drop(cache);
+        Some(stats)
     }
 }
 
