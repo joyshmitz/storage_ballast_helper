@@ -152,12 +152,15 @@ impl ScoringEngine {
         let expected_loss_delete = (1.0 - posterior_abandoned) * self.false_positive_loss;
         let calibration = calibration_score(input.classification.combined_confidence, factors);
         let fallback_active = calibration < self.calibration_floor;
+        let uncertainty = epistemic_uncertainty(posterior_abandoned, calibration);
 
         let action = decide_action(
             total,
             self.min_score,
             expected_loss_keep,
             expected_loss_delete,
+            posterior_abandoned,
+            calibration,
             fallback_active,
         );
 
@@ -168,6 +171,7 @@ impl ScoringEngine {
             expected_loss_keep,
             expected_loss_delete,
             calibration,
+            uncertainty,
             action,
         );
 
@@ -398,19 +402,38 @@ fn decide_action(
     min_score: f64,
     keep_loss: f64,
     delete_loss: f64,
+    posterior_abandoned: f64,
+    calibration: f64,
     fallback_active: bool,
 ) -> DecisionAction {
     if total_score < min_score || fallback_active {
         return DecisionAction::Keep;
     }
-    let diff = (keep_loss - delete_loss).abs();
-    if diff < 2.0 {
+    let uncertainty = epistemic_uncertainty(posterior_abandoned, calibration);
+    let decision_margin = (keep_loss - delete_loss).abs();
+    let review_band = (1.0 - calibration).mul_add(1.5, 4.0f64.mul_add(uncertainty, 1.5));
+    if decision_margin <= review_band {
         DecisionAction::Review
     } else if delete_loss < keep_loss {
-        DecisionAction::Delete
+        let min_delete_posterior =
+            0.55f64.mul_add(1.0, (1.0 - calibration).mul_add(0.25, 0.15 * uncertainty));
+        if posterior_abandoned >= min_delete_posterior.clamp(0.55, 0.90) {
+            DecisionAction::Delete
+        } else {
+            DecisionAction::Review
+        }
     } else {
         DecisionAction::Keep
     }
+}
+
+fn epistemic_uncertainty(posterior_abandoned: f64, calibration: f64) -> f64 {
+    let p = posterior_abandoned.clamp(1e-6, 1.0 - 1e-6);
+    let entropy = -(p * p.ln() + (1.0 - p) * (1.0 - p).ln()) / std::f64::consts::LN_2;
+    let calibration_penalty = 1.0 - calibration.clamp(0.0, 1.0);
+    0.65f64
+        .mul_add(entropy, 0.35 * calibration_penalty)
+        .clamp(0.0, 1.0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -421,6 +444,7 @@ fn build_ledger(
     expected_loss_keep: f64,
     expected_loss_delete: f64,
     calibration: f64,
+    uncertainty: f64,
     action: DecisionAction,
 ) -> EvidenceLedger {
     let terms = vec![
@@ -454,10 +478,18 @@ fn build_ledger(
             value: factors.structure,
             contribution: weights.structure * factors.structure,
         },
+        EvidenceTerm {
+            name: "pressure_multiplier",
+            weight: 1.0,
+            value: factors.pressure_multiplier,
+            contribution: factors.pressure_multiplier,
+        },
     ];
+    let decision_margin = expected_loss_keep - expected_loss_delete;
     let summary = format!(
         "posterior_abandoned={posterior_abandoned:.3}; keep_loss={expected_loss_keep:.2}; \
-delete_loss={expected_loss_delete:.2}; calibration={calibration:.3}; action={action:?}"
+delete_loss={expected_loss_delete:.2}; loss_margin={decision_margin:.2}; \
+uncertainty={uncertainty:.3}; calibration={calibration:.3}; action={action:?}"
     );
     EvidenceLedger { terms, summary }
 }
@@ -526,7 +558,7 @@ mod tests {
             0.8,
         );
         assert!(score.vetoed);
-        assert_eq!(score.total_score, 0.0);
+        assert!(score.total_score.abs() < f64::EPSILON);
         assert_eq!(score.decision.action, DecisionAction::Keep);
     }
 
@@ -586,7 +618,7 @@ mod tests {
         };
         let a = engine.score_candidate(&input, 0.5);
         let b = engine.score_candidate(&input, 0.5);
-        assert_eq!(a.total_score, b.total_score);
+        assert!((a.total_score - b.total_score).abs() < f64::EPSILON);
         assert_eq!(a.decision, b.decision);
         assert_eq!(a.ledger.summary, b.ledger.summary);
     }
@@ -614,5 +646,27 @@ mod tests {
         let low = engine.score_candidate(&input, 0.0);
         let high = engine.score_candidate(&input, 1.0);
         assert!(high.total_score >= low.total_score);
+    }
+
+    #[test]
+    fn epistemic_uncertainty_penalizes_mid_probability_and_low_calibration() {
+        let edge_high_cal = super::epistemic_uncertainty(0.95, 0.95);
+        let mid_high_cal = super::epistemic_uncertainty(0.50, 0.95);
+        let mid_low_cal = super::epistemic_uncertainty(0.50, 0.55);
+
+        assert!(mid_high_cal > edge_high_cal);
+        assert!(mid_low_cal > mid_high_cal);
+    }
+
+    #[test]
+    fn decision_boundary_prefers_review_when_margin_is_thin_and_uncertain() {
+        let action = super::decide_action(1.2, 0.45, 24.0, 22.5, 0.78, 0.56, false);
+        assert_eq!(action, DecisionAction::Review);
+    }
+
+    #[test]
+    fn decision_boundary_allows_delete_when_margin_and_confidence_are_strong() {
+        let action = super::decide_action(1.6, 0.45, 28.0, 4.0, 0.93, 0.90, false);
+        assert_eq!(action, DecisionAction::Delete);
     }
 }

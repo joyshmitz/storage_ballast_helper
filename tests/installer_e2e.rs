@@ -14,6 +14,7 @@ mod common;
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use storage_ballast_helper::cli::from_source::{
     Prerequisite, PrerequisiteStatus, all_prerequisites_met, check_prerequisites,
@@ -33,7 +34,7 @@ use storage_ballast_helper::cli::wizard::{
 };
 use storage_ballast_helper::cli::{
     HostSpecifier, OfflineBundleArtifact, OfflineBundleManifest, RELEASE_REPOSITORY,
-    ReleaseChannel, resolve_installer_artifact_contract,
+    ReleaseChannel, resolve_installer_artifact_contract, resolve_updater_artifact_contract,
 };
 use storage_ballast_helper::core::config::Config;
 
@@ -141,6 +142,54 @@ fn create_bad_checksum_bundle(tmp: &Path) -> PathBuf {
     .unwrap();
 
     manifest_path
+}
+
+/// Create an offline update bundle manifest for updater-path E2E tests.
+fn create_update_bundle(tmp: &Path, valid_checksum: bool) -> PathBuf {
+    let host = HostSpecifier::detect().unwrap();
+    let contract =
+        resolve_updater_artifact_contract(host, ReleaseChannel::Stable, Some("99.99.99")).unwrap();
+
+    let archive_name = contract.asset_name();
+    let checksum_name = contract.checksum_name();
+    let archive_bytes = b"offline-update-bundle-archive";
+    std::fs::write(tmp.join(&archive_name), archive_bytes).unwrap();
+
+    let checksum_hex = if valid_checksum {
+        format!("{:x}", Sha256::digest(archive_bytes))
+    } else {
+        "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+    };
+    std::fs::write(
+        tmp.join(&checksum_name),
+        format!("{checksum_hex}  {archive_name}\n"),
+    )
+    .unwrap();
+
+    let manifest = OfflineBundleManifest {
+        version: "1".to_string(),
+        repository: RELEASE_REPOSITORY.to_string(),
+        release_tag: "99.99.99".to_string(),
+        artifacts: vec![OfflineBundleArtifact {
+            target: contract.target.triple.to_string(),
+            archive: archive_name,
+            checksum: checksum_name,
+            sigstore_bundle: None,
+        }],
+    };
+    let manifest_path = tmp.join("update-bundle-manifest.json");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    manifest_path
+}
+
+fn update_sequence_test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
 }
 
 // ============================================================================
@@ -429,6 +478,202 @@ fn e2e_update_check_only_reports_availability() {
     };
     let report = run_update_sequence(&opts);
     assert!(report.check_only, "should be check_only");
+}
+
+#[test]
+fn e2e_update_offline_bundle_bad_checksum_fails_without_network_download() {
+    let _guard = update_sequence_test_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest_path = create_update_bundle(tmp.path(), false);
+
+    let opts = UpdateOptions {
+        check_only: false,
+        dry_run: false,
+        pinned_version: None,
+        install_dir: tmp.path().join("bin"),
+        force: false,
+        no_verify: false,
+        max_backups: 5,
+        notices_enabled: true,
+        metadata_cache_file: tmp.path().join("cache.json"),
+        metadata_cache_ttl: std::time::Duration::from_secs(60),
+        refresh_cache: false,
+        offline_bundle_manifest: Some(manifest_path),
+    };
+
+    let report = run_update_sequence(&opts);
+    assert!(
+        !report.success,
+        "bad bundle checksum should fail offline update: {report:?}"
+    );
+    assert!(
+        report
+            .steps
+            .iter()
+            .any(|s| s.description.contains("Loaded bundle artifact")),
+        "offline update should load bundle artifact before verification failure"
+    );
+    assert!(
+        report
+            .steps
+            .iter()
+            .any(|s| s.description.contains("Loaded bundle checksum")),
+        "offline update should load bundle checksum before verification failure"
+    );
+    assert!(
+        report
+            .steps
+            .iter()
+            .any(|s| { s.description == "Integrity verification" && s.error.as_deref().is_some() }),
+        "integrity step should fail for checksum mismatch"
+    );
+    assert!(
+        !report
+            .steps
+            .iter()
+            .any(|s| s.description.contains("Download artifact")
+                || s.description.contains("Download checksum")),
+        "offline update must not fall back to network downloads"
+    );
+}
+
+#[test]
+fn e2e_update_offline_bundle_missing_manifest_fails_without_network_download() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing_manifest = tmp.path().join("missing-update-bundle.json");
+
+    let opts = UpdateOptions {
+        check_only: true,
+        dry_run: false,
+        pinned_version: None,
+        install_dir: tmp.path().join("bin"),
+        force: false,
+        no_verify: false,
+        max_backups: 5,
+        notices_enabled: true,
+        metadata_cache_file: tmp.path().join("cache.json"),
+        metadata_cache_ttl: std::time::Duration::from_secs(60),
+        refresh_cache: false,
+        offline_bundle_manifest: Some(missing_manifest),
+    };
+
+    let report = run_update_sequence(&opts);
+    assert!(
+        !report.success,
+        "missing update bundle manifest should fail: {report:?}"
+    );
+    assert!(
+        report
+            .steps
+            .iter()
+            .any(|s| s.description == "Resolve offline bundle contract"
+                && s.error.as_deref().is_some()),
+        "should fail while resolving offline bundle contract"
+    );
+    assert!(
+        !report
+            .steps
+            .iter()
+            .any(|s| s.description.contains("Download")),
+        "offline update must not attempt network download when manifest is missing"
+    );
+}
+
+#[test]
+fn e2e_update_offline_bundle_unsupported_target_fails_without_network_download() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest_path = create_update_bundle(tmp.path(), true);
+
+    let mut manifest: OfflineBundleManifest =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest.artifacts[0].target = "riscv64gc-unknown-linux-gnu".to_string();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let opts = UpdateOptions {
+        check_only: true,
+        dry_run: false,
+        pinned_version: None,
+        install_dir: tmp.path().join("bin"),
+        force: false,
+        no_verify: false,
+        max_backups: 5,
+        notices_enabled: true,
+        metadata_cache_file: tmp.path().join("cache.json"),
+        metadata_cache_ttl: std::time::Duration::from_secs(60),
+        refresh_cache: false,
+        offline_bundle_manifest: Some(manifest_path),
+    };
+
+    let report = run_update_sequence(&opts);
+    assert!(
+        !report.success,
+        "unsupported bundle target should fail offline update: {report:?}"
+    );
+    assert!(
+        report
+            .steps
+            .iter()
+            .any(|s| s.description == "Resolve offline bundle contract"
+                && s.error.as_deref().is_some()),
+        "unsupported target should fail while resolving offline bundle contract"
+    );
+    assert!(
+        !report
+            .steps
+            .iter()
+            .any(|s| s.description.contains("Download")),
+        "offline update must not attempt network download when target is unsupported"
+    );
+}
+
+#[test]
+fn e2e_update_offline_bundle_blocked_install_path_fails_deterministically() {
+    let _guard = update_sequence_test_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest_path = create_update_bundle(tmp.path(), true);
+
+    let blocked_install_parent = tmp.path().join("blocked-install-parent");
+    std::fs::write(&blocked_install_parent, "not-a-directory").unwrap();
+
+    let opts = UpdateOptions {
+        check_only: false,
+        dry_run: false,
+        pinned_version: None,
+        install_dir: blocked_install_parent,
+        force: false,
+        no_verify: false,
+        max_backups: 5,
+        notices_enabled: true,
+        metadata_cache_file: tmp.path().join("cache.json"),
+        metadata_cache_ttl: std::time::Duration::from_secs(60),
+        refresh_cache: false,
+        offline_bundle_manifest: Some(manifest_path),
+    };
+
+    let report = run_update_sequence(&opts);
+    assert!(
+        !report.success,
+        "blocked install path should fail deterministic offline update: {report:?}"
+    );
+    assert!(
+        report
+            .steps
+            .iter()
+            .any(|s| s.description == "Install binary" && s.error.as_deref().is_some()),
+        "install step should fail when install parent path is blocked"
+    );
+    assert!(
+        !report
+            .steps
+            .iter()
+            .any(|s| s.description.contains("Download artifact")
+                || s.description.contains("Download checksum")),
+        "offline update must not fall back to network downloads"
+    );
 }
 
 // ============================================================================

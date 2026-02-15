@@ -109,6 +109,7 @@ impl SbhError {
     }
 }
 
+#[cfg(feature = "sqlite")]
 impl From<rusqlite::Error> for SbhError {
     fn from(value: rusqlite::Error) -> Self {
         Self::Sql {
@@ -313,6 +314,7 @@ mod tests {
         assert!(err.to_string().contains("/tmp/test.txt"));
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn from_rusqlite_error() {
         let sql_err =

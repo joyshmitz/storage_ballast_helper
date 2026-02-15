@@ -17,6 +17,7 @@ use crate::core::errors::Result;
 use crate::logger::jsonl::{
     EventType, JsonlConfig, JsonlWriter, LogEntry, ScoreFactorsRecord, Severity,
 };
+#[cfg(feature = "sqlite")]
 use crate::logger::sqlite::{ActivityRow, PressureRow, SqliteLogger};
 
 // ──────────────────── channel capacity ────────────────────
@@ -199,6 +200,7 @@ fn logger_thread_main(
     dropped: Arc<AtomicU64>,
 ) {
     // Open backends.
+    #[cfg(feature = "sqlite")]
     let mut sqlite = sqlite_path.and_then(|p| match SqliteLogger::open(&p) {
         Ok(db) => Some(db),
         Err(e) => {
@@ -206,8 +208,11 @@ fn logger_thread_main(
             None
         }
     });
+    #[cfg(not(feature = "sqlite"))]
+    let _ = sqlite_path;
 
     let mut jsonl = JsonlWriter::open(jsonl_config);
+    #[cfg(feature = "sqlite")]
     let mut sqlite_failures: u32 = 0;
 
     // Process events until Shutdown or channel disconnect.
@@ -228,27 +233,32 @@ fn logger_thread_main(
 
         // Build log representations.
         let jsonl_entry = event_to_log_entry(&event);
-        let activity_row = event_to_activity_row(&event);
-        let pressure_row = event_to_pressure_row(&event);
 
         // Write JSONL (always).
         jsonl.write_entry(&jsonl_entry);
 
         // Write SQLite.
-        if let Some(db) = &sqlite {
-            let activity_ok = activity_row
-                .as_ref()
-                .is_none_or(|row| db.log_activity(row).is_ok());
-            let pressure_ok = pressure_row
-                .as_ref()
-                .is_none_or(|row| db.log_pressure(row).is_ok());
-            if activity_ok && pressure_ok {
-                sqlite_failures = 0;
-            } else {
-                sqlite_failures += 1;
-                if sqlite_failures >= 3 {
-                    eprintln!("[SBH-DUAL] SQLite write failed {sqlite_failures} times, disabling");
-                    sqlite = None;
+        #[cfg(feature = "sqlite")]
+        {
+            let activity_row = event_to_activity_row(&event);
+            let pressure_row = event_to_pressure_row(&event);
+            if let Some(db) = &sqlite {
+                let activity_ok = activity_row
+                    .as_ref()
+                    .is_none_or(|row| db.log_activity(row).is_ok());
+                let pressure_ok = pressure_row
+                    .as_ref()
+                    .is_none_or(|row| db.log_pressure(row).is_ok());
+                if activity_ok && pressure_ok {
+                    sqlite_failures = 0;
+                } else {
+                    sqlite_failures += 1;
+                    if sqlite_failures >= 3 {
+                        eprintln!(
+                            "[SBH-DUAL] SQLite write failed {sqlite_failures} times, disabling"
+                        );
+                        sqlite = None;
+                    }
                 }
             }
         }
@@ -396,6 +406,7 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
     }
 }
 
+#[cfg(feature = "sqlite")]
 #[allow(clippy::too_many_lines, clippy::cast_possible_wrap)]
 fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -528,6 +539,7 @@ fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
     }
 }
 
+#[cfg(feature = "sqlite")]
 fn event_to_pressure_row(event: &ActivityEvent) -> Option<PressureRow> {
     match event {
         ActivityEvent::PressureChanged {
@@ -632,11 +644,14 @@ mod tests {
         assert_eq!(lines.len(), 3);
 
         // Check SQLite too.
-        let db = SqliteLogger::open(&dir.path().join("test.db")).unwrap();
-        let count = db
-            .count_events_since("artifact_delete", "2020-01-01T00:00:00Z")
-            .unwrap();
-        assert_eq!(count, 1);
+        #[cfg(feature = "sqlite")]
+        {
+            let db = SqliteLogger::open(&dir.path().join("test.db")).unwrap();
+            let count = db
+                .count_events_since("artifact_delete", "2020-01-01T00:00:00Z")
+                .unwrap();
+            assert_eq!(count, 1);
+        }
     }
 
     #[test]

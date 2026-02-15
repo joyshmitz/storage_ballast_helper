@@ -1150,6 +1150,43 @@ mod tests {
         .unwrap()
     }
 
+    fn write_offline_bundle_manifest(
+        root: &Path,
+        contract: &ReleaseArtifactContract,
+        release_tag: &str,
+        archive_bytes: &[u8],
+    ) -> PathBuf {
+        let archive_name = contract.asset_name();
+        let checksum_name = contract.checksum_name();
+        let archive_path = root.join(&archive_name);
+        std::fs::write(&archive_path, archive_bytes).unwrap();
+        let checksum_hex = format!("{:x}", Sha256::digest(archive_bytes));
+        std::fs::write(
+            root.join(&checksum_name),
+            format!("{checksum_hex}  {archive_name}\n"),
+        )
+        .unwrap();
+
+        let manifest = OfflineBundleManifest {
+            version: "1".to_string(),
+            repository: RELEASE_REPOSITORY.to_string(),
+            release_tag: release_tag.to_string(),
+            artifacts: vec![OfflineBundleArtifact {
+                target: contract.target.triple.to_string(),
+                archive: archive_name,
+                checksum: checksum_name,
+                sigstore_bundle: None,
+            }],
+        };
+        let manifest_path = root.join("bundle-manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        manifest_path
+    }
+
     #[test]
     fn current_version_is_not_empty() {
         assert!(!current_version().is_empty());
@@ -1353,35 +1390,12 @@ mod tests {
         let host = HostSpecifier::detect().unwrap();
         let contract =
             resolve_updater_artifact_contract(host, ReleaseChannel::Stable, Some("9.9.9")).unwrap();
-        let archive_name = contract.asset_name();
-        let checksum_name = contract.checksum_name();
-        let archive_path = tmp.path().join(&archive_name);
-        let archive_bytes = b"offline-update-archive";
-        std::fs::write(&archive_path, archive_bytes).unwrap();
-        let checksum_hex = format!("{:x}", Sha256::digest(archive_bytes));
-        std::fs::write(
-            tmp.path().join(&checksum_name),
-            format!("{checksum_hex}  {archive_name}\n"),
-        )
-        .unwrap();
-
-        let manifest = OfflineBundleManifest {
-            version: "1".to_string(),
-            repository: RELEASE_REPOSITORY.to_string(),
-            release_tag: "9.9.9".to_string(),
-            artifacts: vec![OfflineBundleArtifact {
-                target: contract.target.triple.to_string(),
-                archive: archive_name,
-                checksum: checksum_name,
-                sigstore_bundle: None,
-            }],
-        };
-        let manifest_path = tmp.path().join("bundle-manifest.json");
-        std::fs::write(
-            &manifest_path,
-            serde_json::to_string_pretty(&manifest).unwrap(),
-        )
-        .unwrap();
+        let manifest_path = write_offline_bundle_manifest(
+            tmp.path(),
+            &contract,
+            "9.9.9",
+            b"offline-update-archive",
+        );
 
         let opts = UpdateOptions {
             check_only: true,
@@ -1427,32 +1441,12 @@ mod tests {
         let host = HostSpecifier::detect().unwrap();
         let contract =
             resolve_updater_artifact_contract(host, ReleaseChannel::Stable, Some("9.9.9")).unwrap();
-        let archive_name = contract.asset_name();
-        let checksum_name = contract.checksum_name();
-        std::fs::write(tmp.path().join(&archive_name), b"offline-update-archive").unwrap();
-        std::fs::write(
-            tmp.path().join(&checksum_name),
-            "0000000000000000000000000000000000000000000000000000000000000000\n",
-        )
-        .unwrap();
-
-        let manifest = OfflineBundleManifest {
-            version: "1".to_string(),
-            repository: RELEASE_REPOSITORY.to_string(),
-            release_tag: "9.9.9".to_string(),
-            artifacts: vec![OfflineBundleArtifact {
-                target: contract.target.triple.to_string(),
-                archive: archive_name,
-                checksum: checksum_name,
-                sigstore_bundle: None,
-            }],
-        };
-        let manifest_path = tmp.path().join("bundle-manifest.json");
-        std::fs::write(
-            &manifest_path,
-            serde_json::to_string_pretty(&manifest).unwrap(),
-        )
-        .unwrap();
+        let manifest_path = write_offline_bundle_manifest(
+            tmp.path(),
+            &contract,
+            "9.9.9",
+            b"offline-update-archive",
+        );
 
         let opts = UpdateOptions {
             check_only: true,
@@ -1484,6 +1478,101 @@ mod tests {
                         .as_deref()
                         .is_some_and(|err| err.contains("offline bundle tag mismatch"))),
             "report should include offline bundle pin mismatch diagnostic"
+        );
+    }
+
+    #[test]
+    fn run_update_sequence_offline_bundle_dry_run_ignores_refresh_and_suppresses_notices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = HostSpecifier::detect().unwrap();
+        let contract =
+            resolve_updater_artifact_contract(host, ReleaseChannel::Stable, Some("9.9.9")).unwrap();
+        let manifest_path = write_offline_bundle_manifest(
+            tmp.path(),
+            &contract,
+            "9.9.9",
+            b"offline-update-archive",
+        );
+
+        let opts = UpdateOptions {
+            check_only: false,
+            pinned_version: None,
+            force: false,
+            install_dir: default_install_dir(false),
+            no_verify: false,
+            dry_run: true,
+            max_backups: 5,
+            metadata_cache_file: tmp.path().join("update-cache.json"),
+            metadata_cache_ttl: Duration::from_secs(60),
+            refresh_cache: true,
+            notices_enabled: false,
+            offline_bundle_manifest: Some(manifest_path),
+        };
+
+        let report = run_update_sequence(&opts);
+        assert!(report.success, "offline dry-run should succeed: {report:?}");
+        assert!(report.update_available);
+        assert!(report.follow_up.is_empty(), "notices should be suppressed");
+        assert!(report.steps.iter().any(|step| {
+            step.description
+                .contains("Ignored --refresh-cache in offline bundle mode")
+        }));
+        assert!(report.steps.iter().any(|step| {
+            step.description
+                .contains("Would use offline bundle artifact")
+        }));
+        assert!(!report.steps.iter().any(|step| {
+            step.description
+                .contains("Fetched update metadata from network")
+        }));
+        assert!(!report.steps.iter().any(|step| {
+            step.description
+                .contains("Refreshed update metadata from network")
+        }));
+    }
+
+    #[test]
+    fn run_update_sequence_check_only_offline_bundle_same_version_is_up_to_date() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = HostSpecifier::detect().unwrap();
+        let current = current_version();
+        let contract =
+            resolve_updater_artifact_contract(host, ReleaseChannel::Stable, Some(&current))
+                .unwrap();
+        let manifest_path = write_offline_bundle_manifest(
+            tmp.path(),
+            &contract,
+            &current,
+            b"offline-update-archive",
+        );
+
+        let opts = UpdateOptions {
+            check_only: true,
+            pinned_version: None,
+            force: false,
+            install_dir: default_install_dir(false),
+            no_verify: false,
+            dry_run: false,
+            max_backups: 5,
+            metadata_cache_file: tmp.path().join("update-cache.json"),
+            metadata_cache_ttl: Duration::from_secs(60),
+            refresh_cache: false,
+            notices_enabled: true,
+            offline_bundle_manifest: Some(manifest_path),
+        };
+
+        let report = run_update_sequence(&opts);
+        assert!(
+            report.success,
+            "same-version offline check-only should succeed: {report:?}"
+        );
+        assert!(!report.update_available);
+        assert_eq!(report.target_version, Some(format!("v{current}")));
+        assert!(
+            report
+                .steps
+                .iter()
+                .any(|step| step.description.contains("no update needed"))
         );
     }
 

@@ -8,39 +8,51 @@ readme = "README.md"
 keywords = ["disk", "ballast", "cleanup", "daemon", "storage"]
 categories = ["command-line-utilities", "filesystem"]
 
+[lib]
+name = "storage_ballast_helper"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sbh"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli", "daemon", "sqlite"]
+cli = ["dep:clap", "dep:clap_complete", "dep:colored", "sqlite"]
+daemon = ["dep:signal-hook"]
+tui = ["dep:crossterm"]
+sqlite = ["dep:rusqlite"]
 
 [dependencies]
-# CLI
-clap = { version = "4.5", features = ["derive"] }
-clap_complete = "4.5"
-# Serialization
+# CLI (optional — gated behind "cli" feature)
+clap = { version = "4.5", features = ["derive"], optional = true }
+clap_complete = { version = "4.5", optional = true }
+colored = { version = "3.0", optional = true }
+# Serialization (core)
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
-# Database
-rusqlite = { version = "0.33", features = ["bundled"] }
-# Error handling
+# Database (optional — gated behind "sqlite" feature)
+rusqlite = { version = "0.33", features = ["bundled"], optional = true }
+# Error handling (core)
 thiserror = "2.0"
-# Terminal output
-colored = "3.0"
-crossterm = "0.28"
-# Timestamps
+# TUI (optional — gated behind "tui" feature)
+crossterm = { version = "0.28", optional = true }
+# Timestamps (core)
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-# Concurrency (no tokio — std threads + channels)
+# Concurrency (core — used by scanner walker, not just daemon)
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
-# Fast byte scanning
+# Fast byte scanning (core)
 memchr = "2.7"
-# Pattern matching for artifact classification
+# Pattern matching for artifact classification (core)
 regex = "1.11"
-# Supply-chain checksum verification
+# Supply-chain checksum verification (core)
 sha2 = "0.10"
-# Signal handling for graceful shutdown wiring
-signal-hook = "0.3"
-# Ballast generation and randomized test fixtures
+# Signal handling (optional — gated behind "daemon" feature)
+signal-hook = { version = "0.3", optional = true }
+# Ballast generation and randomized test fixtures (core)
 rand = "0.9"
 
 # Platform-specific

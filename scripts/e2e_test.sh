@@ -514,6 +514,77 @@ EOF
   fi
 }
 
+create_offline_update_bundle_fixture() {
+  local fixture_dir="$1"
+  local release_tag="${2:-v99.77.55}"
+  local triple=""
+  local archive_ext="tar.xz"
+
+  case "$(uname -s)" in
+    Linux)
+      case "$(uname -m)" in
+        x86_64) triple="x86_64-unknown-linux-gnu" ;;
+        aarch64|arm64) triple="aarch64-unknown-linux-gnu" ;;
+      esac
+      ;;
+    Darwin)
+      case "$(uname -m)" in
+        x86_64) triple="x86_64-apple-darwin" ;;
+        arm64|aarch64) triple="aarch64-apple-darwin" ;;
+      esac
+      ;;
+    MINGW*|MSYS*|CYGWIN*|Windows_NT)
+      case "$(uname -m)" in
+        x86_64) triple="x86_64-pc-windows-msvc" ;;
+        aarch64|arm64) triple="aarch64-pc-windows-msvc" ;;
+      esac
+      archive_ext="zip"
+      ;;
+  esac
+
+  if [[ -z "${triple}" ]]; then
+    log "SKIP: offline update bundle fixture (unsupported host $(uname -s)/$(uname -m))"
+    return 1
+  fi
+
+  mkdir -p "${fixture_dir}"
+
+  local archive_name="sbh-${triple}.${archive_ext}"
+  local checksum_name="${archive_name}.sha256"
+  local archive_path="${fixture_dir}/${archive_name}"
+  local checksum_path="${fixture_dir}/${checksum_name}"
+  local manifest_path="${fixture_dir}/bundle-manifest.json"
+
+  printf 'offline-e2e-bundle-%s\n' "${release_tag}" > "${archive_path}"
+
+  local checksum_hex=""
+  if command -v sha256sum >/dev/null 2>&1; then
+    checksum_hex="$(sha256sum "${archive_path}" | awk '{print $1}')"
+  else
+    checksum_hex="$(shasum -a 256 "${archive_path}" | awk '{print $1}')"
+  fi
+  printf '%s  %s\n' "${checksum_hex}" "${archive_name}" > "${checksum_path}"
+
+  cat > "${manifest_path}" <<EOF
+{
+  "version": "1",
+  "repository": "Dicklesworthstone/storage_ballast_helper",
+  "release_tag": "${release_tag}",
+  "artifacts": [
+    {
+      "target": "${triple}",
+      "archive": "${archive_name}",
+      "checksum": "${checksum_name}",
+      "sigstore_bundle": null
+    }
+  ]
+}
+EOF
+
+  # Print paths and expected normalized tag for callers.
+  printf '%s\n' "${manifest_path}" "v${release_tag#v}"
+}
+
 # Create a tree of fake build artifacts for scan/clean testing.
 create_artifact_tree() {
   local root="$1"
@@ -1003,6 +1074,30 @@ TOML
   fi
 
   # ── Section 20: Large directory tree performance ────────────────────────
+
+  # ── Section 19b: Offline bundle update E2E ─────────────────────────────
+
+  log "=== Section 19b: Offline bundle update E2E ==="
+
+  local offline_fixture="${LOG_DIR}/offline-update-fixture"
+  register_cleanup_dir "${offline_fixture}"
+  local offline_manifest=""
+  local offline_expected_tag=""
+  local offline_fixture_output=""
+  local -a offline_fixture_info=()
+  if offline_fixture_output="$(create_offline_update_bundle_fixture "${offline_fixture}" "v99.77.55")"; then
+    mapfile -t offline_fixture_info <<< "${offline_fixture_output}"
+    offline_manifest="${offline_fixture_info[0]}"
+    offline_expected_tag="${offline_fixture_info[1]}"
+
+    tally_case run_case update_check_offline_bundle_json "${offline_expected_tag}" \
+      "${bin}" update --check --offline "${offline_manifest}" --json
+
+    tally_case run_case_expect_fail update_check_offline_bundle_mismatch 2 "offline bundle tag mismatch" \
+      "${bin}" update --check --offline "${offline_manifest}" --version v99.77.56 --json
+  else
+    log "SKIP: offline bundle update E2E (fixture generation unsupported on host)"
+  fi
 
   if check_suite_budget; then
     log "=== Section 20: Large directory tree performance ==="

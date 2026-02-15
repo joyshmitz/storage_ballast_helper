@@ -62,13 +62,13 @@ All flags below are contract-level and must be kept stable unless the parity mat
 | `--check` | Check for update only | No mutation; report available versions |
 | `--refresh-cache` | Force metadata refresh | Bypasses cached index data |
 | `--force` | Apply despite soft guards | Still obeys hard safety constraints and logs override reason |
-| `--rollback [version]` | Roll back to prior backup/version | Restores selected backup with verification |
-| `--list-versions` | Show available versions | Deterministic sorted version list |
-| `--pin <version>` | Pin active version | Sets/update pin and enforces on future checks |
+| `--rollback [backup-id]` | Roll back to prior backup snapshot | Restores selected backup with verification |
+| `--list-backups` | Show available backup snapshots | Deterministic newest-first backup inventory |
+| `--version <version>` | Target a specific release version | Uses pinned target for check/apply (supports `v` prefix) |
 | `--system` / `--user` | Scope selection | Chooses install root and privilege model |
 | `--json` | Machine output mode | Phase-level structured output with trace ID |
 
-### Bootstrap (`sbh bootstrap` or install-time integration phase)
+### Bootstrap (install-time integration phase via `sbh install` / `sbh setup`)
 
 | Flag | Meaning | Expected Behavior |
 | --- | --- | --- |
@@ -120,7 +120,7 @@ This runbook is the default operational sequence for humans and agents.
    - user install/update path: `--user`
    - system install/update path: `--system`
 3. Prefer machine-readable execution in automation:
-   - add `--json` to install/update/bootstrap/uninstall operations
+   - add `--json` to install/update/setup/uninstall operations
 
 ### 2. Update Decision Path
 
@@ -129,12 +129,12 @@ This runbook is the default operational sequence for humans and agents.
 2. Apply only when check output is acceptable:
    - `sbh update --json`
 3. For pinned rollouts:
-   - `sbh update --pin <version> --json`
+   - `sbh update --version <version> --json`
 
 ### 3. Recovery Path
 
 1. On failed update, inspect rollback inventory:
-   - `sbh update --list-versions --json`
+   - `sbh update --list-backups --json`
 2. Roll back to latest known-good state:
    - `sbh update --rollback --json`
 3. Roll back to a specific restore point when required:

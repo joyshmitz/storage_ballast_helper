@@ -174,6 +174,7 @@ sbh dashboard
 | Command | Purpose |
 | --- | --- |
 | `sbh config show|set|validate|diff|reset` | Manage effective config |
+| `sbh update [--check] [--refresh-cache] [--offline PATH]` | Check/apply updates with cache control and optional offline manifest |
 | `sbh install` / `sbh uninstall` | Install/remove service integration |
 
 ## Operator Docs
@@ -183,6 +184,34 @@ sbh dashboard
 
 For installer/update changes, use the parity matrix as the source of truth for
 flag semantics, integrity policy, rollback expectations, and release-gate tests.
+
+## Update Cache and Notice Controls
+
+`sbh update` supports local metadata caching and explicit refresh controls:
+
+- `update.metadata_cache_ttl_seconds`: cache TTL for update metadata.
+- `update.metadata_cache_file`: on-disk cache path (default in `~/.local/share/sbh/`).
+- `update.notices_enabled`: enable/disable human follow-up prompts in update output.
+- `sbh update --refresh-cache`: bypass cached metadata and fetch fresh release metadata.
+
+Environment overrides are available for operator automation:
+
+- `SBH_UPDATE_METADATA_CACHE_TTL_SECONDS`
+- `SBH_UPDATE_METADATA_CACHE_FILE`
+- `SBH_UPDATE_NOTICES_ENABLED`
+- `SBH_UPDATE_ENABLED`
+- `SBH_UPDATE_BACKGROUND_REFRESH`
+- `SBH_UPDATE_OPT_OUT`
+
+Useful operator checks:
+
+```bash
+# Inspect effective update policy/config
+sbh config show --json | jq '.update'
+
+# Force fresh metadata fetch for diagnostics
+sbh update --check --refresh-cache --json
+```
 
 ## Configuration Example
 

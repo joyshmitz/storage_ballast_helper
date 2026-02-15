@@ -2,5 +2,7 @@
 
 pub mod dual;
 pub mod jsonl;
+#[cfg(feature = "sqlite")]
 pub mod sqlite;
+#[cfg(feature = "sqlite")]
 pub mod stats;
