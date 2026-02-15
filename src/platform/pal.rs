@@ -13,7 +13,7 @@ use crate::core::config::PathsConfig;
 use crate::core::errors::{Result, SbhError};
 
 /// Filesystem statistics for a path/mount.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FsStats {
     pub total_bytes: u64,
     pub free_bytes: u64,
@@ -246,7 +246,7 @@ impl Platform for MockPlatform {
 pub fn detect_platform() -> Result<Arc<dyn Platform>> {
     #[cfg(target_os = "linux")]
     {
-        return Ok(Arc::new(LinuxPlatform::new()));
+        Ok(Arc::new(LinuxPlatform::new()))
     }
     #[cfg(not(target_os = "linux"))]
     {

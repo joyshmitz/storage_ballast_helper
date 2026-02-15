@@ -16,7 +16,7 @@ use storage_ballast_helper::daemon::policy::{
 };
 use storage_ballast_helper::monitor::ewma::DiskRateEstimator;
 use storage_ballast_helper::monitor::guardrails::{
-    AdaptiveGuard, CalibrationObservation, GuardDiagnostics, GuardStatus, GuardrailConfig,
+    AdaptiveGuard, CalibrationObservation, GuardDiagnostics, GuardStatus,
 };
 use storage_ballast_helper::monitor::pid::{PidPressureController, PressureLevel, PressureReading};
 use storage_ballast_helper::monitor::predictive::{PredictiveActionPolicy, PredictiveConfig};
@@ -880,6 +880,7 @@ fn e2e_bad_observations(count: usize, error_factor: f64) -> Vec<CalibrationObser
         .collect()
 }
 
+#[allow(dead_code)]
 fn e2e_scored_candidate(action: DecisionAction, score: f64) -> CandidacyScore {
     CandidacyScore {
         path: PathBuf::from("/data/projects/test/.target_opus"),
@@ -1128,7 +1129,7 @@ fn e2e_scenario_4_index_corruption_full_scan() {
     // or unavailable, the system falls back to a full scan and still
     // produces valid scoring results.
     let scoring = e2e_scoring_engine();
-    let policy = PolicyEngine::new(PolicyConfig::default());
+    let _policy = PolicyEngine::new(PolicyConfig::default());
 
     // Simulate a full scan by scoring candidates directly (no incremental index).
     let candidates: Vec<CandidateInput> = vec![
@@ -1262,7 +1263,7 @@ fn e2e_scenario_6_progressive_recovery() {
     // Verify that evaluate works normally post-recovery.
     let candidates = vec![e2e_candidate("/data/projects/recovery/target", 3, 72, 0.85)];
     let scored = scoring.score_batch(&candidates, 0.5);
-    let decision = policy.evaluate(&scored, None);
+    let _decision = policy.evaluate(&scored, None);
 
     // In enforce mode, deletions may be approved (unlike fallback).
     // The key assertion: we are no longer in FallbackSafe.

@@ -99,8 +99,7 @@ impl FsStatsCollector {
         }
 
         let fresh = self.platform.fs_stats(mount_path)?;
-        let mut cache = self.cache.write();
-        cache.insert(
+        self.cache.write().insert(
             mount_path.to_path_buf(),
             CachedStats {
                 stats: fresh.clone(),
@@ -111,12 +110,15 @@ impl FsStatsCollector {
     }
 
     fn cache_hit(&self, mount_path: &Path) -> Option<FsStats> {
-        let cache = self.cache.read();
-        let entry = cache.get(mount_path)?;
-        if entry.collected_at.elapsed() > self.cache_ttl {
-            return None;
-        }
-        Some(entry.stats.clone())
+        let result = {
+            let cache = self.cache.read();
+            let entry = cache.get(mount_path)?;
+            if entry.collected_at.elapsed() > self.cache_ttl {
+                return None;
+            }
+            entry.stats.clone()
+        };
+        Some(result)
     }
 }
 

@@ -301,24 +301,21 @@ impl JsonlWriter {
 
     fn try_open_fallback(&mut self) {
         if let Some(fb) = &self.config.fallback_path {
-            match open_append(fb) {
-                Ok((file, size)) => {
-                    let _ = writeln!(
-                        io::stderr(),
-                        "[SBH-JSONL] primary path failed, using fallback: {}",
-                        fb.display()
-                    );
-                    self.writer = Some(BufWriter::with_capacity(64 * 1024, file));
-                    self.state = WriterState::Fallback;
-                    self.bytes_written = size;
-                }
-                Err(_) => {
-                    self.state = WriterState::Stderr;
-                    let _ = writeln!(
-                        io::stderr(),
-                        "[SBH-JSONL] both primary and fallback paths failed, using stderr"
-                    );
-                }
+            if let Ok((file, size)) = open_append(fb) {
+                let _ = writeln!(
+                    io::stderr(),
+                    "[SBH-JSONL] primary path failed, using fallback: {}",
+                    fb.display()
+                );
+                self.writer = Some(BufWriter::with_capacity(64 * 1024, file));
+                self.state = WriterState::Fallback;
+                self.bytes_written = size;
+            } else {
+                self.state = WriterState::Stderr;
+                let _ = writeln!(
+                    io::stderr(),
+                    "[SBH-JSONL] both primary and fallback paths failed, using stderr"
+                );
             }
         } else {
             self.state = WriterState::Stderr;
@@ -376,7 +373,7 @@ impl JsonlWriter {
         let _ = fs::remove_file(&oldest);
 
         // Rename current → .1
-        let _ = rename(base, &rotated_name(base, 1));
+        let _ = rename(base, rotated_name(base, 1));
 
         // Reopen a fresh file.
         match open_append(base) {

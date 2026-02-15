@@ -7,6 +7,9 @@
 //! - `create_fake_rust_target()` — builds a realistic `target/` directory
 //! - `SyntheticTimeSeries` — generates pressure patterns for EWMA/PID testing
 
+// Not every test binary uses every item; suppress dead-code warnings for the shared module.
+#![allow(dead_code)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};

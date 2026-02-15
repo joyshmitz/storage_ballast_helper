@@ -119,7 +119,7 @@ impl PidPressureController {
         self.last_error = error;
         self.last_update = Some(now);
 
-        let raw = self.kp * error + self.ki * self.integral + self.kd * derivative;
+        let raw = self.kd.mul_add(derivative, self.kp.mul_add(error, self.ki * self.integral));
         let mut urgency = (1.0 - (-raw.max(0.0)).exp()).clamp(0.0, 1.0);
 
         if let Some(seconds) = predicted_seconds_to_red {
@@ -215,6 +215,7 @@ fn response_policy(
     level: PressureLevel,
     urgency: f64,
 ) -> (Duration, usize, usize) {
+    #[allow(clippy::cast_possible_truncation)]
     let base_ms = base_poll.as_millis() as u64;
     match level {
         PressureLevel::Green => (Duration::from_millis(base_ms.max(1)), 0, 2),

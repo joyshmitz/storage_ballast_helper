@@ -249,6 +249,7 @@ impl MonitoringDaemon {
     /// Run the monitoring loop until shutdown is requested.
     ///
     /// This is the main entry point for `sbh daemon`.
+    #[allow(clippy::too_many_lines)]
     pub fn run(&mut self) -> Result<()> {
         // Log startup.
         let config_hash = self.config.stable_hash().unwrap_or_default();
@@ -325,7 +326,7 @@ impl MonitoringDaemon {
             }
 
             // 5. Handle pressure response.
-            self.handle_pressure(&response, &scan_tx)?;
+            self.handle_pressure(&response, &scan_tx);
 
             // 6. Check special locations independently.
             self.check_special_locations();
@@ -372,7 +373,7 @@ impl MonitoringDaemon {
             if last_health_check.elapsed() >= THREAD_HEALTH_CHECK_INTERVAL {
                 last_health_check = Instant::now();
 
-                let scanner_dead = scanner_join.as_ref().is_some_and(|h| h.is_finished());
+                let scanner_dead = scanner_join.as_ref().is_some_and(std::thread::JoinHandle::is_finished);
                 if scanner_dead {
                     eprintln!("[SBH-DAEMON] scanner thread exited unexpectedly");
                     if let Some(handle) = scanner_join.take() {
@@ -395,7 +396,7 @@ impl MonitoringDaemon {
                     }
                 }
 
-                let executor_dead = executor_join.as_ref().is_some_and(|h| h.is_finished());
+                let executor_dead = executor_join.as_ref().is_some_and(std::thread::JoinHandle::is_finished);
                 if executor_dead {
                     eprintln!("[SBH-DAEMON] executor thread exited unexpectedly");
                     if let Some(handle) = executor_join.take() {
@@ -423,7 +424,8 @@ impl MonitoringDaemon {
         }
 
         // ──────── shutdown sequence ────────
-        self.shutdown(scan_tx, del_tx, scanner_join, executor_join)
+        self.shutdown(scan_tx, del_tx, scanner_join, executor_join);
+        Ok(())
     }
 
     // ──────────────────── pressure monitoring ────────────────────
@@ -440,6 +442,7 @@ impl MonitoringDaemon {
         let stats = self.fs_collector.collect(&primary_path)?;
 
         // Update EWMA rate estimator.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let red_threshold_bytes =
             (stats.total_bytes as f64 * self.config.pressure.red_min_free_pct / 100.0) as u64;
         let now = Instant::now();
@@ -483,6 +486,7 @@ impl MonitoringDaemon {
         // Best-effort: collect fresh stats for the log entry.
         let (free_pct, mount, total, free) =
             if let Ok(stats) = self.fs_collector.collect(&primary_path) {
+                #[allow(clippy::cast_possible_wrap)]
                 (
                     stats.free_pct(),
                     stats.mount_point.to_string_lossy().to_string(),
@@ -512,7 +516,7 @@ impl MonitoringDaemon {
         &mut self,
         response: &crate::monitor::pid::PressureResponse,
         scan_tx: &Sender<ScanRequest>,
-    ) -> Result<()> {
+    ) {
         match response.level {
             PressureLevel::Green => {
                 // Maybe replenish ballast.
@@ -567,8 +571,6 @@ impl MonitoringDaemon {
                 });
             }
         }
-
-        Ok(())
     }
 
     fn send_scan_request(
@@ -618,9 +620,8 @@ impl MonitoringDaemon {
 
             self.last_special_scan.insert(location.path.clone(), now);
 
-            let stats = match self.fs_collector.collect(&location.path) {
-                Ok(s) => s,
-                Err(_) => continue,
+            let Ok(stats) = self.fs_collector.collect(&location.path) else {
+                continue;
             };
 
             if location.needs_attention(&stats) {
@@ -682,7 +683,9 @@ impl MonitoringDaemon {
                 let old_hash = self.config.stable_hash().unwrap_or_default();
                 let new_hash = new_config.stable_hash().unwrap_or_default();
 
-                if old_hash != new_hash {
+                if old_hash == new_hash {
+                    eprintln!("[SBH-DAEMON] config unchanged, skipping reload");
+                } else {
                     // Update components that can be reconfigured at runtime.
                     self.scoring_engine = ScoringEngine::from_config(
                         &new_config.scoring,
@@ -698,8 +701,6 @@ impl MonitoringDaemon {
                     });
                     self.config = new_config;
                     eprintln!("[SBH-DAEMON] config reloaded successfully");
-                } else {
-                    eprintln!("[SBH-DAEMON] config unchanged, skipping reload");
                 }
             }
             Err(e) => {
@@ -728,12 +729,12 @@ impl MonitoringDaemon {
             .name("sbh-scanner".to_string())
             .spawn(move || {
                 scanner_thread_main(
-                    scan_rx,
-                    del_tx,
-                    logger,
-                    scoring_config,
+                    &scan_rx,
+                    &del_tx,
+                    &logger,
+                    &scoring_config,
                     min_file_age,
-                    heartbeat,
+                    &heartbeat,
                 );
             })
             .expect("failed to spawn scanner thread")
@@ -752,7 +753,7 @@ impl MonitoringDaemon {
         thread::Builder::new()
             .name("sbh-executor".to_string())
             .spawn(move || {
-                executor_thread_main(del_rx, logger, dry_run, max_batch, min_score, heartbeat);
+                executor_thread_main(&del_rx, &logger, dry_run, max_batch, min_score, &heartbeat);
             })
             .expect("failed to spawn executor thread")
     }
@@ -765,7 +766,7 @@ impl MonitoringDaemon {
         del_tx: Sender<DeletionBatch>,
         scanner_join: Option<thread::JoinHandle<()>>,
         executor_join: Option<thread::JoinHandle<()>>,
-    ) -> Result<()> {
+    ) {
         let uptime_secs = self.start_time.elapsed().as_secs();
 
         // 1. Drop channel senders to signal worker threads to exit.
@@ -798,7 +799,6 @@ impl MonitoringDaemon {
         }
 
         eprintln!("[SBH-DAEMON] shutdown complete (uptime={uptime_secs}s)");
-        Ok(())
     }
 }
 
@@ -810,14 +810,14 @@ impl MonitoringDaemon {
 /// The walker module (bd-1w9) provides the actual directory traversal.
 /// Until it's built, this thread performs a simplified scan using std::fs.
 fn scanner_thread_main(
-    scan_rx: Receiver<ScanRequest>,
-    del_tx: Sender<DeletionBatch>,
-    logger: ActivityLoggerHandle,
-    scoring_config: crate::core::config::ScoringConfig,
+    scan_rx: &Receiver<ScanRequest>,
+    del_tx: &Sender<DeletionBatch>,
+    logger: &ActivityLoggerHandle,
+    scoring_config: &crate::core::config::ScoringConfig,
     min_file_age: u64,
-    heartbeat: Arc<ThreadHeartbeat>,
+    heartbeat: &Arc<ThreadHeartbeat>,
 ) {
-    let engine = ScoringEngine::from_config(&scoring_config, min_file_age);
+    let engine = ScoringEngine::from_config(scoring_config, min_file_age);
 
     while let Ok(request) = scan_rx.recv() {
         heartbeat.beat();
@@ -836,9 +836,8 @@ fn scanner_thread_main(
             }
 
             // Shallow scan of top-level entries in each root path.
-            let entries = match std::fs::read_dir(root) {
-                Ok(e) => e,
-                Err(_) => continue,
+            let Ok(entries) = std::fs::read_dir(root) else {
+                continue;
             };
 
             for entry in entries.flatten() {
@@ -846,9 +845,8 @@ fn scanner_thread_main(
                 let path = entry.path();
 
                 // Quick classification for known artifact patterns.
-                let meta = match entry.metadata() {
-                    Ok(m) => m,
-                    Err(_) => continue,
+                let Ok(meta) = entry.metadata() else {
+                    continue;
                 };
 
                 let name = entry.file_name().to_string_lossy().to_lowercase();
@@ -900,6 +898,7 @@ fn scanner_thread_main(
             }
         }
 
+        #[allow(clippy::cast_possible_truncation)]
         let scan_duration_ms = scan_start.elapsed().as_millis() as u64;
 
         // Log scan completion.
@@ -940,12 +939,12 @@ fn scanner_thread_main(
 
 /// Executor thread: receives deletion batches and safely removes artifacts.
 fn executor_thread_main(
-    del_rx: Receiver<DeletionBatch>,
-    logger: ActivityLoggerHandle,
+    del_rx: &Receiver<DeletionBatch>,
+    logger: &ActivityLoggerHandle,
     dry_run: bool,
     max_batch_size: usize,
     min_score: f64,
-    heartbeat: Arc<ThreadHeartbeat>,
+    heartbeat: &Arc<ThreadHeartbeat>,
 ) {
     let executor = DeletionExecutor::new(
         DeletionConfig {
@@ -1001,9 +1000,8 @@ fn detect_structural_signals(
     }
 
     let mut signals = StructuralSignals::default();
-    let entries = match std::fs::read_dir(path) {
-        Ok(e) => e,
-        Err(_) => return signals,
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return signals;
     };
 
     for entry in entries.flatten().take(50) {
@@ -1031,7 +1029,11 @@ fn classify_by_name(name: &str) -> crate::scanner::patterns::ArtifactClassificat
         (ArtifactCategory::RustTarget, 0.85)
     } else if name == "node_modules" {
         (ArtifactCategory::NodeModules, 0.95)
-    } else if name == "__pycache__" || name.ends_with(".pyc") {
+    } else if name == "__pycache__"
+        || std::path::Path::new(name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pyc"))
+    {
         (ArtifactCategory::PythonCache, 0.90)
     } else if name.starts_with("pi_agent_")
         || name.starts_with("pi_target_")
@@ -1054,9 +1056,8 @@ fn classify_by_name(name: &str) -> crate::scanner::patterns::ArtifactClassificat
 
 /// Rough directory size estimate (sum of immediate children sizes).
 fn dir_size_estimate(path: &std::path::Path) -> u64 {
-    let entries = match std::fs::read_dir(path) {
-        Ok(e) => e,
-        Err(_) => return 0,
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
     };
 
     entries

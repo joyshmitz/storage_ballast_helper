@@ -17,6 +17,7 @@ use crate::daemon::notifications::NotificationConfig;
 /// Full SBH configuration model.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
     pub pressure: PressureConfig,
     pub scanner: ScannerConfig,
@@ -62,7 +63,7 @@ pub struct PredictionConfig {
 }
 
 /// Scanner behavior and safety constraints.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ScannerConfig {
     pub root_paths: Vec<PathBuf>,
@@ -93,7 +94,7 @@ pub struct ScoringConfig {
 }
 
 /// Ballast allocation settings.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct BallastConfig {
     pub file_count: usize,
@@ -107,7 +108,7 @@ pub struct BallastConfig {
 }
 
 /// Per-volume override for ballast pool settings.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct BallastVolumeOverride {
     /// Whether to provision a ballast pool on this volume (default: true).
@@ -150,7 +151,7 @@ impl BallastConfig {
     /// Check whether a volume is enabled for ballast (disabled via override).
     #[must_use]
     pub fn is_volume_enabled(&self, mount_path: &str) -> bool {
-        self.overrides.get(mount_path).map_or(true, |o| o.enabled)
+        self.overrides.get(mount_path).is_none_or(|o| o.enabled)
     }
 }
 
@@ -166,7 +167,7 @@ pub struct TelemetryConfig {
 }
 
 /// Update-check behavior, cache policy, and opt-out controls.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct UpdateConfig {
     pub enabled: bool,
@@ -177,7 +178,7 @@ pub struct UpdateConfig {
 }
 
 /// Filesystem paths used by sbh.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct PathsConfig {
     pub config_file: PathBuf,
@@ -187,20 +188,6 @@ pub struct PathsConfig {
     pub jsonl_log: PathBuf,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            pressure: PressureConfig::default(),
-            scanner: ScannerConfig::default(),
-            scoring: ScoringConfig::default(),
-            ballast: BallastConfig::default(),
-            update: UpdateConfig::default(),
-            telemetry: TelemetryConfig::default(),
-            paths: PathsConfig::default(),
-            notifications: NotificationConfig::default(),
-        }
-    }
-}
 
 impl Default for PressureConfig {
     fn default() -> Self {
@@ -361,12 +348,14 @@ impl Config {
 
     /// Deterministic hash of the effective config for logging/telemetry.
     pub fn stable_hash(&self) -> Result<String> {
+        #[allow(clippy::collection_is_never_read)]
         let canonical = serde_json::to_string(self)?;
         let mut hasher = DefaultHasher::new();
         canonical.hash(&mut hasher);
         Ok(format!("{:016x}", hasher.finish()))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_env_overrides(&mut self) -> Result<()> {
         // pressure
         set_env_f64(
@@ -518,13 +507,12 @@ impl Config {
         }
 
         // Global opt-out: disables checks, background refresh, and update notices.
-        if let Some(raw) = lookup("SBH_UPDATE_OPT_OUT") {
-            if parse_env_bool("SBH_UPDATE_OPT_OUT", &raw)? {
+        if let Some(raw) = lookup("SBH_UPDATE_OPT_OUT")
+            && parse_env_bool("SBH_UPDATE_OPT_OUT", &raw)? {
                 self.update.enabled = false;
                 self.update.background_refresh = false;
                 self.update.notices_enabled = false;
             }
-        }
 
         Ok(())
     }

@@ -331,7 +331,7 @@ impl AdaptiveGuard {
             .map(|o| o.rate_error_ratio())
             .collect();
         errors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median_error = if errors.len() % 2 == 0 {
+        let median_error = if errors.len().is_multiple_of(2) {
             let mid = errors.len() / 2;
             f64::midpoint(errors[mid - 1], errors[mid])
         } else {

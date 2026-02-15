@@ -594,6 +594,7 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
     }
 }
 
+#[allow(dead_code)]
 fn ballast_command_label(args: &BallastArgs) -> &'static str {
     match args.command {
         None => "ballast",
@@ -605,6 +606,7 @@ fn ballast_command_label(args: &BallastArgs) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn config_command_label(args: &ConfigArgs) -> &'static str {
     match args.command {
         None => "config",

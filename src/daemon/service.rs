@@ -328,11 +328,10 @@ pub struct ServiceActionResult {
 /// Resolve the sbh binary path (prefers the running binary, falls back to PATH).
 fn resolve_sbh_binary() -> Result<PathBuf> {
     // First try: the currently running executable.
-    if let Ok(exe) = env::current_exe() {
-        if exe.exists() {
+    if let Ok(exe) = env::current_exe()
+        && exe.exists() {
             return Ok(exe);
         }
-    }
     // Fallback: search PATH.
     for candidate in &["/usr/local/bin/sbh", "/usr/bin/sbh"] {
         let p = Path::new(candidate);
@@ -483,6 +482,7 @@ impl LaunchdServiceManager {
     }
 
     /// Run launchctl with the given arguments.
+    #[allow(clippy::unused_self)]
     fn run_launchctl(&self, args: &[&str]) -> Result<String> {
         let output = Command::new("launchctl")
             .args(args)
@@ -508,6 +508,7 @@ impl LaunchdServiceManager {
     }
 
     /// Run launchctl without erroring on failure.
+    #[allow(clippy::unused_self)]
     fn run_launchctl_lenient(&self, args: &[&str]) -> String {
         let output = Command::new("launchctl").args(args).output();
         match output {

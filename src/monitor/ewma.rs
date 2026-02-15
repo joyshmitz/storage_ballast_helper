@@ -90,7 +90,7 @@ impl DiskRateEstimator {
         let consumed = previous.free_bytes as f64 - free_bytes as f64;
         let inst_rate = consumed / dt;
         let burstiness = ((inst_rate - self.ewma_rate).abs()) / (self.ewma_rate.abs() + 1.0);
-        let alpha = (self.base_alpha + 0.20 * burstiness).clamp(self.min_alpha, self.max_alpha);
+        let alpha = 0.20f64.mul_add(burstiness, self.base_alpha).clamp(self.min_alpha, self.max_alpha);
 
         self.ewma_rate = ewma(alpha, self.ewma_rate, inst_rate);
         let inst_accel = (inst_rate - previous.inst_rate) / dt;
@@ -140,7 +140,7 @@ impl DiskRateEstimator {
         }
         let sample_term = (self.samples as f64 / self.min_samples.max(1) as f64).min(1.0);
         let residual_term = 1.0 / (1.0 + self.residual_ewma / (self.ewma_rate.abs() + 1.0));
-        (0.7 * sample_term + 0.3 * residual_term).clamp(0.0, 1.0)
+        0.7f64.mul_add(sample_term, 0.3 * residual_term).clamp(0.0, 1.0)
     }
 
     fn fallback_estimate(&self, free_bytes: u64, threshold_free_bytes: u64) -> RateEstimate {
@@ -168,7 +168,7 @@ impl DiskRateEstimator {
 
 #[inline]
 fn ewma(alpha: f64, prev: f64, current: f64) -> f64 {
-    alpha * current + (1.0 - alpha) * prev
+    alpha.mul_add(current, (1.0 - alpha) * prev)
 }
 
 fn classify_trend(rate: f64, accel: f64) -> Trend {
@@ -195,7 +195,7 @@ fn project_time(rate: f64, accel: f64, distance_bytes: f64) -> f64 {
         return distance_bytes / rate;
     }
 
-    let discriminant = rate * rate + 2.0 * accel * distance_bytes;
+    let discriminant = rate.mul_add(rate, 2.0 * accel * distance_bytes);
     if discriminant.is_sign_negative() {
         return distance_bytes / rate;
     }

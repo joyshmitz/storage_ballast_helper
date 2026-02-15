@@ -21,6 +21,7 @@ use super::{
 
 /// Options controlling the update orchestration.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct UpdateOptions {
     /// Only check, do not apply.
     pub check_only: bool,
@@ -80,6 +81,7 @@ pub struct PruneResult {
 
 /// Structured report from an update check or apply.
 #[derive(Debug, Clone, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct UpdateReport {
     pub current_version: String,
     pub target_version: Option<String>,
@@ -225,9 +227,8 @@ impl BackupStore {
     pub fn list(&self) -> Vec<BackupSnapshot> {
         let mut entries = Vec::new();
 
-        let read_dir = match std::fs::read_dir(&self.dir) {
-            Ok(rd) => rd,
-            Err(_) => return entries,
+        let Ok(read_dir) = std::fs::read_dir(&self.dir) else {
+            return entries;
         };
 
         for dir_entry in read_dir.flatten() {
@@ -243,8 +244,8 @@ impl BackupStore {
             let id = dir_entry.file_name().to_string_lossy().into_owned();
             let meta_path = entry_path.join("backup.json");
 
-            if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
-                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+            if let Ok(meta_str) = std::fs::read_to_string(&meta_path)
+                && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
                     let version = meta
                         .get("version")
                         .and_then(|v| v.as_str())
@@ -252,11 +253,11 @@ impl BackupStore {
                         .to_string();
                     let timestamp = meta
                         .get("timestamp")
-                        .and_then(|v| v.as_u64())
+                        .and_then(serde_json::Value::as_u64)
                         .unwrap_or(0);
                     let binary_size = meta
                         .get("binary_size")
-                        .and_then(|v| v.as_u64())
+                        .and_then(serde_json::Value::as_u64)
                         .unwrap_or(0);
 
                     entries.push(BackupSnapshot {
@@ -268,7 +269,6 @@ impl BackupStore {
                     });
                     continue;
                 }
-            }
 
             // Fallback: no valid metadata file.
             let binary_size = std::fs::metadata(&binary_path)
@@ -381,9 +381,7 @@ impl BackupStore {
 
 /// Default backup directory.
 fn default_backup_dir() -> PathBuf {
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/var/lib/sbh"));
+    let base = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/var/lib/sbh"), PathBuf::from);
     base.join(".local/share/sbh/backups")
 }
 
@@ -392,6 +390,7 @@ fn default_backup_dir() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// Run the full update sequence and return a structured report.
+#[allow(clippy::too_many_lines)]
 pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
     let current = current_version();
     let mut report = UpdateReport::new(&current, opts.check_only, opts.dry_run);
@@ -433,7 +432,7 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
             tag
         }
         Err(e) => {
-            report.step_fail("Resolve target version", e.to_string());
+            report.step_fail("Resolve target version", e);
             return report;
         }
     };
@@ -476,7 +475,7 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
     let tmp_dir = match tempdir_for_update() {
         Ok(d) => d,
         Err(e) => {
-            report.step_fail("Create temp directory", e.to_string());
+            report.step_fail("Create temp directory", e);
             return report;
         }
     };
@@ -487,14 +486,14 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
     let checksum_url = format!("{archive_url}.sha256");
 
     if let Err(e) = curl_download(&archive_url, &archive_path) {
-        report.step_fail("Download artifact", e.to_string());
+        report.step_fail("Download artifact", e);
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return report;
     }
     report.step_ok(format!("Downloaded {}", contract.asset_name()));
 
     if let Err(e) = curl_download(&checksum_url, &checksum_path) {
-        report.step_fail("Download checksum", e.to_string());
+        report.step_fail("Download checksum", e);
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return report;
     }
@@ -552,7 +551,7 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
                 let _ = store.prune(opts.max_backups);
             }
             Err(e) => {
-                report.step_fail("Backup current binary", e.to_string());
+                report.step_fail("Backup current binary", e);
             }
         }
     }
@@ -564,7 +563,7 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
             report.applied = true;
         }
         Err(e) => {
-            report.step_fail("Install binary", e.to_string());
+            report.step_fail("Install binary", e);
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return report;
         }
@@ -703,6 +702,7 @@ pub fn format_prune_result(result: &PruneResult) -> String {
     out
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn format_size(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
@@ -718,11 +718,10 @@ pub fn default_install_dir(system: bool) -> PathBuf {
     if system {
         PathBuf::from("/usr/local/bin")
     } else {
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(parent) = exe.parent() {
                 return parent.to_path_buf();
             }
-        }
         std::env::var_os("HOME")
             .map_or_else(|| PathBuf::from("/usr/local/bin"), PathBuf::from)
             .join(".local/bin")

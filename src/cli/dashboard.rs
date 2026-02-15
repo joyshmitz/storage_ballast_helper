@@ -186,7 +186,7 @@ impl RateHistory {
             .map(|i| {
                 let idx = (start + i) % len;
                 // Map from [-max, +max] to [0, 1].
-                (self.values[idx] / max_abs + 1.0) / 2.0
+                f64::midpoint(self.values[idx] / max_abs, 1.0)
             })
             .collect()
     }
@@ -207,14 +207,14 @@ impl RateHistory {
 // ──────────────────── main dashboard loop ────────────────────
 
 /// Run the dashboard until the user exits (q/Ctrl-C/Esc).
-pub fn run(config: DashboardConfig) -> io::Result<()> {
+pub fn run(config: &DashboardConfig) -> io::Result<()> {
     let mut stdout = io::stdout();
 
     // Enter raw mode + alternate screen.
     terminal::enable_raw_mode()?;
     execute!(stdout, EnterAlternateScreen)?;
 
-    let result = run_inner(&mut stdout, &config);
+    let result = run_inner(&mut stdout, config);
 
     // Always restore terminal state.
     let _ = execute!(stdout, LeaveAlternateScreen);
@@ -232,12 +232,12 @@ fn run_inner(stdout: &mut io::Stdout, config: &DashboardConfig) -> io::Result<()
         .as_ref()
         .map(|p| FsStatsCollector::new(std::sync::Arc::clone(p), Duration::from_secs(1)));
 
-    let mut last_render = Instant::now() - config.refresh; // Force immediate first render.
+    let mut last_render = Instant::now().checked_sub(config.refresh).unwrap(); // Force immediate first render.
 
     loop {
         // Poll for keyboard events.
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
+        if event::poll(Duration::from_millis(50))?
+            && let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -246,7 +246,6 @@ fn run_inner(stdout: &mut io::Stdout, config: &DashboardConfig) -> io::Result<()
                     _ => {}
                 }
             }
-        }
 
         // Refresh at configured interval.
         if last_render.elapsed() < config.refresh {
@@ -291,6 +290,7 @@ fn run_inner(stdout: &mut io::Stdout, config: &DashboardConfig) -> io::Result<()
 
 // ──────────────────── frame rendering ────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn render_frame(
     stdout: &mut io::Stdout,
     width: usize,
@@ -309,9 +309,7 @@ fn render_frame(
     let version = state
         .map(|s| s.version.as_str())
         .unwrap_or(env!("CARGO_PKG_VERSION"));
-    let uptime_str = state
-        .map(|s| human_duration(s.uptime_seconds))
-        .unwrap_or_else(|| "N/A".to_string());
+    let uptime_str = state.map_or_else(|| "N/A".to_string(), |s| human_duration(s.uptime_seconds));
     let mode = if state.is_some() { "LIVE" } else { "DEGRADED" };
 
     let header = format!(" Storage Ballast Helper v{version}  [{mode}]");
@@ -343,7 +341,7 @@ fn render_frame(
     queue!(stdout, SetAttribute(Attribute::Reset))?;
     row += 1;
 
-    if let Some(ref s) = state {
+    if let Some(s) = state {
         for mount in &s.pressure.mounts {
             let used_pct = 100.0 - mount.free_pct;
             let gauge = render_gauge(used_pct, gauge_width);
@@ -356,13 +354,12 @@ fn render_frame(
             write!(stdout, "{gauge}  ({free_str})  {level_str}")?;
 
             // Time-to-exhaustion hint if rate is positive.
-            if let Some(rate) = mount.rate_bps {
-                if rate > 0.0 && mount.free_pct > 0.0 {
+            if let Some(rate) = mount.rate_bps
+                && rate > 0.0 && mount.free_pct > 0.0 {
                     // rough estimate — free_bytes not available, use percentage
                     queue!(stdout, SetForegroundColor(Color::Yellow))?;
                     write!(stdout, "  ⚠")?;
                 }
-            }
 
             queue!(stdout, SetAttribute(Attribute::Reset))?;
             row += 1;
@@ -463,7 +460,7 @@ fn render_frame(
     row += 1;
 
     // ── Ballast Status + Counters ──
-    if let Some(ref s) = state {
+    if let Some(s) = state {
         // Activity + Ballast on the same row section.
         queue!(
             stdout,
@@ -543,7 +540,6 @@ fn render_frame(
             s.counters.scans, s.counters.deletions, gb_freed, s.counters.errors, rss_mb, s.pid,
         )?;
         queue!(stdout, SetAttribute(Attribute::Reset))?;
-        row += 1;
     } else {
         queue!(stdout, MoveTo(3, row), SetForegroundColor(Color::DarkGrey))?;
         write!(
@@ -551,8 +547,8 @@ fn render_frame(
             "(daemon not running — showing static filesystem stats)"
         )?;
         queue!(stdout, SetAttribute(Attribute::Reset))?;
-        row += 1;
     }
+    row += 1;
 
     // ── Footer ──
     row += 1;

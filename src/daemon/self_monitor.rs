@@ -145,15 +145,17 @@ impl ThreadHeartbeat {
         let now = epoch_ms();
         let elapsed_ms = now.saturating_sub(last);
 
-        if elapsed_ms > stall_threshold.as_millis() as u64 {
+        #[allow(clippy::cast_possible_truncation)]
+        let threshold_ms = stall_threshold.as_millis() as u64;
+        if elapsed_ms > threshold_ms {
             ThreadStatus::Stalled {
                 name: self.name.clone(),
-                stalled_since: Instant::now() - Duration::from_millis(elapsed_ms),
+                stalled_since: Instant::now().checked_sub(Duration::from_millis(elapsed_ms)).unwrap(),
             }
         } else {
             ThreadStatus::Running {
                 name: self.name.clone(),
-                last_heartbeat: Instant::now() - Duration::from_millis(elapsed_ms),
+                last_heartbeat: Instant::now().checked_sub(Duration::from_millis(elapsed_ms)).unwrap(),
             }
         }
     }
@@ -162,10 +164,12 @@ impl ThreadHeartbeat {
 /// Milliseconds since an arbitrary process-local epoch.
 fn epoch_ms() -> u64 {
     use std::time::SystemTime;
-    SystemTime::now()
+    #[allow(clippy::cast_possible_truncation)]
+    let ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_millis() as u64;
+    ms
 }
 
 // ──────────────────── daemon health ────────────────────
@@ -243,11 +247,10 @@ impl SelfMonitor {
         ballast_total: usize,
     ) -> u64 {
         let now = Instant::now();
-        if let Some(last) = self.last_write {
-            if now.duration_since(last) < self.write_interval {
+        if let Some(last) = self.last_write
+            && now.duration_since(last) < self.write_interval {
                 return 0;
             }
-        }
 
         self.last_write = Some(now);
         let rss = read_rss_bytes();
@@ -335,7 +338,9 @@ impl SelfMonitor {
         if self.scan_count == 0 {
             return Duration::ZERO;
         }
-        self.scan_duration_total / self.scan_count as u32
+        #[allow(clippy::cast_possible_truncation)]
+        let count = self.scan_count as u32;
+        self.scan_duration_total / count
     }
 
     /// Build a health snapshot from current state plus thread heartbeats.
@@ -411,7 +416,7 @@ fn write_state_atomic(path: &Path, state: &DaemonState) -> std::io::Result<()> {
     }
 
     let json = serde_json::to_string_pretty(state)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     fs::write(&tmp_path, json)?;
     fs::rename(&tmp_path, path)?;
 
@@ -436,19 +441,17 @@ fn read_rss_bytes() -> u64 {
 
 #[cfg(target_os = "linux")]
 fn read_rss_linux() -> u64 {
-    let status = match fs::read_to_string("/proc/self/status") {
-        Ok(s) => s,
-        Err(_) => return 0,
+    let Ok(status) = fs::read_to_string("/proc/self/status") else {
+        return 0;
     };
 
     for line in status.lines() {
         if line.starts_with("VmRSS:") {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                if let Ok(kb) = parts[1].parse::<u64>() {
+            if parts.len() >= 2
+                && let Ok(kb) = parts[1].parse::<u64>() {
                     return kb * 1024; // kB to bytes
                 }
-            }
         }
     }
 

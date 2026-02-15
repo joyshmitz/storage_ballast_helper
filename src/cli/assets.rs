@@ -414,6 +414,7 @@ pub struct FetchSummary {
 
 /// Run the fetch pipeline for all manifest assets.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn fetch_assets(
     manifest: &AssetManifest,
     cache: &AssetCache,

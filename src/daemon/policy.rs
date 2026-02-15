@@ -570,7 +570,7 @@ pub struct PolicyDiagnostics {
 mod tests {
     use super::*;
     use crate::monitor::guardrails::GuardDiagnostics;
-    use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
+    use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification};
     use crate::scanner::scoring::{
         CandidacyScore, DecisionAction, DecisionOutcome, EvidenceLedger, EvidenceTerm, ScoreFactors,
     };
@@ -875,7 +875,7 @@ mod tests {
         engine.promote();
         engine.promote(); // enforce
 
-        let mut candidate = sample_candidate(DecisionAction::Delete, 2.5);
+        let candidate = sample_candidate(DecisionAction::Delete, 2.5);
         // expected_loss_delete=1.3, guard_penalty=50.0 → penalized=51.3 > keep=8.7
         let guard = GuardDiagnostics {
             status: GuardStatus::Unknown,
