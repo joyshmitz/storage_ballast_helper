@@ -1774,11 +1774,10 @@ fn generate_recommendations(
             && week.pressure.transitions > 0
             && config.ballast.file_count > 3
         {
-            let pool_gb = ballast_total_pool_bytes(
-                config.ballast.file_count,
-                config.ballast.file_size_bytes,
-            ) as f64
-                / 1_073_741_824.0;
+            let pool_gb =
+                ballast_total_pool_bytes(config.ballast.file_count, config.ballast.file_size_bytes)
+                    as f64
+                    / 1_073_741_824.0;
             let suggested = (config.ballast.file_count / 2).max(3);
             recs.push(Recommendation {
                 category: TuningCategory::Ballast,

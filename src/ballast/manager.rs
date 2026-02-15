@@ -447,12 +447,16 @@ impl BallastManager {
     }
 
     fn write_ballast_file_inner(&self, index: u32, path: &Path, size: u64) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-            .map_err(|e| SbhError::io(path, e))?;
+        let mut file = {
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o600);
+            }
+            opts.open(path).map_err(|e| SbhError::io(path, e))?
+        };
 
         // Write header (4096 bytes, null-padded).
         let header = BallastHeader::new(index, size);
@@ -726,5 +730,19 @@ mod tests {
         assert!(parsed.validate());
         assert_eq!(parsed.file_index, 7);
         assert_eq!(parsed.file_size, 1_073_741_824);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ballast_files_have_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        mgr.provision(None).unwrap();
+
+        let path = dir.path().join("SBH_BALLAST_FILE_00001.dat");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "ballast file should be owner-only (0o600)");
     }
 }
