@@ -303,12 +303,7 @@ fn parse_meminfo(raw: &str) -> Result<MemoryInfo> {
             .map_err(|error| SbhError::MountParse {
                 details: format!("invalid meminfo value in line {line:?}: {error}"),
             })?;
-        let multiplier = match tokens.next() {
-            Some("kB") => 1024,
-            Some("mB") => 1024 * 1024,
-            Some("gB") => 1024 * 1024 * 1024,
-            _ => 1,
-        };
+        let multiplier = meminfo_unit_multiplier(tokens.next(), line)?;
         values.insert(key.trim(), raw_value.saturating_mul(multiplier));
     }
 
@@ -318,6 +313,18 @@ fn parse_meminfo(raw: &str) -> Result<MemoryInfo> {
         swap_total_bytes: *values.get("SwapTotal").unwrap_or(&0),
         swap_free_bytes: *values.get("SwapFree").unwrap_or(&0),
     })
+}
+
+fn meminfo_unit_multiplier(unit: Option<&str>, line: &str) -> Result<u64> {
+    match unit {
+        Some("kB" | "KB" | "KiB") => Ok(1024_u64),
+        Some("mB" | "MB" | "MiB") => Ok(1024_u64 * 1024),
+        Some("gB" | "GB" | "GiB") => Ok(1024_u64 * 1024 * 1024),
+        None => Ok(1),
+        Some(other) => Err(SbhError::MountParse {
+            details: format!("unsupported meminfo unit in line {line:?}: {other}"),
+        }),
+    }
 }
 
 fn find_mount<'a>(path: &Path, mounts: &'a [MountPoint]) -> Option<&'a MountPoint> {
@@ -357,6 +364,8 @@ fn unescape_mount_field(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::errors::SbhError;
+
     use super::{
         MountPoint, find_mount, is_ram_fs, parse_meminfo, parse_proc_mounts, unescape_mount_field,
     };
@@ -420,6 +429,28 @@ mod tests {
         assert_eq!(info.available_bytes, 524_288);
         assert_eq!(info.swap_total_bytes, 0);
         assert_eq!(info.swap_free_bytes, 0);
+    }
+
+    #[test]
+    fn rejects_meminfo_with_unknown_unit_suffix() {
+        let error = parse_meminfo(
+            "MemTotal:       1024 blocks\n\
+             MemAvailable:   512 kB\n\
+             SwapTotal:      0 kB\n\
+             SwapFree:       0 kB\n",
+        )
+        .expect_err("unknown unit suffix should fail");
+
+        assert!(
+            matches!(error, SbhError::MountParse { .. }),
+            "expected mount-parse error, got: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported meminfo unit in line"),
+            "expected unsupported-unit context, got: {error}"
+        );
     }
 
     #[test]

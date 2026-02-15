@@ -194,13 +194,11 @@ impl DeletionExecutor {
                 Ok(()) => {}
                 Err(skip) => {
                     report.items_skipped += 1;
-                    if skip == SkipReason::FileOpen {
-                        self.log_event(ActivityEvent::ArtifactDeletionFailed {
-                            path: candidate.path.to_string_lossy().to_string(),
-                            error_code: "SBH-2003".to_string(),
-                            error_message: format!("skipped: {skip:?}"),
-                        });
-                    }
+                    self.log_event(ActivityEvent::ArtifactDeletionFailed {
+                        path: candidate.path.to_string_lossy().to_string(),
+                        error_code: "SBH-2003".to_string(),
+                        error_message: format!("skipped: {skip:?}"),
+                    });
                     continue;
                 }
             }

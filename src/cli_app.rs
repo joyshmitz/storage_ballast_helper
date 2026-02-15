@@ -14,6 +14,9 @@ use thiserror::Error;
 
 use storage_ballast_helper::ballast::manager::BallastManager;
 use storage_ballast_helper::core::config::Config;
+use storage_ballast_helper::daemon::loop_main::{
+    DaemonArgs as RuntimeDaemonArgs, MonitoringDaemon,
+};
 use storage_ballast_helper::daemon::service::{
     LaunchdServiceManager, ServiceActionResult, SystemdServiceManager,
 };
@@ -27,6 +30,9 @@ use storage_ballast_helper::scanner::scoring::{CandidacyScore, CandidateInput, S
 use storage_ballast_helper::scanner::walker::{
     DirectoryWalker, WalkerConfig, collect_open_files, is_path_open,
 };
+
+const LIVE_REFRESH_MIN_MS: u64 = 100;
+const STATUS_WATCH_REFRESH_MS: u64 = 1_000;
 
 /// Storage Ballast Helper — prevents disk-full scenarios from coding agent swarms.
 #[derive(Debug, Parser)]
@@ -552,15 +558,14 @@ impl CliError {
     }
 }
 
-/// Dispatch CLI commands. Command bodies are still scaffold stubs; this bead only
-/// establishes the full parser + output contract.
+/// Dispatch CLI commands.
 pub fn run(cli: &Cli) -> Result<(), CliError> {
     if cli.no_color {
         control::set_override(false);
     }
 
     match &cli.command {
-        Command::Daemon(args) => emit_stub_with_args(cli, "daemon", args),
+        Command::Daemon(args) => run_daemon(cli, args),
         Command::Install(args) => run_install(cli, args),
         Command::Uninstall(args) => run_uninstall(cli, args),
         Command::Status(args) => run_status(cli, args),
@@ -576,7 +581,7 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Tune(args) => run_tune(cli, args),
         Command::Check(args) => run_check(cli, args),
         Command::Blame(args) => run_blame(cli, args),
-        Command::Dashboard(args) => emit_stub_with_args(cli, "dashboard", args),
+        Command::Dashboard(args) => run_dashboard(cli, args),
         Command::Completions(args) => {
             let mut command = Cli::command();
             let binary_name = command.get_name().to_string();
@@ -586,6 +591,25 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Update(args) => run_update(cli, args),
         Command::Setup(args) => run_setup(cli, args),
     }
+}
+
+fn to_runtime_daemon_args(args: &DaemonArgs) -> RuntimeDaemonArgs {
+    RuntimeDaemonArgs {
+        foreground: !args.background,
+        pidfile: args.pidfile.clone(),
+        watchdog_sec: args.watchdog_sec,
+    }
+}
+
+fn run_daemon(cli: &Cli, args: &DaemonArgs) -> Result<(), CliError> {
+    let config =
+        Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let runtime_args = to_runtime_daemon_args(args);
+    let mut daemon = MonitoringDaemon::init(config, &runtime_args)
+        .map_err(|e| CliError::Runtime(format!("failed to initialize daemon: {e}")))?;
+    daemon
+        .run()
+        .map_err(|e| CliError::Runtime(format!("daemon runtime failure: {e}")))
 }
 
 #[allow(dead_code)]
@@ -2648,8 +2672,47 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
     }
 }
 
+const fn normalize_refresh_ms(refresh_ms: u64) -> u64 {
+    if refresh_ms < LIVE_REFRESH_MIN_MS {
+        LIVE_REFRESH_MIN_MS
+    } else {
+        refresh_ms
+    }
+}
+
+fn run_live_status_loop(cli: &Cli, refresh_ms: u64, command: &str) -> Result<(), CliError> {
+    if output_mode(cli) == OutputMode::Json {
+        return Err(CliError::User(format!(
+            "{command}: live mode does not support --json; use `sbh status --json` for snapshots"
+        )));
+    }
+
+    let refresh_ms = normalize_refresh_ms(refresh_ms);
+
+    loop {
+        print!("\x1B[2J\x1B[H");
+        io::stdout().flush()?;
+        render_status(cli)?;
+        println!("\nRefreshing every {refresh_ms}ms (Ctrl-C to exit)");
+        io::stdout().flush()?;
+        std::thread::sleep(std::time::Duration::from_millis(refresh_ms));
+    }
+}
+
+fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
+    run_live_status_loop(cli, args.refresh_ms, "dashboard")
+}
+
+fn run_status(cli: &Cli, args: &StatusArgs) -> Result<(), CliError> {
+    if args.watch {
+        run_live_status_loop(cli, STATUS_WATCH_REFRESH_MS, "status --watch")
+    } else {
+        render_status(cli)
+    }
+}
+
 #[allow(clippy::too_many_lines)]
-fn run_status(cli: &Cli, _args: &StatusArgs) -> Result<(), CliError> {
+fn render_status(cli: &Cli) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
     let platform = LinuxPlatform::new();
@@ -4149,25 +4212,6 @@ fn truncate_path(path: &std::path::Path, max_len: usize) -> String {
     }
 }
 
-fn emit_stub_with_args<T: Serialize>(cli: &Cli, command: &str, args: &T) -> Result<(), CliError> {
-    let message = format!("{command}: not yet implemented");
-    match output_mode(cli) {
-        OutputMode::Human => {
-            println!("{message}");
-        }
-        OutputMode::Json => {
-            let payload = json!({
-                "command": command,
-                "status": "not_implemented",
-                "message": message,
-                "args": serde_json::to_value(args)?,
-            });
-            write_json_line(&payload)?;
-        }
-    }
-    Ok(())
-}
-
 fn emit_version(cli: &Cli, args: &VersionArgs) -> Result<(), CliError> {
     let version = env!("CARGO_PKG_VERSION");
     let package = env!("CARGO_PKG_NAME");
@@ -4900,6 +4944,38 @@ mod tests {
             let parsed = Cli::try_parse_from(case.iter().copied());
             assert!(parsed.is_ok(), "failed to parse case: {case:?}");
         }
+    }
+
+    #[test]
+    fn daemon_args_convert_to_runtime_daemon_args() {
+        let args = DaemonArgs {
+            background: true,
+            pidfile: Some(PathBuf::from("/tmp/sbh.pid")),
+            watchdog_sec: 42,
+        };
+        let runtime = to_runtime_daemon_args(&args);
+        assert!(!runtime.foreground);
+        assert_eq!(runtime.pidfile, Some(PathBuf::from("/tmp/sbh.pid")));
+        assert_eq!(runtime.watchdog_sec, 42);
+
+        let runtime_default = to_runtime_daemon_args(&DaemonArgs::default());
+        assert!(runtime_default.foreground);
+        assert_eq!(runtime_default.pidfile, None);
+        assert_eq!(runtime_default.watchdog_sec, 0);
+    }
+
+    #[test]
+    fn normalize_refresh_ms_enforces_minimum_floor() {
+        assert_eq!(normalize_refresh_ms(0), LIVE_REFRESH_MIN_MS);
+        assert_eq!(
+            normalize_refresh_ms(LIVE_REFRESH_MIN_MS - 1),
+            LIVE_REFRESH_MIN_MS
+        );
+        assert_eq!(
+            normalize_refresh_ms(LIVE_REFRESH_MIN_MS),
+            LIVE_REFRESH_MIN_MS
+        );
+        assert_eq!(normalize_refresh_ms(2_500), 2_500);
     }
 
     #[test]

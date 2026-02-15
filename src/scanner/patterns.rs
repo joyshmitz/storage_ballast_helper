@@ -59,7 +59,7 @@ enum MatchKind {
     Exact(&'static str),
     Prefix(&'static str),
     Suffix(&'static str),
-    #[allow(dead_code)]
+    #[allow(dead_code)] // match arm exists but no patterns use this variant yet
     Contains(&'static str),
 }
 

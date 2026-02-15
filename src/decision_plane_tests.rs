@@ -776,11 +776,11 @@ fn property_policy_engine_invariants_under_random_operations() {
 
 /// An operation to perform on the policy engine during replay.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 enum PolicyOp {
     /// Promote the policy mode (observe→canary→enforce).
     Promote,
     /// Demote the policy mode (enforce→canary→observe).
+    #[allow(dead_code)] // match arm exists but no replay scenario uses this yet
     Demote,
     /// Force fallback with the given reason.
     Fallback(FallbackReason),
@@ -807,12 +807,12 @@ struct ReplayStep {
 
 /// Result of a single replay step.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct ReplayStepResult {
     label: String,
     mode_before: ActiveMode,
     mode_after: ActiveMode,
     guard_status: GuardStatus,
+    #[allow(dead_code)] // populated for diagnostic completeness
     guard_observation_count: usize,
     decisions_made: u64,
     approved_count: usize,
@@ -937,15 +937,16 @@ impl ReplayEngine {
 
 /// Types of faults that can be injected into a replay scenario.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 enum FaultType {
     /// Guard receives wildly miscalibrated observations.
     StaleStats { error_factor: f64 },
     /// Force serialization failure fallback.
     SerializerFailure,
     /// Guard stuck at Unknown (no observations fed).
+    #[allow(dead_code)] // fault scenario scaffolding
     LockContention,
     /// E-process alarm triggered via high drift.
+    #[allow(dead_code)] // fault scenario scaffolding
     HighDrift { drift_magnitude: f64 },
     /// Sudden urgency spike.
     BurstPressure { urgency: f64 },
@@ -1271,11 +1272,11 @@ impl ReproPack {
 
 /// Statistical summary with percentile values.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct BenchmarkStats {
     p50: f64,
     p95: f64,
     p99: f64,
+    #[allow(dead_code)] // populated but currently unused in assertions
     mean: f64,
     count: usize,
 }

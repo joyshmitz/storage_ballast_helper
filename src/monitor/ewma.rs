@@ -83,8 +83,13 @@ impl DiskRateEstimator {
             return self.fallback_estimate(free_bytes, threshold_free_bytes);
         };
 
-        let dt = observed_at.duration_since(previous.at).as_secs_f64();
-        if dt <= f64::EPSILON {
+        let Some(dt_duration) = observed_at.checked_duration_since(previous.at) else {
+            // Out-of-order timestamps can happen under clock jitter or caller
+            // scheduling races. Fail safe instead of panicking.
+            return self.fallback_estimate(free_bytes, threshold_free_bytes);
+        };
+        let dt = dt_duration.as_secs_f64();
+        if dt <= 1e-6 {
             return self.fallback_estimate(free_bytes, threshold_free_bytes);
         }
 
@@ -210,11 +215,14 @@ fn project_time(rate: f64, accel: f64, distance_bytes: f64) -> f64 {
     }
 
     let discriminant = rate.mul_add(rate, 2.0 * accel * distance_bytes);
-    // Use absolute value of discriminant so decelerating scenarios still
-    // produce a quadratic correction instead of falling back to linear.
-    let root = discriminant.abs().sqrt();
+    if discriminant < 0.0 {
+        // Deceleration is strong enough that the rate will reach zero before
+        // covering `distance_bytes`. The disk will never fill at this trend.
+        return f64::INFINITY;
+    }
+    let root = discriminant.sqrt();
     let numerator = -rate + root;
-    if accel.abs() < 1e-9 || numerator <= 0.0 {
+    if numerator <= 0.0 {
         return distance_bytes / rate;
     }
     let t = numerator / accel;
@@ -334,6 +342,23 @@ mod tests {
         // Same timestamp — zero dt.
         let reading = estimator.update(9_000, t0, 1_000);
         assert!(reading.fallback_active);
+    }
+
+    #[test]
+    fn out_of_order_timestamp_returns_fallback_without_panicking() {
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 2);
+        let t0 = Instant::now();
+        let _ = estimator.update(10_000, t0, 1_000);
+        let _ = estimator.update(9_500, t0 + Duration::from_secs(1), 1_000);
+
+        // Regressed timestamp: previously this path could panic.
+        let reading = estimator.update(9_000, t0, 1_000);
+        assert!(reading.fallback_active);
+        assert_eq!(
+            estimator.sample_count(),
+            1,
+            "out-of-order sample should be ignored, not counted"
+        );
     }
 
     #[test]

@@ -346,13 +346,7 @@ impl MonitoringDaemon {
 
             // 7b. Self-monitoring: write state file + check RSS.
             {
-                let primary_path = self
-                    .config
-                    .scanner
-                    .root_paths
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| PathBuf::from("/"));
+                let primary_path = self.primary_path();
                 let free_pct = self
                     .fs_collector
                     .collect(&primary_path)
@@ -439,6 +433,18 @@ impl MonitoringDaemon {
         Ok(())
     }
 
+    // ──────────────────── helpers ────────────────────
+
+    /// Return the first configured root path, or `/` as fallback.
+    fn primary_path(&self) -> PathBuf {
+        self.config
+            .scanner
+            .root_paths
+            .first()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("/"))
+    }
+
     // ──────────────────── pressure monitoring ────────────────────
 
     fn check_pressure(&mut self) -> Result<crate::monitor::pid::PressureResponse> {
@@ -498,13 +504,7 @@ impl MonitoringDaemon {
     }
 
     fn log_pressure_change(&self, response: &crate::monitor::pid::PressureResponse) {
-        let primary_path = self
-            .config
-            .scanner
-            .root_paths
-            .first()
-            .cloned()
-            .unwrap_or_else(|| PathBuf::from("/"));
+        let primary_path = self.primary_path();
         // Best-effort: collect fresh stats for the log entry.
         let (free_pct, mount, total, free) =
             if let Ok(stats) = self.fs_collector.collect(&primary_path) {
@@ -542,13 +542,7 @@ impl MonitoringDaemon {
         match response.level {
             PressureLevel::Green => {
                 // Maybe replenish ballast.
-                let primary_path = self
-                    .config
-                    .scanner
-                    .root_paths
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| PathBuf::from("/"));
+                let primary_path = self.primary_path();
                 let collector = &self.fs_collector;
                 let _ = self.release_controller.maybe_replenish(
                     &mut self.ballast_manager,
@@ -592,12 +586,10 @@ impl MonitoringDaemon {
                     .maybe_release(&mut self.ballast_manager, response);
                 self.send_scan_request(scan_tx, response);
 
+                let primary = self.primary_path();
                 let actual_free_pct = self
-                    .config
-                    .scanner
-                    .root_paths
-                    .first()
-                    .and_then(|p| self.fs_collector.collect(p).ok())
+                    .fs_collector
+                    .collect(&primary)
                     .map_or(0.0, |s| s.free_pct());
                 self.logger_handle.send(ActivityEvent::Emergency {
                     details: format!(
@@ -681,13 +673,7 @@ impl MonitoringDaemon {
     // ──────────────────── ballast ────────────────────
 
     fn provision_ballast(&mut self) -> Result<()> {
-        let primary_path = self
-            .config
-            .scanner
-            .root_paths
-            .first()
-            .cloned()
-            .unwrap_or_else(|| PathBuf::from("/"));
+        let primary_path = self.primary_path();
         let collector = &self.fs_collector;
         let report = self.ballast_manager.provision(Some(&|| {
             collector
