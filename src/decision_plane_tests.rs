@@ -49,12 +49,19 @@ impl SeededRng {
     }
 
     fn next_f64(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+        // Generate uniform [0, 1) without lossy integer->float casts.
+        let bits = (self.next_u64() >> 12) | 0x3ff0_0000_0000_0000;
+        f64::from_bits(bits) - 1.0
     }
 
     fn next_range(&mut self, lo: u64, hi: u64) -> u64 {
         lo + self.next_u64() % (hi - lo + 1)
     }
+}
+
+fn usize_to_f64(value: usize) -> f64 {
+    let narrowed = u32::try_from(value).expect("value must fit in u32 for test fixture scaling");
+    f64::from(narrowed)
 }
 
 // ──────────────────── fixture builders ────────────────────
@@ -101,7 +108,7 @@ fn random_candidates(rng: &mut SeededRng, count: usize) -> Vec<CandidateInput> {
     for i in 0..count {
         let age = rng.next_range(1, 48);
         let size = rng.next_range(1, 10);
-        let conf = 0.5 + rng.next_f64() * 0.45;
+        let conf = rng.next_f64().mul_add(0.45, 0.5);
         let suffix = rng.next_u64() % 1000;
         let path = format!("/data/projects/p{i}/.target_opus_{suffix}");
         results.push(make_candidate(rng, &path, age, size, conf));
@@ -128,7 +135,8 @@ fn scoring_is_perfectly_deterministic() {
 
         for (a, b) in scored_a.iter().zip(scored_b.iter()) {
             assert_eq!(
-                a.total_score, b.total_score,
+                a.total_score.to_bits(),
+                b.total_score.to_bits(),
                 "trial {trial}: scores must be bitwise identical"
             );
             assert_eq!(a.path, b.path, "trial {trial}: paths must be identical");
@@ -206,16 +214,15 @@ fn higher_score_implies_higher_posterior() {
         if (pair[0].classification.combined_confidence - pair[1].classification.combined_confidence)
             .abs()
             < 0.01
+            && pair[0].total_score > pair[1].total_score + 0.01
         {
-            if pair[0].total_score > pair[1].total_score + 0.01 {
-                assert!(
-                    pair[0].decision.posterior_abandoned >= pair[1].decision.posterior_abandoned,
-                    "higher score ({:.3}) should give higher posterior ({:.4} vs {:.4})",
-                    pair[0].total_score,
-                    pair[0].decision.posterior_abandoned,
-                    pair[1].decision.posterior_abandoned,
-                );
-            }
+            assert!(
+                pair[0].decision.posterior_abandoned >= pair[1].decision.posterior_abandoned,
+                "higher score ({:.3}) should give higher posterior ({:.4} vs {:.4})",
+                pair[0].total_score,
+                pair[0].decision.posterior_abandoned,
+                pair[1].decision.posterior_abandoned,
+            );
         }
     }
 }
@@ -251,7 +258,7 @@ fn pressure_multiplier_is_monotone() {
 
     let mut prev_score = 0.0f64;
     for urgency_pct in 0..=10 {
-        let urgency = urgency_pct as f64 / 10.0;
+        let urgency = f64::from(urgency_pct) / 10.0;
         let scored = engine.score_candidate(&input, urgency);
         assert!(
             scored.total_score >= prev_score,
@@ -405,8 +412,10 @@ fn policy_fallback_idempotent() {
 
 #[test]
 fn policy_fallback_recovery_restores_mode() {
-    let mut config = PolicyConfig::default();
-    config.recovery_clean_windows = 1;
+    let config = PolicyConfig {
+        recovery_clean_windows: 1,
+        ..PolicyConfig::default()
+    };
     let mut engine = PolicyEngine::new(config);
     engine.promote(); // canary
     engine.enter_fallback(FallbackReason::GuardrailDrift);
@@ -433,8 +442,10 @@ fn policy_fallback_recovery_restores_mode() {
 #[test]
 fn policy_fallback_from_any_active_mode() {
     for initial in [ActiveMode::Observe, ActiveMode::Canary, ActiveMode::Enforce] {
-        let mut config = PolicyConfig::default();
-        config.initial_mode = initial;
+        let config = PolicyConfig {
+            initial_mode: initial,
+            ..PolicyConfig::default()
+        };
         let mut engine = PolicyEngine::new(config);
 
         // Promote to desired mode.
@@ -531,8 +542,10 @@ fn decision_records_carry_correct_policy_mode() {
     ];
 
     for (active, expected_policy) in modes {
-        let mut config = PolicyConfig::default();
-        config.initial_mode = active;
+        let config = PolicyConfig {
+            initial_mode: active,
+            ..PolicyConfig::default()
+        };
         let mut engine = PolicyEngine::new(config);
         while engine.mode() != active {
             if active == ActiveMode::FallbackSafe {
@@ -630,7 +643,8 @@ fn property_vetoed_candidates_have_zero_score() {
             let scored = engine.score_candidate(c, 0.5);
             if scored.vetoed {
                 assert_eq!(
-                    scored.total_score, 0.0,
+                    scored.total_score.to_bits(),
+                    0.0_f64.to_bits(),
                     "seed={seed}: vetoed candidate must have score 0.0"
                 );
                 assert_eq!(scored.decision.action, DecisionAction::Keep);
@@ -670,10 +684,12 @@ fn property_decision_record_never_panics_on_serialize() {
 fn property_policy_engine_invariants_under_random_operations() {
     for seed in 0..10 {
         let mut rng = SeededRng::new(seed * 17 + 3);
-        let mut config = PolicyConfig::default();
-        config.recovery_clean_windows = 2;
-        config.calibration_breach_windows = 2;
-        config.max_canary_deletes_per_hour = 5;
+        let config = PolicyConfig {
+            recovery_clean_windows: 2,
+            calibration_breach_windows: 2,
+            max_canary_deletes_per_hour: 5,
+            ..PolicyConfig::default()
+        };
         let mut engine = PolicyEngine::new(config);
 
         let candidates: Vec<CandidacyScore> = (0..5)
@@ -941,11 +957,11 @@ enum FaultType {
 #[derive(Debug, Clone)]
 struct FaultExpectation {
     /// Whether the engine should be in fallback mode.
-    expect_fallback: bool,
+    fallback_expected: bool,
     /// Expected reason for fallback (if applicable).
-    expect_reason_contains: Option<String>,
+    reason_contains: Option<String>,
     /// Whether deletions should be blocked.
-    expect_no_deletions: bool,
+    no_deletions_expected: bool,
 }
 
 /// A single fault injection scenario.
@@ -965,11 +981,14 @@ struct FaultScenario {
 /// Build guard observations that are well-calibrated.
 fn good_observations(count: usize) -> Vec<CalibrationObservation> {
     (0..count)
-        .map(|i| CalibrationObservation {
-            predicted_rate: 1000.0 + (i as f64 * 10.0),
-            actual_rate: 1050.0 + (i as f64 * 10.0),
-            predicted_tte: 90.0 + (i as f64),
-            actual_tte: 110.0 + (i as f64),
+        .map(|i| {
+            let i_f = usize_to_f64(i);
+            CalibrationObservation {
+                predicted_rate: i_f.mul_add(10.0, 1000.0),
+                actual_rate: i_f.mul_add(10.0, 1050.0),
+                predicted_tte: i_f + 90.0,
+                actual_tte: i_f + 110.0,
+            }
         })
         .collect()
 }
@@ -977,11 +996,15 @@ fn good_observations(count: usize) -> Vec<CalibrationObservation> {
 /// Build guard observations that are poorly calibrated.
 fn bad_observations(count: usize, error_factor: f64) -> Vec<CalibrationObservation> {
     (0..count)
-        .map(|i| CalibrationObservation {
-            predicted_rate: 1000.0 + (i as f64 * 10.0),
-            actual_rate: (1000.0 + (i as f64 * 10.0)) * error_factor,
-            predicted_tte: 100.0,
-            actual_tte: 20.0, // non-conservative: predicted > actual
+        .map(|i| {
+            let i_f = usize_to_f64(i);
+            let predicted_rate = i_f.mul_add(10.0, 1000.0);
+            CalibrationObservation {
+                predicted_rate,
+                actual_rate: predicted_rate * error_factor,
+                predicted_tte: 100.0,
+                actual_tte: 20.0, // non-conservative: predicted > actual
+            }
         })
         .collect()
 }
@@ -1031,6 +1054,7 @@ fn warmup_to_mode(rng: &mut SeededRng, target: ActiveMode) -> Vec<ReplayStep> {
 }
 
 /// Execute a fault scenario and validate the expectation.
+#[allow(clippy::too_many_lines)]
 fn run_fault_scenario(scenario: &FaultScenario) {
     let mut engine = ReplayEngine::new(scenario.seed);
 
@@ -1119,7 +1143,7 @@ fn run_fault_scenario(scenario: &FaultScenario) {
     // Validate the expectation against the last trace entry.
     let last = engine.trace.last().expect("trace must not be empty");
 
-    if scenario.expectation.expect_fallback {
+    if scenario.expectation.fallback_expected {
         assert!(
             last.fallback_active,
             "scenario '{}': expected fallback mode, got {:?}",
@@ -1127,7 +1151,7 @@ fn run_fault_scenario(scenario: &FaultScenario) {
         );
     }
 
-    if let Some(ref reason_fragment) = scenario.expectation.expect_reason_contains {
+    if let Some(ref reason_fragment) = scenario.expectation.reason_contains {
         let reason_str = last
             .fallback_reason
             .as_ref()
@@ -1141,7 +1165,7 @@ fn run_fault_scenario(scenario: &FaultScenario) {
         );
     }
 
-    if scenario.expectation.expect_no_deletions {
+    if scenario.expectation.no_deletions_expected {
         assert_eq!(
             last.approved_count, 0,
             "scenario '{}': expected no deletions, got {}",
@@ -1257,6 +1281,10 @@ struct BenchmarkStats {
 }
 
 impl BenchmarkStats {
+    fn percentile_index(sample_count: usize, percentile: usize) -> usize {
+        (sample_count.saturating_sub(1) * percentile) / 100
+    }
+
     fn from_samples(mut samples: Vec<f64>) -> Self {
         assert!(
             !samples.is_empty(),
@@ -1264,11 +1292,11 @@ impl BenchmarkStats {
         );
         samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let n = samples.len();
-        let mean = samples.iter().sum::<f64>() / n as f64;
+        let mean = samples.iter().sum::<f64>() / usize_to_f64(n);
         Self {
             p50: samples[n / 2],
-            p95: samples[(n as f64 * 0.95) as usize],
-            p99: samples[(n as f64 * 0.99) as usize],
+            p95: samples[Self::percentile_index(n, 95)],
+            p99: samples[Self::percentile_index(n, 99)],
             mean,
             count: n,
         }
@@ -1535,9 +1563,9 @@ fn fault_stale_stats_triggers_fallback() {
         fault: FaultType::StaleStats { error_factor: 5.0 },
         post_fault_steps: Vec::new(),
         expectation: FaultExpectation {
-            expect_fallback: false,
-            expect_reason_contains: None,
-            expect_no_deletions: false,
+            fallback_expected: false,
+            reason_contains: None,
+            no_deletions_expected: false,
         },
     });
 }
@@ -1552,9 +1580,9 @@ fn fault_serializer_failure_blocks_deletions() {
         fault: FaultType::SerializerFailure,
         post_fault_steps: Vec::new(),
         expectation: FaultExpectation {
-            expect_fallback: true,
-            expect_reason_contains: Some("serialization".to_string()),
-            expect_no_deletions: true,
+            fallback_expected: true,
+            reason_contains: Some("serialization".to_string()),
+            no_deletions_expected: true,
         },
     });
 }
@@ -1569,9 +1597,9 @@ fn fault_kill_switch_blocks_all_actions() {
         fault: FaultType::KillSwitch,
         post_fault_steps: Vec::new(),
         expectation: FaultExpectation {
-            expect_fallback: true,
-            expect_reason_contains: Some("kill".to_string()),
-            expect_no_deletions: true,
+            fallback_expected: true,
+            reason_contains: Some("kill".to_string()),
+            no_deletions_expected: true,
         },
     });
 }
@@ -1613,9 +1641,9 @@ fn fault_burst_pressure_respects_mode() {
         fault: FaultType::BurstPressure { urgency: 0.99 },
         post_fault_steps: Vec::new(),
         expectation: FaultExpectation {
-            expect_fallback: false,
-            expect_reason_contains: None,
-            expect_no_deletions: true, // Observe mode never deletes.
+            fallback_expected: false,
+            reason_contains: None,
+            no_deletions_expected: true, // Observe mode never deletes.
         },
     });
 }

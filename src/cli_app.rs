@@ -647,7 +647,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
                 .map_err(|e| CliError::User(format!("wizard cancelled: {e}")))?
         };
 
-        let config_path = answers.to_config().paths.config_file.clone();
+        let config_path = answers.to_config().paths.config_file;
 
         let config_written = write_config(&answers, &config_path)
             .map_err(|e| CliError::Runtime(format!("failed to write config: {e}")))?;
@@ -685,17 +685,14 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
             format_prerequisite_failures, format_result_human,
         };
 
-        let checkout = match &args.tag {
-            Some(tag) => {
-                let normalized = if tag.starts_with('v') {
-                    tag.clone()
-                } else {
-                    format!("v{tag}")
-                };
-                SourceCheckout::Tag(normalized)
-            }
-            None => SourceCheckout::Head,
-        };
+        let checkout = args.tag.as_ref().map_or(SourceCheckout::Head, |tag| {
+            let normalized = if tag.starts_with('v') {
+                tag.clone()
+            } else {
+                format!("v{tag}")
+            };
+            SourceCheckout::Tag(normalized)
+        });
 
         let config = SourceInstallConfig::new(checkout, args.prefix.clone());
 
@@ -823,7 +820,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
                     action: "install",
                     service_type: "launchd",
                     scope,
-                    unit_path: plist_path.clone(),
+                    unit_path: plist_path,
                     success: false,
                     error: Some(e.to_string()),
                 };
@@ -882,7 +879,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
                 action: "install",
                 service_type: "systemd",
                 scope,
-                unit_path: unit_path.clone(),
+                unit_path,
                 success: false,
                 error: Some(e.to_string()),
             };
@@ -956,7 +953,7 @@ fn run_uninstall(cli: &Cli, args: &UninstallArgs) -> Result<(), CliError> {
                     action: "uninstall",
                     service_type: "launchd",
                     scope,
-                    unit_path: plist_path.clone(),
+                    unit_path: plist_path,
                     success: false,
                     error: Some(e.to_string()),
                 };
@@ -1028,7 +1025,7 @@ fn run_uninstall(cli: &Cli, args: &UninstallArgs) -> Result<(), CliError> {
                 action: "uninstall",
                 service_type: "systemd",
                 scope,
-                unit_path: unit_path.clone(),
+                unit_path,
                 success: false,
                 error: Some(e.to_string()),
             };
@@ -1090,10 +1087,9 @@ fn parse_window_duration(s: &str) -> Result<std::time::Duration, CliError> {
         .map_err(|_| CliError::User(format!("invalid window value: {s}")))?;
     let multiplier = match suffix {
         "s" | "sec" => 1,
-        "m" | "min" => 60,
+        "m" | "min" | "" => 60, // bare number defaults to minutes
         "h" | "hr" => 3600,
         "d" | "day" => 86400,
-        "" => 60, // bare number defaults to minutes
         _ => return Err(CliError::User(format!("unknown window suffix: {suffix}"))),
     };
     Ok(std::time::Duration::from_secs(n * multiplier))

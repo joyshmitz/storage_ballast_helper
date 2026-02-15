@@ -1205,7 +1205,7 @@ mod tests {
             format!("{checksum_hex}  {archive_name}\n"),
         )
         .unwrap();
-        let sigstore_bundle = sigstore_bundle_contents.map_or(None, |contents| {
+        let sigstore_bundle = sigstore_bundle_contents.and_then(|contents| {
             std::fs::write(root.join(&sigstore_name), contents).unwrap();
             Some(sigstore_name)
         });
