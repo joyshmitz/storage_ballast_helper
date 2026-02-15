@@ -65,9 +65,14 @@ impl BallastPool {
         self.manager.available_count()
     }
 
-    /// Total files expected in this pool (from config).
-    pub fn expected_count(&self) -> usize {
+    /// Number of files currently on disk in this pool.
+    pub fn actual_count(&self) -> usize {
         self.manager.inventory().len()
+    }
+
+    /// Number of files this pool is configured to hold.
+    pub fn expected_count(&self) -> usize {
+        self.manager.config().file_count
     }
 }
 
@@ -142,6 +147,13 @@ impl BallastPoolCoordinator {
 
         for (mount_path, mount) in &seen_mounts {
             let mount_str = mount_path.to_string_lossy();
+
+            // Warn about non-UTF-8 mount paths that may cause config-matching issues.
+            if mount_path.to_str().is_none() {
+                eprintln!(
+                    "[SBH-WARN] mount path contains non-UTF-8 bytes, lossy representation: {mount_str}"
+                );
+            }
 
             // Check override: explicitly disabled?
             if !config.is_volume_enabled(&mount_str) {

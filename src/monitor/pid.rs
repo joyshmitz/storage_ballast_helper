@@ -53,11 +53,15 @@ pub struct PidPressureController {
     integral_cap: f64,
     hysteresis_pct: f64,
     target_free_pct: f64,
+    prev_target_free_pct: f64,
     green_min_free_pct: f64,
     yellow_min_free_pct: f64,
     orange_min_free_pct: f64,
     red_min_free_pct: f64,
     base_poll_interval: Duration,
+    /// Urgency boost thresholds derived from action_horizon_minutes.
+    /// [critical_seconds, high_seconds, moderate_seconds]
+    urgency_thresholds: [f64; 3],
     last_error: f64,
     last_update: Option<Instant>,
     level: PressureLevel,
@@ -87,15 +91,39 @@ impl PidPressureController {
             integral_cap,
             hysteresis_pct,
             target_free_pct,
+            prev_target_free_pct: target_free_pct,
             green_min_free_pct,
             yellow_min_free_pct,
             orange_min_free_pct,
             red_min_free_pct,
             base_poll_interval,
+            urgency_thresholds: [60.0, 300.0, 900.0],
             last_error: 0.0,
             last_update: None,
             level: PressureLevel::Green,
         }
+    }
+
+    /// Derive urgency boost thresholds from the predictive action horizon.
+    ///
+    /// The thresholds scale linearly: critical = horizon/30, high = horizon/6, moderate = horizon/2.
+    pub fn set_action_horizon_minutes(&mut self, action_horizon_minutes: f64) {
+        let horizon_secs = action_horizon_minutes * 60.0;
+        self.urgency_thresholds = [
+            (horizon_secs / 30.0).max(30.0),   // critical ~1min for 30min horizon
+            (horizon_secs / 6.0).max(60.0),    // high ~5min for 30min horizon
+            (horizon_secs / 2.0).max(120.0),   // moderate ~15min for 30min horizon
+        ];
+    }
+
+    /// Update the target free percentage (e.g., after config reload).
+    /// Resets the derivative term if the target changed to avoid a spike.
+    pub fn set_target_free_pct(&mut self, target: f64) {
+        if (target - self.prev_target_free_pct).abs() > f64::EPSILON {
+            self.last_error = 0.0; // reset derivative to avoid spike
+            self.prev_target_free_pct = target;
+        }
+        self.target_free_pct = target;
     }
 
     /// Update controller state.
@@ -113,7 +141,7 @@ impl PidPressureController {
             .map_or(1.0, |prev| now.duration_since(prev).as_secs_f64())
             .max(1e-6);
 
-        let error = (self.target_free_pct - free_pct).max(0.0);
+        let error = self.target_free_pct - free_pct;
         self.integral = (self.integral + error * dt).clamp(-self.integral_cap, self.integral_cap);
         let derivative = (error - self.last_error) / dt;
         self.last_error = error;
@@ -125,11 +153,12 @@ impl PidPressureController {
         let mut urgency = (1.0 - (-raw.max(0.0)).exp()).clamp(0.0, 1.0);
 
         if let Some(seconds) = predicted_seconds_to_red {
-            if seconds <= 60.0 {
+            let [critical, high, moderate] = self.urgency_thresholds;
+            if seconds <= critical {
                 urgency = urgency.max(1.0);
-            } else if seconds <= 300.0 {
+            } else if seconds <= high {
                 urgency = urgency.max(0.90);
-            } else if seconds <= 900.0 {
+            } else if seconds <= moderate {
                 urgency = urgency.max(0.70);
             }
         }

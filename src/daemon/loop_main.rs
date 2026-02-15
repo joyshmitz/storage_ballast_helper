@@ -435,15 +435,30 @@ impl MonitoringDaemon {
     // ──────────────────── pressure monitoring ────────────────────
 
     fn check_pressure(&mut self) -> Result<crate::monitor::pid::PressureResponse> {
-        // Collect stats for the primary monitored path.
-        let primary_path = self
-            .config
-            .scanner
-            .root_paths
-            .first()
-            .cloned()
-            .unwrap_or_else(|| PathBuf::from("/"));
-        let stats = self.fs_collector.collect(&primary_path)?;
+        // Collect stats for all root paths and find the most-pressured volume.
+        let paths = if self.config.scanner.root_paths.is_empty() {
+            vec![PathBuf::from("/")]
+        } else {
+            self.config.scanner.root_paths.clone()
+        };
+
+        let mut worst_stats = None;
+        let mut worst_free_pct = f64::MAX;
+
+        for path in &paths {
+            if let Ok(stats) = self.fs_collector.collect(path) {
+                let pct = stats.free_pct();
+                if pct < worst_free_pct {
+                    worst_free_pct = pct;
+                    worst_stats = Some(stats);
+                }
+            }
+        }
+
+        let stats = worst_stats.ok_or_else(|| crate::core::errors::SbhError::FsStats {
+            path: paths.first().cloned().unwrap_or_else(|| PathBuf::from("/")),
+            details: "no filesystem stats available for any root path".to_string(),
+        })?;
 
         // Update EWMA rate estimator.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -452,7 +467,7 @@ impl MonitoringDaemon {
         let now = Instant::now();
         let rate_estimate = self
             .rate_estimator
-            .update(stats.free_bytes, now, red_threshold_bytes);
+            .update(stats.available_bytes, now, red_threshold_bytes);
 
         // Predicted time to red threshold.
         let predicted_seconds = if rate_estimate.seconds_to_threshold.is_finite()

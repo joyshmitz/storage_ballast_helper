@@ -68,7 +68,6 @@ pub struct BallastFile {
     pub size: u64,
     pub created_at: String,
     pub integrity_ok: bool,
-    pub released: bool,
 }
 
 // ──────────────────── reports ────────────────────
@@ -128,23 +127,24 @@ impl BallastManager {
         &self.ballast_dir
     }
 
+    /// Configuration for this manager.
+    pub fn config(&self) -> &BallastConfig {
+        &self.config
+    }
+
     /// Current inventory of ballast files.
     pub fn inventory(&self) -> &[BallastFile] {
         &self.inventory
     }
 
-    /// How many bytes can be released (sum of non-released files).
+    /// How many bytes can be released (sum of all inventoried files).
     pub fn releasable_bytes(&self) -> u64 {
-        self.inventory
-            .iter()
-            .filter(|f| !f.released)
-            .map(|f| f.size)
-            .sum()
+        self.inventory.iter().map(|f| f.size).sum()
     }
 
-    /// Number of ballast files currently available (not released).
+    /// Number of ballast files currently available.
     pub fn available_count(&self) -> usize {
-        self.inventory.iter().filter(|f| !f.released).count()
+        self.inventory.len()
     }
 
     // ──────────────────── provision ────────────────────
@@ -192,7 +192,8 @@ impl BallastManager {
             match self.create_ballast_file(index) {
                 Ok(()) => {
                     report.files_created += 1;
-                    report.total_bytes += self.config.file_size_bytes;
+                    let actual_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(self.config.file_size_bytes);
+                    report.total_bytes += actual_size;
                 }
                 Err(e) => {
                     report.errors.push(format!("file {index}: {e}"));
@@ -215,20 +216,16 @@ impl BallastManager {
         };
 
         // Collect indices of available files in descending order.
-        let mut available: Vec<u32> = self
-            .inventory
-            .iter()
-            .filter(|f| !f.released)
-            .map(|f| f.index)
-            .collect();
+        let mut available: Vec<u32> = self.inventory.iter().map(|f| f.index).collect();
         available.sort_unstable_by(|a, b| b.cmp(a));
 
         for &index in available.iter().take(count) {
             let path = self.file_path(index);
+            let actual_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             match fs::remove_file(&path) {
                 Ok(()) => {
                     report.files_released += 1;
-                    report.bytes_freed += self.config.file_size_bytes;
+                    report.bytes_freed += actual_size;
                 }
                 Err(e) => {
                     report
@@ -288,6 +285,59 @@ impl BallastManager {
         self.provision(free_pct_check)
     }
 
+    /// Recreate at most one missing ballast file (for gradual replenishment).
+    pub fn replenish_one(
+        &mut self,
+        free_pct_check: Option<&dyn Fn() -> f64>,
+    ) -> Result<ProvisionReport> {
+        let mut report = ProvisionReport {
+            files_created: 0,
+            files_skipped: 0,
+            total_bytes: 0,
+            errors: Vec::new(),
+        };
+
+        for i in 1..=self.config.file_count {
+            let index = i as u32;
+            let path = self.file_path(index);
+
+            if path.exists() {
+                if self.verify_single_file(&path, index).is_ok() {
+                    report.files_skipped += 1;
+                    continue;
+                }
+                let _ = fs::remove_file(&path);
+            }
+
+            // Free-space check.
+            if let Some(check) = free_pct_check {
+                let free = check();
+                if free < MIN_FREE_PCT {
+                    report.errors.push(format!(
+                        "aborted at file {index}: free space {free:.1}% < {MIN_FREE_PCT}%"
+                    ));
+                    break;
+                }
+            }
+
+            match self.create_ballast_file(index) {
+                Ok(()) => {
+                    report.files_created += 1;
+                    let actual_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(self.config.file_size_bytes);
+                    report.total_bytes += actual_size;
+                    // Only create one file per call.
+                    break;
+                }
+                Err(e) => {
+                    report.errors.push(format!("file {index}: {e}"));
+                }
+            }
+        }
+
+        self.scan_existing();
+        Ok(report)
+    }
+
     // ──────────────────── internal ────────────────────
 
     fn file_path(&self, index: u32) -> PathBuf {
@@ -318,7 +368,6 @@ impl BallastManager {
                     size,
                     created_at,
                     integrity_ok,
-                    released: false,
                 });
             }
             // If the file doesn't exist, it's been released (not added to inventory).
@@ -379,12 +428,29 @@ impl BallastManager {
         let path = self.file_path(index);
         let size = self.config.file_size_bytes;
 
+        if size < HEADER_SIZE as u64 {
+            return Err(SbhError::InvalidConfig {
+                details: format!(
+                    "file_size_bytes ({size}) must be >= HEADER_SIZE ({HEADER_SIZE})"
+                ),
+            });
+        }
+
+        let result = self.write_ballast_file_inner(index, &path, size);
+        if result.is_err() {
+            // Clean up partial file on write error.
+            let _ = fs::remove_file(&path);
+        }
+        result
+    }
+
+    fn write_ballast_file_inner(&self, index: u32, path: &Path, size: u64) -> Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&path)
-            .map_err(|e| SbhError::io(&path, e))?;
+            .open(path)
+            .map_err(|e| SbhError::io(path, e))?;
 
         // Write header (4096 bytes, null-padded).
         let header = BallastHeader::new(index, size);
@@ -392,7 +458,7 @@ impl BallastManager {
         let mut header_buf = vec![0u8; HEADER_SIZE];
         header_buf[..header_json.len()].copy_from_slice(header_json.as_bytes());
         file.write_all(&header_buf)
-            .map_err(|e| SbhError::io(&path, e))?;
+            .map_err(|e| SbhError::io(path, e))?;
 
         // Write data portion.
         let data_size = size - HEADER_SIZE as u64;
@@ -400,15 +466,16 @@ impl BallastManager {
         // Try fallocate CLI first (instant on ext4/xfs, no unsafe needed).
         #[cfg(target_os = "linux")]
         {
-            if try_fallocate_cli(&path, size) {
+            if try_fallocate_cli(path, size) {
+                file.sync_all().map_err(|e| SbhError::io(path, e))?;
                 return Ok(());
             }
         }
 
         // Fallback: write random data in chunks (works on all FS including CoW).
-        self.write_random_data(&mut file, data_size, &path)?;
+        self.write_random_data(&mut file, data_size, path)?;
 
-        file.sync_all().map_err(|e| SbhError::io(&path, e))?;
+        file.sync_all().map_err(|e| SbhError::io(path, e))?;
         Ok(())
     }
 
@@ -443,14 +510,23 @@ impl BallastManager {
 ///
 /// Falls back to random data writing if the command is not available or fails
 /// (e.g., on CoW filesystems like btrfs/zfs where fallocate doesn't prevent dedup).
+///
+/// Only extends the file from the current position (after header) to total_size,
+/// so we pass `total_size - HEADER_SIZE` as the length.
 #[cfg(target_os = "linux")]
 fn try_fallocate_cli(path: &Path, total_size: u64) -> bool {
     use std::process::Command;
-    // fallocate -l SIZE PATH — allocates blocks without writing data.
-    // The file must already exist (we wrote the header).
+    // Guard: total_size must be larger than the header we already wrote.
+    let remaining = match total_size.checked_sub(HEADER_SIZE as u64) {
+        Some(r) if r > 0 => r,
+        _ => return false,
+    };
+    // fallocate -o OFFSET -l LENGTH PATH — extend the file past the header.
     Command::new("fallocate")
+        .arg("-o")
+        .arg(HEADER_SIZE.to_string())
         .arg("-l")
-        .arg(total_size.to_string())
+        .arg(remaining.to_string())
         .arg(path)
         .output()
         .map(|o| o.status.success())

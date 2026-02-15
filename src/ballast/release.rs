@@ -1,10 +1,11 @@
 //! Pressure-responsive ballast release: PID-driven incremental deletion strategy
 //! with cooldown-based automatic replenishment.
 //!
-//! Graduated release strategy based on PID urgency:
-//! - 0.0..0.3: release 1 file
-//! - 0.3..0.6: release 3 files
-//! - 0.6..0.9: release half of remaining ballast
+//! Graduated fallback release strategy based on PID urgency (when PID
+//! controller itself recommends 0 files):
+//! - 0.0..0.3: no release
+//! - 0.3..0.6: release 1 file
+//! - 0.6..0.9: release 3 files
 //! - 0.9..1.0: release ALL ballast (emergency)
 //!
 //! Replenishment only occurs when pressure stays Green for the configured cooldown
@@ -140,8 +141,8 @@ impl BallastReleaseController {
             return Ok(false);
         }
 
-        // Replenish one file (provision is idempotent — creates missing files).
-        let report = manager.replenish(Some(free_pct_check))?;
+        // Replenish at most one file per cycle to avoid a burst of disk activity.
+        let report = manager.replenish_one(Some(free_pct_check))?;
         if report.files_created > 0 {
             self.last_replenish_time = Some(Instant::now());
             self.files_released_since_green = self
