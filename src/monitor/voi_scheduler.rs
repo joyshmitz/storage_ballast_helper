@@ -362,9 +362,13 @@ impl VoiScheduler {
     /// VOI-prioritized scheduler with exploration quota.
     fn schedule_voi(&self, paths: &[&PathBuf], budget: usize, now: Instant) -> ScanPlan {
         // Split budget: exploration vs exploitation.
+        // Guarantee at least 1 exploitation slot when budget >= 1: under pressure,
+        // the scheduler must scan the highest-yield path, not waste the single
+        // slot on exploration.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let exploration_budget =
-            ((budget as f64 * self.config.exploration_quota_fraction).ceil() as usize).min(budget);
+        let exploration_budget = ((budget as f64 * self.config.exploration_quota_fraction).ceil()
+            as usize)
+            .min(budget.saturating_sub(1));
         let exploitation_budget = budget.saturating_sub(exploration_budget);
 
         // 1. Score all paths by utility.

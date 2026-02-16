@@ -225,13 +225,19 @@ impl BallastPoolCoordinator {
                 overrides: BTreeMap::new(),
             };
 
-            let manager = match BallastManager::new(ballast_dir.clone(), pool_config) {
+            let mut manager = match BallastManager::new(ballast_dir.clone(), pool_config) {
                 Ok(manager) => manager,
                 Err(err) => {
                     skip_with(format!("failed to initialize ballast manager: {err}"));
                     continue;
                 }
             };
+
+            // On CoW filesystems, force random-data writes (fallocate zeros are
+            // trivially deduplicated, defeating the purpose of ballast).
+            if strategy == ProvisionStrategy::RandomData {
+                manager.set_skip_fallocate(true);
+            }
 
             pools.insert(
                 mount_path.clone(),

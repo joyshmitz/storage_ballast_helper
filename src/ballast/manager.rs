@@ -109,6 +109,10 @@ pub struct BallastManager {
     ballast_dir: PathBuf,
     config: BallastConfig,
     inventory: Vec<BallastFile>,
+    /// When true, skip `fallocate` and always write random data.
+    /// Set for CoW filesystems (btrfs, zfs) where fallocate-allocated zeros
+    /// are trivially deduplicated, defeating the purpose of ballast.
+    skip_fallocate: bool,
 }
 
 impl BallastManager {
@@ -120,6 +124,7 @@ impl BallastManager {
             ballast_dir,
             config,
             inventory: Vec::new(),
+            skip_fallocate: false,
         };
         mgr.scan_existing();
         Ok(mgr)
@@ -155,6 +160,14 @@ impl BallastManager {
         self.config = config;
         // Re-scan inventory to reflect new file count limits.
         self.scan_existing();
+    }
+
+    /// Force random-data provisioning, skipping `fallocate`.
+    ///
+    /// Required on CoW filesystems (btrfs, zfs, bcachefs) where fallocate
+    /// allocates zero-filled blocks that are trivially deduplicated.
+    pub fn set_skip_fallocate(&mut self, skip: bool) {
+        self.skip_fallocate = skip;
     }
 
     // ──────────────────── locking ────────────────────
@@ -518,12 +531,11 @@ impl BallastManager {
         let data_size = size - HEADER_SIZE as u64;
 
         // Try fallocate CLI first (instant on ext4/xfs, no unsafe needed).
+        // Skipped on CoW filesystems where zero-filled blocks defeat dedup.
         #[cfg(target_os = "linux")]
-        {
-            if try_fallocate_cli(path, size) {
-                file.sync_all().map_err(|e| SbhError::io(path, e))?;
-                return Ok(());
-            }
+        if !self.skip_fallocate && try_fallocate_cli(path, size) {
+            file.sync_all().map_err(|e| SbhError::io(path, e))?;
+            return Ok(());
         }
 
         // Fallback: write random data in chunks (works on all FS including CoW).
