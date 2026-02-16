@@ -207,6 +207,146 @@ sbh dashboard
 | `sbh update [--check] [--refresh-cache] [--offline PATH]` | Check/apply updates with cache control and optional offline manifest |
 | `sbh install` / `sbh uninstall` | Install/remove service integration |
 
+## Dashboard
+
+The `sbh dashboard` command opens a real-time TUI cockpit for monitoring disk pressure, reviewing scan candidates, inspecting policy decisions, and managing ballast pools. It replaces the legacy single-screen status display with a seven-screen navigation model, overlay system, and incident workflow shortcuts.
+
+### Launching
+
+```bash
+# Open the dashboard (requires a running daemon for live data)
+sbh dashboard
+
+# Start with a specific screen
+sbh dashboard --start-screen ballast
+
+# Use legacy single-screen mode (fallback)
+sbh dashboard --legacy-dashboard
+
+# Force new cockpit even if kill switch is set
+sbh dashboard --new-dashboard
+```
+
+Rollout controls (in `config.toml`):
+
+```toml
+[dashboard]
+mode = "new"       # "legacy" | "new" (default: "new")
+kill_switch = false # Emergency fallback to legacy
+```
+
+Environment overrides: `SBH_DASHBOARD_MODE`, `SBH_DASHBOARD_KILL_SWITCH`.
+
+### Screens
+
+| Key | Screen | Purpose |
+| --- | --- | --- |
+| `1` | Overview | Pressure gauges, EWMA trends, ballast summary, counters |
+| `2` | Timeline | Event stream with severity filtering and detail drill-down |
+| `3` | Explainability | Decision evidence, posterior traces, factor contributions |
+| `4` | Candidates | Ranked scan results with score breakdown and veto visibility |
+| `5` | Ballast | Per-volume ballast inventory, release, and replenish controls |
+| `6` | LogSearch | JSONL/SQLite log viewing with search and filter |
+| `7` | Diagnostics | Daemon health, frame performance, thread status, RSS |
+
+### Keybindings
+
+**Navigation:**
+
+| Key | Action |
+| --- | --- |
+| `1`-`7` | Jump directly to screen |
+| `[` / `]` | Previous / next screen |
+| `b` | Jump to Ballast screen |
+| `Esc` | Back (pops history stack; quits when empty) |
+| `q` | Quit dashboard |
+| `Ctrl-C` | Immediate quit |
+
+**Overlays:**
+
+| Key | Action |
+| --- | --- |
+| `?` | Toggle help overlay (contextual keybinding reference) |
+| `Ctrl-P` or `:` | Open command palette (fuzzy search 33 actions) |
+| `v` | Toggle VOI scheduler overlay |
+| `r` | Force data refresh |
+
+**Incident shortcuts (active during pressure events):**
+
+| Key | Action |
+| --- | --- |
+| `!` | Open incident triage playbook overlay |
+| `x` | Quick-release ballast (jumps to Ballast + opens release confirmation) |
+
+**Screen-specific keys:**
+
+| Key | Screens | Action |
+| --- | --- | --- |
+| `j` / `k` or arrows | Timeline, Candidates, Explainability, Ballast | Cursor navigation |
+| `Enter` or `Space` | Candidates, Explainability, Ballast | Toggle detail view |
+| `d` | Candidates, Explainability, Ballast | Close detail panel |
+| `f` | Timeline | Cycle severity filter |
+| `Shift-F` | Timeline | Toggle follow mode (auto-scroll to latest) |
+| `s` | Candidates | Cycle sort order (Score, Size, Age, Path) |
+| `Shift-V` | Diagnostics | Toggle verbose frame metrics |
+
+### Command Palette
+
+Press `:` or `Ctrl-P` to open the command palette. Type to fuzzy-search through 33 available actions including navigation, preference changes, and incident commands. Press `Enter` to execute, `Esc` to cancel. Palette actions include:
+
+- `nav.overview` through `nav.diagnostics` (screen navigation)
+- `pref.density.compact`, `pref.density.normal`, `pref.density.comfortable` (visual density)
+- `pref.hints.off`, `pref.hints.minimal`, `pref.hints.full` (hint verbosity)
+- `pref.start.*` (startup screen)
+- `incident.playbook`, `incident.quick-release`, `incident.triage` (incident shortcuts)
+
+### Incident Workflows
+
+During disk pressure events, the dashboard provides guided triage shortcuts. The incident system classifies pressure into four severity levels based on the daemon's pressure state:
+
+| Severity | Trigger | Dashboard behavior |
+| --- | --- | --- |
+| Normal | Green pressure | Standard operation, no hints |
+| Elevated | Yellow/warning | Context-aware hints appear on relevant screens |
+| High | Orange pressure | Alert banner + all triage hints visible |
+| Critical | Red/emergency | Urgent alert banner + maximum triage guidance |
+
+**Triage playbook** (`!` key): Opens a 7-entry guided playbook ordered by triage priority:
+1. Release ballast (Ballast screen)
+2. Review scan candidates (Candidates screen)
+3. Check decision rationale (Explainability screen)
+4. Inspect timeline events (Timeline screen)
+5. Verify ballast inventory
+6. Review diagnostics
+7. Assess overall pressure (Overview screen)
+
+Use `j`/`k` to navigate entries and `Enter` to jump to the target screen.
+
+**Quick-release** (`x` key): One-keystroke shortcut that navigates to the Ballast screen and opens a release confirmation dialog. Reduces the typical pressure-triage path from 8 steps (legacy) to 1 keystroke.
+
+### Degraded Mode
+
+When the daemon is unreachable (not running, state file missing, or permissions issue), the dashboard enters degraded mode:
+
+- A `DEGRADED` indicator appears on the Overview screen.
+- Mount pressure data falls back to direct filesystem probes via `statvfs`.
+- Telemetry screens (Timeline, Candidates, Explainability, Ballast) show stale or empty data.
+- All navigation and overlay features remain functional.
+
+Check Diagnostics (key `7`) for daemon connection details and error counts.
+
+### Preferences
+
+Dashboard preferences persist across sessions in `~/.config/sbh/dashboard-preferences.json`:
+
+- **Start screen**: Which screen to show on launch (`overview`, `timeline`, etc.)
+- **Density**: Visual density mode (`compact`, `normal`, `comfortable`)
+- **Hint verbosity**: How much context to show (`off`, `minimal`, `full`)
+- **Contrast**: High-contrast mode (respects `NO_COLOR` environment variable)
+- **Motion**: Reduced-motion mode (respects `REDUCE_MOTION` environment variable)
+
+Configure via command palette (`:` then type `pref`) or directly in the preferences file.
+
 ## Operator Docs
 
 - Installer/update parity contract and security policy: `docs/installer-dx-parity-matrix.md`
@@ -759,6 +899,21 @@ src/
     uninstall.rs            Uninstall with 5 cleanup modes
     wizard.rs               Guided first-run install wizard + --auto mode
 
+  tui/
+    model.rs                Elm-style state model (7 screens, overlays, telemetry)
+    update.rs               Pure update function (message → model mutation + command)
+    render.rs               Text-mode render pipeline (all screens + overlays)
+    input.rs                Three-layer key routing (overlay → global → screen)
+    incident.rs             Severity classification, playbook, incident shortcuts
+    adapters.rs             State-file adapter with schema drift detection
+    layout.rs               Responsive layout builders with priority-based hiding
+    preferences.rs          Persisted UX preferences with atomic writes
+    runtime.rs              Terminal lifecycle, event loop, panic safety
+    theme.rs                Color palette with NO_COLOR/high-contrast support
+    telemetry.rs            Telemetry data types for timeline/candidates/decisions
+    widgets.rs              Reusable gauge, badge, sparkline components
+    terminal_guard.rs       Raw mode cleanup and signal-safe terminal restore
+
   platform/
     pal.rs                  Platform abstraction (Linux: procfs, statvfs, mounts)
 ```
@@ -778,8 +933,14 @@ All errors implement `code()` for the stable string code, `is_retryable()` to in
 ## Testing
 
 ```bash
-# Unit tests
+# Unit tests (core)
 rch exec "cargo test --lib"
+
+# TUI tests (requires tui feature flag)
+rch exec "cargo test --lib --features tui -- tui::"
+
+# Dashboard operator benchmarks
+rch exec "cargo test --lib --features tui -- tui::test_operator_benchmark"
 
 # Integration tests
 rch exec "cargo test --test integration_tests"
@@ -815,10 +976,28 @@ For test harness conventions and structured logging registration, see `docs/test
 - Ensure the pressured path has a corresponding ballast pool.
 - Check for read-only/tmpfs/NFS skip rules.
 
+### "Dashboard shows DEGRADED"
+- Confirm daemon is running: `systemctl status sbh-daemon` or `sbh daemon`.
+- Check state file path and permissions (default: `/var/lib/sbh/state.json`).
+- Validate config with `sbh config validate`.
+- Press `7` to view Diagnostics screen for connection error details.
+- Press `r` to force a data refresh.
+
 ### "Dashboard or status looks stale"
+- Press `r` to force a data refresh.
 - Confirm daemon is running.
 - Check state/log paths and permissions.
 - Validate config with `sbh config validate`.
+
+### "Dashboard keybindings don't work"
+- Check if an overlay is active (help, palette, playbook). Overlays consume input before screen keys.
+- Press `Esc` to close any active overlay.
+- Press `?` to see available keybindings for the current context.
+
+### "Incident shortcuts not appearing"
+- Incident hints only appear at Elevated severity or higher (Yellow/Orange/Red pressure).
+- Check that hint verbosity is not set to `off` (use `:` then type `pref.hints.full`).
+- Press `!` to manually open the incident playbook regardless of severity.
 
 ### "Service fails to start"
 - Linux: inspect `systemctl status` and journal logs.
@@ -840,7 +1019,10 @@ No. Safety vetoes and protection mechanisms are designed to avoid source directo
 Yes. Use `sbh emergency ...` for zero-write recovery, then return to normal policy modes.
 
 ### Can I run `sbh` without the daemon?
-Yes. `scan`, `clean`, `check`, and `emergency` support operational workflows without a long-running service.
+Yes. `scan`, `clean`, `check`, and `emergency` support operational workflows without a long-running service. The dashboard will enter degraded mode but remains functional for navigation and overlay features.
+
+### How do I switch back to the legacy dashboard?
+Use `sbh dashboard --legacy-dashboard`, set `dashboard.mode = "legacy"` in config, or set `SBH_DASHBOARD_KILL_SWITCH=true` as an environment variable for emergency fallback.
 
 ### How do I audit why something was deleted?
 Use `sbh explain --id <decision-id>` and inspect structured logs/evidence records.
