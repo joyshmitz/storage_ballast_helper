@@ -289,6 +289,199 @@ fn render_extended_counters(model: &DashboardModel) -> String {
     }
 }
 
+// ──────────────────── S2: Timeline ────────────────────
+
+fn render_timeline(model: &DashboardModel, theme: Theme, out: &mut String) {
+    use std::fmt::Write as _;
+    let layout = build_timeline_layout(model.terminal_size.0, model.terminal_size.1);
+
+    // ── Filter bar ──
+    let filter_bar = layout
+        .placements
+        .iter()
+        .find(|p| p.pane == TimelinePane::FilterBar && p.visible);
+    if filter_bar.is_some() {
+        let follow_indicator = if model.timeline_follow {
+            " [FOLLOW]"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "filter={}{follow_indicator}",
+            model.timeline_filter.label(),
+        );
+    }
+
+    // ── Data-source header ──
+    let source_label = match model.timeline_source {
+        DataSource::Sqlite => "SQLite",
+        DataSource::Jsonl => "JSONL",
+        DataSource::None => "none",
+    };
+    let health_badge = if model.timeline_source == DataSource::None {
+        status_badge("NO DATA", theme.palette.muted, theme.accessibility)
+    } else if model.timeline_partial {
+        status_badge("PARTIAL", theme.palette.warning, theme.accessibility)
+    } else {
+        status_badge("OK", theme.palette.success, theme.accessibility)
+    };
+    let _ = writeln!(out, "data-source={source_label} {health_badge}");
+
+    if !model.timeline_diagnostics.is_empty() {
+        let _ = writeln!(out, "  diag: {}", model.timeline_diagnostics);
+    }
+
+    // ── Filtered event list ──
+    let filtered = model.timeline_filtered_events();
+    let total = model.timeline_events.len();
+    let shown = filtered.len();
+    let _ = writeln!(out, "events={shown}/{total}");
+
+    if filtered.is_empty() {
+        let _ = writeln!(out);
+        if total == 0 {
+            let _ = writeln!(
+                out,
+                "No timeline events available. The daemon must be running with"
+            );
+            let _ = writeln!(out, "telemetry enabled to populate this screen.");
+        } else {
+            let _ = writeln!(
+                out,
+                "No events match the current filter ({}).",
+                model.timeline_filter.label()
+            );
+            let _ = writeln!(out, "Press f to cycle the severity filter.");
+        }
+    } else {
+        let _ = writeln!(out);
+        let list_visible = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == TimelinePane::EventList && p.visible);
+        let max_rows = list_visible
+            .map(|p| usize::from(p.rect.height))
+            .unwrap_or(shown);
+
+        // Compute visible window around selected item.
+        let window_start = model
+            .timeline_selected
+            .saturating_sub(max_rows / 2)
+            .min(shown.saturating_sub(max_rows));
+        let window_end = (window_start + max_rows).min(shown);
+
+        for (idx, event) in filtered[window_start..window_end].iter().enumerate() {
+            let abs_idx = window_start + idx;
+            let cursor = if abs_idx == model.timeline_selected {
+                ">"
+            } else {
+                " "
+            };
+            render_event_row(cursor, event, theme, out);
+        }
+    }
+
+    // ── Detail pane (wide layout only) ──
+    let detail_visible = layout
+        .placements
+        .iter()
+        .any(|p| p.pane == TimelinePane::EventDetail && p.visible);
+    if detail_visible {
+        if let Some(event) = model.timeline_selected_event() {
+            let _ = writeln!(out);
+            let width = usize::from(model.terminal_size.0).max(40);
+            let _ = writeln!(out, "{}", section_header("Event Detail", width));
+            render_event_detail(event, theme, out);
+        }
+    }
+
+    // ── Status footer ──
+    let footer_visible = layout
+        .placements
+        .iter()
+        .any(|p| p.pane == TimelinePane::StatusFooter && p.visible);
+    if footer_visible {
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "j/k or \u{2191}/\u{2193} navigate  f filter  F follow  r refresh  ? help"
+        );
+    }
+}
+
+fn render_event_row(cursor: &str, event: &TimelineEvent, theme: Theme, out: &mut String) {
+    use std::fmt::Write as _;
+    let time = extract_time(&event.timestamp);
+    let sev_badge = severity_badge(&event.severity, theme);
+    let path_short = event
+        .path
+        .as_deref()
+        .map(|p| truncate_path(p, 30))
+        .unwrap_or("-");
+    let size_str = event.size_bytes.map(human_bytes).unwrap_or_default();
+    let success_marker = match event.success {
+        Some(true) => " \u{2713}",
+        Some(false) => " \u{2717}",
+        None => "",
+    };
+    let _ = writeln!(
+        out,
+        "{cursor} {time} {sev_badge} {:<20} {path_short} {size_str}{success_marker}",
+        event.event_type,
+    );
+}
+
+fn render_event_detail(event: &TimelineEvent, theme: Theme, out: &mut String) {
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "  timestamp:  {}", event.timestamp);
+    let _ = writeln!(out, "  event-type: {}", event.event_type);
+    let sev_badge = severity_badge(&event.severity, theme);
+    let _ = writeln!(out, "  severity:   {sev_badge}");
+
+    if let Some(ref path) = event.path {
+        let _ = writeln!(out, "  path:       {path}");
+    }
+    if let Some(size) = event.size_bytes {
+        let _ = writeln!(out, "  size:       {} ({size} bytes)", human_bytes(size));
+    }
+    if let Some(score) = event.score {
+        let _ = writeln!(out, "  score:      {score:.4}");
+    }
+    if let Some(ref level) = event.pressure_level {
+        let _ = writeln!(out, "  pressure:   {level}");
+    }
+    if let Some(pct) = event.free_pct {
+        let _ = writeln!(out, "  free:       {pct:.1}%");
+    }
+    if let Some(success) = event.success {
+        let marker = if success { "yes" } else { "no" };
+        let _ = writeln!(out, "  success:    {marker}");
+    }
+    if let Some(ref code) = event.error_code {
+        let _ = writeln!(out, "  error-code: {code}");
+    }
+    if let Some(ref msg) = event.error_message {
+        let _ = writeln!(out, "  error:      {msg}");
+    }
+    if let Some(ms) = event.duration_ms {
+        let _ = writeln!(out, "  duration:   {ms}ms");
+    }
+    if let Some(ref details) = event.details {
+        let _ = writeln!(out, "  details:    {details}");
+    }
+}
+
+fn severity_badge(severity: &str, theme: Theme) -> String {
+    let (palette, label) = match severity {
+        "critical" => (theme.palette.critical, "CRITICAL"),
+        "warning" => (theme.palette.warning, "WARNING"),
+        "info" => (theme.palette.accent, "INFO"),
+        _ => (theme.palette.muted, severity),
+    };
+    status_badge(label, palette, theme.accessibility)
+}
+
 // ──────────────────── S3: Explainability ────────────────────
 
 fn render_explainability(model: &DashboardModel, theme: Theme, out: &mut String) {
@@ -340,11 +533,11 @@ fn render_explainability(model: &DashboardModel, theme: Theme, out: &mut String)
             out,
             "No decision evidence available. The daemon must be running with"
         );
+        let _ = writeln!(out, "telemetry enabled to populate this screen.");
         let _ = writeln!(
             out,
-            "telemetry enabled to populate this screen."
+            "Press r to force refresh, or check daemon status with key 1."
         );
-        let _ = writeln!(out, "Press r to force refresh, or check daemon status with key 1.");
         return;
     }
 
@@ -377,11 +570,7 @@ fn render_explainability(model: &DashboardModel, theme: Theme, out: &mut String)
     if model.explainability_detail {
         if let Some(decision) = model.explainability_selected_decision() {
             let _ = writeln!(out);
-            let _ = writeln!(
-                out,
-                "{}",
-                section_header("Decision Detail", width)
-            );
+            let _ = writeln!(out, "{}", section_header("Decision Detail", width));
             render_decision_detail(decision, theme, width, out);
         }
     } else {
@@ -415,11 +604,7 @@ fn render_decision_detail(
         human_bytes(decision.size_bytes),
         decision.size_bytes
     );
-    let _ = writeln!(
-        out,
-        "  age:         {}",
-        human_duration(decision.age_secs)
-    );
+    let _ = writeln!(out, "  age:         {}", human_duration(decision.age_secs));
 
     // ── Action & Policy ──
     let action_badge = action_badge(&decision.action, theme);
@@ -446,17 +631,25 @@ fn render_decision_detail(
 
     // ── Factor breakdown ──
     let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "{}",
-        section_header("Factor Breakdown", width)
-    );
+    let _ = writeln!(out, "{}", section_header("Factor Breakdown", width));
     let bar_width = (width / 3).clamp(10, 30);
-    render_factor_bar(out, "location ", decision.factors.location, bar_width, theme);
+    render_factor_bar(
+        out,
+        "location ",
+        decision.factors.location,
+        bar_width,
+        theme,
+    );
     render_factor_bar(out, "name     ", decision.factors.name, bar_width, theme);
     render_factor_bar(out, "age      ", decision.factors.age, bar_width, theme);
     render_factor_bar(out, "size     ", decision.factors.size, bar_width, theme);
-    render_factor_bar(out, "structure", decision.factors.structure, bar_width, theme);
+    render_factor_bar(
+        out,
+        "structure",
+        decision.factors.structure,
+        bar_width,
+        theme,
+    );
     let _ = writeln!(
         out,
         "  pressure-multiplier: {:.2}x",
@@ -466,11 +659,7 @@ fn render_decision_detail(
 
     // ── Bayesian decision ──
     let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "{}",
-        section_header("Bayesian Decision", width)
-    );
+    let _ = writeln!(out, "{}", section_header("Bayesian Decision", width));
     let _ = writeln!(
         out,
         "  P(abandoned):     {:.4}",
@@ -486,11 +675,7 @@ fn render_decision_detail(
         "  E[loss|delete]:   {:.2}",
         decision.expected_loss_delete
     );
-    let _ = writeln!(
-        out,
-        "  calibration:      {:.4}",
-        decision.calibration_score
-    );
+    let _ = writeln!(out, "  calibration:      {:.4}", decision.calibration_score);
 
     // ── Uncertainty indicator ──
     let confidence_level = if decision.calibration_score >= 0.85 {
@@ -507,8 +692,7 @@ fn render_decision_detail(
     } else {
         theme.palette.danger
     };
-    let confidence_badge =
-        status_badge(confidence_level, confidence_palette, theme.accessibility);
+    let confidence_badge = status_badge(confidence_level, confidence_palette, theme.accessibility);
     let _ = writeln!(out, "  confidence:       {confidence_badge}");
 
     // ── Summary ──
@@ -653,9 +837,9 @@ mod tests {
             Duration::from_secs(1),
             (80, 24),
         );
-        model.screen = Screen::Timeline;
+        model.screen = Screen::Candidates;
         let frame = render(&model);
-        assert!(frame.contains("[S2 Timeline]"));
+        assert!(frame.contains("[S4 Candidates]"));
         assert!(frame.contains("pending"));
     }
 
@@ -876,7 +1060,11 @@ mod tests {
 
     use crate::tui::telemetry::FactorBreakdown;
 
-    fn sample_decision(id: u64, action: &str, vetoed: bool) -> crate::tui::telemetry::DecisionEvidence {
+    fn sample_decision(
+        id: u64,
+        action: &str,
+        vetoed: bool,
+    ) -> crate::tui::telemetry::DecisionEvidence {
         crate::tui::telemetry::DecisionEvidence {
             decision_id: id,
             timestamp: String::from("2026-02-16T03:15:42Z"),
@@ -900,7 +1088,11 @@ mod tests {
             expected_loss_delete: 13.0,
             calibration_score: 0.82,
             vetoed,
-            veto_reason: if vetoed { Some(String::from("contains .git")) } else { None },
+            veto_reason: if vetoed {
+                Some(String::from("contains .git"))
+            } else {
+                None
+            },
             guard_status: Some(String::from("Pass")),
             summary: String::from("High-confidence build artifact, scored above threshold"),
             raw_json: None,
@@ -1074,5 +1266,197 @@ mod tests {
         let truncated = truncate_path(long, 30);
         assert!(truncated.len() <= 35); // might be slightly longer due to boundary
         assert!(truncated.starts_with('/'));
+    }
+
+    // ── S2 Timeline screen tests ──
+
+    use crate::tui::telemetry::TimelineEvent as TlEvent;
+
+    fn sample_timeline_event(severity: &str, event_type: &str) -> TlEvent {
+        TlEvent {
+            timestamp: String::from("2026-02-16T03:15:42Z"),
+            event_type: event_type.to_owned(),
+            severity: severity.to_owned(),
+            path: Some(String::from("/data/projects/test/target/debug")),
+            size_bytes: Some(524_288_000),
+            score: Some(2.15),
+            pressure_level: Some(String::from("yellow")),
+            free_pct: Some(12.5),
+            success: Some(true),
+            error_code: None,
+            error_message: None,
+            duration_ms: Some(150),
+            details: Some(String::from("artifact cleanup")),
+        }
+    }
+
+    #[test]
+    fn timeline_empty_shows_no_events_message() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Timeline;
+
+        let frame = render(&model);
+        assert!(frame.contains("[S2 Timeline]"));
+        assert!(frame.contains("events=0/0"));
+        assert!(frame.contains("No timeline events available"));
+    }
+
+    #[test]
+    fn timeline_shows_event_list() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Timeline;
+        model.timeline_events = vec![
+            sample_timeline_event("info", "scan_complete"),
+            sample_timeline_event("warning", "pressure_change"),
+        ];
+        model.timeline_source = DataSource::Sqlite;
+
+        let frame = render(&model);
+        assert!(frame.contains("events=2/2"));
+        assert!(frame.contains("data-source=SQLite"));
+        assert!(frame.contains("scan_complete"));
+        assert!(frame.contains("pressure_change"));
+    }
+
+    #[test]
+    fn timeline_filter_shows_subset_count() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Timeline;
+        model.timeline_events = vec![
+            sample_timeline_event("info", "scan"),
+            sample_timeline_event("warning", "pressure_change"),
+            sample_timeline_event("critical", "artifact_delete"),
+        ];
+        model.timeline_filter = SeverityFilter::Warning;
+
+        let frame = render(&model);
+        assert!(frame.contains("filter=warning"));
+        assert!(frame.contains("events=1/3"));
+    }
+
+    #[test]
+    fn timeline_follow_mode_shows_indicator() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Timeline;
+        model.timeline_follow = true;
+
+        let frame = render(&model);
+        assert!(frame.contains("[FOLLOW]"));
+    }
+
+    #[test]
+    fn timeline_cursor_shows_marker() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Timeline;
+        model.timeline_events = vec![
+            sample_timeline_event("info", "first"),
+            sample_timeline_event("info", "second"),
+        ];
+        model.timeline_selected = 1;
+
+        let frame = render(&model);
+        let lines: Vec<&str> = frame.lines().collect();
+        let cursor_line = lines
+            .iter()
+            .find(|l| l.contains("second") && l.starts_with('>'));
+        assert!(cursor_line.is_some(), "cursor should be on second event");
+    }
+
+    #[test]
+    fn timeline_wide_shows_event_detail() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (140, 30),
+        );
+        model.screen = Screen::Timeline;
+        model.timeline_events = vec![sample_timeline_event("info", "scan_complete")];
+
+        let frame = render(&model);
+        assert!(frame.contains("Event Detail"));
+        assert!(frame.contains("timestamp:"));
+        assert!(frame.contains("artifact cleanup"));
+    }
+
+    #[test]
+    fn timeline_empty_filter_shows_hint() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Timeline;
+        model.timeline_events = vec![sample_timeline_event("info", "scan")];
+        model.timeline_filter = SeverityFilter::Critical;
+
+        let frame = render(&model);
+        assert!(frame.contains("events=0/1"));
+        assert!(frame.contains("No events match"));
+    }
+
+    #[test]
+    fn timeline_partial_data_shows_warning() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Timeline;
+        model.timeline_source = DataSource::Jsonl;
+        model.timeline_partial = true;
+        model.timeline_diagnostics = "SQLite unavailable".into();
+
+        let frame = render(&model);
+        assert!(frame.contains("PARTIAL"));
+        assert!(frame.contains("SQLite unavailable"));
+    }
+
+    #[test]
+    fn timeline_severity_badges() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Timeline;
+        model.timeline_events = vec![
+            sample_timeline_event("info", "a"),
+            sample_timeline_event("warning", "b"),
+            sample_timeline_event("critical", "c"),
+        ];
+
+        let frame = render(&model);
+        assert!(frame.contains("INFO"));
+        assert!(frame.contains("WARNING"));
+        assert!(frame.contains("CRITICAL"));
     }
 }

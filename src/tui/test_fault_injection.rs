@@ -12,7 +12,6 @@
 #![allow(clippy::too_many_lines)]
 
 use std::collections::HashMap;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,17 +20,15 @@ use filetime::{FileTime, set_file_mtime};
 use tempfile::TempDir;
 
 use super::adapters::{
-    DashboardSnapshot, DashboardStateAdapter, MountSnapshot, SchemaWarnings, SnapshotSource,
-    StateFreshness,
+    DashboardStateAdapter, SchemaWarnings, SnapshotSource, StateFreshness,
 };
-use super::model::{DashboardModel, DashboardMsg, NotificationLevel, Screen};
+use super::model::Screen;
 use super::preferences::{self, DebouncedWriter, LoadOutcome, UserPreferences};
 use super::telemetry::{
     BackendHealth, CompositeTelemetryAdapter, DataSource, EventFilter, JsonlTelemetryAdapter,
-    NullTelemetryAdapter, TelemetryHealth, TelemetryQueryAdapter, TelemetryResult,
+    NullTelemetryAdapter, TelemetryQueryAdapter,
 };
 use super::test_harness::{DashboardHarness, HarnessStep, sample_healthy_state};
-use super::update;
 use crate::daemon::self_monitor::{
     BallastState, Counters, DaemonState, LastScanState, MountPressure, PressureState,
 };
@@ -224,9 +221,8 @@ fn state_stale_falls_back_with_daemon_state_preserved() {
     write_state(&path, &sample_state());
 
     // Make file 2 hours old.
-    let stale = FileTime::from_system_time(
-        std::time::SystemTime::now() - Duration::from_secs(7200),
-    );
+    let stale =
+        FileTime::from_system_time(std::time::SystemTime::now() - Duration::from_secs(7200));
     set_file_mtime(&path, stale).unwrap();
 
     let adapter = make_adapter(90);
@@ -248,9 +244,7 @@ fn state_barely_fresh_is_not_stale() {
     write_state(&path, &sample_state());
 
     // 80 seconds old with 90-second threshold → fresh.
-    let mtime = FileTime::from_system_time(
-        std::time::SystemTime::now() - Duration::from_secs(80),
-    );
+    let mtime = FileTime::from_system_time(std::time::SystemTime::now() - Duration::from_secs(80));
     set_file_mtime(&path, mtime).unwrap();
 
     let adapter = make_adapter(90);
@@ -280,8 +274,16 @@ fn state_future_schema_fields_detected_but_load_succeeds() {
     assert_eq!(snap.freshness, StateFreshness::Fresh);
     assert!(snap.daemon_state.is_some());
     assert!(snap.warnings.has_drift());
-    assert!(snap.warnings.unknown_fields.contains(&"v2_telemetry".to_string()));
-    assert!(snap.warnings.unknown_fields.contains(&"v2_prediction".to_string()));
+    assert!(
+        snap.warnings
+            .unknown_fields
+            .contains(&"v2_telemetry".to_string())
+    );
+    assert!(
+        snap.warnings
+            .unknown_fields
+            .contains(&"v2_prediction".to_string())
+    );
 }
 
 #[test]
@@ -860,7 +862,7 @@ fn scripted_fault_sequence_maintains_determinism() {
     let script = vec![
         HarnessStep::Tick,
         HarnessStep::FeedHealthyState,
-        HarnessStep::Char('3'), // Navigate to Explainability
+        HarnessStep::Char('3'),       // Navigate to Explainability
         HarnessStep::FeedUnavailable, // Daemon goes down
         HarnessStep::Error {
             message: "sqlite locked".to_string(),
@@ -871,7 +873,7 @@ fn scripted_fault_sequence_maintains_determinism() {
             message: "preference save failed".to_string(),
             source: "preferences".to_string(),
         },
-        HarnessStep::FeedUnavailable, // Daemon goes down again
+        HarnessStep::FeedUnavailable,  // Daemon goes down again
         HarnessStep::FeedHealthyState, // Final recovery
     ];
 

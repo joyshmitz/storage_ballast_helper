@@ -224,45 +224,6 @@ impl MountMonitor {
     }
 }
 
-struct MountMonitor {
-    rate_estimator: DiskRateEstimator,
-    pressure_controller: PidPressureController,
-}
-
-impl MountMonitor {
-    fn new(config: &Config) -> Self {
-        let rate_estimator = DiskRateEstimator::new(
-            config.telemetry.ewma_base_alpha,
-            config.telemetry.ewma_min_alpha,
-            config.telemetry.ewma_max_alpha,
-            config.telemetry.ewma_min_samples,
-        );
-
-        let mut pressure_controller = PidPressureController::new(
-            0.25,  // kp
-            0.08,  // ki
-            0.02,  // kd
-            100.0, // integral_cap
-            config.pressure.green_min_free_pct,
-            1.0,   // hysteresis_pct
-            config.pressure.green_min_free_pct,
-            config.pressure.yellow_min_free_pct,
-            config.pressure.orange_min_free_pct,
-            config.pressure.red_min_free_pct,
-            Duration::from_millis(config.pressure.poll_interval_ms),
-        );
-        if config.pressure.prediction.enabled {
-            pressure_controller
-                .set_action_horizon_minutes(config.pressure.prediction.action_horizon_minutes);
-        }
-
-        Self {
-            rate_estimator,
-            pressure_controller,
-        }
-    }
-}
-
 // ──────────────────── main daemon struct ────────────────────
 
 /// The monitoring daemon: orchestrates all sbh components.
@@ -280,7 +241,6 @@ pub struct MonitoringDaemon {
     ballast_coordinator: BallastPoolCoordinator,
     release_controller: BallastReleaseController,
     notification_manager: NotificationManager,
-    mount_monitors: HashMap<PathBuf, MountMonitor>,
     scoring_engine: ScoringEngine,
     voi_scheduler: VoiScheduler,
     shared_executor_config: Arc<SharedExecutorConfig>,

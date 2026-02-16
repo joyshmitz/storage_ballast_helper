@@ -902,10 +902,7 @@ mod tests {
     #[test]
     fn timeline_cycle_filter_resets_cursor() {
         let mut model = test_model();
-        model.timeline_events = vec![
-            make_event("info", "a"),
-            make_event("warning", "b"),
-        ];
+        model.timeline_events = vec![make_event("info", "a"), make_event("warning", "b")];
         model.timeline_selected = 1;
 
         model.timeline_cycle_filter();
@@ -932,10 +929,7 @@ mod tests {
     #[test]
     fn timeline_selected_event_returns_correct_item() {
         let mut model = test_model();
-        model.timeline_events = vec![
-            make_event("info", "first"),
-            make_event("warning", "second"),
-        ];
+        model.timeline_events = vec![make_event("info", "first"), make_event("warning", "second")];
 
         assert_eq!(
             model.timeline_selected_event().map(|e| &e.event_type),

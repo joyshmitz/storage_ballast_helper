@@ -909,11 +909,8 @@ mod tests {
     fn explainability_j_k_navigate_cursor() {
         let mut model = test_model();
         model.screen = Screen::Explainability;
-        model.explainability_decisions = vec![
-            sample_decision(1),
-            sample_decision(2),
-            sample_decision(3),
-        ];
+        model.explainability_decisions =
+            vec![sample_decision(1), sample_decision(2), sample_decision(3)];
         assert_eq!(model.explainability_selected, 0);
 
         // j moves down
@@ -958,16 +955,10 @@ mod tests {
         model.explainability_decisions = vec![sample_decision(1)];
         assert!(!model.explainability_detail);
 
-        update(
-            &mut model,
-            DashboardMsg::Key(make_key(KeyCode::Enter)),
-        );
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
         assert!(model.explainability_detail);
 
-        update(
-            &mut model,
-            DashboardMsg::Key(make_key(KeyCode::Enter)),
-        );
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
         assert!(!model.explainability_detail);
     }
 
@@ -1005,7 +996,10 @@ mod tests {
         let cmd = update(&mut model, DashboardMsg::TelemetryDecisions(result));
         assert!(matches!(cmd, DashboardCmd::None));
         assert_eq!(model.explainability_decisions.len(), 2);
-        assert_eq!(model.explainability_source, crate::tui::telemetry::DataSource::Sqlite);
+        assert_eq!(
+            model.explainability_source,
+            crate::tui::telemetry::DataSource::Sqlite
+        );
         assert!(!model.explainability_partial);
     }
 
@@ -1071,7 +1065,10 @@ mod tests {
             let has_telemetry = cmds
                 .iter()
                 .any(|c| matches!(c, DashboardCmd::FetchTelemetry));
-            assert!(!has_telemetry, "Tick on S1 should not include FetchTelemetry");
+            assert!(
+                !has_telemetry,
+                "Tick on S1 should not include FetchTelemetry"
+            );
         }
     }
 }
