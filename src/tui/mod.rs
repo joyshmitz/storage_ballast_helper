@@ -33,6 +33,8 @@ mod test_replay;
 #[cfg(test)]
 mod test_stress;
 #[cfg(test)]
+mod test_properties;
+#[cfg(test)]
 mod test_unit_coverage;
 
 pub use runtime::{DashboardRuntimeConfig, DashboardRuntimeMode, run_dashboard};
