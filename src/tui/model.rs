@@ -340,6 +340,30 @@ impl RateHistory {
             .collect()
     }
 
+    /// Number of values currently stored.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// True if the ring buffer has no values.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Compute (latest, avg, min, max) over stored values, or None if empty.
+    #[must_use]
+    pub fn stats(&self) -> Option<(f64, f64, f64, f64)> {
+        let latest = self.latest()?;
+        let sum: f64 = self.values.iter().sum();
+        #[allow(clippy::cast_precision_loss)]
+        let avg = sum / self.values.len() as f64;
+        let min = self.values.iter().cloned().reduce(f64::min).unwrap_or(0.0);
+        let max = self.values.iter().cloned().reduce(f64::max).unwrap_or(0.0);
+        Some((latest, avg, min, max))
+    }
+
     /// Most recently pushed value, if any.
     #[must_use]
     pub fn latest(&self) -> Option<f64> {
@@ -442,6 +466,18 @@ pub struct DashboardModel {
     pub candidates_diagnostics: String,
     /// Sort order for the candidates list.
     pub candidates_sort: CandidatesSortOrder,
+
+    // ── Diagnostics screen (S7) state ──
+    /// Toggle for verbose diagnostics output.
+    pub diagnostics_verbose: bool,
+    /// Ring buffer of recent frame durations (milliseconds) for sparkline.
+    pub frame_times: RateHistory,
+    /// Count of missed/skipped ticks detected by the runtime.
+    pub missed_ticks: u64,
+    /// Total successful adapter reads (DataUpdate with Some).
+    pub adapter_reads: u64,
+    /// Total adapter read errors (DataUpdate with None).
+    pub adapter_errors: u64,
 }
 
 impl DashboardModel {
@@ -489,6 +525,11 @@ impl DashboardModel {
             candidates_partial: false,
             candidates_diagnostics: String::new(),
             candidates_sort: CandidatesSortOrder::default(),
+            diagnostics_verbose: false,
+            frame_times: RateHistory::new(60),
+            missed_ticks: 0,
+            adapter_reads: 0,
+            adapter_errors: 0,
         }
     }
 
@@ -673,6 +714,20 @@ impl DashboardModel {
         self.candidates_list.get(self.candidates_selected)
     }
 
+    // ── Diagnostics (S7) methods ──
+
+    /// Toggle verbose diagnostics mode.
+    pub fn diagnostics_toggle_verbose(&mut self) {
+        self.diagnostics_verbose = !self.diagnostics_verbose;
+    }
+
+    /// Compute frame time statistics from the ring buffer.
+    /// Returns (current_ms, avg_ms, min_ms, max_ms) or None if empty.
+    #[must_use]
+    pub fn frame_time_stats(&self) -> Option<(f64, f64, f64, f64)> {
+        self.frame_times.stats()
+    }
+
     /// Go back to the previous screen. Returns `true` if history was non-empty.
     pub fn navigate_back(&mut self) -> bool {
         if let Some(prev) = self.screen_history.pop() {
@@ -717,6 +772,8 @@ pub enum DashboardMsg {
     TelemetryDecisions(TelemetryResult<Vec<DecisionEvidence>>),
     /// Candidate ranking data arrived from the telemetry adapter.
     TelemetryCandidates(TelemetryResult<Vec<DecisionEvidence>>),
+    /// Frame metrics reported by the runtime after each render cycle.
+    FrameMetrics { duration_ms: f64 },
 }
 
 // ──────────────────── commands ────────────────────
@@ -1199,5 +1256,177 @@ mod tests {
         let mut model = test_model();
         assert!(!model.explainability_cursor_down());
         assert!(!model.explainability_cursor_up());
+    }
+
+    // ── Candidates state tests ──
+
+    fn sample_candidate(id: u64, score: f64, size: u64, age: u64) -> DecisionEvidence {
+        DecisionEvidence {
+            decision_id: id,
+            timestamp: String::new(),
+            path: format!("/test/{id}"),
+            size_bytes: size,
+            age_secs: age,
+            action: String::from("delete"),
+            effective_action: None,
+            policy_mode: String::from("live"),
+            factors: crate::tui::telemetry::FactorBreakdown {
+                location: 0.5,
+                name: 0.5,
+                age: 0.5,
+                size: 0.5,
+                structure: 0.5,
+                pressure_multiplier: 1.0,
+            },
+            total_score: score,
+            posterior_abandoned: 0.7,
+            expected_loss_keep: 20.0,
+            expected_loss_delete: 30.0,
+            calibration_score: 0.75,
+            vetoed: false,
+            veto_reason: None,
+            guard_status: None,
+            summary: String::new(),
+            raw_json: None,
+        }
+    }
+
+    #[test]
+    fn new_model_candidates_defaults() {
+        let model = test_model();
+        assert!(model.candidates_list.is_empty());
+        assert_eq!(model.candidates_selected, 0);
+        assert!(!model.candidates_detail);
+        assert_eq!(model.candidates_source, DataSource::None);
+        assert_eq!(model.candidates_sort, CandidatesSortOrder::Score);
+    }
+
+    #[test]
+    fn candidates_cursor_down_moves() {
+        let mut model = test_model();
+        model.candidates_list = vec![
+            sample_candidate(1, 2.0, 1000, 60),
+            sample_candidate(2, 1.5, 2000, 120),
+        ];
+        assert!(model.candidates_cursor_down());
+        assert_eq!(model.candidates_selected, 1);
+    }
+
+    #[test]
+    fn candidates_cursor_down_clamps_at_end() {
+        let mut model = test_model();
+        model.candidates_list = vec![sample_candidate(1, 2.0, 1000, 60)];
+        assert!(!model.candidates_cursor_down());
+        assert_eq!(model.candidates_selected, 0);
+    }
+
+    #[test]
+    fn candidates_cursor_up_moves() {
+        let mut model = test_model();
+        model.candidates_list = vec![
+            sample_candidate(1, 2.0, 1000, 60),
+            sample_candidate(2, 1.5, 2000, 120),
+        ];
+        model.candidates_selected = 1;
+        assert!(model.candidates_cursor_up());
+        assert_eq!(model.candidates_selected, 0);
+    }
+
+    #[test]
+    fn candidates_cursor_up_clamps_at_start() {
+        let mut model = test_model();
+        model.candidates_list = vec![sample_candidate(1, 2.0, 1000, 60)];
+        assert!(!model.candidates_cursor_up());
+        assert_eq!(model.candidates_selected, 0);
+    }
+
+    #[test]
+    fn candidates_toggle_detail() {
+        let mut model = test_model();
+        model.candidates_toggle_detail();
+        assert!(model.candidates_detail);
+        model.candidates_toggle_detail();
+        assert!(!model.candidates_detail);
+    }
+
+    #[test]
+    fn candidates_selected_item_returns_correct() {
+        let mut model = test_model();
+        model.candidates_list = vec![
+            sample_candidate(10, 2.0, 1000, 60),
+            sample_candidate(20, 1.5, 2000, 120),
+        ];
+        model.candidates_selected = 1;
+        let c = model.candidates_selected_item().unwrap();
+        assert_eq!(c.decision_id, 20);
+    }
+
+    #[test]
+    fn candidates_selected_item_none_when_empty() {
+        let model = test_model();
+        assert!(model.candidates_selected_item().is_none());
+    }
+
+    #[test]
+    fn candidates_cursor_empty_list() {
+        let mut model = test_model();
+        assert!(!model.candidates_cursor_down());
+        assert!(!model.candidates_cursor_up());
+    }
+
+    #[test]
+    fn candidates_sort_order_cycles() {
+        let s = CandidatesSortOrder::Score;
+        assert_eq!(s.cycle(), CandidatesSortOrder::Size);
+        assert_eq!(s.cycle().cycle(), CandidatesSortOrder::Age);
+        assert_eq!(s.cycle().cycle().cycle(), CandidatesSortOrder::Path);
+        assert_eq!(
+            s.cycle().cycle().cycle().cycle(),
+            CandidatesSortOrder::Score
+        );
+    }
+
+    #[test]
+    fn candidates_sort_order_labels() {
+        assert_eq!(CandidatesSortOrder::Score.label(), "score");
+        assert_eq!(CandidatesSortOrder::Size.label(), "size");
+        assert_eq!(CandidatesSortOrder::Age.label(), "age");
+        assert_eq!(CandidatesSortOrder::Path.label(), "path");
+    }
+
+    #[test]
+    fn candidates_cycle_sort_reorders_list() {
+        let mut model = test_model();
+        model.candidates_list = vec![
+            sample_candidate(1, 1.0, 5000, 60),
+            sample_candidate(2, 2.0, 1000, 120),
+            sample_candidate(3, 0.5, 3000, 30),
+        ];
+        // Default sort is Score (descending).
+        model.candidates_apply_sort();
+        assert_eq!(model.candidates_list[0].decision_id, 2); // score 2.0
+        assert_eq!(model.candidates_list[1].decision_id, 1); // score 1.0
+        assert_eq!(model.candidates_list[2].decision_id, 3); // score 0.5
+
+        // Cycle to Size (descending).
+        model.candidates_cycle_sort();
+        assert_eq!(model.candidates_sort, CandidatesSortOrder::Size);
+        assert_eq!(model.candidates_list[0].decision_id, 1); // 5000 bytes
+        assert_eq!(model.candidates_list[1].decision_id, 3); // 3000 bytes
+        assert_eq!(model.candidates_list[2].decision_id, 2); // 1000 bytes
+
+        // Cycle to Age (descending).
+        model.candidates_cycle_sort();
+        assert_eq!(model.candidates_sort, CandidatesSortOrder::Age);
+        assert_eq!(model.candidates_list[0].decision_id, 2); // 120s
+        assert_eq!(model.candidates_list[1].decision_id, 1); // 60s
+        assert_eq!(model.candidates_list[2].decision_id, 3); // 30s
+
+        // Cycle to Path (ascending).
+        model.candidates_cycle_sort();
+        assert_eq!(model.candidates_sort, CandidatesSortOrder::Path);
+        assert_eq!(model.candidates_list[0].decision_id, 1); // /test/1
+        assert_eq!(model.candidates_list[1].decision_id, 2); // /test/2
+        assert_eq!(model.candidates_list[2].decision_id, 3); // /test/3
     }
 }

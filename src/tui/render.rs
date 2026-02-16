@@ -5,7 +5,7 @@
 use super::layout::{
     OverviewPane, PanePriority, TimelinePane, build_overview_layout, build_timeline_layout,
 };
-use super::model::{CandidatesSortOrder, DashboardModel, NotificationLevel, Screen, SeverityFilter};
+use super::model::{DashboardModel, NotificationLevel, Screen, SeverityFilter};
 use super::theme::{AccessibilityProfile, Theme, ThemePalette};
 use super::widgets::{
     extract_time, gauge, human_bytes, human_duration, human_rate, section_header, sparkline,
@@ -50,6 +50,7 @@ pub fn render(model: &DashboardModel) -> String {
         Screen::Timeline => render_timeline(model, theme, &mut out),
         Screen::Explainability => render_explainability(model, theme, &mut out),
         Screen::Candidates => render_candidates(model, theme, &mut out),
+        Screen::Diagnostics => render_diagnostics(model, theme, &mut out),
         screen => render_screen_stub(screen_label(screen), theme, &mut out),
     }
 
@@ -829,12 +830,7 @@ fn render_candidates(model: &DashboardModel, theme: Theme, out: &mut String) {
         let _ = writeln!(
             out,
             "{cursor} {:<4} {action_badge} {:.2}  {:<10} {:<8} {:<6} {}",
-            candidate.decision_id,
-            candidate.total_score,
-            size_str,
-            age_str,
-            veto_col,
-            path_short,
+            candidate.decision_id, candidate.total_score, size_str, age_str, veto_col, path_short,
         );
     }
 
@@ -976,7 +972,11 @@ fn render_candidate_detail(
         "  E[loss|delete]:   {:.2}",
         candidate.expected_loss_delete
     );
-    let _ = writeln!(out, "  calibration:      {:.4}", candidate.calibration_score);
+    let _ = writeln!(
+        out,
+        "  calibration:      {:.4}",
+        candidate.calibration_score
+    );
 
     // ── Confidence badge ──
     let confidence_level = if candidate.calibration_score >= 0.85 {
@@ -1001,6 +1001,226 @@ fn render_candidate_detail(
         let _ = writeln!(out);
         let _ = writeln!(out, "  summary: {}", candidate.summary);
     }
+}
+
+// ──────────────────── S7: Diagnostics ────────────────────
+
+fn render_diagnostics(model: &DashboardModel, theme: Theme, out: &mut String) {
+    use std::fmt::Write as _;
+    let width = usize::from(model.terminal_size.0).max(40);
+
+    // ── Dashboard health ──
+    let mode_badge = if model.degraded {
+        status_badge("DEGRADED", theme.palette.warning, theme.accessibility)
+    } else {
+        status_badge("NORMAL", theme.palette.success, theme.accessibility)
+    };
+    let _ = writeln!(out, "{}", section_header("Dashboard Health", width));
+    let _ = writeln!(out, "  mode:          {mode_badge}");
+    let _ = writeln!(
+        out,
+        "  tick:          {} (refresh={}ms)",
+        model.tick,
+        model.refresh.as_millis(),
+    );
+    let _ = writeln!(out, "  missed-ticks:  {}", model.missed_ticks);
+
+    // ── Last fetch staleness ──
+    let fetch_label = match model.last_fetch {
+        Some(t) => {
+            let elapsed = t.elapsed();
+            format!("{}ms ago", elapsed.as_millis())
+        }
+        None => String::from("never"),
+    };
+    let _ = writeln!(out, "  last-fetch:    {fetch_label}");
+    let _ = writeln!(
+        out,
+        "  notifications: {} active",
+        model.notifications.len(),
+    );
+
+    // ── Frame timing ──
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", section_header("Frame Timing", width));
+
+    if let Some((current, avg, min, max)) = model.frame_time_stats() {
+        let _ = writeln!(
+            out,
+            "  current: {current:.1}ms  avg: {avg:.1}ms  min: {min:.1}ms  max: {max:.1}ms",
+        );
+
+        #[allow(clippy::cast_precision_loss)]
+        let budget_ms = model.refresh.as_millis() as f64;
+        let budget_pct = if budget_ms > 0.0 {
+            (avg / budget_ms) * 100.0
+        } else {
+            0.0
+        };
+        let budget_badge = if budget_pct > 80.0 {
+            status_badge("OVER", theme.palette.danger, theme.accessibility)
+        } else if budget_pct > 50.0 {
+            status_badge("HIGH", theme.palette.warning, theme.accessibility)
+        } else {
+            status_badge("OK", theme.palette.success, theme.accessibility)
+        };
+        let _ = writeln!(
+            out,
+            "  budget:  {budget_pct:.0}% of {budget_ms:.0}ms {budget_badge}",
+        );
+
+        // Sparkline of recent frame times.
+        let normalized = model.frame_times.normalized();
+        if !normalized.is_empty() {
+            let trace = sparkline(&normalized);
+            let _ = writeln!(
+                out,
+                "  history: {trace} ({} samples)",
+                model.frame_times.len(),
+            );
+        }
+    } else {
+        let _ = writeln!(out, "  no frame data yet");
+    }
+
+    // ── Data adapters ──
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", section_header("Data Adapters", width));
+
+    let adapter_total = model.adapter_reads + model.adapter_errors;
+    #[allow(clippy::cast_precision_loss)]
+    let error_rate = if adapter_total > 0 {
+        (model.adapter_errors as f64 / adapter_total as f64) * 100.0
+    } else {
+        0.0
+    };
+    let adapter_badge = if model.adapter_errors == 0 {
+        status_badge("OK", theme.palette.success, theme.accessibility)
+    } else if error_rate < 10.0 {
+        status_badge("DEGRADED", theme.palette.warning, theme.accessibility)
+    } else {
+        status_badge("FAILING", theme.palette.danger, theme.accessibility)
+    };
+    let _ = writeln!(
+        out,
+        "  state-adapter: {adapter_badge} reads={} errors={} ({error_rate:.0}%)",
+        model.adapter_reads, model.adapter_errors,
+    );
+
+    // ── Telemetry backends ──
+    let sources = [
+        ("timeline", model.timeline_source, model.timeline_partial),
+        (
+            "explainability",
+            model.explainability_source,
+            model.explainability_partial,
+        ),
+        (
+            "candidates",
+            model.candidates_source,
+            model.candidates_partial,
+        ),
+    ];
+    for (name, source, partial) in &sources {
+        let src_label = match source {
+            DataSource::Sqlite => "SQLite",
+            DataSource::Jsonl => "JSONL",
+            DataSource::None => "none",
+        };
+        let src_badge = if matches!(source, DataSource::None) {
+            status_badge("INACTIVE", theme.palette.muted, theme.accessibility)
+        } else if *partial {
+            status_badge("PARTIAL", theme.palette.warning, theme.accessibility)
+        } else {
+            status_badge("OK", theme.palette.success, theme.accessibility)
+        };
+        let _ = writeln!(out, "  {name:<16} {src_badge} source={src_label}");
+    }
+
+    // ── Terminal ──
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", section_header("Terminal", width));
+    let _ = writeln!(
+        out,
+        "  size:    {}x{}",
+        model.terminal_size.0, model.terminal_size.1,
+    );
+    let _ = writeln!(
+        out,
+        "  theme:   {} spacing={}",
+        color_mode_label(theme),
+        spacing_mode_label(theme),
+    );
+
+    // ── Daemon process (verbose) ──
+    if model.diagnostics_verbose {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "{}", section_header("Daemon Process", width));
+        if let Some(ref state) = model.daemon_state {
+            let _ = writeln!(out, "  version: {}", state.version);
+            let _ = writeln!(out, "  pid:     {}", state.pid);
+            let _ = writeln!(
+                out,
+                "  uptime:  {}",
+                human_duration(state.uptime_seconds),
+            );
+            let _ = writeln!(out, "  rss:     {}", human_bytes(state.memory_rss_bytes));
+            let _ = writeln!(
+                out,
+                "  scans={} deletions={} errors={} dropped={}",
+                state.counters.scans,
+                state.counters.deletions,
+                state.counters.errors,
+                state.counters.dropped_log_events,
+            );
+        } else {
+            let _ = writeln!(out, "  daemon not connected");
+        }
+
+        // ── Screen state summary ──
+        let _ = writeln!(out);
+        let _ = writeln!(out, "{}", section_header("Screen State", width));
+        let _ = writeln!(out, "  active:      {}", screen_label(model.screen));
+        let _ = writeln!(
+            out,
+            "  history:     {} entries",
+            model.screen_history.len(),
+        );
+        let _ = writeln!(
+            out,
+            "  rate-mounts: {} tracked",
+            model.rate_histories.len(),
+        );
+        let _ = writeln!(
+            out,
+            "  timeline:    {} events (filter={})",
+            model.timeline_events.len(),
+            model.timeline_filter.label(),
+        );
+        let _ = writeln!(
+            out,
+            "  decisions:   {}",
+            model.explainability_decisions.len(),
+        );
+        let _ = writeln!(
+            out,
+            "  candidates:  {} (sort={})",
+            model.candidates_list.len(),
+            model.candidates_sort.label(),
+        );
+    }
+
+    // ── Navigation hint ──
+    let verbose_label = if model.diagnostics_verbose {
+        "on"
+    } else {
+        "off"
+    };
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "V verbose ({verbose_label})  r refresh  ? help  q quit"
+    );
 }
 
 fn render_screen_stub(name: &str, theme: Theme, out: &mut String) {
@@ -1720,5 +1940,239 @@ mod tests {
         assert!(frame.contains("INFO"));
         assert!(frame.contains("WARNING"));
         assert!(frame.contains("CRITICAL"));
+    }
+
+    // ── S4 Candidates screen tests ──
+
+    fn sample_candidate(
+        id: u64,
+        action: &str,
+        vetoed: bool,
+        score: f64,
+        size: u64,
+    ) -> crate::tui::telemetry::DecisionEvidence {
+        crate::tui::telemetry::DecisionEvidence {
+            decision_id: id,
+            timestamp: String::from("2026-02-16T04:30:00Z"),
+            path: String::from("/data/projects/myapp/target/debug"),
+            size_bytes: size,
+            age_secs: 3600,
+            action: action.to_string(),
+            effective_action: Some(action.to_string()),
+            policy_mode: String::from("live"),
+            factors: FactorBreakdown {
+                location: 0.80,
+                name: 0.75,
+                age: 0.90,
+                size: 0.60,
+                structure: 0.85,
+                pressure_multiplier: 1.3,
+            },
+            total_score: score,
+            posterior_abandoned: 0.87,
+            expected_loss_keep: 26.1,
+            expected_loss_delete: 13.0,
+            calibration_score: 0.82,
+            vetoed,
+            veto_reason: if vetoed {
+                Some(String::from("path contains .git"))
+            } else {
+                None
+            },
+            guard_status: Some(String::from("Pass")),
+            summary: String::from("Build artifact candidate"),
+            raw_json: None,
+        }
+    }
+
+    #[test]
+    fn candidates_empty_shows_no_data_message() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Candidates;
+
+        let frame = render(&model);
+        assert!(frame.contains("[S4 Candidates]"));
+        assert!(frame.contains("NO DATA") || frame.contains("no data"));
+        assert!(frame.contains("No scan candidates available"));
+    }
+
+    #[test]
+    fn candidates_shows_ranking_list() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Candidates;
+        model.candidates_list = vec![
+            sample_candidate(10, "delete", false, 2.15, 524_288_000),
+            sample_candidate(11, "keep", false, 0.45, 1_048_576),
+        ];
+        model.candidates_source = crate::tui::telemetry::DataSource::Sqlite;
+
+        let frame = render(&model);
+        assert!(frame.contains("[S4 Candidates]"));
+        assert!(frame.contains("data-source=SQLite"));
+        assert!(frame.contains("candidates=2"));
+        assert!(frame.contains("Scan Candidates"));
+        assert!(frame.contains("DELETE"));
+        assert!(frame.contains("KEEP"));
+    }
+
+    #[test]
+    fn candidates_shows_veto_markers() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Candidates;
+        model.candidates_list = vec![
+            sample_candidate(10, "delete", true, 2.15, 100_000),
+            sample_candidate(11, "delete", false, 1.50, 200_000),
+        ];
+
+        let frame = render(&model);
+        assert!(frame.contains("VETOED"));
+        assert!(frame.contains("1 candidate(s)"));
+        assert!(frame.contains("protected from deletion"));
+    }
+
+    #[test]
+    fn candidates_shows_sort_indicator() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Candidates;
+        model.candidates_list = vec![sample_candidate(1, "delete", false, 2.0, 1000)];
+
+        let frame = render(&model);
+        assert!(frame.contains("sort=score"));
+    }
+
+    #[test]
+    fn candidates_cursor_indicator() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Candidates;
+        model.candidates_list = vec![
+            sample_candidate(1, "delete", false, 2.0, 1000),
+            sample_candidate(2, "keep", false, 0.5, 2000),
+        ];
+        model.candidates_selected = 1;
+
+        let frame = render(&model);
+        let lines: Vec<&str> = frame.lines().collect();
+        let cursor_line = lines.iter().find(|l| l.contains("2") && l.starts_with('>'));
+        assert!(cursor_line.is_some(), "cursor should be on candidate #2");
+    }
+
+    #[test]
+    fn candidates_detail_shows_score_breakdown() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 40),
+        );
+        model.screen = Screen::Candidates;
+        model.candidates_list = vec![sample_candidate(42, "delete", false, 2.15, 524_288_000)];
+        model.candidates_detail = true;
+
+        let frame = render(&model);
+        assert!(frame.contains("Candidate Detail"));
+        assert!(frame.contains("Score Breakdown"));
+        assert!(frame.contains("location"));
+        assert!(frame.contains("0.80"));
+        assert!(frame.contains("Decision Statistics"));
+        assert!(frame.contains("P(abandoned)"));
+    }
+
+    #[test]
+    fn candidates_detail_shows_veto_reason() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 40),
+        );
+        model.screen = Screen::Candidates;
+        model.candidates_list = vec![sample_candidate(99, "delete", true, 2.0, 1000)];
+        model.candidates_detail = true;
+
+        let frame = render(&model);
+        assert!(frame.contains("VETOED"));
+        assert!(frame.contains("path contains .git"));
+    }
+
+    #[test]
+    fn candidates_shows_reclaim_estimate() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Candidates;
+        model.candidates_list = vec![
+            sample_candidate(1, "delete", false, 2.0, 1_073_741_824),
+            sample_candidate(2, "delete", false, 1.5, 524_288_000),
+            sample_candidate(3, "keep", false, 0.3, 100_000_000),
+        ];
+
+        let frame = render(&model);
+        // Only delete (non-vetoed) candidates counted: 1GB + 500MB = 1.5GB
+        assert!(frame.contains("estimated reclaimable: 1.5 GB"));
+    }
+
+    #[test]
+    fn candidates_partial_data_shows_warning() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Candidates;
+        model.candidates_list = vec![sample_candidate(1, "keep", false, 0.5, 1000)];
+        model.candidates_source = crate::tui::telemetry::DataSource::Jsonl;
+        model.candidates_partial = true;
+        model.candidates_diagnostics = "SQLite unavailable, using JSONL fallback".into();
+
+        let frame = render(&model);
+        assert!(frame.contains("PARTIAL"));
+        assert!(frame.contains("JSONL"));
+        assert!(frame.contains("SQLite unavailable"));
+    }
+
+    #[test]
+    fn candidates_confidence_badge_in_detail() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 40),
+        );
+        model.screen = Screen::Candidates;
+        model.candidates_list = vec![sample_candidate(42, "delete", false, 2.15, 1000)];
+        model.candidates_detail = true;
+
+        let frame = render(&model);
+        // calibration_score = 0.82 => MODERATE confidence
+        assert!(frame.contains("MODERATE"));
     }
 }

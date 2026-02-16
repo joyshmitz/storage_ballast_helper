@@ -28,7 +28,10 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
                 DashboardCmd::ScheduleTick(model.refresh),
             ];
             // Request telemetry data when on a screen that needs it.
-            if matches!(model.screen, Screen::Explainability | Screen::Candidates) {
+            if matches!(
+                model.screen,
+                Screen::Timeline | Screen::Explainability | Screen::Candidates
+            ) {
                 cmds.push(DashboardCmd::FetchTelemetry);
             }
             DashboardCmd::Batch(cmds)
@@ -55,6 +58,7 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
 
             if let Some(ref s) = state {
                 model.degraded = false;
+                model.adapter_reads += 1;
 
                 // Update rate histories from mount data.
                 let mut active_mounts = Vec::new();
@@ -72,6 +76,7 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
                     .retain(|k, _| active_mounts.contains(k));
             } else {
                 model.degraded = true;
+                model.adapter_errors += 1;
             }
 
             model.daemon_state = state.map(|s| *s);
@@ -165,6 +170,11 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
             } else if model.candidates_selected >= model.candidates_list.len() {
                 model.candidates_selected = model.candidates_list.len() - 1;
             }
+            DashboardCmd::None
+        }
+
+        DashboardMsg::FrameMetrics { duration_ms } => {
+            model.frame_times.push(duration_ms);
             DashboardCmd::None
         }
     }
@@ -287,8 +297,40 @@ fn handle_global_key(model: &mut DashboardModel, key: ftui_core::event::KeyEvent
 /// Dispatch screen-specific keys that are not global navigation.
 fn handle_screen_key(model: &mut DashboardModel, key: ftui_core::event::KeyEvent) -> DashboardCmd {
     match model.screen {
+        Screen::Timeline => handle_timeline_key(model, key),
         Screen::Explainability => handle_explainability_key(model, key),
         Screen::Candidates => handle_candidates_key(model, key),
+        Screen::Diagnostics => handle_diagnostics_key(model, key),
+        _ => DashboardCmd::None,
+    }
+}
+
+/// Handle keys specific to the Timeline screen (S2).
+fn handle_timeline_key(
+    model: &mut DashboardModel,
+    key: ftui_core::event::KeyEvent,
+) -> DashboardCmd {
+    match key.code {
+        // Up/k: move cursor up in the event list.
+        KeyCode::Up | KeyCode::Char('k') => {
+            model.timeline_cursor_up();
+            DashboardCmd::None
+        }
+        // Down/j: move cursor down in the event list.
+        KeyCode::Down | KeyCode::Char('j') => {
+            model.timeline_cursor_down();
+            DashboardCmd::None
+        }
+        // f: cycle severity filter (All → Info → Warning → Critical → All).
+        KeyCode::Char('f') => {
+            model.timeline_cycle_filter();
+            DashboardCmd::None
+        }
+        // F (shift-f): toggle follow mode.
+        KeyCode::Char('F') => {
+            model.timeline_toggle_follow();
+            DashboardCmd::None
+        }
         _ => DashboardCmd::None,
     }
 }
@@ -356,6 +398,21 @@ fn handle_candidates_key(
         // s: cycle sort order.
         KeyCode::Char('s') => {
             model.candidates_cycle_sort();
+            DashboardCmd::None
+        }
+        _ => DashboardCmd::None,
+    }
+}
+
+/// Handle keys specific to the Diagnostics screen (S7).
+fn handle_diagnostics_key(
+    model: &mut DashboardModel,
+    key: ftui_core::event::KeyEvent,
+) -> DashboardCmd {
+    match key.code {
+        // V (shift-v): toggle verbose diagnostics mode.
+        KeyCode::Char('V') => {
+            model.diagnostics_toggle_verbose();
             DashboardCmd::None
         }
         _ => DashboardCmd::None,
@@ -1143,6 +1200,413 @@ mod tests {
                 !has_telemetry,
                 "Tick on S1 should not include FetchTelemetry"
             );
+        }
+    }
+
+    // ── S2 Timeline key handling tests ──
+
+    use crate::tui::model::SeverityFilter;
+    use crate::tui::telemetry::TimelineEvent;
+
+    fn sample_timeline_event(severity: &str, event_type: &str) -> TimelineEvent {
+        TimelineEvent {
+            timestamp: String::from("2026-02-16T03:15:42Z"),
+            event_type: event_type.to_owned(),
+            severity: severity.to_owned(),
+            path: None,
+            size_bytes: None,
+            score: None,
+            pressure_level: None,
+            free_pct: None,
+            success: None,
+            error_code: None,
+            error_message: None,
+            duration_ms: None,
+            details: None,
+        }
+    }
+
+    #[test]
+    fn timeline_j_k_navigate_cursor() {
+        let mut model = test_model();
+        model.screen = Screen::Timeline;
+        model.timeline_events = vec![
+            sample_timeline_event("info", "a"),
+            sample_timeline_event("info", "b"),
+            sample_timeline_event("info", "c"),
+        ];
+        assert_eq!(model.timeline_selected, 0);
+
+        // j moves down
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('j'))));
+        assert_eq!(model.timeline_selected, 1);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('j'))));
+        assert_eq!(model.timeline_selected, 2);
+
+        // j at bottom is clamped
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('j'))));
+        assert_eq!(model.timeline_selected, 2);
+
+        // k moves up
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('k'))));
+        assert_eq!(model.timeline_selected, 1);
+    }
+
+    #[test]
+    fn timeline_arrows_navigate_cursor() {
+        let mut model = test_model();
+        model.screen = Screen::Timeline;
+        model.timeline_events = vec![
+            sample_timeline_event("info", "a"),
+            sample_timeline_event("info", "b"),
+        ];
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Down)));
+        assert_eq!(model.timeline_selected, 1);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Up)));
+        assert_eq!(model.timeline_selected, 0);
+    }
+
+    #[test]
+    fn timeline_f_cycles_filter() {
+        let mut model = test_model();
+        model.screen = Screen::Timeline;
+        model.timeline_events = vec![sample_timeline_event("info", "a")];
+        assert_eq!(model.timeline_filter, SeverityFilter::All);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('f'))));
+        assert_eq!(model.timeline_filter, SeverityFilter::Info);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('f'))));
+        assert_eq!(model.timeline_filter, SeverityFilter::Warning);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('f'))));
+        assert_eq!(model.timeline_filter, SeverityFilter::Critical);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('f'))));
+        assert_eq!(model.timeline_filter, SeverityFilter::All);
+    }
+
+    #[test]
+    fn timeline_f_resets_cursor() {
+        let mut model = test_model();
+        model.screen = Screen::Timeline;
+        model.timeline_events = vec![
+            sample_timeline_event("info", "a"),
+            sample_timeline_event("info", "b"),
+        ];
+        model.timeline_selected = 1;
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('f'))));
+        assert_eq!(model.timeline_selected, 0);
+    }
+
+    #[test]
+    fn timeline_shift_f_toggles_follow() {
+        let mut model = test_model();
+        model.screen = Screen::Timeline;
+        model.timeline_events = vec![
+            sample_timeline_event("info", "a"),
+            sample_timeline_event("info", "b"),
+        ];
+        model.timeline_follow = false;
+        model.timeline_selected = 0;
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('F'))));
+        assert!(model.timeline_follow);
+        assert_eq!(model.timeline_selected, 1); // jumped to latest
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('F'))));
+        assert!(!model.timeline_follow);
+    }
+
+    #[test]
+    fn timeline_manual_nav_disables_follow() {
+        let mut model = test_model();
+        model.screen = Screen::Timeline;
+        model.timeline_events = vec![
+            sample_timeline_event("info", "a"),
+            sample_timeline_event("info", "b"),
+        ];
+        model.timeline_follow = true;
+        model.timeline_selected = 1;
+
+        // Moving up disables follow mode
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('k'))));
+        assert!(!model.timeline_follow);
+        assert_eq!(model.timeline_selected, 0);
+    }
+
+    #[test]
+    fn timeline_keys_noop_on_other_screens() {
+        let mut model = test_model();
+        model.screen = Screen::Overview;
+
+        // f should not cycle filter on Overview
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('f'))));
+        assert_eq!(model.timeline_filter, SeverityFilter::All);
+    }
+
+    #[test]
+    fn telemetry_timeline_msg_updates_model() {
+        let mut model = test_model();
+        let result = TelemetryResult {
+            data: vec![
+                sample_timeline_event("info", "scan"),
+                sample_timeline_event("warning", "pressure_change"),
+            ],
+            source: DataSource::Sqlite,
+            partial: false,
+            diagnostics: String::new(),
+        };
+
+        let cmd = update(&mut model, DashboardMsg::TelemetryTimeline(result));
+        assert!(matches!(cmd, DashboardCmd::None));
+        assert_eq!(model.timeline_events.len(), 2);
+        assert_eq!(model.timeline_source, DataSource::Sqlite);
+        assert!(!model.timeline_partial);
+    }
+
+    #[test]
+    fn telemetry_timeline_clamps_cursor() {
+        let mut model = test_model();
+        model.timeline_selected = 10; // out of range
+
+        let result = TelemetryResult {
+            data: vec![sample_timeline_event("info", "a")],
+            source: DataSource::Sqlite,
+            partial: false,
+            diagnostics: String::new(),
+        };
+
+        update(&mut model, DashboardMsg::TelemetryTimeline(result));
+        assert_eq!(model.timeline_selected, 0); // clamped to last (only 1 event)
+    }
+
+    #[test]
+    fn telemetry_timeline_follow_jumps_to_latest() {
+        let mut model = test_model();
+        model.timeline_follow = true;
+        model.timeline_selected = 0;
+
+        let result = TelemetryResult {
+            data: vec![
+                sample_timeline_event("info", "a"),
+                sample_timeline_event("info", "b"),
+                sample_timeline_event("info", "c"),
+            ],
+            source: DataSource::Sqlite,
+            partial: false,
+            diagnostics: String::new(),
+        };
+
+        update(&mut model, DashboardMsg::TelemetryTimeline(result));
+        assert_eq!(model.timeline_selected, 2); // jumped to latest
+    }
+
+    #[test]
+    fn telemetry_timeline_empty_resets_cursor() {
+        let mut model = test_model();
+        model.timeline_selected = 5;
+
+        let result = TelemetryResult {
+            data: vec![],
+            source: DataSource::None,
+            partial: true,
+            diagnostics: String::from("no data"),
+        };
+
+        update(&mut model, DashboardMsg::TelemetryTimeline(result));
+        assert_eq!(model.timeline_selected, 0);
+        assert!(model.timeline_partial);
+    }
+
+    #[test]
+    fn tick_on_timeline_requests_telemetry() {
+        let mut model = test_model();
+        model.screen = Screen::Timeline;
+
+        let cmd = update(&mut model, DashboardMsg::Tick);
+        if let DashboardCmd::Batch(cmds) = cmd {
+            let has_telemetry = cmds
+                .iter()
+                .any(|c| matches!(c, DashboardCmd::FetchTelemetry));
+            assert!(has_telemetry, "Tick on S2 should include FetchTelemetry");
+        } else {
+            panic!("Expected Batch command from Tick");
+        }
+    }
+
+    // ── S4 Candidates key handling tests ──
+
+    #[test]
+    fn candidates_j_k_navigate_cursor() {
+        let mut model = test_model();
+        model.screen = Screen::Candidates;
+        model.candidates_list =
+            vec![sample_decision(1), sample_decision(2), sample_decision(3)];
+        assert_eq!(model.candidates_selected, 0);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('j'))));
+        assert_eq!(model.candidates_selected, 1);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('j'))));
+        assert_eq!(model.candidates_selected, 2);
+
+        // j at bottom is clamped
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('j'))));
+        assert_eq!(model.candidates_selected, 2);
+
+        // k moves up
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('k'))));
+        assert_eq!(model.candidates_selected, 1);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('k'))));
+        assert_eq!(model.candidates_selected, 0);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('k'))));
+        assert_eq!(model.candidates_selected, 0);
+    }
+
+    #[test]
+    fn candidates_arrows_navigate_cursor() {
+        let mut model = test_model();
+        model.screen = Screen::Candidates;
+        model.candidates_list = vec![sample_decision(1), sample_decision(2)];
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Down)));
+        assert_eq!(model.candidates_selected, 1);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Up)));
+        assert_eq!(model.candidates_selected, 0);
+    }
+
+    #[test]
+    fn candidates_enter_toggles_detail() {
+        let mut model = test_model();
+        model.screen = Screen::Candidates;
+        model.candidates_list = vec![sample_decision(1)];
+        assert!(!model.candidates_detail);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+        assert!(model.candidates_detail);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+        assert!(!model.candidates_detail);
+    }
+
+    #[test]
+    fn candidates_d_closes_detail() {
+        let mut model = test_model();
+        model.screen = Screen::Candidates;
+        model.candidates_list = vec![sample_decision(1)];
+        model.candidates_detail = true;
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('d'))));
+        assert!(!model.candidates_detail);
+    }
+
+    #[test]
+    fn candidates_s_cycles_sort() {
+        let mut model = test_model();
+        model.screen = Screen::Candidates;
+        model.candidates_list = vec![sample_decision(1)];
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('s'))));
+        assert_eq!(
+            model.candidates_sort,
+            crate::tui::model::CandidatesSortOrder::Size
+        );
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('s'))));
+        assert_eq!(
+            model.candidates_sort,
+            crate::tui::model::CandidatesSortOrder::Age
+        );
+    }
+
+    #[test]
+    fn candidates_keys_noop_on_other_screens() {
+        let mut model = test_model();
+        model.screen = Screen::Overview;
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('s'))));
+        assert_eq!(
+            model.candidates_sort,
+            crate::tui::model::CandidatesSortOrder::Score
+        );
+    }
+
+    #[test]
+    fn telemetry_candidates_msg_updates_model() {
+        let mut model = test_model();
+        let result = TelemetryResult {
+            data: vec![sample_decision(10), sample_decision(20)],
+            source: crate::tui::telemetry::DataSource::Sqlite,
+            partial: false,
+            diagnostics: String::new(),
+        };
+
+        let cmd = update(&mut model, DashboardMsg::TelemetryCandidates(result));
+        assert!(matches!(cmd, DashboardCmd::None));
+        assert_eq!(model.candidates_list.len(), 2);
+        assert_eq!(
+            model.candidates_source,
+            crate::tui::telemetry::DataSource::Sqlite
+        );
+        assert!(!model.candidates_partial);
+    }
+
+    #[test]
+    fn telemetry_candidates_clamps_cursor() {
+        let mut model = test_model();
+        model.candidates_selected = 5;
+
+        let result = TelemetryResult {
+            data: vec![sample_decision(1), sample_decision(2)],
+            source: crate::tui::telemetry::DataSource::Sqlite,
+            partial: false,
+            diagnostics: String::new(),
+        };
+
+        update(&mut model, DashboardMsg::TelemetryCandidates(result));
+        assert_eq!(model.candidates_selected, 1);
+    }
+
+    #[test]
+    fn telemetry_candidates_empty_resets_state() {
+        let mut model = test_model();
+        model.candidates_selected = 3;
+        model.candidates_detail = true;
+
+        let result = TelemetryResult {
+            data: vec![],
+            source: crate::tui::telemetry::DataSource::None,
+            partial: true,
+            diagnostics: String::from("no data available"),
+        };
+
+        update(&mut model, DashboardMsg::TelemetryCandidates(result));
+        assert_eq!(model.candidates_selected, 0);
+        assert!(!model.candidates_detail);
+        assert!(model.candidates_partial);
+    }
+
+    #[test]
+    fn tick_on_candidates_requests_telemetry() {
+        let mut model = test_model();
+        model.screen = Screen::Candidates;
+
+        let cmd = update(&mut model, DashboardMsg::Tick);
+        if let DashboardCmd::Batch(cmds) = cmd {
+            let has_telemetry = cmds
+                .iter()
+                .any(|c| matches!(c, DashboardCmd::FetchTelemetry));
+            assert!(has_telemetry, "Tick on S4 should include FetchTelemetry");
+        } else {
+            panic!("Expected Batch command from Tick");
         }
     }
 }
