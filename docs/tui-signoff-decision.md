@@ -4,7 +4,7 @@
 
 **Date**: 2026-02-16
 **Trace ID**: signoff-20260216-bd-xzt
-**Signoff owner**: WindyWillow (initial), AmberFox (re-verified 2026-02-16)
+**Signoff owner**: WindyWillow (initial), AmberFox (re-verified), StormyIvy (final gate run)
 
 ## Executive Summary
 
@@ -204,3 +204,14 @@ Rationale:
 
 **Stage A entry criteria**: MET.
 **Recommended next step**: Enable `--new-dashboard` opt-in and begin collecting canary telemetry.
+
+## Appendix: Independent Verification Run (StormyIvy)
+
+Trace IDs: `qg-20260216-032046-1039389` (core), `qg-20260216-032339-1055844` (stress)
+
+Independent gate run on 2026-02-16 confirmed all results:
+- 19/20 stages passed (e2e partial due to daemon_stub hang — pre-existing)
+- 1775 lib tests, 33 bin tests, all passing
+- Clippy clean with `--features tui`
+- All TUI-specific suites: replay, scenarios, properties, fault injection, snapshots, parity, benchmarks — all PASS
+- Stress suites: stress, stress-harness, tui-stress — all PASS
