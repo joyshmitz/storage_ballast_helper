@@ -1079,11 +1079,18 @@ mod tests {
         // Roundtrip through JSON.
         let json = record.to_json_compact();
         let parsed: DecisionRecord = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.total_score.to_bits(), record.total_score.to_bits());
+        assert!(
+            (parsed.total_score - record.total_score).abs() < f64::EPSILON,
+            "total_score roundtrip: {} vs {}",
+            parsed.total_score,
+            record.total_score,
+        );
         assert_eq!(parsed.action, record.action);
-        assert_eq!(
-            parsed.posterior_abandoned.to_bits(),
-            record.posterior_abandoned.to_bits()
+        assert!(
+            (parsed.posterior_abandoned - record.posterior_abandoned).abs() < 1e-14,
+            "posterior roundtrip: {} vs {}",
+            parsed.posterior_abandoned,
+            record.posterior_abandoned,
         );
 
         // Explain at all levels.

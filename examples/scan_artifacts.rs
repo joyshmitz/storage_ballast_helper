@@ -47,11 +47,11 @@ fn main() {
         if entry.metadata.is_dir {
             let classification = registry.classify(&entry.path, entry.structural_signals);
             let age = now
-                .duration_since(entry.metadata.modified)
+                .duration_since(entry.metadata.effective_age_timestamp())
                 .unwrap_or_default();
             candidates.push(CandidateInput {
                 path: entry.path.clone(),
-                size_bytes: entry.metadata.size_bytes,
+                size_bytes: entry.metadata.content_size_bytes,
                 age,
                 classification,
                 signals: entry.structural_signals,

@@ -403,7 +403,7 @@ fn pressure_multiplier(urgency: f64) -> f64 {
 }
 
 fn posterior_from_score(total_score: f64, confidence: f64) -> f64 {
-    let scaled_score = (total_score / 3.0).clamp(0.0, 1.0);
+    let scaled_score = (total_score / 1.5).clamp(0.0, 1.0);
     let logit = 3.5f64.mul_add(scaled_score - 0.5, 2.0 * (confidence - 0.5));
     1.0 / (1.0 + (-logit).exp())
 }
@@ -894,5 +894,127 @@ mod tests {
         assert!(keep_loss > 24.0);
         assert!(delete_loss > 10.0);
         assert!(delete_loss - 10.0 > keep_loss - 24.0);
+    }
+
+    /// Regression test: verifies the full scoring pipeline produces Delete decisions
+    /// for realistic build artifacts at various pressure levels. This catches the
+    /// production bug where /3.0 scaling + 100:30 loss asymmetry made Delete
+    /// mathematically impossible at non-Critical pressure.
+    #[test]
+    fn realistic_artifacts_get_delete_at_red_pressure() {
+        let engine = default_engine();
+
+        // Realistic Rust target directory: 4 hours old, 2 GiB, high-confidence
+        // structural markers, located in /data/projects.
+        let input = CandidateInput {
+            path: PathBuf::from("/data/projects/myapp/target"),
+            size_bytes: 2 * 1_073_741_824,
+            age: Duration::from_secs(4 * 3600),
+            classification: classification(0.85, ArtifactCategory::RustTarget),
+            signals: StructuralSignals {
+                has_incremental: true,
+                has_deps: true,
+                has_build: true,
+                has_fingerprint: true,
+                has_git: false,
+                has_cargo_toml: false,
+                mostly_object_files: false,
+            },
+            is_open: false,
+            excluded: false,
+        };
+
+        // At Red pressure (urgency ~0.7), must produce Delete.
+        let red = engine.score_candidate(&input, 0.7);
+        assert!(!red.vetoed, "realistic target should not be vetoed");
+        assert!(red.total_score > 0.45, "score should exceed min_score");
+        assert_eq!(
+            red.decision.action,
+            DecisionAction::Delete,
+            "realistic artifact at Red pressure must get Delete, not {:?} (score={:.3}, posterior={:.3})",
+            red.decision.action,
+            red.total_score,
+            red.decision.posterior_abandoned,
+        );
+
+        // At Yellow pressure (urgency ~0.4), should still produce Delete or Review.
+        let yellow = engine.score_candidate(&input, 0.4);
+        assert_ne!(
+            yellow.decision.action,
+            DecisionAction::Keep,
+            "realistic artifact at Yellow pressure should not be kept (score={:.3}, posterior={:.3})",
+            yellow.total_score,
+            yellow.decision.posterior_abandoned,
+        );
+    }
+
+    /// Verify that a range of typical agent swarm artifacts all produce Delete
+    /// at Critical pressure. This is the absolute minimum bar for the scoring
+    /// engine to be useful in production.
+    #[test]
+    fn swarm_artifacts_delete_at_critical_pressure() {
+        let engine = default_engine();
+        let urgency = 0.95; // Critical pressure
+
+        let artifacts = vec![
+            // Rust target in /tmp
+            (
+                "/tmp/cargo-target-quietwillow",
+                5 * 1_073_741_824u64,
+                2 * 3600u64,
+                0.90,
+            ),
+            // Rust target in /data/projects
+            (
+                "/data/projects/foo/.target_opus_42",
+                3 * 1_073_741_824,
+                3 * 3600,
+                0.80,
+            ),
+            // Agent build artifact
+            (
+                "/data/projects/bar/pi_agent_rust_target",
+                1_073_741_824,
+                4 * 3600,
+                0.75,
+            ),
+            // Hidden target dir
+            (
+                "/data/projects/baz/.tmp_target_rch",
+                2 * 1_073_741_824,
+                6 * 3600,
+                0.85,
+            ),
+        ];
+
+        for (path, size, age_secs, confidence) in &artifacts {
+            let input = CandidateInput {
+                path: PathBuf::from(path),
+                size_bytes: *size,
+                age: Duration::from_secs(*age_secs),
+                classification: classification(*confidence, ArtifactCategory::RustTarget),
+                signals: StructuralSignals {
+                    has_incremental: true,
+                    has_deps: true,
+                    has_build: false,
+                    has_fingerprint: true,
+                    has_git: false,
+                    has_cargo_toml: false,
+                    mostly_object_files: false,
+                },
+                is_open: false,
+                excluded: false,
+            };
+
+            let score = engine.score_candidate(&input, urgency);
+            assert!(!score.vetoed, "{path}: should not be vetoed");
+            assert_eq!(
+                score.decision.action,
+                DecisionAction::Delete,
+                "{path}: must get Delete at critical pressure (score={:.3}, posterior={:.3})",
+                score.total_score,
+                score.decision.posterior_abandoned,
+            );
+        }
     }
 }

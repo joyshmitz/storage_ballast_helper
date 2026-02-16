@@ -348,7 +348,7 @@ impl Default for ScannerConfig {
                 PathBuf::from("/var/log"),
             ],
             protected_paths: Vec::new(),
-            min_file_age_minutes: 30,
+            min_file_age_minutes: 10,
             max_depth: 10,
             parallelism: std::thread::available_parallelism()
                 .map_or(2, |n| n.get().saturating_div(2).max(1)),
@@ -369,7 +369,7 @@ impl Default for ScoringConfig {
             age_weight: 0.20,
             size_weight: 0.15,
             structure_weight: 0.15,
-            false_positive_loss: 100.0,
+            false_positive_loss: 50.0,
             false_negative_loss: 30.0,
             calibration_floor: 0.55,
         }

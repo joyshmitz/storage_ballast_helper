@@ -37,12 +37,37 @@ pub struct WalkerConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryMetadata {
     pub size_bytes: u64,
+    /// Estimated content size for directories: sum of immediate children's file
+    /// sizes observed during iteration. For files, equals `size_bytes`.
+    /// This is a lower bound (capped at `MAX_ENTRIES_PER_DIR` children, does not
+    /// recurse into subdirectories), but far more useful for scoring than the
+    /// inode entry size (~4096) that `size_bytes` returns for directories.
+    pub content_size_bytes: u64,
     pub modified: SystemTime,
     pub created: Option<SystemTime>,
     pub is_dir: bool,
     pub inode: u64,
     pub device_id: u64,
     pub permissions: u32,
+}
+
+impl EntryMetadata {
+    /// Return the timestamp to use for age-based scoring.
+    ///
+    /// For **directories**, returns the creation (birth) time when available,
+    /// because directory `mtime` updates whenever any direct child is added or
+    /// removed — making active build caches like `target/` appear perpetually
+    /// young. Birth time reflects when the directory was actually created and is
+    /// stable across builds.
+    ///
+    /// For **files**, always returns `modified` (content change is what matters).
+    pub fn effective_age_timestamp(&self) -> SystemTime {
+        if self.is_dir {
+            self.created.unwrap_or(self.modified)
+        } else {
+            self.modified
+        }
+    }
 }
 
 /// A single entry discovered during a walk.
@@ -271,6 +296,7 @@ fn process_directory(
     let mut signals = StructuralSignals::default();
     let mut object_count = 0u32;
     let mut total_count = 0u32;
+    let mut content_size: u64 = 0;
 
     // Collect child directories during iteration; queue them AFTER the loop.
     // This prevents a race where a child dir is queued and processed by another
@@ -349,14 +375,27 @@ fn process_directory(
             ft.is_dir()
         };
 
+        // ─── Accumulate Content Size ───
+        // For files: lstat to get actual size. On ext4 this is ~1μs per call,
+        // so 2000 children ≈ 2ms — acceptable for accurate scoring.
+        // For child dirs: skip (their recursive size will be computed when they
+        // are processed as their own WalkEntry).
+        if !is_dir
+            && let Ok(child_meta) = entry.metadata()
+        {
+            content_size = content_size.saturating_add(child_meta.len());
+        }
+
         // ─── Collect Child Dirs ───
         // Deferred dispatch: collect child dirs but don't queue yet. Queueing
         // happens after the loop, ensuring .sbh-protect markers are discovered
         // before any children are dispatched to other worker threads.
-        if depth < config.max_depth && is_dir && pending_children.len() < MAX_CHILDREN_QUEUED {
-            if !config.excluded_paths.contains(&child_path) {
-                pending_children.push(child_path);
-            }
+        if depth < config.max_depth
+            && is_dir
+            && pending_children.len() < MAX_CHILDREN_QUEUED
+            && !config.excluded_paths.contains(&child_path)
+        {
+            pending_children.push(child_path);
         }
     }
 
@@ -382,9 +421,17 @@ fn process_directory(
     if depth > 0
         && let Some(meta) = dir_meta
     {
+        let mut emeta = entry_metadata(&meta);
+        // Override content_size_bytes with the sum of immediate children's file
+        // sizes. This is a lower bound (doesn't recurse into subdirs, capped at
+        // MAX_ENTRIES_PER_DIR children) but vastly better than the inode entry
+        // size (~4096) for scoring purposes.
+        if emeta.is_dir && content_size > 0 {
+            emeta.content_size_bytes = content_size;
+        }
         let _ = result_tx.send(WalkEntry {
             path: dir_path.to_path_buf(),
-            metadata: entry_metadata(&meta),
+            metadata: emeta,
             depth,
             structural_signals: signals,
             is_open: false, // Caller sets this after walk using /proc scan.
@@ -431,8 +478,10 @@ fn entry_metadata(meta: &fs::Metadata) -> EntryMetadata {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let size = meta.len();
         EntryMetadata {
-            size_bytes: meta.len(),
+            size_bytes: size,
+            content_size_bytes: size, // Overridden for directories in process_directory.
             modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             created: meta.created().ok(),
             is_dir: meta.is_dir(),
@@ -443,8 +492,10 @@ fn entry_metadata(meta: &fs::Metadata) -> EntryMetadata {
     }
     #[cfg(not(unix))]
     {
+        let size = meta.len();
         EntryMetadata {
-            size_bytes: meta.len(),
+            size_bytes: size,
+            content_size_bytes: size,
             modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             created: meta.created().ok(),
             is_dir: meta.is_dir(),

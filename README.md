@@ -604,7 +604,7 @@ The scoring engine does not use the composite score directly as a delete/keep th
 First, the composite score is converted to a posterior probability that the artifact is abandoned (no longer needed by any running process):
 
 ```
-scaled = min(total_score / 3.0, 1.0)
+scaled = min(total_score / 1.5, 1.0)
 logit = 3.5 * (scaled - 0.5) + 2.0 * (confidence - 0.5)
 posterior_abandoned = sigmoid(logit)
 ```
@@ -612,9 +612,9 @@ posterior_abandoned = sigmoid(logit)
 Then the expected loss of each action is computed:
 
 - **Loss of keeping an abandoned artifact**: `posterior * false_negative_loss` (default: 30.0)
-- **Loss of deleting a useful artifact**: `(1 - posterior) * false_positive_loss` (default: 100.0)
+- **Loss of deleting a useful artifact**: `(1 - posterior) * false_positive_loss` (default: 50.0)
 
-The asymmetric defaults (100 vs. 30) encode the design principle that wrongly deleting something useful is roughly 3x worse than failing to clean up something stale.
+The asymmetric defaults (50 vs. 30) encode the design principle that wrongly deleting something useful is costlier than failing to clean up something stale, while remaining aggressive enough to actually reclaim space under pressure.
 
 These base losses are then adjusted by epistemic uncertainty, which combines entropy of the posterior with calibration confidence:
 

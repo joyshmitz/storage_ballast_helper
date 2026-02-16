@@ -783,6 +783,7 @@ mod tests {
             path: PathBuf::from(path),
             metadata: EntryMetadata {
                 size_bytes: size,
+                content_size_bytes: size,
                 modified: UNIX_EPOCH + Duration::from_secs(modified_secs),
                 created: None,
                 is_dir: true,

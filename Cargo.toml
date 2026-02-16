@@ -18,7 +18,7 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-default = ["cli", "daemon", "sqlite"]
+default = ["cli", "daemon", "sqlite", "tui"]
 cli = ["dep:clap", "dep:clap_complete", "dep:colored", "dep:crossterm", "sqlite", "daemon"]
 daemon = ["dep:signal-hook"]
 tui = ["dep:ftui-core", "dep:ftui-backend", "dep:ftui-tty", "cli"]

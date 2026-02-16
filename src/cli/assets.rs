@@ -847,9 +847,7 @@ fn download_and_verify(entry: &AssetEntry, cache: &AssetCache) -> io::Result<u64
         .arg(&partial)
         .arg(&entry.url)
         .status()
-        .map_err(|e| {
-            io::Error::other(format!("failed to execute curl: {e}"))
-        })?;
+        .map_err(|e| io::Error::other(format!("failed to execute curl: {e}")))?;
 
     if !status.success() {
         return Err(io::Error::other(format!(

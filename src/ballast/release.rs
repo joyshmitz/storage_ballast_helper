@@ -113,8 +113,7 @@ impl BallastReleaseController {
         manager: &mut BallastManager,
         response: &PressureResponse,
     ) -> Result<Option<ReleaseReport>> {
-        let to_release =
-            self.files_to_release(mount_path, response, manager.available_count());
+        let to_release = self.files_to_release(mount_path, response, manager.available_count());
 
         if to_release == 0 {
             return Ok(None);
@@ -210,9 +209,7 @@ impl BallastReleaseController {
     pub fn on_replenished(&mut self, mount_path: &Path, count: usize) {
         let state = self.states.entry(mount_path.to_path_buf()).or_default();
         state.last_replenish_time = Some(Instant::now());
-        state.files_released_since_green = state
-            .files_released_since_green
-            .saturating_sub(count);
+        state.files_released_since_green = state.files_released_since_green.saturating_sub(count);
     }
 
     /// Reset all state (e.g., after config reload).
@@ -366,7 +363,10 @@ mod tests {
         let response = test_response(PressureLevel::Critical, 1.0, 5);
         ctrl.maybe_release(mount, &mut mgr, &response).unwrap();
 
-        ctrl.states.entry(mount.to_path_buf()).or_default().green_since = Some(one_hour_ago());
+        ctrl.states
+            .entry(mount.to_path_buf())
+            .or_default()
+            .green_since = Some(one_hour_ago());
 
         // Replenish one file.
         ctrl.maybe_replenish(mount, &mut mgr, PressureLevel::Green, &|| 50.0)
@@ -376,11 +376,7 @@ mod tests {
         // Pressure rises — green_since resets.
         ctrl.maybe_replenish(mount, &mut mgr, PressureLevel::Orange, &|| 50.0)
             .unwrap();
-        assert!(ctrl
-            .states
-            .get(mount)
-            .and_then(|s| s.green_since)
-            .is_none());
+        assert!(ctrl.states.get(mount).and_then(|s| s.green_since).is_none());
 
         // Even after setting green again, cooldown restarts.
         let replenished = ctrl

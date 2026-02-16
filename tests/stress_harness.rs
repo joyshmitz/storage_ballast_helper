@@ -281,6 +281,7 @@ fn make_walk_entry(path: &str, size: u64, depth: usize) -> WalkEntry {
         path: PathBuf::from(path),
         metadata: EntryMetadata {
             size_bytes: size,
+            content_size_bytes: size,
             modified: SystemTime::now() - Duration::from_secs(3600),
             created: None,
             is_dir: true,
@@ -1162,6 +1163,7 @@ fn run_scenario_g(seed: u64, iterations: usize) -> ScenarioResult {
                     path,
                     metadata: EntryMetadata {
                         size_bytes: 1024 * (u64_from_usize(i) + 1),
+                        content_size_bytes: 1024 * (u64_from_usize(i) + 1),
                         modified: SystemTime::now()
                             - Duration::from_secs(3600 * (u64_from_usize(i) + 1)),
                         created: None,

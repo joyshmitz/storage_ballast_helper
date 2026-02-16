@@ -1960,6 +1960,7 @@ fn replay_multi_fault_sequence() {
 
     let config = PolicyConfig {
         recovery_clean_windows: 1,
+        max_canary_deletes_per_hour: 100, // High cap so canary budget doesn't trip during recovery test
         ..PolicyConfig::default()
     };
 

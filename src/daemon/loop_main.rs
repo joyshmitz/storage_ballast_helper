@@ -1007,19 +1007,14 @@ impl MonitoringDaemon {
             .release_controller
             .files_to_release(mount, response, available);
 
-                if count > 0
+        if count > 0
+            && let Some(report) = self.ballast_coordinator.release_for_mount(mount, count)?
+        {
+            self.release_controller
+                .on_released(mount, report.files_released);
 
-                    && let Some(report) = self.ballast_coordinator.release_for_mount(mount, count)?
-
-                {
-
-                    self.release_controller
-
-                        .on_released(mount, report.files_released);
-
-                    self.notification_manager
-
-                        .notify(&NotificationEvent::BallastReleased {
+            self.notification_manager
+                .notify(&NotificationEvent::BallastReleased {
                     mount: mount.to_string_lossy().to_string(),
                     files_released: report.files_released,
                     bytes_freed: report.bytes_freed,
@@ -1590,13 +1585,10 @@ fn scanner_thread_main(
         // overlaps with the walker's initial directory reads instead of
         // blocking the scanner thread.
         let open_files_paths = request.paths.clone();
-        let mut open_files_handle: Option<std::thread::JoinHandle<_>> =
-            std::thread::Builder::new()
-                .name("sbh-open-files".into())
-                .spawn(move || {
-                    crate::scanner::walker::collect_open_path_ancestors(&open_files_paths)
-                })
-                .ok();
+        let mut open_files_handle: Option<std::thread::JoinHandle<_>> = std::thread::Builder::new()
+            .name("sbh-open-files".into())
+            .spawn(move || crate::scanner::walker::collect_open_path_ancestors(&open_files_paths))
+            .ok();
         // Join lazily — we only need results when classifying candidates.
         let mut open_files_joined: Option<std::collections::HashSet<std::path::PathBuf>> = None;
 
@@ -1651,7 +1643,7 @@ fn scanner_thread_main(
                 break;
             }
 
-            let age = entry.metadata.modified.elapsed().unwrap_or(Duration::ZERO);
+            let age = entry.metadata.effective_age_timestamp().elapsed().unwrap_or(Duration::ZERO);
 
             // Classify.
             let classification = pattern_registry.classify(&entry.path, entry.structural_signals);
@@ -1670,12 +1662,11 @@ fn scanner_thread_main(
                     .and_then(|h| h.join().ok())
                     .unwrap_or_default()
             });
-            let is_open =
-                crate::scanner::walker::is_path_open_by_ancestor(&entry.path, open_files);
+            let is_open = crate::scanner::walker::is_path_open_by_ancestor(&entry.path, open_files);
 
             let input = crate::scanner::scoring::CandidateInput {
                 path: entry.path.clone(), // Clone needed for input
-                size_bytes: entry.metadata.size_bytes,
+                size_bytes: entry.metadata.content_size_bytes,
                 age,
                 classification,
                 signals: entry.structural_signals,
