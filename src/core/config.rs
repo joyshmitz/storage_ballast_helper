@@ -591,8 +591,32 @@ impl Config {
             });
         }
 
+        // Prevent CPU spin from zero poll interval.
+        if self.pressure.poll_interval_ms < 100 {
+            return Err(SbhError::InvalidConfig {
+                details: format!(
+                    "pressure.poll_interval_ms must be >= 100, got {}",
+                    self.pressure.poll_interval_ms
+                ),
+            });
+        }
+
         if self.pressure.prediction.enabled {
             let pred = &self.pressure.prediction;
+
+            // All horizon minutes must be positive (used in division/comparison).
+            for (name, val) in [
+                ("action_horizon_minutes", pred.action_horizon_minutes),
+                ("warning_horizon_minutes", pred.warning_horizon_minutes),
+                ("imminent_danger_minutes", pred.imminent_danger_minutes),
+            ] {
+                if val <= 0.0 {
+                    return Err(SbhError::InvalidConfig {
+                        details: format!("prediction.{name} must be > 0, got {val}"),
+                    });
+                }
+            }
+
             if pred.warning_horizon_minutes <= pred.action_horizon_minutes {
                 return Err(SbhError::InvalidConfig {
                     details: "prediction.warning_horizon_minutes must be > action_horizon_minutes"

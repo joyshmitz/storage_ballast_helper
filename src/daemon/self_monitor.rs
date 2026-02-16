@@ -134,7 +134,7 @@ impl ThreadStatus {
 /// checks for staleness (> 60s without update → stalled).
 #[derive(Debug)]
 pub struct ThreadHeartbeat {
-    /// Epoch-relative tick counter (monotonic, not wall clock).
+    /// Milliseconds since process-local monotonic origin (`Instant`).
     last_beat_epoch_ms: AtomicU64,
     name: String,
 }
@@ -181,14 +181,16 @@ impl ThreadHeartbeat {
     }
 }
 
-/// Milliseconds since an arbitrary process-local epoch.
+/// Milliseconds since a process-local monotonic origin.
+///
+/// Uses `Instant` (monotonic clock) instead of `SystemTime` to avoid
+/// false heartbeat readings when the system clock is adjusted.
 fn epoch_ms() -> u64 {
-    use std::time::SystemTime;
+    use std::sync::OnceLock;
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    let origin = ORIGIN.get_or_init(Instant::now);
     #[allow(clippy::cast_possible_truncation)]
-    let ms = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let ms = origin.elapsed().as_millis() as u64;
     ms
 }
 
