@@ -1490,8 +1490,8 @@ fn replay_observe_canary_enforce_lifecycle() {
     assert_eq!(engine.trace[1].mode_after, ActiveMode::Canary);
     assert_eq!(engine.trace[2].mode_after, ActiveMode::Enforce);
     assert_eq!(engine.trace[3].mode_after, ActiveMode::FallbackSafe);
-    // Recovery: should restore to enforce (pre-fallback mode).
-    assert_eq!(engine.trace[4].mode_after, ActiveMode::Enforce);
+    // Recovery caps at Canary — mandatory canary gate re-traversal after fallback.
+    assert_eq!(engine.trace[4].mode_after, ActiveMode::Canary);
 
     // Observe and fallback modes must never approve deletions.
     assert_eq!(engine.trace[0].approved_count, 0, "observe must not delete");
@@ -1942,12 +1942,13 @@ fn replay_recovery_after_serialization_fault() {
         engine.execute_step(&recovery_step);
     }
 
-    // After 3 clean windows (recovery_clean_windows=2), should be back to enforce.
+    // After 3 clean windows (recovery_clean_windows=2), recovery caps at Canary —
+    // mandatory canary gate re-traversal before returning to Enforce.
     let last = engine.trace.last().unwrap();
     assert_eq!(
         last.mode_after,
-        ActiveMode::Enforce,
-        "should recover to enforce after clean windows",
+        ActiveMode::Canary,
+        "recovery from enforce should cap at canary (mandatory canary gate)",
     );
 }
 
@@ -2032,12 +2033,12 @@ fn replay_multi_fault_sequence() {
         ops: vec![PolicyOp::ObserveWindow(clean_diag), PolicyOp::Evaluate],
     });
 
-    // Should be back to enforce.
+    // Recovery caps at Canary — mandatory canary gate re-traversal after fallback.
     let last = engine.trace.last().unwrap();
     assert_eq!(
         last.mode_after,
-        ActiveMode::Enforce,
-        "should recover after multiple faults",
+        ActiveMode::Canary,
+        "recovery from enforce should cap at canary after multiple faults",
     );
 
     // Verify total fallback entries.

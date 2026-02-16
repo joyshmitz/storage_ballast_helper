@@ -891,13 +891,18 @@ fn fault_recovery_after_drift() {
     assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
 
     // Second clean window — recovery.
+    // Recovery caps at Canary (mandatory canary gate), not directly to Enforce.
     engine.observe_window(&good_guard());
     assert_eq!(
         engine.mode(),
-        ActiveMode::Enforce,
-        "should restore pre-fallback mode (enforce)"
+        ActiveMode::Canary,
+        "recovery caps at Canary (mandatory canary gate)"
     );
     assert!(engine.fallback_reason().is_none());
+
+    // An explicit promote is required to return to Enforce.
+    engine.promote();
+    assert_eq!(engine.mode(), ActiveMode::Enforce);
 }
 
 // Fault family 8: Guard with mixed observations → correct status transitions

@@ -205,6 +205,11 @@ fn logger_thread_main(
 ) {
     #[cfg(feature = "sqlite")]
     const SQLITE_RECOVERY_INTERVAL: u32 = 50;
+    // Retention: prune old rows every PRUNE_INTERVAL events (~1 hour at typical rates).
+    #[cfg(feature = "sqlite")]
+    const PRUNE_INTERVAL: u64 = 3600;
+    #[cfg(feature = "sqlite")]
+    const RETENTION_DAYS: u32 = 30;
 
     // Open backends.
     #[cfg(feature = "sqlite")]
@@ -226,11 +231,6 @@ fn logger_thread_main(
     #[cfg(feature = "sqlite")]
     let mut sqlite_disabled_cycles: u32 = 0;
 
-    // Retention: prune old rows every PRUNE_INTERVAL events (~1 hour at typical rates).
-    #[cfg(feature = "sqlite")]
-    const PRUNE_INTERVAL: u64 = 3600;
-    #[cfg(feature = "sqlite")]
-    const RETENTION_DAYS: u32 = 30;
     #[cfg(feature = "sqlite")]
     let mut events_since_prune: u64 = 0;
 

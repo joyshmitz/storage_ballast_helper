@@ -1690,12 +1690,13 @@ fn e2e_scenario_6_progressive_recovery() {
     }
 
     // Phase 3: The policy should have recovered from fallback.
-    // Recovery restores the pre-fallback mode (Enforce).
+    // Recovery caps at Canary (mandatory canary gate) rather than restoring
+    // directly to Enforce, so the system must re-prove itself before enforce.
     let mode = policy.mode();
     assert_eq!(
         mode,
-        ActiveMode::Enforce,
-        "after recovery should return to pre-fallback mode (enforce), got {mode:?}",
+        ActiveMode::Canary,
+        "after recovery should return to Canary (mandatory canary gate), got {mode:?}",
     );
 
     // Fallback reason should be cleared after recovery.
@@ -1704,18 +1705,22 @@ fn e2e_scenario_6_progressive_recovery() {
         "fallback reason should be cleared after recovery"
     );
 
-    // Verify that evaluate works normally post-recovery.
+    // Verify that evaluate works normally post-recovery (in canary mode).
     let candidates = vec![e2e_candidate("/data/projects/recovery/target", 3, 72, 0.85)];
     let scored = scoring.score_batch(&candidates, 0.5);
     let _decision = policy.evaluate(&scored, None);
 
-    // In enforce mode, deletions may be approved (unlike fallback).
+    // In canary mode, limited deletions may be approved (unlike fallback).
     // The key assertion: we are no longer in FallbackSafe.
     assert_ne!(
         policy.mode(),
         ActiveMode::FallbackSafe,
         "should remain out of fallback after clean evaluation"
     );
+
+    // An explicit promote returns to Enforce.
+    policy.promote();
+    assert_eq!(policy.mode(), ActiveMode::Enforce);
 
     // Phase 4: Verify the full lifecycle is traceable.
     let mut builder = DecisionRecordBuilder::new();

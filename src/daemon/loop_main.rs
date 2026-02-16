@@ -21,6 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use parking_lot::RwLock;
 
 use crate::ballast::manager::BallastManager;
 use crate::ballast::release::BallastReleaseController;
@@ -43,10 +44,10 @@ use crate::scanner::walker::{DirectoryWalker, WalkerConfig};
 
 // ──────────────────── channel capacities ────────────────────
 
-/// Monitor → Scanner: bounded(2). Small buffer keeps at most 1 queued request while
-/// scanner processes another, bounding data staleness. If full, newest is deferred
-/// to the next monitor tick (typically 5-10s).
-const SCANNER_CHANNEL_CAP: usize = 2;
+/// Monitor → Scanner: bounded(0). Rendezvous channel.
+/// Scanner only accepts work when idle. If busy, monitor drops the request
+/// and retries next tick with fresh urgency. This prevents staleness.
+const SCANNER_CHANNEL_CAP: usize = 0;
 /// Scanner → Executor: bounded(64). Natural backpressure — scanner blocks on send.
 const EXECUTOR_CHANNEL_CAP: usize = 64;
 
@@ -130,6 +131,25 @@ pub struct DeletionBatch {
     pub urgency: f64,
 }
 
+/// Results reported from worker threads back to the main monitoring loop.
+#[derive(Debug)]
+enum WorkerReport {
+    /// Scanner completed a scan pass.
+    ScanCompleted {
+        candidates: usize,
+        duration: Duration,
+    },
+    /// Executor completed a deletion batch.
+    DeletionCompleted {
+        deleted: u64,
+        bytes_freed: u64,
+        failed: u64,
+    },
+}
+
+/// Bounded capacity for the worker→monitor results channel.
+const REPORT_CHANNEL_CAP: usize = 64;
+
 // ──────────────────── daemon configuration ────────────────────
 
 /// Arguments for `sbh daemon` subcommand.
@@ -172,6 +192,8 @@ pub struct MonitoringDaemon {
     release_controller: BallastReleaseController,
     scoring_engine: ScoringEngine,
     shared_executor_config: Arc<SharedExecutorConfig>,
+    shared_scoring_config: Arc<RwLock<crate::core::config::ScoringConfig>>,
+    shared_scanner_config: Arc<RwLock<crate::core::config::ScannerConfig>>,
     start_time: Instant,
     last_pressure_level: PressureLevel,
     last_special_scan: HashMap<PathBuf, Instant>,
@@ -268,6 +290,9 @@ impl MonitoringDaemon {
             config.scoring.min_score,
         ));
 
+        let shared_scoring_config = Arc::new(RwLock::new(config.scoring.clone()));
+        let shared_scanner_config = Arc::new(RwLock::new(config.scanner.clone()));
+
         // 11. Self-monitor (writes state.json for CLI, tracks health).
         let self_monitor = SelfMonitor::new(config.paths.state_file.clone());
 
@@ -290,6 +315,8 @@ impl MonitoringDaemon {
             release_controller,
             scoring_engine,
             shared_executor_config,
+            shared_scoring_config,
+            shared_scanner_config,
             start_time,
             last_pressure_level: PressureLevel::Green,
             last_special_scan: HashMap::new(),
@@ -326,6 +353,7 @@ impl MonitoringDaemon {
         // Create inter-thread channels.
         let (scan_tx, scan_rx) = bounded::<ScanRequest>(SCANNER_CHANNEL_CAP);
         let (del_tx, del_rx) = bounded::<DeletionBatch>(EXECUTOR_CHANNEL_CAP);
+        let (report_tx, report_rx) = bounded::<WorkerReport>(REPORT_CHANNEL_CAP);
 
         // Spawn worker threads with heartbeats.
         let mut scanner_health = ThreadHealth::new();
@@ -336,11 +364,13 @@ impl MonitoringDaemon {
             del_tx.clone(),
             self.logger_handle.clone(),
             Arc::clone(&self.scanner_heartbeat),
+            report_tx.clone(),
         )?);
         let mut executor_join: Option<thread::JoinHandle<()>> = Some(self.spawn_executor_thread(
             del_rx.clone(),
             self.logger_handle.clone(),
             Arc::clone(&self.executor_heartbeat),
+            report_tx.clone(),
         )?);
 
         let mut last_health_check = Instant::now();
@@ -390,7 +420,29 @@ impl MonitoringDaemon {
                 response.level, response.urgency
             ));
 
-            // 7b. Self-monitoring: write state file + check RSS.
+            // 7b. Drain worker reports so counters are current for state write.
+            while let Ok(report) = report_rx.try_recv() {
+                match report {
+                    WorkerReport::ScanCompleted {
+                        candidates,
+                        duration,
+                    } => {
+                        self.self_monitor.record_scan(candidates, 0, duration);
+                    }
+                    WorkerReport::DeletionCompleted {
+                        deleted,
+                        bytes_freed,
+                        failed,
+                    } => {
+                        self.self_monitor.record_deletions(deleted, bytes_freed);
+                        for _ in 0..failed {
+                            self.self_monitor.record_error();
+                        }
+                    }
+                }
+            }
+
+            // 7c. Self-monitoring: write state file + check RSS.
             {
                 let primary_path = self.primary_path();
                 let free_pct = self
@@ -438,6 +490,7 @@ impl MonitoringDaemon {
                             del_tx.clone(),
                             self.logger_handle.clone(),
                             Arc::clone(&self.scanner_heartbeat),
+                            report_tx.clone(),
                         ) {
                             Ok(handle) => scanner_join = Some(handle),
                             Err(err) => {
@@ -474,6 +527,7 @@ impl MonitoringDaemon {
                             del_rx.clone(),
                             self.logger_handle.clone(),
                             Arc::clone(&self.executor_heartbeat),
+                            report_tx.clone(),
                         ) {
                             Ok(handle) => executor_join = Some(handle),
                             Err(err) => {
@@ -782,7 +836,7 @@ impl MonitoringDaemon {
 
     // ──────────────────── config reload ────────────────────
 
-    fn handle_config_reload(&mut self, scan_tx: &Sender<ScanRequest>) {
+    fn handle_config_reload(&mut self, _scan_tx: &Sender<ScanRequest>) {
         eprintln!("[SBH-DAEMON] config reload requested (SIGHUP)");
 
         match Config::load(Some(&self.config.paths.config_file)) {
@@ -829,18 +883,9 @@ impl MonitoringDaemon {
                     self.shared_executor_config
                         .set_min_score(new_config.scoring.min_score);
 
-                    // Propagate scoring and scanner config to scanner thread.
-                    let config_update = ScanRequest {
-                        paths: Vec::new(),
-                        urgency: 0.0,
-                        pressure_level: PressureLevel::Green,
-                        max_delete_batch: 0,
-                        config_update: Some((
-                            new_config.scoring.clone(),
-                            new_config.scanner.clone(),
-                        )),
-                    };
-                    let _ = scan_tx.try_send(config_update);
+                    // Update shared configs for scanner thread.
+                    *self.shared_scoring_config.write() = new_config.scoring.clone();
+                    *self.shared_scanner_config.write() = new_config.scanner.clone();
 
                     self.logger_handle.send(ActivityEvent::ConfigReloaded {
                         details: format!("config hash: {old_hash} -> {new_hash}"),
@@ -867,9 +912,10 @@ impl MonitoringDaemon {
         del_tx: Sender<DeletionBatch>,
         logger: ActivityLoggerHandle,
         heartbeat: Arc<ThreadHeartbeat>,
+        report_tx: Sender<WorkerReport>,
     ) -> Result<thread::JoinHandle<()>> {
-        let scoring_config = self.config.scoring.clone();
-        let scanner_config = self.config.scanner.clone();
+        let scoring_config = Arc::clone(&self.shared_scoring_config);
+        let scanner_config = Arc::clone(&self.shared_scanner_config);
 
         thread::Builder::new()
             .name("sbh-scanner".to_string())
@@ -881,6 +927,7 @@ impl MonitoringDaemon {
                     &scoring_config,
                     &scanner_config,
                     &heartbeat,
+                    &report_tx,
                 );
             })
             .map_err(|source| SbhError::Runtime {
@@ -893,13 +940,14 @@ impl MonitoringDaemon {
         del_rx: Receiver<DeletionBatch>,
         logger: ActivityLoggerHandle,
         heartbeat: Arc<ThreadHeartbeat>,
+        report_tx: Sender<WorkerReport>,
     ) -> Result<thread::JoinHandle<()>> {
         let shared_config = Arc::clone(&self.shared_executor_config);
 
         thread::Builder::new()
             .name("sbh-executor".to_string())
             .spawn(move || {
-                executor_thread_main(&del_rx, &logger, &shared_config, &heartbeat);
+                executor_thread_main(&del_rx, &logger, &shared_config, &heartbeat, &report_tx);
             })
             .map_err(|source| SbhError::Runtime {
                 details: format!("failed to spawn executor thread: {source}"),
@@ -957,31 +1005,23 @@ fn scanner_thread_main(
     scan_rx: &Receiver<ScanRequest>,
     del_tx: &Sender<DeletionBatch>,
     logger: &ActivityLoggerHandle,
-    scoring_config: &crate::core::config::ScoringConfig,
-    scanner_config: &crate::core::config::ScannerConfig,
+    shared_scoring_config: &Arc<RwLock<crate::core::config::ScoringConfig>>,
+    shared_scanner_config: &Arc<RwLock<crate::core::config::ScannerConfig>>,
     heartbeat: &Arc<ThreadHeartbeat>,
+    report_tx: &Sender<WorkerReport>,
 ) {
-    let mut current_scoring_config = scoring_config.clone();
-    let mut current_scanner_config = scanner_config.clone();
-
-    // Initialize scoring engine.
-    let mut engine = ScoringEngine::from_config(
-        &current_scoring_config,
-        current_scanner_config.min_file_age_minutes,
-    );
     // Initialize pattern registry (default built-ins).
     let pattern_registry = ArtifactPatternRegistry::default();
 
     while let Ok(request) = scan_rx.recv() {
-        // Handle config updates.
-        if let Some((new_scoring, new_scanner)) = request.config_update {
-            current_scoring_config = new_scoring;
-            current_scanner_config = new_scanner;
-            engine = ScoringEngine::from_config(
-                &current_scoring_config,
-                current_scanner_config.min_file_age_minutes,
-            );
-        }
+        // Read latest config at the start of each scan.
+        let current_scoring_config = shared_scoring_config.read().clone();
+        let current_scanner_config = shared_scanner_config.read().clone();
+
+        let engine = ScoringEngine::from_config(
+            &current_scoring_config,
+            current_scanner_config.min_file_age_minutes,
+        );
 
         // If no paths to scan, skip.
         if request.paths.is_empty() {
@@ -1084,6 +1124,12 @@ fn scanner_thread_main(
             duration_ms: scan_duration_ms,
         });
 
+        // Report scan stats back to main loop for SelfMonitor counters.
+        let _ = report_tx.try_send(WorkerReport::ScanCompleted {
+            candidates: candidates_found,
+            duration: scan_start.elapsed(),
+        });
+
         // Send scored candidates to executor.
         if !scored.is_empty() {
             // Sort by score descending.
@@ -1122,6 +1168,7 @@ fn executor_thread_main(
     logger: &ActivityLoggerHandle,
     shared_config: &Arc<SharedExecutorConfig>,
     heartbeat: &Arc<ThreadHeartbeat>,
+    report_tx: &Sender<WorkerReport>,
 ) {
     while let Ok(batch) = del_rx.recv() {
         heartbeat.beat();
@@ -1160,6 +1207,13 @@ fn executor_thread_main(
                 report.duration,
             );
         }
+
+        // Report deletion stats back to main loop for SelfMonitor counters.
+        let _ = report_tx.try_send(WorkerReport::DeletionCompleted {
+            deleted: report.items_deleted as u64,
+            bytes_freed: report.bytes_freed,
+            failed: report.items_failed as u64,
+        });
 
         if report.circuit_breaker_tripped {
             logger.send(ActivityEvent::Error {
@@ -1221,7 +1275,12 @@ mod tests {
             max_delete_batch: 10,
             config_update: None,
         };
-        scan_tx.send(request).unwrap();
+        // With capacity 0, send blocks until recv is called.
+        // We use thread to unblock.
+        std::thread::spawn(move || {
+            scan_tx.send(request).unwrap();
+        });
+
         let received = scan_rx.recv().unwrap();
         assert_eq!(received.urgency.to_bits(), 0.5_f64.to_bits());
 
@@ -1240,19 +1299,7 @@ mod tests {
     fn scanner_channel_defers_when_full() {
         let (tx, _rx) = bounded::<ScanRequest>(SCANNER_CHANNEL_CAP);
 
-        // Fill the channel to capacity.
-        for _ in 0..SCANNER_CHANNEL_CAP {
-            tx.try_send(ScanRequest {
-                paths: vec![],
-                urgency: 0.1,
-                pressure_level: PressureLevel::Green,
-                max_delete_batch: 5,
-                config_update: None,
-            })
-            .unwrap();
-        }
-
-        // Next send is deferred (channel full) — will be retried next tick.
+        // With capacity 0, even the first send fails if no receiver.
         let result = tx.try_send(ScanRequest {
             paths: vec![],
             urgency: 0.9,

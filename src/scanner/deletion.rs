@@ -250,9 +250,8 @@ impl DeletionExecutor {
 
     fn preflight_check(&self, path: &Path) -> std::result::Result<(), SkipReason> {
         // 1. Path still exists (use symlink_metadata to not follow symlinks).
-        let meta = match fs::symlink_metadata(path) {
-            Ok(m) => m,
-            Err(_) => return Err(SkipReason::PathGone),
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            return Err(SkipReason::PathGone);
         };
 
         // 2. Reject symlinks — remove_dir_all follows symlinks into the target,

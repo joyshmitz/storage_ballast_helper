@@ -202,12 +202,7 @@ impl AdaptiveGuard {
         // Without an upper bound the accumulator grows without limit after a
         // long streak of good observations, making the guard effectively
         // impossible to trip even after a sudden regime change.
-        if self.e_process_log < -50.0 {
-            self.e_process_log = -50.0;
-        }
-        if self.e_process_log > 50.0 {
-            self.e_process_log = 50.0;
-        }
+        self.e_process_log = self.e_process_log.clamp(-50.0, 50.0);
 
         // Recompute guard status.
         self.recompute_status(obs_good);

@@ -148,7 +148,7 @@ impl Platform for LinuxPlatform {
             path: PathBuf::from("/proc/self/mounts"),
             source,
         })?;
-        let mounts = parse_proc_mounts(&raw)?;
+        let mounts = parse_proc_mounts(&raw);
         Ok(mounts)
     }
 
@@ -256,7 +256,7 @@ pub fn detect_platform() -> Result<Arc<dyn Platform>> {
     }
 }
 
-fn parse_proc_mounts(raw: &str) -> Result<Vec<MountPoint>> {
+fn parse_proc_mounts(raw: &str) -> Vec<MountPoint> {
     let mut mounts = Vec::new();
     for line in raw.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
@@ -282,7 +282,7 @@ fn parse_proc_mounts(raw: &str) -> Result<Vec<MountPoint>> {
             .len()
             .cmp(&left.path.as_os_str().len())
     });
-    Ok(mounts)
+    mounts
 }
 
 fn parse_meminfo(raw: &str) -> Result<MemoryInfo> {
@@ -379,7 +379,7 @@ mod tests {
     fn parses_mount_table() {
         let sample = "/dev/sda1 / ext4 rw,relatime 0 0\n\
                       tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n";
-        let mounts = parse_proc_mounts(sample).expect("mounts should parse");
+        let mounts = parse_proc_mounts(sample);
         assert_eq!(mounts.len(), 2);
         assert!(mounts.iter().any(|entry| entry.path == Path::new("/tmp")));
         assert!(mounts.iter().any(|entry| entry.fs_type == "ext4"));

@@ -504,7 +504,13 @@ impl PolicyEngine {
     }
 
     fn recover_from_fallback(&mut self) {
-        let target = self.pre_fallback_mode;
+        // Cap recovery at Canary to enforce the mandatory canary gate.
+        // If the system was in Enforce when fallback triggered, it must
+        // re-prove itself in Canary before returning to Enforce.
+        let target = match self.pre_fallback_mode {
+            ActiveMode::Enforce => ActiveMode::Canary,
+            other => other,
+        };
         self.fallback_reason = None;
         self.log_transition("recover", self.mode, target, None);
         self.mode = target;
@@ -740,6 +746,31 @@ mod tests {
         engine.observe_window(&good);
         assert_eq!(engine.mode(), ActiveMode::Canary);
         assert!(engine.fallback_reason().is_none());
+    }
+
+    #[test]
+    fn recovery_from_enforce_caps_at_canary() {
+        let mut config = default_config();
+        config.recovery_clean_windows = 2;
+        let mut engine = PolicyEngine::new(config);
+        engine.promote(); // observe → canary
+        engine.promote(); // canary → enforce
+        assert_eq!(engine.mode(), ActiveMode::Enforce);
+
+        engine.enter_fallback(FallbackReason::GuardrailDrift);
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+
+        // Recovery must return to Canary, NOT Enforce — the mandatory
+        // canary gate must be re-traversed after a fallback event.
+        let good = passing_guard();
+        engine.observe_window(&good);
+        engine.observe_window(&good);
+        assert_eq!(engine.mode(), ActiveMode::Canary);
+        assert!(engine.fallback_reason().is_none());
+
+        // Only an explicit promote returns to Enforce.
+        engine.promote();
+        assert_eq!(engine.mode(), ActiveMode::Enforce);
     }
 
     #[test]

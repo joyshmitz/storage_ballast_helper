@@ -9,7 +9,6 @@
 #![allow(missing_docs)]
 
 use std::collections::HashSet;
-use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -385,43 +384,7 @@ fn normalize_path_for_matching(path: &Path) -> String {
 }
 
 fn normalize_path_for_protection(path: &Path) -> PathBuf {
-    let absolute = absolute_path(path);
-    if let Ok(canonical) = fs::canonicalize(&absolute) {
-        return canonical;
-    }
-
-    // If the full path doesn't exist yet, canonicalize the deepest existing
-    // ancestor and append the unresolved suffix. This keeps alias/symlink paths
-    // stable for marker ancestor matching.
-    let mut suffix: Vec<OsString> = Vec::new();
-    let mut current = absolute.as_path();
-    loop {
-        if let Ok(canonical_parent) = fs::canonicalize(current) {
-            let mut normalized = canonical_parent;
-            for segment in suffix.iter().rev() {
-                normalized.push(segment);
-            }
-            return normalized;
-        }
-        let Some(name) = current.file_name() else {
-            break;
-        };
-        suffix.push(name.to_os_string());
-        let Some(parent) = current.parent() else {
-            break;
-        };
-        current = parent;
-    }
-
-    absolute
-}
-
-fn absolute_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
-    }
+    crate::core::paths::resolve_absolute_path(path)
 }
 
 #[cfg(test)]
