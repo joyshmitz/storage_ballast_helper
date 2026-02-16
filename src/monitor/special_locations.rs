@@ -125,6 +125,19 @@ impl SpecialLocationRegistry {
             });
         }
 
+        if locations
+            .iter()
+            .all(|location| location.path != Path::new("/data/tmp"))
+        {
+            locations.push(SpecialLocation {
+                path: PathBuf::from("/data/tmp"),
+                kind: SpecialKind::UserTmp,
+                buffer_pct: 15,
+                scan_interval: Duration::from_secs(5),
+                priority: 155,
+            });
+        }
+
         Ok(Self::new(locations))
     }
 
@@ -202,24 +215,18 @@ mod tests {
         let registry =
             SpecialLocationRegistry::discover(&platform, &[PathBuf::from("/data/tmp/custom")])
                 .expect("discovery should succeed");
-        assert!(
-            registry
-                .all()
-                .iter()
-                .any(|location| location.path == Path::new("/dev/shm"))
-        );
-        assert!(
-            registry
-                .all()
-                .iter()
-                .any(|location| matches!(location.kind, SpecialKind::Custom(_)))
-        );
-        assert!(
-            registry
-                .all()
-                .iter()
-                .any(|location| location.path == Path::new("/tmp"))
-        );
+        assert!(registry
+            .all()
+            .iter()
+            .any(|location| location.path == Path::new("/dev/shm")));
+        assert!(registry
+            .all()
+            .iter()
+            .any(|location| matches!(location.kind, SpecialKind::Custom(_))));
+        assert!(registry
+            .all()
+            .iter()
+            .any(|location| location.path == Path::new("/tmp")));
     }
 
     #[test]
@@ -358,6 +365,20 @@ mod tests {
                 .iter()
                 .any(|loc| loc.path == Path::new("/tmp")),
             "/tmp should be added as fallback"
+        );
+    }
+
+    #[test]
+    fn discover_adds_data_tmp_fallback() {
+        let platform = TestPlatform { mounts: vec![] };
+        let registry =
+            SpecialLocationRegistry::discover(&platform, &[]).expect("discovery should succeed");
+        assert!(
+            registry
+                .all()
+                .iter()
+                .any(|loc| loc.path == Path::new("/data/tmp")),
+            "/data/tmp should be added as fallback"
         );
     }
 

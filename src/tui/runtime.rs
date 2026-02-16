@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ftui::{Buffer, BufferDiff, Event, Frame, GraphemePool, KeyEventKind};
-use ftui_backend::{Backend, BackendEventSource, BackendPresenter};
+use ftui_backend::{Backend, BackendEventSource, BackendFeatures, BackendPresenter};
 use ftui_tty::{TtyBackend, TtySessionOptions};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -336,12 +336,16 @@ pub fn run_dashboard(config: &DashboardRuntimeConfig) -> io::Result<()> {
     }
 }
 
+#[allow(clippy::too_many_lines)] // TUI event loop is a natural single flow
 fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
     // TtyBackend handles raw mode + alternate screen with RAII cleanup.
     // Drop restores the terminal even on panic or early return.
     let options = TtySessionOptions {
         alternate_screen: true,
-        ..Default::default()
+        features: BackendFeatures {
+            mouse_capture: true,
+            ..Default::default()
+        },
     };
     let mut backend = TtyBackend::open(80, 24, options)?;
 
@@ -416,6 +420,7 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         update::update(&mut model, input::map_key_event(key))
                     }
+                    Event::Mouse(mouse) => update::update(&mut model, DashboardMsg::Mouse(mouse)),
                     Event::Resize { width, height } => update::update(
                         &mut model,
                         DashboardMsg::Resize {
@@ -487,6 +492,23 @@ fn execute_cmd(
         }
         DashboardCmd::FetchTelemetry => {
             let inner_cmd = match model.screen {
+                Screen::Overview => {
+                    let events =
+                        telemetry.recent_events(80, &crate::tui::telemetry::EventFilter::default());
+                    let decisions = telemetry.recent_decisions(40);
+                    let candidates = crate::tui::telemetry::TelemetryResult {
+                        data: decisions.data.clone(),
+                        source: decisions.source,
+                        partial: decisions.partial,
+                        diagnostics: decisions.diagnostics.clone(),
+                    };
+                    let cmds = vec![
+                        update::update(model, DashboardMsg::TelemetryTimeline(events)),
+                        update::update(model, DashboardMsg::TelemetryDecisions(decisions)),
+                        update::update(model, DashboardMsg::TelemetryCandidates(candidates)),
+                    ];
+                    DashboardCmd::Batch(cmds)
+                }
                 Screen::Timeline => {
                     let result =
                         telemetry.recent_events(50, &model.timeline_filter.to_event_filter());
@@ -497,13 +519,8 @@ fn execute_cmd(
                     update::update(model, DashboardMsg::TelemetryDecisions(result))
                 }
                 Screen::Candidates => {
-                    // Candidates are not yet persisted to DB in a queryable way for the screen.
-                    // For now, we return empty/unavailable.
-                    // (Scanner state lives in memory/JSONL mostly).
-                    // This matches current architecture.
-                    let result = crate::tui::telemetry::TelemetryResult::unavailable(
-                        "live candidates not yet queryable".to_string(),
-                    );
+                    // Candidate ranking derived from recent decision evidence.
+                    let result = telemetry.recent_decisions(40);
                     update::update(model, DashboardMsg::TelemetryCandidates(result))
                 }
                 Screen::Ballast => {

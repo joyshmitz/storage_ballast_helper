@@ -156,10 +156,12 @@ impl RateHistory {
     }
 
     fn push(&mut self, value: f64) {
+        // Sanitize input to prevent NaN/Inf from poisoning calculations/rendering.
+        let safe_value = if value.is_finite() { value } else { 0.0 };
         if self.values.len() < self.capacity {
-            self.values.push(value);
+            self.values.push(safe_value);
         } else {
-            self.values[self.write_pos] = value;
+            self.values[self.write_pos] = safe_value;
         }
         self.write_pos = (self.write_pos + 1) % self.capacity;
     }
@@ -573,7 +575,7 @@ fn render_frame(
     row += 1;
     if row <= max_row {
         let footer = " Press q or Esc to exit ";
-        let pad = width.saturating_sub(footer.len() + 4);
+        let pad = width.saturating_sub(footer.len() + 5);
         queue!(stdout, MoveTo(0, row), SetForegroundColor(Color::Cyan),)?;
         write!(stdout, "└─{footer}{:─<pad$}──┘", "", pad = pad)?;
         queue!(stdout, SetAttribute(Attribute::Reset))?;

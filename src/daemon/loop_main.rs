@@ -1247,9 +1247,10 @@ impl MonitoringDaemon {
             return Ok(());
         };
         let available = pool.available_count();
+        let expected = pool.expected_count();
         let count = self
             .release_controller
-            .files_to_release(mount, response, available);
+            .files_to_release(mount, response, available, expected);
 
         if count > 0
             && let Some(report) = self.ballast_coordinator.release_for_mount(mount, count)?
@@ -1698,7 +1699,6 @@ impl MonitoringDaemon {
     ) -> Result<thread::JoinHandle<()>> {
         let scoring_config = Arc::clone(&self.shared_scoring_config);
         let scanner_config = Arc::clone(&self.shared_scanner_config);
-
         thread::Builder::new()
             .name("sbh-scanner".to_string())
             .spawn(move || {

@@ -646,10 +646,10 @@ fn narrow_hides_lower_priority_panes() {
         + frame.matches(" p1 ").count()
         + frame.matches(" p2 ").count();
 
-    // With a 20-row terminal, not all 6 panes can fit.
+    // With a 20-row terminal, not all rich overview panes can fit.
     assert!(
-        pane_count <= 6,
-        "Narrow short terminal should show at most 6 panes, got {pane_count}"
+        pane_count <= 7,
+        "Narrow short terminal should show at most 7 panes, got {pane_count}"
     );
 }
 

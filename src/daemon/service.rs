@@ -201,6 +201,28 @@ impl SystemdServiceManager {
 
     // -- systemctl helpers -------------------------------------------------
 
+    fn check_binary_ownership(&self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if !self.config.user_scope
+                && let Ok(meta) = fs::metadata(&self.config.binary_path)
+                && meta.uid() != 0
+            {
+                eprintln!(
+                    "[SBH-WARN] SECURITY RISK: System service binary '{}' is NOT owned by root (uid={}).",
+                    self.config.binary_path.display(),
+                    meta.uid()
+                );
+                eprintln!("[SBH-WARN] A non-root user could replace this binary and gain root privileges.");
+                eprintln!(
+                    "[SBH-WARN] Recommendation: 'sudo chown root:root {}'",
+                    self.config.binary_path.display()
+                );
+            }
+        }
+    }
+
     fn systemctl_args(&self, args: &[&str]) -> Vec<String> {
         let mut cmd_args: Vec<String> = Vec::with_capacity(args.len() + 1);
         if self.config.user_scope {
@@ -249,6 +271,8 @@ impl SystemdServiceManager {
 
 impl ServiceManager for SystemdServiceManager {
     fn install(&self) -> Result<()> {
+        self.check_binary_ownership();
+
         let unit_dir = self.config.unit_dir();
         let unit_path = self.config.unit_path();
         let unit_content = self.generate_unit_file();

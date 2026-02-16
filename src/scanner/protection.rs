@@ -150,7 +150,7 @@ impl ProtectionRegistry {
 
         while let Some((dir, depth)) = queue.pop() {
             let marker_path = dir.join(MARKER_FILENAME);
-            if marker_path.exists() {
+            if fs::symlink_metadata(&marker_path).is_ok() {
                 let marker_dir = normalize_path_for_protection(&dir);
                 if self.marker_paths.insert(marker_dir) {
                     found += 1;

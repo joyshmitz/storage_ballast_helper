@@ -20,7 +20,7 @@
 
 #![allow(missing_docs)]
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -632,22 +632,36 @@ impl JsonlTelemetryAdapter {
 
     /// Read the last `n` lines from the JSONL file and parse them.
     fn tail_entries(&self, n: usize) -> TailEntries {
-        let Ok(file) = std::fs::File::open(&self.path) else {
+        let Ok(mut file) = std::fs::File::open(&self.path) else {
             return TailEntries::default();
         };
 
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let chunk_size = 256 * 1024; // 256KB buffer
+        let start_pos = len.saturating_sub(chunk_size);
+
+        if start_pos > 0 && file.seek(SeekFrom::Start(start_pos)).is_err() {
+            return TailEntries::default();
+        }
+
         let reader = BufReader::new(file);
-        let mut all_lines: Vec<String> = Vec::new();
+        let mut raw_lines: Vec<String> = Vec::with_capacity(128);
+
         for line in reader.lines() {
             match line {
-                Ok(l) if !l.trim().is_empty() => all_lines.push(l),
+                Ok(l) if !l.trim().is_empty() => raw_lines.push(l),
                 _ => {}
             }
         }
 
+        // If we seeked, the first line is likely partial; discard it.
+        if start_pos > 0 && !raw_lines.is_empty() {
+            raw_lines.remove(0);
+        }
+
         // Take last n lines.
-        let start = all_lines.len().saturating_sub(n);
-        let tail = &all_lines[start..];
+        let start = raw_lines.len().saturating_sub(n);
+        let tail = &raw_lines[start..];
 
         let mut entries = Vec::with_capacity(tail.len());
         let mut recovered_lines = 0;
@@ -793,17 +807,29 @@ impl TelemetryQueryAdapter for JsonlTelemetryAdapter {
 pub struct CompositeTelemetryAdapter {
     #[cfg(feature = "sqlite")]
     sqlite: Option<SqliteTelemetryAdapter>,
+    #[cfg(feature = "sqlite")]
+    sqlite_path: Option<PathBuf>,
     jsonl: Option<JsonlTelemetryAdapter>,
+    jsonl_path: Option<PathBuf>,
 }
 
 impl CompositeTelemetryAdapter {
     /// Build from configured paths. Tolerant of missing files.
     #[must_use]
     pub fn new(sqlite_path: Option<&Path>, jsonl_path: Option<&Path>) -> Self {
+        #[cfg(feature = "sqlite")]
+        let sqlite_path = sqlite_path.map(Path::to_path_buf);
+        let jsonl_path = jsonl_path.map(Path::to_path_buf);
+
         Self {
             #[cfg(feature = "sqlite")]
-            sqlite: sqlite_path.and_then(SqliteTelemetryAdapter::open),
-            jsonl: jsonl_path.and_then(JsonlTelemetryAdapter::open),
+            sqlite: sqlite_path
+                .as_deref()
+                .and_then(SqliteTelemetryAdapter::open),
+            #[cfg(feature = "sqlite")]
+            sqlite_path,
+            jsonl: jsonl_path.as_deref().and_then(JsonlTelemetryAdapter::open),
+            jsonl_path,
         }
     }
 
@@ -828,9 +854,17 @@ impl TelemetryQueryAdapter for CompositeTelemetryAdapter {
     ) -> TelemetryResult<Vec<TimelineEvent>> {
         // Try SQLite first.
         #[cfg(feature = "sqlite")]
-        if let Some(ref sqlite) = self.sqlite {
-            let result = sqlite.recent_events(limit, filter);
-            if !result.partial {
+        {
+            let sqlite_result = self.sqlite.as_ref()
+                .map(|sqlite| sqlite.recent_events(limit, filter))
+                .or_else(|| {
+                    self.sqlite_path.as_deref()
+                        .and_then(SqliteTelemetryAdapter::open)
+                        .map(|sqlite| sqlite.recent_events(limit, filter))
+                });
+            if let Some(result) = sqlite_result
+                && !result.partial
+            {
                 return result;
             }
         }
@@ -839,20 +873,42 @@ impl TelemetryQueryAdapter for CompositeTelemetryAdapter {
         if let Some(ref jsonl) = self.jsonl {
             return jsonl.recent_events(limit, filter);
         }
+        if let Some(jsonl) = self
+            .jsonl_path
+            .as_deref()
+            .and_then(JsonlTelemetryAdapter::open)
+        {
+            return jsonl.recent_events(limit, filter);
+        }
 
         TelemetryResult::unavailable("no telemetry backend available".to_string())
     }
 
     fn recent_decisions(&self, limit: usize) -> TelemetryResult<Vec<DecisionEvidence>> {
         #[cfg(feature = "sqlite")]
-        if let Some(ref sqlite) = self.sqlite {
-            let result = sqlite.recent_decisions(limit);
-            if !result.partial {
+        {
+            let sqlite_result = self.sqlite.as_ref()
+                .map(|sqlite| sqlite.recent_decisions(limit))
+                .or_else(|| {
+                    self.sqlite_path.as_deref()
+                        .and_then(SqliteTelemetryAdapter::open)
+                        .map(|sqlite| sqlite.recent_decisions(limit))
+                });
+            if let Some(result) = sqlite_result
+                && !result.partial
+            {
                 return result;
             }
         }
 
         if let Some(ref jsonl) = self.jsonl {
+            return jsonl.recent_decisions(limit);
+        }
+        if let Some(jsonl) = self
+            .jsonl_path
+            .as_deref()
+            .and_then(JsonlTelemetryAdapter::open)
+        {
             return jsonl.recent_decisions(limit);
         }
 
@@ -866,14 +922,29 @@ impl TelemetryQueryAdapter for CompositeTelemetryAdapter {
         limit: usize,
     ) -> TelemetryResult<Vec<PressurePoint>> {
         #[cfg(feature = "sqlite")]
-        if let Some(ref sqlite) = self.sqlite {
-            let result = sqlite.pressure_history(mount, since, limit);
-            if !result.partial {
+        {
+            let sqlite_result = self.sqlite.as_ref()
+                .map(|sqlite| sqlite.pressure_history(mount, since, limit))
+                .or_else(|| {
+                    self.sqlite_path.as_deref()
+                        .and_then(SqliteTelemetryAdapter::open)
+                        .map(|sqlite| sqlite.pressure_history(mount, since, limit))
+                });
+            if let Some(result) = sqlite_result
+                && !result.partial
+            {
                 return result;
             }
         }
 
         if let Some(ref jsonl) = self.jsonl {
+            return jsonl.pressure_history(mount, since, limit);
+        }
+        if let Some(jsonl) = self
+            .jsonl_path
+            .as_deref()
+            .and_then(JsonlTelemetryAdapter::open)
+        {
             return jsonl.pressure_history(mount, since, limit);
         }
 
@@ -888,11 +959,25 @@ impl TelemetryQueryAdapter for CompositeTelemetryAdapter {
         };
 
         #[cfg(feature = "sqlite")]
-        if let Some(ref sqlite) = self.sqlite {
-            health.sqlite = sqlite.health().sqlite;
+        {
+            if let Some(ref sqlite) = self.sqlite {
+                health.sqlite = sqlite.health().sqlite;
+            } else if let Some(sqlite) = self
+                .sqlite_path
+                .as_deref()
+                .and_then(SqliteTelemetryAdapter::open)
+            {
+                health.sqlite = sqlite.health().sqlite;
+            }
         }
 
         if let Some(ref jsonl) = self.jsonl {
+            health.jsonl = jsonl.health().jsonl;
+        } else if let Some(jsonl) = self
+            .jsonl_path
+            .as_deref()
+            .and_then(JsonlTelemetryAdapter::open)
+        {
             health.jsonl = jsonl.health().jsonl;
         }
 
@@ -1654,6 +1739,46 @@ mod tests {
         assert!(!result.partial);
         assert_eq!(result.source, DataSource::Jsonl);
         assert_eq!(result.data.len(), 1);
+    }
+
+    #[test]
+    fn composite_retries_jsonl_open_when_file_appears_later() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_path = tmp.path().join("activity-late.jsonl");
+
+        let adapter = CompositeTelemetryAdapter::new(None, Some(&jsonl_path));
+        let first = adapter.recent_events(10, &EventFilter::default());
+        assert_eq!(first.source, DataSource::None);
+        assert!(first.partial);
+
+        let entry = crate::logger::jsonl::LogEntry {
+            ts: "2026-02-16T00:00:03Z".to_string(),
+            event: crate::logger::jsonl::EventType::DaemonStart,
+            severity: crate::logger::jsonl::Severity::Info,
+            path: None,
+            size: None,
+            score: None,
+            factors: None,
+            pressure: None,
+            free_pct: None,
+            rate_bps: None,
+            duration_ms: None,
+            ok: None,
+            error_code: None,
+            error_message: None,
+            mount_point: None,
+            details: Some("late file".to_string()),
+        };
+        std::fs::write(
+            &jsonl_path,
+            serde_json::to_string(&entry).expect("serialize") + "\n",
+        )
+        .expect("write jsonl");
+
+        let second = adapter.recent_events(10, &EventFilter::default());
+        assert_eq!(second.source, DataSource::Jsonl);
+        assert_eq!(second.data.len(), 1);
+        assert_eq!(second.data[0].details.as_deref(), Some("late file"));
     }
 
     #[cfg(feature = "sqlite")]

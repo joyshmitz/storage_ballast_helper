@@ -9,7 +9,8 @@
 #![allow(clippy::too_many_lines)]
 
 use super::layout::{
-    OverviewPane, PanePriority, TimelinePane, build_overview_layout, build_timeline_layout,
+    MIN_USABLE_COLS, MIN_USABLE_ROWS, OverviewPane, PanePriority, TimelinePane,
+    build_overview_layout, build_timeline_layout, is_terminal_too_small,
 };
 use super::model::{
     BallastVolume, DashboardModel, NotificationLevel, PreferenceProfileMode, Screen,
@@ -82,6 +83,15 @@ pub fn render_to_string(model: &DashboardModel) -> String {
         model.density,
         model.hint_verbosity,
     );
+
+    if is_terminal_too_small(model.terminal_size.0, model.terminal_size.1) {
+        let _ = writeln!(
+            out,
+            "terminal-too-small: need >= {}x{}, got {}x{}",
+            MIN_USABLE_COLS, MIN_USABLE_ROWS, model.terminal_size.0, model.terminal_size.1
+        );
+        return out;
+    }
 
     // Breadcrumb navigation trail.
     if !model.screen_history.is_empty() {
@@ -162,6 +172,11 @@ pub fn render_frame(model: &DashboardModel, frame: &mut Frame) {
         }
     }
 
+    if is_terminal_too_small(model.terminal_size.0, model.terminal_size.1) {
+        frame_render_too_small(model, &theme, area, frame);
+        return;
+    }
+
     // Split: header (3 rows) | body (fill) | footer (1 row) | notifications.
     let notif_rows = u16::try_from(model.notifications.len().min(3)).unwrap_or(3);
     let chunks = Flex::vertical()
@@ -192,6 +207,29 @@ pub fn render_frame(model: &DashboardModel, frame: &mut Frame) {
 
     // ── Notification toasts ──
     frame_render_notifications(model, &theme, notif_area, frame);
+}
+
+#[cfg(feature = "tui")]
+fn frame_render_too_small(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title("SBH Dashboard")
+        .border_style(Style::default().fg(theme.palette.warning_color()))
+        .style(Style::default().bg(theme.palette.panel_bg()));
+    let inner = block.inner(area);
+    block.render(area, frame);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let msg = format!(
+        "Terminal too small for dashboard layout.\nNeed >= {}x{}, got {}x{}.\nResize terminal to continue.",
+        MIN_USABLE_COLS, MIN_USABLE_ROWS, model.terminal_size.0, model.terminal_size.1
+    );
+    Paragraph::new(msg)
+        .style(Style::default().fg(theme.palette.warning_color()))
+        .render(inner, frame);
 }
 
 #[cfg(feature = "tui")]
@@ -248,44 +286,50 @@ fn frame_render_screen(model: &DashboardModel, theme: &Theme, area: Rect, frame:
 
 #[cfg(feature = "tui")]
 fn frame_render_overview(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
-    // Split overview into rows: pressure | ewma+actions | ballast+counters.
-    let chunks = Flex::vertical()
-        .constraints([
-            Constraint::Fixed(6), // pressure panel
-            Constraint::Fixed(5), // ewma + actions row
-            Constraint::Fill,     // ballast + counters
-        ])
-        .split(area);
-
-    // ── Pressure panel ──
-    frame_render_pressure_panel(model, theme, chunks[0], frame);
-
-    // ── EWMA + Actions row ──
-    let mid_chunks = Flex::horizontal()
-        .constraints([Constraint::Percentage(60.0), Constraint::Fill])
-        .split(chunks[1]);
-    frame_render_ewma_panel(model, theme, mid_chunks[0], frame);
-    frame_render_actions_panel(model, theme, mid_chunks[1], frame);
-
-    // ── Ballast + Counters row ──
-    let bot_chunks = Flex::horizontal()
-        .constraints([Constraint::Percentage(50.0), Constraint::Fill])
-        .split(chunks[2]);
-    frame_render_ballast_quick_panel(model, theme, bot_chunks[0], frame);
-    frame_render_counters_panel(model, theme, bot_chunks[1], frame);
+    let layout = build_overview_layout(area.width, area.height);
+    for placement in layout.placements.iter().filter(|p| p.visible) {
+        let pane_area = rect_in_body(area, placement.rect);
+        if pane_area.width < 2 || pane_area.height < 2 {
+            continue;
+        }
+        frame_render_overview_card(model, theme, placement.pane, pane_area, frame);
+    }
 }
 
 #[cfg(feature = "tui")]
-fn frame_render_pressure_panel(
+fn rect_in_body(body: Rect, pane: crate::tui::layout::PaneRect) -> Rect {
+    let x = body.x.saturating_add(pane.col);
+    let y = body.y.saturating_add(pane.row);
+    let body_right = body.x.saturating_add(body.width);
+    let body_bottom = body.y.saturating_add(body.height);
+    if x >= body_right || y >= body_bottom {
+        return Rect::new(body.x, body.y, 0, 0);
+    }
+    let max_w = body_right.saturating_sub(x);
+    let max_h = body_bottom.saturating_sub(y);
+    Rect::new(x, y, pane.width.min(max_w), pane.height.min(max_h))
+}
+
+#[cfg(feature = "tui")]
+fn frame_render_overview_card(
     model: &DashboardModel,
     theme: &Theme,
+    pane: OverviewPane,
     area: Rect,
     frame: &mut Frame,
 ) {
+    let border_color = if model.overview_focus_pane == pane {
+        theme.palette.accent_color()
+    } else if model.overview_hover_pane == Some(pane) {
+        theme.palette.warning_color()
+    } else {
+        theme.palette.border_color()
+    };
+
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title("Pressure")
-        .border_style(Style::default().fg(theme.palette.border_color()))
+        .title(overview_pane_title(pane))
+        .border_style(Style::default().fg(border_color))
         .style(Style::default().bg(theme.palette.panel_bg()));
     let inner = block.inner(area);
     block.render(area, frame);
@@ -293,189 +337,60 @@ fn frame_render_pressure_panel(
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-
-    if let Some(ref state) = model.daemon_state {
-        let mut lines = Vec::new();
-        let level_color = theme.palette.pressure_color(&state.pressure.overall);
-        let worst_free = state
-            .pressure
-            .mounts
-            .iter()
-            .map(|m| m.free_pct)
-            .reduce(f64::min)
-            .unwrap_or(100.0);
-        lines.push(Line::from_spans([
-            Span::raw("  Overall: "),
-            Span::styled(
-                state.pressure.overall.to_ascii_uppercase(),
-                Style::default().fg(level_color).bold(),
-            ),
-            Span::raw(format!(
-                "  worst-free={worst_free:.1}%  mounts={}",
-                state.pressure.mounts.len()
-            )),
-        ]));
-
-        for mount in &state.pressure.mounts {
-            let used_pct = 100.0 - mount.free_pct;
-            let mount_color = theme.palette.pressure_color(&mount.level);
-            let bar = gauge(used_pct, 15);
-            lines.push(Line::from_spans([
-                Span::raw(format!("  {:<14} ", mount.path)),
-                Span::styled(bar, Style::default().fg(mount_color)),
-                Span::raw(format!(" ({:.1}% free)", mount.free_pct)),
-            ]));
-        }
-        let text = Text::from_lines(lines);
-        Paragraph::new(text).render(inner, frame);
-    } else {
-        let msg = if model.degraded {
-            "  Daemon state unavailable (DEGRADED)"
-        } else {
-            "  Awaiting daemon connection..."
-        };
-        Paragraph::new(msg)
-            .style(Style::default().fg(theme.palette.muted_color()))
-            .render(inner, frame);
-    }
-}
-
-#[cfg(feature = "tui")]
-fn frame_render_ewma_panel(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title("EWMA Trend")
-        .border_style(Style::default().fg(theme.palette.border_color()))
-        .style(Style::default().bg(theme.palette.panel_bg()));
-    let inner = block.inner(area);
-    block.render(area, frame);
-
-    if model.rate_histories.is_empty() {
-        Paragraph::new("  No rate data")
-            .style(Style::default().fg(theme.palette.muted_color()))
-            .render(inner, frame);
-        return;
-    }
-
-    let mut lines = Vec::new();
-    let mut sorted: Vec<_> = model.rate_histories.iter().collect();
-    sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    for (path, history) in &sorted {
-        let normalized = history.normalized();
-        let trace = sparkline(&normalized);
-        let latest = history.latest().unwrap_or(0.0);
-        let rate_str = human_rate(latest);
-        let trend = trend_label(latest);
-        lines.push(Line::from_spans([
-            Span::raw(format!("  {path:<14} ")),
-            Span::styled(trace, Style::default().fg(theme.palette.accent_color())),
-            Span::raw(format!(" {rate_str} {trend}")),
-        ]));
-    }
-    Paragraph::new(Text::from_lines(lines)).render(inner, frame);
-}
-
-#[cfg(feature = "tui")]
-fn frame_render_actions_panel(
-    model: &DashboardModel,
-    theme: &Theme,
-    area: Rect,
-    frame: &mut Frame,
-) {
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title("Actions")
-        .border_style(Style::default().fg(theme.palette.border_color()))
-        .style(Style::default().bg(theme.palette.panel_bg()));
-    let inner = block.inner(area);
-    block.render(area, frame);
-
-    let content = model.daemon_state.as_ref().map_or_else(
-        || String::from("  Awaiting daemon connection"),
-        |state| {
-            format!(
-                "  Scans: {}  Deleted: {}  Freed: {}",
-                state.counters.scans,
-                state.counters.deletions,
-                human_bytes(state.counters.bytes_freed),
-            )
-        },
-    );
+    let content = overview_pane_text(model, theme, pane, inner.width);
     Paragraph::new(content)
         .style(Style::default().fg(theme.palette.text_secondary()))
         .render(inner, frame);
 }
 
-#[cfg(feature = "tui")]
-fn frame_render_ballast_quick_panel(
-    model: &DashboardModel,
-    theme: &Theme,
-    area: Rect,
-    frame: &mut Frame,
-) {
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title("Ballast")
-        .border_style(Style::default().fg(theme.palette.border_color()))
-        .style(Style::default().bg(theme.palette.panel_bg()));
-    let inner = block.inner(area);
-    block.render(area, frame);
-
-    if let Some(ref state) = model.daemon_state {
-        let (badge_text, badge_color) = if state.ballast.total > 0 && state.ballast.available == 0 {
-            ("CRITICAL", theme.palette.critical_color())
-        } else if state.ballast.available.saturating_mul(2) < state.ballast.total {
-            ("LOW", theme.palette.warning_color())
-        } else {
-            ("OK", theme.palette.success_color())
-        };
-        let line = Line::from_spans([
-            Span::raw("  "),
-            Span::styled(badge_text, Style::default().fg(badge_color).bold()),
-            Span::raw(format!(
-                "  available={}/{}  released={}",
-                state.ballast.available, state.ballast.total, state.ballast.released,
-            )),
-        ]);
-        Paragraph::new(Text::from(line)).render(inner, frame);
-    } else {
-        Paragraph::new("  Ballast data unavailable")
-            .style(Style::default().fg(theme.palette.muted_color()))
-            .render(inner, frame);
+fn overview_pane_title(pane: OverviewPane) -> &'static str {
+    match pane {
+        OverviewPane::PressureSummary => "Pressure Matrix",
+        OverviewPane::ForecastHorizon => "Forecast Horizon",
+        OverviewPane::ActionLane => "Action Rail",
+        OverviewPane::EwmaTrend => "Trend Lattice",
+        OverviewPane::DecisionPulse => "Decision Pulse",
+        OverviewPane::CandidateHotlist => "Candidate Hotlist",
+        OverviewPane::BallastQuick => "Ballast Fleet",
+        OverviewPane::SpecialLocations => "Special Locations",
+        OverviewPane::ExtendedCounters => "Runtime Counters",
     }
 }
 
-#[cfg(feature = "tui")]
-fn frame_render_counters_panel(
+fn overview_pane_text(
     model: &DashboardModel,
     theme: &Theme,
-    area: Rect,
-    frame: &mut Frame,
-) {
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title("Counters")
-        .border_style(Style::default().fg(theme.palette.border_color()))
-        .style(Style::default().bg(theme.palette.panel_bg()));
-    let inner = block.inner(area);
-    block.render(area, frame);
+    pane: OverviewPane,
+    pane_width: u16,
+) -> String {
+    let base = match pane {
+        OverviewPane::PressureSummary => render_pressure_summary(model, theme, pane_width),
+        OverviewPane::ForecastHorizon => render_forecast_horizon(model, theme),
+        OverviewPane::ActionLane => render_action_lane(model),
+        OverviewPane::EwmaTrend => render_ewma_trend(model),
+        OverviewPane::DecisionPulse => render_decision_pulse(model, theme),
+        OverviewPane::CandidateHotlist => render_candidate_hotlist(model, theme),
+        OverviewPane::BallastQuick => render_ballast_quick(model, theme),
+        OverviewPane::SpecialLocations => render_special_locations(model, theme),
+        OverviewPane::ExtendedCounters => render_extended_counters(model),
+    };
+    format!(
+        "{base}\n  -> Enter/click opens {}",
+        overview_pane_target_label(pane)
+    )
+}
 
-    let content = model.daemon_state.as_ref().map_or_else(
-        || String::from("  Counters unavailable"),
-        |state| {
-            format!(
-                "  errors={}  dropped={}  rss={}  pid={}  uptime={}",
-                state.counters.errors,
-                state.counters.dropped_log_events,
-                human_bytes(state.memory_rss_bytes),
-                state.pid,
-                human_duration(state.uptime_seconds),
-            )
-        },
-    );
-    Paragraph::new(content)
-        .style(Style::default().fg(theme.palette.text_secondary()))
-        .render(inner, frame);
+fn overview_pane_target_label(pane: OverviewPane) -> &'static str {
+    match pane {
+        OverviewPane::ActionLane | OverviewPane::DecisionPulse => "Explainability",
+        OverviewPane::CandidateHotlist => "Candidates",
+        OverviewPane::BallastQuick => "Ballast",
+        OverviewPane::ExtendedCounters => "Diagnostics",
+        OverviewPane::PressureSummary
+        | OverviewPane::ForecastHorizon
+        | OverviewPane::EwmaTrend
+        | OverviewPane::SpecialLocations => "Timeline",
+    }
 }
 
 /// Generic list-screen renderer for Timeline, Explainability, Candidates, Ballast.
@@ -593,7 +508,7 @@ fn frame_render_stub(theme: &Theme, area: Rect, frame: &mut Frame, title: &str) 
 fn frame_render_footer(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
     let hints = match model.screen {
         Screen::Overview => {
-            "1-7 screens  [/] prev/next  b ballast  r refresh  ? help  : palette  q quit"
+            "Tab/Shift-Tab pane focus  Enter open pane  mouse move/click  1-7 screens  [/] prev/next  b ballast  r refresh  ? help  : palette  q quit"
         }
         Screen::Timeline => "j/k navigate  f filter  F follow  r refresh  ? help  : palette",
         Screen::Explainability | Screen::Ballast => {
@@ -707,7 +622,7 @@ fn frame_render_overlay(
             Paragraph::new(Text::from_lines(lines)).render(inner, frame);
         }
         super::model::Overlay::Help => {
-            let help_text = "  ?     toggle help\n  :     command palette\n  1-7   screens\n  [/]   prev/next screen\n  j/k   navigate lists\n  r     refresh\n  q     quit";
+            let help_text = "  ?     toggle help\n  :     command palette\n  1-7   screens\n  [/]   prev/next screen\n  Tab   next overview pane\n  S-Tab prev overview pane\n  Enter open focused pane\n  mouse hover/click overview\n  Esc   close overlay/back/quit\n  r     refresh\n  q     quit";
             Paragraph::new(help_text)
                 .style(Style::default().fg(theme.palette.text_primary()))
                 .render(inner, frame);
@@ -815,8 +730,11 @@ fn render_overview(model: &DashboardModel, theme: &Theme, out: &mut String) {
     let visible = layout.placements.iter().filter(|pane| pane.visible).count();
     let _ = writeln!(
         out,
-        "overview-layout={:?} visible-panes={visible}",
-        layout.class
+        "overview-layout={:?}/{:?} visible-panes={visible} focus={} hover={}",
+        layout.class,
+        layout.density,
+        model.overview_focus_pane.id(),
+        model.overview_hover_pane.map_or("-", OverviewPane::id),
     );
 
     for placement in layout.placements.iter().filter(|pane| pane.visible) {
@@ -824,10 +742,13 @@ fn render_overview(model: &DashboardModel, theme: &Theme, out: &mut String) {
             OverviewPane::PressureSummary => {
                 render_pressure_summary(model, theme, placement.rect.width)
             }
+            OverviewPane::ForecastHorizon => render_forecast_horizon(model, theme),
             OverviewPane::ActionLane => render_action_lane(model),
             OverviewPane::EwmaTrend => render_ewma_trend(model),
-            OverviewPane::RecentActivity => render_recent_activity(model),
+            OverviewPane::DecisionPulse => render_decision_pulse(model, theme),
+            OverviewPane::CandidateHotlist => render_candidate_hotlist(model, theme),
             OverviewPane::BallastQuick => render_ballast_quick(model, theme),
+            OverviewPane::SpecialLocations => render_special_locations(model, theme),
             OverviewPane::ExtendedCounters => render_extended_counters(model),
         };
         // First line shares the pane header; continuation lines are indented.
@@ -853,8 +774,8 @@ fn render_overview(model: &DashboardModel, theme: &Theme, out: &mut String) {
     write_navigation_hint(
         model,
         out,
-        "1-7 screens  [/] prev/next  b ballast  r refresh  ? help  : palette",
-        "1-7 screens  [/] prev/next  b ballast  ? help",
+        "Tab/Shift-Tab pane focus  Enter open pane  mouse move/click drill-in  1-7 screens  [/] prev/next  b ballast  r refresh  ? help  : palette",
+        "Tab focus  Enter open pane  mouse click  1-7 screens  [/] prev/next",
     );
 }
 
@@ -939,6 +860,39 @@ fn render_action_lane(model: &DashboardModel) -> String {
     }
 }
 
+#[allow(clippy::option_if_let_else)]
+fn render_forecast_horizon(model: &DashboardModel, theme: &Theme) -> String {
+    if let Some(ref state) = model.daemon_state {
+        let worst = state
+            .pressure
+            .mounts
+            .iter()
+            .min_by(|a, b| a.free_pct.total_cmp(&b.free_pct));
+        if let Some(worst) = worst {
+            let eta = worst.rate_bps.and_then(|rate| {
+                if rate <= 0.0 || worst.free_pct <= 0.0 {
+                    None
+                } else {
+                    // Rough forecast: assume 100GiB * free% remaining.
+                    let bytes_left = (worst.free_pct / 100.0) * 100.0 * 1024.0 * 1024.0 * 1024.0;
+                    Some((bytes_left / rate).max(0.0))
+                }
+            });
+            let eta_label = eta.map_or_else(|| "insufficient trend data".to_string(), eta_label);
+            let badge = status_badge(
+                &worst.level.to_ascii_uppercase(),
+                theme.palette.for_pressure_level(&worst.level),
+                theme.accessibility,
+            );
+            return format!(
+                "forecast {badge} worst={} free={:.1}% eta≈{eta_label}",
+                worst.path, worst.free_pct
+            );
+        }
+    }
+    String::from("forecast awaiting daemon trend inputs")
+}
+
 fn render_ewma_trend(model: &DashboardModel) -> String {
     use std::fmt::Write as _;
 
@@ -967,13 +921,117 @@ fn render_ewma_trend(model: &DashboardModel) -> String {
 }
 
 #[allow(clippy::option_if_let_else)]
+fn render_decision_pulse(model: &DashboardModel, theme: &Theme) -> String {
+    let activity_line = render_recent_activity(model);
+    if model.explainability_decisions.is_empty() {
+        return format!("decision-pulse no evidence loaded yet\n  {activity_line}");
+    }
+    let total = model.explainability_decisions.len();
+    let total_u32 = u32::try_from(total).unwrap_or(u32::MAX);
+    let vetoed = model
+        .explainability_decisions
+        .iter()
+        .filter(|d| d.vetoed)
+        .count();
+    let avg = model
+        .explainability_decisions
+        .iter()
+        .map(|d| d.total_score)
+        .sum::<f64>()
+        / f64::from(total_u32.max(1));
+    let badge = if vetoed > 0 {
+        status_badge("VETOES", theme.palette.warning, theme.accessibility)
+    } else {
+        status_badge("CLEAR", theme.palette.success, theme.accessibility)
+    };
+    format!(
+        "decision-pulse {badge} decisions={total} vetoed={vetoed} avg-score={avg:.2}\n  {activity_line}"
+    )
+}
+
+#[allow(clippy::option_if_let_else)]
+fn render_candidate_hotlist(model: &DashboardModel, theme: &Theme) -> String {
+    use std::fmt::Write as _;
+
+    if model.candidates_list.is_empty() {
+        return String::from("hotlist no candidate ranking loaded yet");
+    }
+    let mut out = format!(
+        "hotlist total={} source={:?}",
+        model.candidates_list.len(),
+        model.candidates_source
+    );
+    for candidate in model.candidates_list.iter().take(3) {
+        let badge = if candidate.total_score >= 0.8 {
+            status_badge("HOT", theme.palette.critical, theme.accessibility)
+        } else if candidate.total_score >= 0.6 {
+            status_badge("WARM", theme.palette.warning, theme.accessibility)
+        } else {
+            status_badge("MILD", theme.palette.accent, theme.accessibility)
+        };
+        let _ = write!(
+            out,
+            "\n  {} {:<20} score={:.2} size={}",
+            badge,
+            truncate_path(&candidate.path, 20),
+            candidate.total_score,
+            human_bytes(candidate.size_bytes),
+        );
+    }
+    out
+}
+
+#[allow(clippy::option_if_let_else)]
+fn render_special_locations(model: &DashboardModel, theme: &Theme) -> String {
+    if model.timeline_events.is_empty() {
+        return String::from("special-locations no timeline telemetry loaded yet");
+    }
+    let mut tmp_hits = 0usize;
+    let mut data_tmp_hits = 0usize;
+    let mut critical = 0usize;
+    for event in &model.timeline_events {
+        if let Some(path) = event.path.as_deref() {
+            if path.contains("/tmp") {
+                tmp_hits += 1;
+            }
+            if path.contains("/data/tmp") {
+                data_tmp_hits += 1;
+            }
+        }
+        if event.severity == "critical" {
+            critical += 1;
+        }
+    }
+    let badge = if critical > 0 {
+        status_badge("WATCH", theme.palette.warning, theme.accessibility)
+    } else {
+        status_badge("STABLE", theme.palette.success, theme.accessibility)
+    };
+    format!(
+        "special-locations {badge} /tmp-events={tmp_hits} /data/tmp-events={data_tmp_hits} critical-events={critical}"
+    )
+}
+
+fn eta_label(secs: f64) -> String {
+    if !secs.is_finite() {
+        return "unknown".to_string();
+    }
+    if secs >= 86_400.0 {
+        return format!("{:.1}d", secs / 86_400.0);
+    }
+    if secs >= 3_600.0 {
+        return format!("{:.1}h", secs / 3_600.0);
+    }
+    if secs >= 60.0 {
+        return format!("{:.1}m", secs / 60.0);
+    }
+    format!("{secs:.0}s")
+}
+
+#[allow(clippy::option_if_let_else)]
 fn render_recent_activity(model: &DashboardModel) -> String {
     if let Some(ref state) = model.daemon_state {
-        let at_str = state
-            .last_scan
-            .at
-            .as_deref()
-            .map_or("never", |s| extract_time(s));
+        let at_str = state.last_scan.at.as_deref().map_or("never", extract_time);
         format!(
             "activity last-scan={at_str} candidates={} deleted={} errors={}",
             state.last_scan.candidates, state.last_scan.deleted, state.counters.errors,
@@ -2253,6 +2311,20 @@ mod tests {
         assert!(frame.contains("start=timeline"));
         assert!(frame.contains("density=compact"));
         assert!(frame.contains("hints=off"));
+    }
+
+    #[test]
+    fn render_reports_terminal_too_small() {
+        let model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (30, 7),
+        );
+
+        let frame = render(&model);
+        assert!(frame.contains("terminal-too-small"));
+        assert!(frame.contains("need >= 40x8"));
     }
 
     #[test]

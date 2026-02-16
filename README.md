@@ -241,7 +241,7 @@ Environment overrides: `SBH_DASHBOARD_MODE`, `SBH_DASHBOARD_KILL_SWITCH`.
 
 | Key | Screen | Purpose |
 | --- | --- | --- |
-| `1` | Overview | Pressure gauges, EWMA trends, ballast summary, counters |
+| `1` | Overview | Dense cockpit grid: pressure matrix, forecasts, decision pulse, hotlist, ballast, special-locations watch, counters |
 | `2` | Timeline | Event stream with severity filtering and detail drill-down |
 | `3` | Explainability | Decision evidence, posterior traces, factor contributions |
 | `4` | Candidates | Ranked scan results with score breakdown and veto visibility |
@@ -257,8 +257,10 @@ Environment overrides: `SBH_DASHBOARD_MODE`, `SBH_DASHBOARD_KILL_SWITCH`.
 | --- | --- |
 | `1`-`7` | Jump directly to screen |
 | `[` / `]` | Previous / next screen |
+| `Tab` / `Shift-Tab` | Cycle focused pane on Overview |
+| `Enter` / `Space` (Overview) | Open focused pane target screen |
 | `b` | Jump to Ballast screen |
-| `Esc` | Back (pops history stack; quits when empty) |
+| `Esc` | Close overlay, then close open detail pane, then back, then quit |
 | `q` | Quit dashboard |
 | `Ctrl-C` | Immediate quit |
 
@@ -267,7 +269,7 @@ Environment overrides: `SBH_DASHBOARD_MODE`, `SBH_DASHBOARD_KILL_SWITCH`.
 | Key | Action |
 | --- | --- |
 | `?` | Toggle help overlay (contextual keybinding reference) |
-| `Ctrl-P` or `:` | Open command palette (fuzzy search 33 actions) |
+| `Ctrl-P` or `:` | Open command palette (fuzzy search 36 actions) |
 | `v` | Toggle VOI scheduler overlay |
 | `r` | Force data refresh |
 
@@ -290,14 +292,23 @@ Environment overrides: `SBH_DASHBOARD_MODE`, `SBH_DASHBOARD_KILL_SWITCH`.
 | `s` | Candidates | Cycle sort order (Score, Size, Age, Path) |
 | `Shift-V` | Diagnostics | Toggle verbose frame metrics |
 
+**Mouse support:**
+
+| Input | Action |
+| --- | --- |
+| Move | Hover-highlight Overview panes |
+| Left click | Focus + open Overview pane target screen |
+| Wheel on hotlist | Scroll candidate hotlist selection |
+
 ### Command Palette
 
-Press `:` or `Ctrl-P` to open the command palette. Type to fuzzy-search through 33 available actions including navigation, preference changes, and incident commands. Press `Enter` to execute, `Esc` to cancel. Palette actions include:
+Press `:` or `Ctrl-P` to open the command palette. Type to fuzzy-search through 36 available actions including navigation, preference changes, overview pane controls, and incident commands. Press `Enter` to execute, `Esc` to cancel. Palette actions include:
 
 - `nav.overview` through `nav.diagnostics` (screen navigation)
 - `pref.density.compact`, `pref.density.normal`, `pref.density.comfortable` (visual density)
 - `pref.hints.off`, `pref.hints.minimal`, `pref.hints.full` (hint verbosity)
 - `pref.start.*` (startup screen)
+- `action.overview.focus-next`, `action.overview.focus-prev`, `action.overview.open-focused` (overview pane navigation)
 - `incident.playbook`, `incident.quick-release`, `incident.triage` (incident shortcuts)
 
 ### Incident Workflows
@@ -340,10 +351,11 @@ Check Diagnostics (key `7`) for daemon connection details and error counts.
 Dashboard preferences persist across sessions in `~/.config/sbh/dashboard-preferences.json`:
 
 - **Start screen**: Which screen to show on launch (`overview`, `timeline`, etc.)
-- **Density**: Visual density mode (`compact`, `normal`, `comfortable`)
+- **Density**: Visual density mode (`compact`, `comfortable`)
 - **Hint verbosity**: How much context to show (`off`, `minimal`, `full`)
 - **Contrast**: High-contrast mode (respects `NO_COLOR` environment variable)
 - **Motion**: Reduced-motion mode (respects `REDUCE_MOTION` environment variable)
+- **Startup help modal**: `show_help_on_start` defaults to `false` (open help with `?`)
 
 Configure via command palette (`:` then type `pref`) or directly in the preferences file.
 

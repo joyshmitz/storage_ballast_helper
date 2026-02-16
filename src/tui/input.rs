@@ -39,6 +39,9 @@ pub enum InputAction {
     SetHintVerbosity(HintVerbosity),
     ResetPreferencesToPersisted,
     RevertPreferencesToDefaults,
+    OverviewFocusNext,
+    OverviewFocusPrev,
+    OverviewActivateFocused,
     PaletteType(char),
     PaletteBackspace,
     PaletteExecute,
@@ -119,7 +122,7 @@ pub fn resolve_key_event(key: &KeyEvent, context: InputContext) -> InputResoluti
     if let Some(overlay) = context.active_overlay {
         return resolve_overlay_key(key, overlay);
     }
-    resolve_global_key(key)
+    resolve_global_key(key, context.screen)
 }
 
 /// Stable command-palette catalog with deterministic action IDs.
@@ -245,7 +248,7 @@ fn resolve_overlay_key(key: &KeyEvent, overlay: Overlay) -> InputResolution {
     }
 }
 
-fn resolve_global_key(key: &KeyEvent) -> InputResolution {
+fn resolve_global_key(key: &KeyEvent, screen: Screen) -> InputResolution {
     match key.code {
         KeyCode::Char('c') if key.ctrl() => InputResolution::action(InputAction::Quit),
         KeyCode::Char('q') => InputResolution::action(InputAction::Quit),
@@ -268,6 +271,15 @@ fn resolve_global_key(key: &KeyEvent) -> InputResolution {
         KeyCode::Char('r') => InputResolution::action(InputAction::ForceRefresh),
         KeyCode::Char('!') => InputResolution::action(InputAction::IncidentShowPlaybook),
         KeyCode::Char('x') => InputResolution::action(InputAction::IncidentQuickRelease),
+        KeyCode::Tab if screen == Screen::Overview => {
+            InputResolution::action(InputAction::OverviewFocusNext)
+        }
+        KeyCode::BackTab if screen == Screen::Overview => {
+            InputResolution::action(InputAction::OverviewFocusPrev)
+        }
+        KeyCode::Enter | KeyCode::Char(' ') if screen == Screen::Overview => {
+            InputResolution::action(InputAction::OverviewActivateFocused)
+        }
         _ => InputResolution::passthrough(),
     }
 }
@@ -433,7 +445,7 @@ fn screen_help(screen: Screen) -> ContextualHelp {
     }
 }
 
-const GLOBAL_HELP_BINDINGS: [HelpBinding; 13] = [
+const GLOBAL_HELP_BINDINGS: [HelpBinding; 15] = [
     HelpBinding {
         keys: "1..7",
         description: "Jump directly to screen",
@@ -471,6 +483,14 @@ const GLOBAL_HELP_BINDINGS: [HelpBinding; 13] = [
         description: "Jump to Ballast screen",
     },
     HelpBinding {
+        keys: "Tab / Shift-Tab",
+        description: "Cycle overview pane focus",
+    },
+    HelpBinding {
+        keys: "Enter",
+        description: "Open focused overview pane target screen",
+    },
+    HelpBinding {
         keys: "r",
         description: "Force data refresh",
     },
@@ -488,7 +508,7 @@ const GLOBAL_HELP_BINDINGS: [HelpBinding; 13] = [
     },
 ];
 
-const PALETTE_ACTIONS: [PaletteAction; 33] = [
+const PALETTE_ACTIONS: [PaletteAction; 36] = [
     PaletteAction {
         id: "nav.overview",
         title: "Go to Overview",
@@ -572,6 +592,24 @@ const PALETTE_ACTIONS: [PaletteAction; 33] = [
         title: "Jump to ballast quick-actions",
         shortcut: "b",
         action: InputAction::JumpBallast,
+    },
+    PaletteAction {
+        id: "action.overview.focus-next",
+        title: "Overview pane focus next",
+        shortcut: "Tab",
+        action: InputAction::OverviewFocusNext,
+    },
+    PaletteAction {
+        id: "action.overview.focus-prev",
+        title: "Overview pane focus previous",
+        shortcut: "Shift-Tab",
+        action: InputAction::OverviewFocusPrev,
+    },
+    PaletteAction {
+        id: "action.overview.open-focused",
+        title: "Open focused overview pane",
+        shortcut: "Enter",
+        action: InputAction::OverviewActivateFocused,
     },
     PaletteAction {
         id: "action.quit",
@@ -754,6 +792,32 @@ mod tests {
     }
 
     #[test]
+    fn overview_tab_keys_and_enter_resolve_to_pane_actions() {
+        let ctx = InputContext {
+            screen: Screen::Overview,
+            active_overlay: None,
+        };
+        let next = resolve_key_event(&key(KeyCode::Tab), ctx);
+        let prev = resolve_key_event(&key(KeyCode::BackTab), ctx);
+        let activate = resolve_key_event(&key(KeyCode::Enter), ctx);
+
+        assert_eq!(next.action, Some(InputAction::OverviewFocusNext));
+        assert_eq!(prev.action, Some(InputAction::OverviewFocusPrev));
+        assert_eq!(activate.action, Some(InputAction::OverviewActivateFocused));
+    }
+
+    #[test]
+    fn tab_is_passthrough_on_non_overview_screens() {
+        let ctx = InputContext {
+            screen: Screen::Timeline,
+            active_overlay: None,
+        };
+        let res = resolve_key_event(&key(KeyCode::Tab), ctx);
+        assert!(!res.consumed);
+        assert!(res.action.is_none());
+    }
+
+    #[test]
     fn overlay_precedence_consumes_unmapped_keys() {
         let ctx = InputContext {
             screen: Screen::Overview,
@@ -814,7 +878,7 @@ mod tests {
         let mixed = search_palette_actions("OvErViEw", 2);
 
         assert!(!upper.is_empty());
-        assert_eq!(upper[0].id, "nav.overview");
+        assert!(upper.iter().all(|a| a.id.contains("overview")));
         assert_eq!(upper, mixed);
     }
 
@@ -1139,7 +1203,10 @@ mod tests {
 
     #[test]
     fn match_score_title_substring() {
-        let action = &super::PALETTE_ACTIONS[14]; // action.quit, title: "Quit dashboard"
+        let action = super::PALETTE_ACTIONS
+            .iter()
+            .find(|a| a.id == "action.quit")
+            .expect("action.quit present");
         let score = super::match_score(action, "dashboard").unwrap();
         assert_eq!(score, 10);
     }

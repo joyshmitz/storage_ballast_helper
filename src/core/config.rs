@@ -14,9 +14,8 @@ use crate::daemon::notifications::NotificationConfig;
 use crate::daemon::policy::PolicyConfig;
 
 /// Full SBH configuration model.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
-#[derive(Default)]
 pub struct Config {
     pub pressure: PressureConfig,
     pub scanner: ScannerConfig,
@@ -848,6 +847,11 @@ impl Config {
                 details: "scanner.max_depth must be >= 1".to_string(),
             });
         }
+        if self.scanner.max_delete_batch == 0 {
+            return Err(SbhError::InvalidConfig {
+                details: "scanner.max_delete_batch must be >= 1".to_string(),
+            });
+        }
         if self.scanner.repeat_deletion_base_cooldown_secs == 0 {
             return Err(SbhError::InvalidConfig {
                 details: "scanner.repeat_deletion_base_cooldown_secs must be >= 1".to_string(),
@@ -916,6 +920,11 @@ impl Config {
                 details: "scheduler.scan_budget_per_interval must be >= 1".to_string(),
             });
         }
+        if self.scheduler.min_observations_for_forecast == 0 {
+            return Err(SbhError::InvalidConfig {
+                details: "scheduler.min_observations_for_forecast must be >= 1".to_string(),
+            });
+        }
         for (name, val) in [
             ("io_cost_weight", self.scheduler.io_cost_weight),
             ("fp_risk_weight", self.scheduler.fp_risk_weight),
@@ -959,13 +968,14 @@ impl Config {
             });
         }
 
-        // BallastManager casts file indices to u32 for headers/filenames.
-        if self.ballast.file_count > u32::MAX as usize {
+        // BallastManager iterates file indices in a tight loop — absurdly large
+        // counts cause hangs. Cap at 100_000 (with default 1 GiB file size =
+        // 100 TiB of ballast, which is far beyond any realistic use).
+        if self.ballast.file_count > 100_000 {
             return Err(SbhError::InvalidConfig {
                 details: format!(
-                    "ballast.file_count ({}) exceeds maximum ({})",
+                    "ballast.file_count ({}) exceeds maximum (100000)",
                     self.ballast.file_count,
-                    u32::MAX,
                 ),
             });
         }
@@ -1160,6 +1170,18 @@ mod tests {
         cfg.telemetry.ewma_base_alpha = 0.1;
         let err = cfg.validate().expect_err("expected alpha validation error");
         assert!(err.to_string().contains("alpha"));
+    }
+
+    #[test]
+    fn min_observations_for_forecast_zero_rejected() {
+        let mut cfg = Config::default();
+        cfg.scheduler.min_observations_for_forecast = 0;
+        let err = cfg
+            .validate()
+            .expect_err("expected min_observations validation error");
+        assert!(err
+            .to_string()
+            .contains("min_observations_for_forecast"));
     }
 
     #[test]
@@ -1439,9 +1461,9 @@ mod tests {
     }
 
     #[test]
-    fn ballast_file_count_exceeding_u32_max_rejected() {
+    fn ballast_file_count_exceeding_cap_rejected() {
         let mut cfg = Config::default();
-        cfg.ballast.file_count = u32::MAX as usize + 1;
+        cfg.ballast.file_count = 100_001;
         let err = cfg.validate().unwrap_err();
         let msg = err.to_string();
         assert!(

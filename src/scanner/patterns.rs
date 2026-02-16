@@ -364,7 +364,7 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
         ArtifactPattern {
             name: "agent-ft-suffix",
             kind: MatchKind::Suffix("-ft"),
-            confidence: 0.90,
+            confidence: 0.65,
             category: ArtifactCategory::AgentWorkspace,
         },
         ArtifactPattern {

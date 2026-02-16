@@ -10,9 +10,10 @@
 
 use std::time::Instant;
 
-use ftui::KeyCode;
+use ftui::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
 
 use super::input::{InputAction, InputContext};
+use super::layout::{build_overview_layout, OverviewPane};
 use super::model::{
     ConfirmAction, DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, Overlay,
     PreferenceAction, RateHistory, Screen,
@@ -33,7 +34,11 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
             // Request telemetry data when on a screen that needs it.
             if matches!(
                 model.screen,
-                Screen::Timeline | Screen::Explainability | Screen::Candidates | Screen::Ballast
+                Screen::Overview
+                    | Screen::Timeline
+                    | Screen::Explainability
+                    | Screen::Candidates
+                    | Screen::Ballast
             ) {
                 cmds.push(DashboardCmd::FetchTelemetry);
             }
@@ -63,6 +68,8 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
             model.terminal_size = (cols, rows);
             DashboardCmd::None
         }
+
+        DashboardMsg::Mouse(event) => handle_mouse_event(model, event),
 
         DashboardMsg::DataUpdate(state) => {
             model.last_fetch = Some(Instant::now());
@@ -219,6 +226,18 @@ fn apply_input_action(model: &mut DashboardModel, action: InputAction) -> Dashbo
             DashboardCmd::Quit
         }
         InputAction::BackOrQuit => {
+            if model.explainability_detail {
+                model.explainability_detail = false;
+                return DashboardCmd::None;
+            }
+            if model.candidates_detail {
+                model.candidates_detail = false;
+                return DashboardCmd::None;
+            }
+            if model.ballast_detail {
+                model.ballast_detail = false;
+                return DashboardCmd::None;
+            }
             if model.navigate_back() {
                 DashboardCmd::None
             } else {
@@ -279,6 +298,26 @@ fn apply_input_action(model: &mut DashboardModel, action: InputAction) -> Dashbo
         }
         InputAction::RevertPreferencesToDefaults => {
             DashboardCmd::ExecutePreferenceAction(PreferenceAction::RevertToDefaults)
+        }
+        InputAction::OverviewFocusNext => {
+            if model.screen == Screen::Overview {
+                overview_focus_step(model, true);
+            }
+            DashboardCmd::None
+        }
+        InputAction::OverviewFocusPrev => {
+            if model.screen == Screen::Overview {
+                overview_focus_step(model, false);
+            }
+            DashboardCmd::None
+        }
+        InputAction::OverviewActivateFocused => {
+            if model.screen == Screen::Overview {
+                overview_ensure_focus_visible(model);
+                let target = model.overview_focus_target_screen();
+                model.navigate_to(target);
+            }
+            DashboardCmd::None
         }
         InputAction::PaletteType(c) => {
             model.palette_query.push(c);
@@ -517,6 +556,111 @@ fn handle_diagnostics_key(model: &mut DashboardModel, key: ftui::KeyEvent) -> Da
     }
 }
 
+fn handle_mouse_event(model: &mut DashboardModel, event: MouseEvent) -> DashboardCmd {
+    if model.active_overlay.is_some() {
+        return DashboardCmd::None;
+    }
+    if model.screen != Screen::Overview {
+        return DashboardCmd::None;
+    }
+
+    let hovered = overview_pane_at(model, event.x, event.y);
+    model.overview_set_hover(hovered);
+
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(pane) = hovered {
+                model.overview_set_focus(pane);
+                let target = model.overview_focus_target_screen();
+                model.navigate_to(target);
+            }
+            DashboardCmd::None
+        }
+        MouseEventKind::ScrollUp => {
+            if hovered == Some(OverviewPane::CandidateHotlist) {
+                model.candidates_cursor_up();
+            }
+            DashboardCmd::None
+        }
+        MouseEventKind::ScrollDown => {
+            if hovered == Some(OverviewPane::CandidateHotlist) {
+                model.candidates_cursor_down();
+            }
+            DashboardCmd::None
+        }
+        _ => DashboardCmd::None,
+    }
+}
+
+fn overview_body_height(model: &DashboardModel) -> u16 {
+    let notif_rows = u16::try_from(model.notifications.len().min(3)).unwrap_or(3);
+    model
+        .terminal_size
+        .1
+        .saturating_sub(3)
+        .saturating_sub(1)
+        .saturating_sub(notif_rows)
+}
+
+fn overview_visible_panes(model: &DashboardModel) -> Vec<OverviewPane> {
+    let body_height = overview_body_height(model);
+    build_overview_layout(model.terminal_size.0, body_height)
+        .placements
+        .into_iter()
+        .filter(|p| p.visible)
+        .map(|p| p.pane)
+        .collect()
+}
+
+fn overview_ensure_focus_visible(model: &mut DashboardModel) {
+    let visible = overview_visible_panes(model);
+    if visible.is_empty() {
+        return;
+    }
+    if !visible.contains(&model.overview_focus_pane) {
+        model.overview_set_focus(visible[0]);
+    }
+}
+
+fn overview_focus_step(model: &mut DashboardModel, forward: bool) {
+    let visible = overview_visible_panes(model);
+    if visible.is_empty() {
+        return;
+    }
+
+    let current = visible
+        .iter()
+        .position(|pane| *pane == model.overview_focus_pane);
+    let next = match (current, forward) {
+        (Some(idx), true) => (idx + 1) % visible.len(),
+        (Some(0) | None, false) => visible.len() - 1,
+        (Some(idx), false) => idx - 1,
+        (None, true) => 0,
+    };
+    model.overview_set_focus(visible[next]);
+}
+
+fn overview_pane_at(model: &DashboardModel, x: u16, y: u16) -> Option<OverviewPane> {
+    let body_top = 3;
+    let body_height = overview_body_height(model);
+    if y < body_top || y >= body_top.saturating_add(body_height) {
+        return None;
+    }
+    let local_y = y.saturating_sub(body_top);
+    let layout = build_overview_layout(model.terminal_size.0, body_height);
+    layout
+        .placements
+        .into_iter()
+        .filter(|p| p.visible)
+        .find(|p| {
+            x >= p.rect.col
+                && x < p.rect.col.saturating_add(p.rect.width)
+                && local_y >= p.rect.row
+                && local_y < p.rect.row.saturating_add(p.rect.height)
+        })
+        .map(|p| p.pane)
+}
+
 // ──────────────────── tests ────────────────────
 
 #[cfg(test)]
@@ -524,12 +668,15 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use ftui::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
+    use ftui::{
+        KeyCode, KeyEvent, KeyEventKind, Modifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
 
     use super::*;
     use crate::daemon::self_monitor::{
         BallastState, Counters, DaemonState, LastScanState, MountPressure, PressureState,
     };
+    use crate::tui::layout::OverviewPane;
     use crate::tui::model::{DashboardError, Overlay};
     use crate::tui::telemetry::DataSource;
 
@@ -555,6 +702,15 @@ mod tests {
             code,
             modifiers: Modifiers::CTRL,
             kind: KeyEventKind::Press,
+        }
+    }
+
+    fn make_mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            x,
+            y,
+            modifiers: Modifiers::NONE,
         }
     }
 
@@ -649,6 +805,20 @@ mod tests {
     }
 
     #[test]
+    fn esc_closes_detail_before_history_navigation() {
+        let mut model = test_model();
+        model.navigate_to(Screen::Candidates);
+        model.candidates_detail = true;
+        model.screen_history = vec![Screen::Overview];
+
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Escape)));
+        assert!(matches!(cmd, DashboardCmd::None));
+        assert_eq!(model.screen, Screen::Candidates);
+        assert!(!model.candidates_detail);
+        assert!(!model.quit);
+    }
+
+    #[test]
     fn esc_cascade_back_then_quit() {
         let mut model = test_model();
         model.navigate_to(Screen::Timeline);
@@ -692,6 +862,56 @@ mod tests {
         );
         assert!(model.quit);
         assert!(matches!(cmd, DashboardCmd::Quit));
+    }
+
+    #[test]
+    fn mouse_click_on_overview_pane_navigates_to_target_screen() {
+        let mut model = test_model();
+        model.screen = Screen::Overview;
+        let body_height = overview_body_height(&model);
+        let pressure = build_overview_layout(model.terminal_size.0, body_height)
+            .placements
+            .into_iter()
+            .find(|p| p.visible && p.pane == OverviewPane::PressureSummary)
+            .expect("pressure pane should be visible");
+        let click_x = pressure.rect.col.saturating_add(pressure.rect.width / 2);
+        let click_y = 3u16
+            .saturating_add(pressure.rect.row)
+            .saturating_add(pressure.rect.height / 2);
+        let cmd = update(
+            &mut model,
+            DashboardMsg::Mouse(make_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                click_x,
+                click_y,
+            )),
+        );
+        assert!(matches!(cmd, DashboardCmd::None));
+        assert_eq!(model.screen, Screen::Timeline);
+    }
+
+    #[test]
+    fn mouse_move_updates_overview_hover_state() {
+        let mut model = test_model();
+        model.screen = Screen::Overview;
+        update(
+            &mut model,
+            DashboardMsg::Mouse(make_mouse(MouseEventKind::Moved, 1, 4)),
+        );
+        assert!(model.overview_hover_pane.is_some());
+    }
+
+    #[test]
+    fn overview_focus_navigation_skips_hidden_panes() {
+        let mut model = test_model();
+        model.screen = Screen::Overview;
+        model.terminal_size = (80, 16);
+        model.overview_set_focus(OverviewPane::ExtendedCounters);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Tab)));
+        let visible = overview_visible_panes(&model);
+        assert!(visible.contains(&model.overview_focus_pane));
+        assert_ne!(model.overview_focus_pane, OverviewPane::ExtendedCounters);
     }
 
     // ── Screen navigation: number keys ──
@@ -1315,7 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn tick_on_overview_does_not_request_telemetry() {
+    fn tick_on_overview_requests_telemetry() {
         let mut model = test_model();
         model.screen = Screen::Overview;
 
@@ -1324,10 +1544,7 @@ mod tests {
             let has_telemetry = cmds
                 .iter()
                 .any(|c| matches!(c, DashboardCmd::FetchTelemetry));
-            assert!(
-                !has_telemetry,
-                "Tick on S1 should not include FetchTelemetry"
-            );
+            assert!(has_telemetry, "Tick on S1 should include FetchTelemetry");
         }
     }
 

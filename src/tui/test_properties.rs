@@ -737,8 +737,8 @@ proptest! {
         }
     }
 
-    /// FetchTelemetry is included in Tick only on telemetry-backed screens
-    /// (Timeline, Explainability, Candidates, Ballast).
+    /// FetchTelemetry is included in Tick on telemetry-backed screens
+    /// (Overview, Timeline, Explainability, Candidates, Ballast).
     #[test]
     fn tick_telemetry_screen_dependent(screen in arb_screen()) {
         let mut model = fresh_model();
@@ -753,7 +753,11 @@ proptest! {
 
         let should_have = matches!(
             screen,
-            Screen::Timeline | Screen::Explainability | Screen::Candidates | Screen::Ballast
+            Screen::Overview
+                | Screen::Timeline
+                | Screen::Explainability
+                | Screen::Candidates
+                | Screen::Ballast
         );
         prop_assert_eq!(has_telemetry, should_have);
     }

@@ -132,7 +132,7 @@ impl DirectoryWalker {
 
         // Channels: work items (bounded) and results (unbounded for throughput).
         // Queue sized to hold children from multiple root paths without starvation.
-        // Per-directory child cap (MAX_CHILDREN_QUEUED) prevents any single huge
+        // Per-directory iteration cap (MAX_ENTRIES_PER_DIR) prevents any single huge
         // directory (e.g. /data/tmp with 60K+ children) from monopolizing the queue.
         let (work_tx, work_rx) = channel::bounded::<WorkItem>(4096);
         let (result_tx, result_rx) = channel::unbounded::<WalkEntry>();

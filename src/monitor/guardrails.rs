@@ -114,7 +114,7 @@ impl Default for GuardrailConfig {
             min_conservative_fraction: 0.70,
             e_process_threshold: 20.0,
             e_process_penalty: 1.5,
-            e_process_reward: 0.8,
+            e_process_reward: 0.75,
             recovery_clean_windows: 3,
         }
     }

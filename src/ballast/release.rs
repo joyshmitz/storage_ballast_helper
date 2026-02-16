@@ -33,8 +33,6 @@ struct MountReleaseState {
     green_since: Option<Instant>,
     /// Last time a file was replenished.
     last_replenish_time: Option<Instant>,
-    /// Total files released since last full replenishment.
-    files_released_since_green: usize,
 }
 
 /// Tracks release/replenishment state across monitoring loop iterations.
@@ -64,19 +62,24 @@ impl BallastReleaseController {
         mount_path: &Path,
         response: &PressureResponse,
         available: usize,
+        configured_total: usize,
     ) -> usize {
         if available == 0 {
             return 0;
         }
 
-        // Get current state for this mount so targets can be cumulative.
-        let state = self.states.entry(mount_path.to_path_buf()).or_default();
-        let already_released = state.files_released_since_green;
-        let total_pool = already_released + available;
+        // Calculate missing files based on physical inventory, robust to restarts.
+        // If files are missing (deleted by us or user), they count as "released".
+        let already_released = configured_total.saturating_sub(available);
+        
+        // Ensure state entry exists for this mount.
+        self.states.entry(mount_path.to_path_buf()).or_default();
+
+        let total_pool = configured_total; // The total capacity is the config target.
 
         let pid_recommendation = response.release_ballast_files;
 
-        // Graduated fallback based on urgency (cumulative target since last green).
+        // Graduated fallback based on urgency (cumulative target).
         let urgency_recommendation = if response.urgency < 0.3 {
             0
         } else if response.urgency < 0.6 {
@@ -87,7 +90,7 @@ impl BallastReleaseController {
             total_pool // Emergency: release everything
         };
 
-        // Safety floor based on pressure level (cumulative target since last green).
+        // Safety floor based on pressure level (cumulative target).
         let level_floor = match response.level {
             PressureLevel::Critical => total_pool, // Always release all on Critical
             PressureLevel::Red => 3,               // Always release at least 3 on Red
@@ -115,7 +118,12 @@ impl BallastReleaseController {
         manager: &mut BallastManager,
         response: &PressureResponse,
     ) -> Result<Option<ReleaseReport>> {
-        let to_release = self.files_to_release(mount_path, response, manager.available_count());
+        let to_release = self.files_to_release(
+            mount_path,
+            response,
+            manager.available_count(),
+            manager.config().file_count,
+        );
 
         if to_release == 0 {
             return Ok(None);
@@ -130,10 +138,9 @@ impl BallastReleaseController {
     }
 
     /// Record a successful release event.
-    pub fn on_released(&mut self, mount_path: &Path, count: usize) {
+    pub fn on_released(&mut self, mount_path: &Path, _count: usize) {
         let state = self.states.entry(mount_path.to_path_buf()).or_default();
         state.last_release_time = Some(Instant::now());
-        state.files_released_since_green += count;
         // Reset green timer since we just released (we're under pressure).
         state.green_since = None;
     }
@@ -193,7 +200,7 @@ impl BallastReleaseController {
         }
 
         // Nothing to replenish if all configured files are present.
-        if current_files >= target_files && state.files_released_since_green == 0 {
+        if current_files >= target_files {
             return false;
         }
 
@@ -208,10 +215,9 @@ impl BallastReleaseController {
     }
 
     /// Record a successful replenishment event.
-    pub fn on_replenished(&mut self, mount_path: &Path, count: usize) {
+    pub fn on_replenished(&mut self, mount_path: &Path, _count: usize) {
         let state = self.states.entry(mount_path.to_path_buf()).or_default();
         state.last_replenish_time = Some(Instant::now());
-        state.files_released_since_green = state.files_released_since_green.saturating_sub(count);
     }
 
     /// Reset all state (e.g., after config reload).
@@ -219,12 +225,6 @@ impl BallastReleaseController {
         self.states.clear();
     }
 
-    /// How many files have been released since the last full green period (for specific mount).
-    pub fn files_released_since_green(&self, mount_path: &Path) -> usize {
-        self.states
-            .get(mount_path)
-            .map_or(0, |s| s.files_released_since_green)
-    }
 }
 
 // ──────────────────── tests ────────────────────
@@ -270,7 +270,7 @@ mod tests {
     fn no_release_when_green() {
         let mut ctrl = BallastReleaseController::new(30);
         let response = test_response(PressureLevel::Green, 0.0, 0);
-        assert_eq!(ctrl.files_to_release(Path::new("/test"), &response, 5), 0);
+        assert_eq!(ctrl.files_to_release(Path::new("/test"), &response, 5, 5), 0);
     }
 
     #[test]
@@ -280,27 +280,27 @@ mod tests {
 
         // Low urgency, PID says 0 -> use urgency fallback.
         let r = test_response(PressureLevel::Orange, 0.4, 0);
-        assert_eq!(ctrl.files_to_release(mount, &r, 5), 1);
+        assert_eq!(ctrl.files_to_release(mount, &r, 5, 5), 1);
 
         let r = test_response(PressureLevel::Red, 0.7, 0);
-        assert_eq!(ctrl.files_to_release(mount, &r, 5), 3);
+        assert_eq!(ctrl.files_to_release(mount, &r, 5, 5), 3);
 
         let r = test_response(PressureLevel::Critical, 0.95, 0);
-        assert_eq!(ctrl.files_to_release(mount, &r, 5), 5); // all
+        assert_eq!(ctrl.files_to_release(mount, &r, 5, 5), 5); // all
     }
 
     #[test]
     fn respects_pid_recommendation() {
         let mut ctrl = BallastReleaseController::new(30);
         let r = test_response(PressureLevel::Orange, 0.5, 2);
-        assert_eq!(ctrl.files_to_release(Path::new("/test"), &r, 5), 2);
+        assert_eq!(ctrl.files_to_release(Path::new("/test"), &r, 5, 5), 2);
     }
 
     #[test]
     fn release_capped_at_available() {
         let mut ctrl = BallastReleaseController::new(30);
         let r = test_response(PressureLevel::Critical, 1.0, 0);
-        assert_eq!(ctrl.files_to_release(Path::new("/test"), &r, 2), 2); // only 2 available
+        assert_eq!(ctrl.files_to_release(Path::new("/test"), &r, 2, 2), 2); // only 2 available
     }
 
     #[test]
@@ -320,7 +320,6 @@ mod tests {
         let r = report.unwrap();
         assert_eq!(r.files_released, 3);
         assert_eq!(mgr.available_count(), 2);
-        assert_eq!(ctrl.files_released_since_green(mount), 3);
     }
 
     #[test]
@@ -430,13 +429,11 @@ mod tests {
         let mut ctrl = BallastReleaseController::new(30);
         let mount = Path::new("/test");
         let state = ctrl.states.entry(mount.to_path_buf()).or_default();
-        state.files_released_since_green = 5;
         state.last_release_time = Some(Instant::now());
         state.green_since = Some(Instant::now());
 
         ctrl.reset();
 
-        assert_eq!(ctrl.files_released_since_green(mount), 0);
         assert!(ctrl.states.is_empty());
     }
 
@@ -455,7 +452,6 @@ mod tests {
         // Tick 1
         ctrl.maybe_release(mount, &mut mgr, &response).unwrap();
         assert_eq!(mgr.available_count(), 4);
-        assert_eq!(ctrl.files_released_since_green(mount), 1);
 
         // Tick 2
         ctrl.maybe_release(mount, &mut mgr, &response).unwrap();
@@ -471,6 +467,5 @@ mod tests {
         ctrl.maybe_release(mount, &mut mgr, &red_response).unwrap();
         // Should release 2 more to reach 3 total.
         assert_eq!(mgr.available_count(), 2);
-        assert_eq!(ctrl.files_released_since_green(mount), 3);
     }
 }

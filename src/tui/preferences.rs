@@ -110,7 +110,7 @@ fn default_notification_timeout() -> u32 {
     5
 }
 fn default_show_help_on_start() -> bool {
-    true
+    false
 }
 
 // ──────────────────── preference enums ────────────────────
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(prefs.motion, MotionPreference::Auto);
         assert_eq!(prefs.hint_verbosity, HintVerbosity::Full);
         assert_eq!(prefs.notification_timeout_secs, 5);
-        assert!(prefs.show_help_on_start);
+        assert!(!prefs.show_help_on_start);
     }
 
     // ── JSON roundtrip ──

@@ -11,9 +11,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use ftui::KeyEvent;
+use ftui::{KeyEvent, MouseEvent};
 
 use crate::daemon::self_monitor::DaemonState;
+use crate::tui::layout::OverviewPane;
 use crate::tui::preferences::{DensityMode, HintVerbosity, StartScreen};
 use crate::tui::telemetry::{
     DataSource, DecisionEvidence, EventFilter, TelemetryResult, TimelineEvent,
@@ -473,6 +474,10 @@ pub struct DashboardModel {
     pub screen_history: Vec<Screen>,
     /// Currently active overlay, if any. Only one at a time per IA §4.2.
     pub active_overlay: Option<Overlay>,
+    /// Focused overview pane for keyboard activation on S1.
+    pub overview_focus_pane: OverviewPane,
+    /// Hovered overview pane from mouse movement on S1.
+    pub overview_hover_pane: Option<OverviewPane>,
     /// Most recent daemon state snapshot (None when daemon is not running).
     pub daemon_state: Option<DaemonState>,
     /// Per-mount rate histories for sparkline rendering.
@@ -604,6 +609,8 @@ impl DashboardModel {
             screen: Screen::default(),
             screen_history: Vec::new(),
             active_overlay: None,
+            overview_focus_pane: OverviewPane::PressureSummary,
+            overview_hover_pane: None,
             daemon_state: None,
             rate_histories: HashMap::new(),
             terminal_size,
@@ -678,6 +685,9 @@ impl DashboardModel {
         }
         self.screen_history.push(self.screen);
         self.screen = target;
+        if self.screen == Screen::Overview {
+            self.overview_hover_pane = None;
+        }
         true
     }
 
@@ -914,9 +924,74 @@ impl DashboardModel {
     pub fn navigate_back(&mut self) -> bool {
         if let Some(prev) = self.screen_history.pop() {
             self.screen = prev;
+            if self.screen == Screen::Overview {
+                self.overview_hover_pane = None;
+            }
             true
         } else {
             false
+        }
+    }
+
+    /// Return the ordered focus ring for overview panes.
+    #[must_use]
+    pub const fn overview_focus_ring() -> [OverviewPane; 9] {
+        [
+            OverviewPane::PressureSummary,
+            OverviewPane::ForecastHorizon,
+            OverviewPane::ActionLane,
+            OverviewPane::EwmaTrend,
+            OverviewPane::DecisionPulse,
+            OverviewPane::CandidateHotlist,
+            OverviewPane::BallastQuick,
+            OverviewPane::SpecialLocations,
+            OverviewPane::ExtendedCounters,
+        ]
+    }
+
+    /// Move focus to the next overview pane in the ring.
+    pub fn overview_focus_next(&mut self) {
+        let ring = Self::overview_focus_ring();
+        let idx = ring
+            .iter()
+            .position(|pane| *pane == self.overview_focus_pane)
+            .unwrap_or(0);
+        self.overview_focus_pane = ring[(idx + 1) % ring.len()];
+    }
+
+    /// Move focus to the previous overview pane in the ring.
+    pub fn overview_focus_prev(&mut self) {
+        let ring = Self::overview_focus_ring();
+        let idx = ring
+            .iter()
+            .position(|pane| *pane == self.overview_focus_pane)
+            .unwrap_or(0);
+        let prev = if idx == 0 { ring.len() - 1 } else { idx - 1 };
+        self.overview_focus_pane = ring[prev];
+    }
+
+    /// Set keyboard focus to a specific overview pane.
+    pub fn overview_set_focus(&mut self, pane: OverviewPane) {
+        self.overview_focus_pane = pane;
+    }
+
+    /// Set hovered overview pane from mouse input.
+    pub fn overview_set_hover(&mut self, pane: Option<OverviewPane>) {
+        self.overview_hover_pane = pane;
+    }
+
+    /// Resolve focused overview pane to a target screen.
+    #[must_use]
+    pub fn overview_focus_target_screen(&self) -> Screen {
+        match self.overview_focus_pane {
+            OverviewPane::ActionLane | OverviewPane::DecisionPulse => Screen::Explainability,
+            OverviewPane::CandidateHotlist => Screen::Candidates,
+            OverviewPane::BallastQuick => Screen::Ballast,
+            OverviewPane::ExtendedCounters => Screen::Diagnostics,
+            OverviewPane::PressureSummary
+            | OverviewPane::ForecastHorizon
+            | OverviewPane::EwmaTrend
+            | OverviewPane::SpecialLocations => Screen::Timeline,
         }
     }
 }
@@ -930,6 +1005,8 @@ pub enum DashboardMsg {
     Tick,
     /// Terminal key press event.
     Key(KeyEvent),
+    /// Terminal mouse event.
+    Mouse(MouseEvent),
     /// Terminal was resized.
     Resize { cols: u16, rows: u16 },
     /// Fresh daemon state arrived (None = daemon unreachable).
@@ -1064,7 +1141,33 @@ mod tests {
         assert_eq!(model.screen, Screen::Overview);
         assert!(model.screen_history.is_empty());
         assert!(model.active_overlay.is_none());
+        assert_eq!(model.overview_focus_pane, OverviewPane::PressureSummary);
+        assert!(model.overview_hover_pane.is_none());
         assert!(model.notifications.is_empty());
+    }
+
+    #[test]
+    fn overview_focus_ring_cycles_next_and_prev() {
+        let mut model = test_model();
+        let start = model.overview_focus_pane;
+        for _ in 0..DashboardModel::overview_focus_ring().len() {
+            model.overview_focus_next();
+        }
+        assert_eq!(model.overview_focus_pane, start);
+
+        model.overview_focus_prev();
+        assert_eq!(model.overview_focus_pane, OverviewPane::ExtendedCounters);
+    }
+
+    #[test]
+    fn overview_focus_target_screen_mapping_is_stable() {
+        let mut model = test_model();
+        model.overview_set_focus(OverviewPane::CandidateHotlist);
+        assert_eq!(model.overview_focus_target_screen(), Screen::Candidates);
+        model.overview_set_focus(OverviewPane::ExtendedCounters);
+        assert_eq!(model.overview_focus_target_screen(), Screen::Diagnostics);
+        model.overview_set_focus(OverviewPane::BallastQuick);
+        assert_eq!(model.overview_focus_target_screen(), Screen::Ballast);
     }
 
     #[test]

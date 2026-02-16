@@ -37,10 +37,13 @@ pub enum PanePriority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverviewPane {
     PressureSummary,
+    ForecastHorizon,
     ActionLane,
     EwmaTrend,
-    RecentActivity,
+    DecisionPulse,
+    CandidateHotlist,
     BallastQuick,
+    SpecialLocations,
     ExtendedCounters,
 }
 
@@ -49,13 +52,25 @@ impl OverviewPane {
     pub const fn id(self) -> &'static str {
         match self {
             Self::PressureSummary => "pressure-summary",
+            Self::ForecastHorizon => "forecast-horizon",
             Self::ActionLane => "action-lane",
             Self::EwmaTrend => "ewma-trend",
-            Self::RecentActivity => "recent-activity",
+            Self::DecisionPulse => "decision-pulse",
+            Self::CandidateHotlist => "candidate-hotlist",
             Self::BallastQuick => "ballast-quick",
+            Self::SpecialLocations => "special-locations",
             Self::ExtendedCounters => "extended-counters",
         }
     }
+}
+
+/// Density tier for S1 Overview composition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverviewDensity {
+    Sm,
+    Md,
+    Lg,
+    Xl,
 }
 
 /// Minimal rectangular placement metadata for a pane.
@@ -109,6 +124,7 @@ impl PanePlacement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverviewLayout {
     pub class: LayoutClass,
+    pub density: OverviewDensity,
     pub placements: Vec<PanePlacement>,
 }
 
@@ -127,15 +143,36 @@ pub const fn classify_layout(cols: u16) -> LayoutClass {
 /// Build pane placements for the overview screen.
 #[must_use]
 pub fn build_overview_layout(cols: u16, rows: u16) -> OverviewLayout {
-    match classify_layout(cols) {
-        LayoutClass::Narrow => build_narrow_layout(cols, rows),
-        LayoutClass::Wide => build_wide_layout(cols, rows),
+    let density = classify_overview_density(cols, rows);
+    match density {
+        OverviewDensity::Sm => build_overview_sm(cols, rows),
+        OverviewDensity::Md => build_overview_md(cols, rows),
+        OverviewDensity::Lg => build_overview_lg(cols, rows),
+        OverviewDensity::Xl => build_overview_xl(cols, rows),
     }
 }
 
-fn build_narrow_layout(cols: u16, rows: u16) -> OverviewLayout {
+#[must_use]
+pub const fn classify_overview_density(cols: u16, rows: u16) -> OverviewDensity {
+    if cols >= 240 && rows >= 34 {
+        OverviewDensity::Xl
+    } else if cols >= 170 && rows >= 28 {
+        OverviewDensity::Lg
+    } else if cols >= 120 && rows >= 22 {
+        OverviewDensity::Md
+    } else {
+        OverviewDensity::Sm
+    }
+}
+
+fn build_overview_sm(cols: u16, rows: u16) -> OverviewLayout {
     let full_width = cols.max(1);
-    let p2_visible = rows >= 20;
+    let ewma_visible = rows >= 12;
+    let decision_visible = rows >= 15;
+    let hotlist_visible = rows >= 18;
+    let ballast_visible = rows >= 20;
+    let special_visible = rows >= 22;
+    let counters_visible = rows >= 24;
 
     let placements = vec![
         PanePlacement::new(
@@ -145,90 +182,281 @@ fn build_narrow_layout(cols: u16, rows: u16) -> OverviewLayout {
             true,
         ),
         PanePlacement::new(
-            OverviewPane::ActionLane,
+            OverviewPane::ForecastHorizon,
             PanePriority::P0,
             PaneRect::new(0, 3, full_width, 3),
             true,
         ),
         PanePlacement::new(
-            OverviewPane::EwmaTrend,
-            PanePriority::P1,
+            OverviewPane::ActionLane,
+            PanePriority::P0,
             PaneRect::new(0, 6, full_width, 3),
             true,
         ),
         PanePlacement::new(
-            OverviewPane::RecentActivity,
+            OverviewPane::EwmaTrend,
             PanePriority::P1,
             PaneRect::new(0, 9, full_width, 3),
-            true,
+            ewma_visible,
+        ),
+        PanePlacement::new(
+            OverviewPane::DecisionPulse,
+            PanePriority::P1,
+            PaneRect::new(0, 12, full_width, 3),
+            decision_visible,
+        ),
+        PanePlacement::new(
+            OverviewPane::CandidateHotlist,
+            PanePriority::P1,
+            PaneRect::new(0, 15, full_width, 3),
+            hotlist_visible,
         ),
         PanePlacement::new(
             OverviewPane::BallastQuick,
             PanePriority::P1,
-            PaneRect::new(0, 12, full_width, 2),
-            true,
+            PaneRect::new(0, 18, full_width, 2),
+            ballast_visible,
+        ),
+        PanePlacement::new(
+            OverviewPane::SpecialLocations,
+            PanePriority::P2,
+            PaneRect::new(0, 20, full_width, 2),
+            special_visible,
         ),
         PanePlacement::new(
             OverviewPane::ExtendedCounters,
             PanePriority::P2,
-            PaneRect::new(0, 14, full_width, 2),
-            p2_visible,
+            PaneRect::new(0, 22, full_width, 2),
+            counters_visible,
         ),
     ];
 
     OverviewLayout {
         class: LayoutClass::Narrow,
+        density: OverviewDensity::Sm,
         placements,
     }
 }
 
-fn build_wide_layout(cols: u16, rows: u16) -> OverviewLayout {
+fn build_overview_md(cols: u16, rows: u16) -> OverviewLayout {
     let full_width = cols.max(1);
     let (left_width, right_width) = split_columns(full_width, 1);
     let right_col = left_width.saturating_add(1);
-    let p2_visible = rows >= 24;
+    let bottom_row = rows >= 24;
+    let extra_row = rows >= 30;
 
     let placements = vec![
         PanePlacement::new(
             OverviewPane::PressureSummary,
             PanePriority::P0,
-            PaneRect::new(0, 0, left_width, 4),
+            PaneRect::new(0, 0, left_width, 5),
+            true,
+        ),
+        PanePlacement::new(
+            OverviewPane::ForecastHorizon,
+            PanePriority::P0,
+            PaneRect::new(right_col, 0, right_width, 5),
             true,
         ),
         PanePlacement::new(
             OverviewPane::ActionLane,
             PanePriority::P0,
-            PaneRect::new(right_col, 0, right_width, 4),
+            PaneRect::new(0, 5, left_width, 5),
             true,
         ),
         PanePlacement::new(
             OverviewPane::EwmaTrend,
             PanePriority::P1,
-            PaneRect::new(0, 4, left_width, 4),
+            PaneRect::new(right_col, 5, right_width, 5),
             true,
         ),
         PanePlacement::new(
-            OverviewPane::RecentActivity,
+            OverviewPane::DecisionPulse,
             PanePriority::P1,
-            PaneRect::new(right_col, 4, right_width, 4),
+            PaneRect::new(0, 10, left_width, 4),
+            bottom_row,
+        ),
+        PanePlacement::new(
+            OverviewPane::CandidateHotlist,
+            PanePriority::P1,
+            PaneRect::new(right_col, 10, right_width, 4),
+            bottom_row,
+        ),
+        PanePlacement::new(
+            OverviewPane::BallastQuick,
+            PanePriority::P1,
+            PaneRect::new(0, 14, left_width, 4),
+            bottom_row,
+        ),
+        PanePlacement::new(
+            OverviewPane::SpecialLocations,
+            PanePriority::P2,
+            PaneRect::new(right_col, 14, right_width, 4),
+            extra_row,
+        ),
+        PanePlacement::new(
+            OverviewPane::ExtendedCounters,
+            PanePriority::P2,
+            PaneRect::new(0, 18, full_width, 3),
+            extra_row,
+        ),
+    ];
+
+    OverviewLayout {
+        class: LayoutClass::Wide,
+        density: OverviewDensity::Md,
+        placements,
+    }
+}
+
+fn build_overview_lg(cols: u16, rows: u16) -> OverviewLayout {
+    let full_width = cols.max(1);
+    let usable = full_width.saturating_sub(2);
+    let left = (usable / 3).max(1);
+    let mid = (usable / 3).max(1);
+    let right = usable.saturating_sub(left + mid).max(1);
+    let col_mid = left.saturating_add(1);
+    let col_right = left.saturating_add(mid).saturating_add(2);
+    let bottom_visible = rows >= 26;
+    let p2_visible = rows >= 32;
+
+    let placements = vec![
+        PanePlacement::new(
+            OverviewPane::PressureSummary,
+            PanePriority::P0,
+            PaneRect::new(0, 0, left, 6),
+            true,
+        ),
+        PanePlacement::new(
+            OverviewPane::ForecastHorizon,
+            PanePriority::P0,
+            PaneRect::new(col_mid, 0, mid, 6),
+            true,
+        ),
+        PanePlacement::new(
+            OverviewPane::ActionLane,
+            PanePriority::P0,
+            PaneRect::new(col_right, 0, right, 6),
+            true,
+        ),
+        PanePlacement::new(
+            OverviewPane::EwmaTrend,
+            PanePriority::P1,
+            PaneRect::new(0, 6, left, 6),
+            true,
+        ),
+        PanePlacement::new(
+            OverviewPane::DecisionPulse,
+            PanePriority::P1,
+            PaneRect::new(col_mid, 6, mid, 6),
+            true,
+        ),
+        PanePlacement::new(
+            OverviewPane::CandidateHotlist,
+            PanePriority::P1,
+            PaneRect::new(col_right, 6, right, 6),
             true,
         ),
         PanePlacement::new(
             OverviewPane::BallastQuick,
             PanePriority::P1,
-            PaneRect::new(right_col, 8, right_width, 3),
-            true,
+            PaneRect::new(0, 12, left + 1 + mid, 5),
+            bottom_visible,
+        ),
+        PanePlacement::new(
+            OverviewPane::SpecialLocations,
+            PanePriority::P2,
+            PaneRect::new(col_right, 12, right, 5),
+            bottom_visible,
         ),
         PanePlacement::new(
             OverviewPane::ExtendedCounters,
             PanePriority::P2,
-            PaneRect::new(0, 11, full_width, 3),
+            PaneRect::new(0, 17, full_width, 4),
             p2_visible,
         ),
     ];
 
     OverviewLayout {
         class: LayoutClass::Wide,
+        density: OverviewDensity::Lg,
+        placements,
+    }
+}
+
+fn build_overview_xl(term_cols: u16, rows: u16) -> OverviewLayout {
+    let full_width = term_cols.max(1);
+    let usable = full_width.saturating_sub(3);
+    let c1 = (usable / 4).max(1);
+    let c2 = (usable / 4).max(1);
+    let c3 = (usable / 4).max(1);
+    let c4 = usable.saturating_sub(c1 + c2 + c3).max(1);
+    let col_b = c1.saturating_add(1);
+    let col_c = c1.saturating_add(c2).saturating_add(2);
+    let col_d = c1.saturating_add(c2 + c3).saturating_add(3);
+    let row3_visible = rows >= 30;
+    let row4_visible = rows >= 36;
+
+    let placements = vec![
+        PanePlacement::new(
+            OverviewPane::PressureSummary,
+            PanePriority::P0,
+            PaneRect::new(0, 0, c1, 6),
+            true,
+        ),
+        PanePlacement::new(
+            OverviewPane::ForecastHorizon,
+            PanePriority::P0,
+            PaneRect::new(col_b, 0, c2, 6),
+            true,
+        ),
+        PanePlacement::new(
+            OverviewPane::ActionLane,
+            PanePriority::P0,
+            PaneRect::new(col_c, 0, c3, 6),
+            true,
+        ),
+        PanePlacement::new(
+            OverviewPane::DecisionPulse,
+            PanePriority::P1,
+            PaneRect::new(col_d, 0, c4, 6),
+            true,
+        ),
+        PanePlacement::new(
+            OverviewPane::EwmaTrend,
+            PanePriority::P1,
+            PaneRect::new(0, 6, c1 + 1 + c2, 8),
+            true,
+        ),
+        PanePlacement::new(
+            OverviewPane::CandidateHotlist,
+            PanePriority::P1,
+            PaneRect::new(col_c, 6, c3, 8),
+            true,
+        ),
+        PanePlacement::new(
+            OverviewPane::BallastQuick,
+            PanePriority::P1,
+            PaneRect::new(col_d, 6, c4, 8),
+            true,
+        ),
+        PanePlacement::new(
+            OverviewPane::SpecialLocations,
+            PanePriority::P2,
+            PaneRect::new(0, 14, c1 + 1 + c2 + 1 + c3, 6),
+            row3_visible,
+        ),
+        PanePlacement::new(
+            OverviewPane::ExtendedCounters,
+            PanePriority::P2,
+            PaneRect::new(col_d, 14, c4, 6),
+            row4_visible,
+        ),
+    ];
+
+    OverviewLayout {
+        class: LayoutClass::Wide,
+        density: OverviewDensity::Xl,
         placements,
     }
 }
@@ -1148,23 +1376,33 @@ mod tests {
             .iter()
             .find(|p| p.pane == OverviewPane::ExtendedCounters);
         assert!(p2.is_some_and(|p| !p.visible));
+        assert_eq!(layout.density, OverviewDensity::Sm);
     }
 
     #[test]
     fn wide_layout_uses_two_columns() {
         let layout = build_overview_layout(140, 30);
         assert_eq!(layout.class, LayoutClass::Wide);
+        assert_eq!(layout.density, OverviewDensity::Md);
         let pressure = layout
             .placements
             .iter()
             .find(|p| p.pane == OverviewPane::PressureSummary)
             .expect("pressure pane");
-        let action = layout
+        let forecast = layout
             .placements
             .iter()
-            .find(|p| p.pane == OverviewPane::ActionLane)
-            .expect("action pane");
-        assert!(action.rect.col > pressure.rect.col);
+            .find(|p| p.pane == OverviewPane::ForecastHorizon)
+            .expect("forecast pane");
+        assert!(forecast.rect.col > pressure.rect.col);
+    }
+
+    #[test]
+    fn overview_density_breakpoints_cover_all_tiers() {
+        assert_eq!(classify_overview_density(80, 24), OverviewDensity::Sm);
+        assert_eq!(classify_overview_density(130, 24), OverviewDensity::Md);
+        assert_eq!(classify_overview_density(180, 30), OverviewDensity::Lg);
+        assert_eq!(classify_overview_density(260, 40), OverviewDensity::Xl);
     }
 
     // ── Timeline layout ──

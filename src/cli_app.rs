@@ -2275,69 +2275,53 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
             // Navigate dot-path and set value.
             set_toml_value(&mut toml_value, &set_args.key, &set_args.value)?;
 
-            // Write back.
+            let toml_str = toml::to_string_pretty(&toml_value)
+                .map_err(|e| CliError::Runtime(format!("serialize config: {e}")))?;
+
+            // Validate BEFORE writing: write to a temp file, validate from it,
+            // then atomically rename to the real path.  This prevents a race
+            // where a daemon SIGHUP reload picks up an invalid config between
+            // the write and the validate step.
             if let Some(parent) = config_path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| CliError::Runtime(format!("create config dir: {e}")))?;
             }
-            let toml_str = toml::to_string_pretty(&toml_value)
-                .map_err(|e| CliError::Runtime(format!("serialize config: {e}")))?;
-            std::fs::write(&config_path, &toml_str)
-                .map_err(|e| CliError::Runtime(format!("write config: {e}")))?;
+            let tmp_path = config_path.with_extension("toml.tmp");
+            std::fs::write(&tmp_path, &toml_str)
+                .map_err(|e| CliError::Runtime(format!("write temp config: {e}")))?;
 
-            // Validate the resulting config.
-            match Config::load(Some(&config_path)) {
-                Ok(_) => {
-                    match output_mode(cli) {
-                        OutputMode::Human => {
-                            println!(
-                                "Set {} = {} in {}",
-                                set_args.key,
-                                set_args.value,
-                                config_path.display()
-                            );
-                        }
-                        OutputMode::Json => {
-                            let payload = json!({
-                                "command": "config set",
-                                "key": set_args.key,
-                                "value": set_args.value,
-                                "path": config_path.to_string_lossy(),
-                                "valid": true,
-                            });
-                            write_json_line(&payload)?;
-                        }
-                    }
-                    Ok(())
+            if let Err(e) = Config::load(Some(&tmp_path)) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(CliError::User(format!(
+                    "refusing to write invalid config: {e}"
+                )));
+            }
+
+            // Validation passed — atomically replace the real config.
+            std::fs::rename(&tmp_path, &config_path)
+                .map_err(|e| CliError::Runtime(format!("rename config: {e}")))?;
+
+            match output_mode(cli) {
+                OutputMode::Human => {
+                    println!(
+                        "Set {} = {} in {}",
+                        set_args.key,
+                        set_args.value,
+                        config_path.display()
+                    );
                 }
-                Err(e) => {
-                    match output_mode(cli) {
-                        OutputMode::Human => {
-                            println!(
-                                "Set {} = {} in {}",
-                                set_args.key,
-                                set_args.value,
-                                config_path.display()
-                            );
-                            eprintln!("Warning: resulting configuration is invalid: {e}");
-                        }
-                        OutputMode::Json => {
-                            let payload = json!({
-                                "command": "config set",
-                                "key": set_args.key,
-                                "value": set_args.value,
-                                "path": config_path.to_string_lossy(),
-                                "valid": false,
-                                "validation_error": e.to_string(),
-                            });
-                            write_json_line(&payload)?;
-                        }
-                    }
-                    Err(CliError::Partial(format!(
-                        "value set but config invalid: {e}"
-                    )))
+                OutputMode::Json => {
+                    let payload = json!({
+                        "command": "config set",
+                        "key": set_args.key,
+                        "value": set_args.value,
+                        "path": config_path.to_string_lossy(),
+                        "valid": true,
+                    });
+                    write_json_line(&payload)?;
                 }
             }
+            Ok(())
         }
     }
 }
@@ -3610,7 +3594,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 })
                 .collect();
 
-            let payload = json!({
+            let mut payload = json!({
                 "command": "scan",
                 "scanned_directories": dir_count,
                 "elapsed_seconds": elapsed.as_secs_f64(),
@@ -3619,6 +3603,30 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 "total_reclaimable_bytes": total_reclaimable,
                 "candidates": entries_json,
             });
+
+            if args.show_protected {
+                let protections = {
+                    let prot = walker.protection().read();
+                    prot.list_protections()
+                };
+                let protected_json: Vec<Value> = protections
+                    .iter()
+                    .map(|e| {
+                        let source = match &e.source {
+                            storage_ballast_helper::scanner::protection::ProtectionSource::MarkerFile => "marker",
+                            storage_ballast_helper::scanner::protection::ProtectionSource::ConfigPattern(p) => p.as_str(),
+                        };
+                        json!({
+                            "path": e.path.to_string_lossy(),
+                            "source": source,
+                        })
+                    })
+                    .collect();
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("protected_paths".to_string(), json!(protected_json));
+                }
+            }
+
             write_json_line(&payload)?;
         }
     }
