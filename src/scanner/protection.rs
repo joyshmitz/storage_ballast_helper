@@ -344,12 +344,12 @@ fn glob_to_regex(pattern: &str) -> Result<Regex> {
     while i < chars.len() {
         match chars[i] {
             '*' if i + 1 < chars.len() && chars[i + 1] == '*' => {
-                regex_str.push_str(".*");
-                i += 2;
-                // Skip trailing slash after ** if present.
-                if i < chars.len() && chars[i] == '/' {
-                    regex_str.push_str("/?");
-                    i += 1;
+                if i + 2 < chars.len() && chars[i + 2] == '/' {
+                    regex_str.push_str("(?:.*/)?");
+                    i += 3;
+                } else {
+                    regex_str.push_str(".*");
+                    i += 2;
                 }
             }
             '*' => {
