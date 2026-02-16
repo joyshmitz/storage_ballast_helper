@@ -298,6 +298,12 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
             category: ArtifactCategory::RustTarget,
         },
         ArtifactPattern {
+            name: "target-suffix",
+            kind: MatchKind::Suffix("-target"),
+            confidence: 0.88,
+            category: ArtifactCategory::RustTarget,
+        },
+        ArtifactPattern {
             name: "tmp-cargo-home",
             kind: MatchKind::Prefix(".tmp_cargo_home_"),
             confidence: 0.90,
@@ -344,6 +350,30 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
             kind: MatchKind::Prefix("br-build"),
             confidence: 0.82,
             category: ArtifactCategory::RustTarget,
+        },
+        ArtifactPattern {
+            name: "frankenterm-prefix",
+            kind: MatchKind::Prefix("frankenterm-"),
+            confidence: 0.90,
+            category: ArtifactCategory::AgentWorkspace,
+        },
+        ArtifactPattern {
+            name: "cargo-home-prefix",
+            kind: MatchKind::Prefix("cargo-home-"),
+            confidence: 0.88,
+            category: ArtifactCategory::TempDir,
+        },
+        ArtifactPattern {
+            name: "dot-cargo-prefix",
+            kind: MatchKind::Prefix(".cargo_"),
+            confidence: 0.86,
+            category: ArtifactCategory::CacheDir,
+        },
+        ArtifactPattern {
+            name: "agent-ft-suffix",
+            kind: MatchKind::Suffix("-ft"),
+            confidence: 0.90,
+            category: ArtifactCategory::AgentWorkspace,
         },
         ArtifactPattern {
             name: "cass-target",
@@ -421,6 +451,9 @@ pub fn extract_pattern_label(path: &str) -> String {
     if lower == "target" || lower.starts_with("target-") {
         return "target/".to_string();
     }
+    if lower.ends_with("-target") {
+        return "*-target".to_string();
+    }
     if lower.starts_with(".target") || lower.starts_with("_target_") {
         return ".target*".to_string();
     }
@@ -438,6 +471,18 @@ pub fn extract_pattern_label(path: &str) -> String {
     }
     if lower.starts_with("br-build") {
         return "br-build*".to_string();
+    }
+    if lower.starts_with("frankenterm-") {
+        return "frankenterm-*".to_string();
+    }
+    if lower.starts_with("cargo-home-") {
+        return "cargo-home-*".to_string();
+    }
+    if lower.starts_with(".cargo_") {
+        return ".cargo_*".to_string();
+    }
+    if lower.ends_with("-ft") {
+        return "*-ft".to_string();
     }
     if lower.starts_with(".tmp_target") {
         return ".tmp_target*".to_string();
@@ -520,5 +565,30 @@ mod tests {
             "score {} was not penalized enough",
             classification.combined_confidence
         );
+    }
+
+    #[test]
+    fn tmp_agent_and_cache_patterns_from_real_world_dirs() {
+        let registry = ArtifactPatternRegistry::default();
+        let cases = [
+            ("green-ft", ArtifactCategory::AgentWorkspace),
+            ("frankenterm-build-1234", ArtifactCategory::AgentWorkspace),
+            ("cargo-home-pearlstone", ArtifactCategory::TempDir),
+            (".cargo_cache_runner", ArtifactCategory::CacheDir),
+            ("work-target", ArtifactCategory::RustTarget),
+        ];
+
+        for (name, expected) in cases {
+            let classification = registry.classify(Path::new(name), StructuralSignals::default());
+            assert_eq!(
+                classification.category, expected,
+                "unexpected classification for {name}"
+            );
+            assert!(
+                classification.combined_confidence > 0.55,
+                "low confidence {:.2} for {name}",
+                classification.combined_confidence
+            );
+        }
     }
 }

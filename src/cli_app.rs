@@ -24,7 +24,7 @@ use storage_ballast_helper::daemon::service::{
 use storage_ballast_helper::logger::sqlite::SqliteLogger;
 use storage_ballast_helper::logger::stats::{StatsEngine, window_label};
 use storage_ballast_helper::monitor::fs_stats::FsStatsCollector;
-use storage_ballast_helper::platform::pal::{ServiceManager, detect_platform};
+use storage_ballast_helper::platform::pal::{MemoryInfo, ServiceManager, detect_platform};
 use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionPlan};
 use storage_ballast_helper::scanner::patterns::ArtifactPatternRegistry;
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
@@ -2984,6 +2984,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
     } else {
         None
     };
+    let memory_info = platform.memory_info().ok();
 
     match output_mode(cli) {
         OutputMode::Human => {
@@ -3036,6 +3037,39 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     free_pct,
                     level.to_uppercase(),
                 );
+            }
+
+            if let Some(memory) = &memory_info {
+                println!("\nMemory:");
+                let ram_free_pct = bytes_to_pct(memory.available_bytes, memory.total_bytes);
+                println!(
+                    "  RAM:  {:>10} free / {:>10} total ({:>5.1}% free)",
+                    format_bytes(memory.available_bytes),
+                    format_bytes(memory.total_bytes),
+                    ram_free_pct
+                );
+
+                if memory.swap_total_bytes > 0 {
+                    let swap_used_bytes = memory
+                        .swap_total_bytes
+                        .saturating_sub(memory.swap_free_bytes);
+                    let swap_used_pct = bytes_to_pct(swap_used_bytes, memory.swap_total_bytes);
+                    let thrash_risk = is_swap_thrash_risk(memory);
+                    let risk_note = if thrash_risk { "  [THRASH-RISK]" } else { "" };
+                    println!(
+                        "  Swap: {:>10} used / {:>10} total ({:>5.1}% used){risk_note}",
+                        format_bytes(swap_used_bytes),
+                        format_bytes(memory.swap_total_bytes),
+                        swap_used_pct
+                    );
+                    if thrash_risk {
+                        println!(
+                            "  Hint: high swap use with substantial free RAM can indicate swap thrashing."
+                        );
+                    }
+                } else {
+                    println!("  Swap: disabled");
+                }
             }
 
             // Rate estimates from daemon state.
@@ -3154,6 +3188,19 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                         config.ballast.file_size_bytes,
                     ),
                 },
+                "memory": memory_info.as_ref().map(|memory| {
+                    let swap_used_bytes = memory.swap_total_bytes.saturating_sub(memory.swap_free_bytes);
+                    json!({
+                        "ram_total_bytes": memory.total_bytes,
+                        "ram_available_bytes": memory.available_bytes,
+                        "ram_free_pct": bytes_to_pct(memory.available_bytes, memory.total_bytes),
+                        "swap_total_bytes": memory.swap_total_bytes,
+                        "swap_free_bytes": memory.swap_free_bytes,
+                        "swap_used_bytes": swap_used_bytes,
+                        "swap_used_pct": bytes_to_pct(swap_used_bytes, memory.swap_total_bytes),
+                        "swap_thrash_risk": is_swap_thrash_risk(memory),
+                    })
+                }),
                 "recent_hour": recent,
             });
             write_json_line(&payload)?;
@@ -3187,6 +3234,33 @@ fn pressure_severity(level: &str) -> u8 {
         "critical" => 4,
         _ => 0,
     }
+}
+
+fn bytes_to_pct(value: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            (value as f64 * 100.0) / total as f64
+        }
+    }
+}
+
+fn is_swap_thrash_risk(memory: &MemoryInfo) -> bool {
+    if memory.swap_total_bytes == 0 {
+        return false;
+    }
+
+    let swap_used_bytes = memory
+        .swap_total_bytes
+        .saturating_sub(memory.swap_free_bytes);
+    let swap_used_pct = bytes_to_pct(swap_used_bytes, memory.swap_total_bytes);
+    // If swap is heavily used while plenty of RAM is still available, the host
+    // likely experienced pressure and is now paging memory back in slowly.
+    const THRASH_SWAP_USED_PCT: f64 = 70.0;
+    const MIN_AVAILABLE_RAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+    swap_used_pct >= THRASH_SWAP_USED_PCT && memory.available_bytes >= MIN_AVAILABLE_RAM_BYTES
 }
 
 fn ballast_total_pool_bytes(file_count: usize, file_size_bytes: u64) -> u64 {
@@ -5850,5 +5924,41 @@ mod tests {
         );
         assert_eq!(opts.metadata_cache_ttl, std::time::Duration::from_secs(42));
         assert!(!opts.notices_enabled);
+    }
+
+    #[test]
+    fn bytes_to_pct_handles_zero_total() {
+        assert_eq!(bytes_to_pct(100, 0), 0.0);
+        assert_eq!(bytes_to_pct(50, 200), 25.0);
+    }
+
+    #[test]
+    fn swap_thrash_risk_detects_high_swap_with_free_ram() {
+        let memory = MemoryInfo {
+            total_bytes: 128 * 1024 * 1024 * 1024,
+            available_bytes: 64 * 1024 * 1024 * 1024,
+            swap_total_bytes: 72 * 1024 * 1024 * 1024,
+            swap_free_bytes: 10 * 1024 * 1024 * 1024,
+        };
+        assert!(is_swap_thrash_risk(&memory));
+    }
+
+    #[test]
+    fn swap_thrash_risk_ignores_no_swap_or_low_usage() {
+        let no_swap = MemoryInfo {
+            total_bytes: 64 * 1024 * 1024 * 1024,
+            available_bytes: 16 * 1024 * 1024 * 1024,
+            swap_total_bytes: 0,
+            swap_free_bytes: 0,
+        };
+        assert!(!is_swap_thrash_risk(&no_swap));
+
+        let low_swap = MemoryInfo {
+            total_bytes: 64 * 1024 * 1024 * 1024,
+            available_bytes: 32 * 1024 * 1024 * 1024,
+            swap_total_bytes: 32 * 1024 * 1024 * 1024,
+            swap_free_bytes: 16 * 1024 * 1024 * 1024,
+        };
+        assert!(!is_swap_thrash_risk(&low_swap));
     }
 }
