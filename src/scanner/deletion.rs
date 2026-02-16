@@ -796,4 +796,30 @@ mod tests {
         );
         drop(handle);
     }
+
+    #[test]
+    fn deletion_report_tracks_deleted_paths() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let file1 = dir.path().join("a.txt");
+        let file2 = dir.path().join("b.txt");
+        let file3 = dir.path().join("c.txt");
+        fs::write(&file1, "data1").unwrap();
+        fs::write(&file2, "data2").unwrap();
+        fs::write(&file3, "data3").unwrap();
+
+        let c1 = make_candidate(&file1, 5, 0.85);
+        let c2 = make_candidate(&file2, 5, 0.80);
+        let c3 = make_candidate(&file3, 5, 0.75);
+
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let plan = executor.plan(vec![c1, c2, c3]);
+        let report = executor.execute(&plan, None);
+
+        assert_eq!(report.items_deleted, 3);
+        assert_eq!(report.deleted_paths.len(), 3);
+        assert!(report.deleted_paths.contains(&file1));
+        assert!(report.deleted_paths.contains(&file2));
+        assert!(report.deleted_paths.contains(&file3));
+    }
 }

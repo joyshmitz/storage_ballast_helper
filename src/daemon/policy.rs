@@ -224,16 +224,17 @@ impl PolicyEngine {
     /// Create a new policy engine with the given configuration.
     #[must_use]
     pub fn new(config: PolicyConfig) -> Self {
-        let initial = if config.kill_switch {
-            ActiveMode::FallbackSafe
+        let intended = config.initial_mode;
+        let (active, reason) = if config.kill_switch {
+            (ActiveMode::FallbackSafe, Some(FallbackReason::KillSwitch))
         } else {
-            config.initial_mode
+            (intended, None)
         };
         Self {
             config,
-            mode: initial,
-            pre_fallback_mode: initial,
-            fallback_reason: None,
+            mode: active,
+            pre_fallback_mode: intended,
+            fallback_reason: reason,
             builder: DecisionRecordBuilder::new(),
             consecutive_clean_windows: 0,
             consecutive_breach_windows: 0,

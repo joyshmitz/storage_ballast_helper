@@ -2012,6 +2012,12 @@ impl RepeatDeletionTracker {
         }
     }
 
+    /// Update cooldown parameters from reloaded config without dropping history.
+    fn update_cooldowns(&mut self, base_cooldown: Duration, max_cooldown: Duration) {
+        self.base_cooldown = base_cooldown;
+        self.max_cooldown = max_cooldown;
+    }
+
     /// Remaining cooldown for a path, or `None` if no cooldown applies.
     ///
     /// Formula: `base_cooldown * 2^(cycle_count - 1)`, capped at `max_cooldown`.
@@ -2032,7 +2038,7 @@ impl RepeatDeletionTracker {
         if elapsed >= cooldown {
             None
         } else {
-            Some(cooldown - elapsed)
+            cooldown.checked_sub(elapsed)
         }
     }
 
@@ -2105,6 +2111,12 @@ fn executor_thread_main(
     while let Ok(batch) = del_rx.recv() {
         heartbeat.beat();
         batch_count += 1;
+
+        // Pick up live config reloads for repeat-deletion dampening.
+        tracker.update_cooldowns(
+            Duration::from_secs(shared_config.repeat_base_cooldown_secs()),
+            Duration::from_secs(shared_config.repeat_max_cooldown_secs()),
+        );
 
         // Gate candidates through the policy engine. The lock is held only for
         // the duration of evaluate() (pure computation, no I/O).
@@ -2195,7 +2207,7 @@ fn executor_thread_main(
         }
 
         // Periodic pruning of expired dampening entries.
-        if batch_count % 10 == 0 {
+        if batch_count.is_multiple_of(10) {
             tracker.prune_expired();
         }
     }
@@ -2655,5 +2667,163 @@ mod tests {
             ..risky
         };
         assert!(!is_swap_thrash_risk(&low_ram));
+    }
+
+    // ──────────────────── repeat deletion dampening ────────────────────
+
+    #[test]
+    fn repeat_dampening_new_path_no_dampening() {
+        let tracker =
+            RepeatDeletionTracker::new(Duration::from_secs(300), Duration::from_secs(3600));
+        let candidates = vec![test_candidate("/tmp/target/debug", 0.9)];
+        let (approved, dampened) = tracker.filter_candidates(candidates, PressureLevel::Orange);
+        assert_eq!(approved.len(), 1);
+        assert!(dampened.is_empty());
+    }
+
+    #[test]
+    fn repeat_dampening_within_cooldown_dampened() {
+        let mut tracker =
+            RepeatDeletionTracker::new(Duration::from_secs(300), Duration::from_secs(3600));
+        let path = PathBuf::from("/tmp/target/debug");
+        tracker.record_deletions(std::slice::from_ref(&path));
+
+        let candidates = vec![test_candidate("/tmp/target/debug", 0.9)];
+        let (approved, dampened) = tracker.filter_candidates(candidates, PressureLevel::Orange);
+        assert!(approved.is_empty());
+        assert_eq!(dampened.len(), 1);
+    }
+
+    #[test]
+    fn repeat_dampening_after_cooldown_allowed() {
+        let mut tracker = RepeatDeletionTracker::new(
+            Duration::from_secs(0), // zero cooldown for test
+            Duration::from_secs(3600),
+        );
+        let path = PathBuf::from("/tmp/target/debug");
+        tracker.record_deletions(std::slice::from_ref(&path));
+
+        // With base_cooldown=0, the cooldown should already be expired.
+        let candidates = vec![test_candidate("/tmp/target/debug", 0.9)];
+        let (approved, dampened) = tracker.filter_candidates(candidates, PressureLevel::Orange);
+        assert_eq!(approved.len(), 1);
+        assert!(dampened.is_empty());
+    }
+
+    #[test]
+    fn repeat_dampening_exponential_backoff_growth() {
+        let mut tracker =
+            RepeatDeletionTracker::new(Duration::from_secs(300), Duration::from_secs(3600));
+        let path = PathBuf::from("/tmp/target/debug");
+
+        // 1st deletion: cycle_count becomes 1, cooldown = 300s
+        tracker.record_deletions(std::slice::from_ref(&path));
+        let cd1 = tracker.cooldown_for(&path).expect("should have cooldown");
+
+        // 2nd deletion: cycle_count becomes 2, cooldown = 600s
+        tracker.record_deletions(std::slice::from_ref(&path));
+        let cd2 = tracker.cooldown_for(&path).expect("should have cooldown");
+
+        // 3rd deletion: cycle_count becomes 3, cooldown = 1200s
+        tracker.record_deletions(std::slice::from_ref(&path));
+        let cd3 = tracker.cooldown_for(&path).expect("should have cooldown");
+
+        // Each should be roughly double (within timing tolerance).
+        assert!(cd2 > cd1, "cd2 ({cd2:?}) should be > cd1 ({cd1:?})");
+        assert!(cd3 > cd2, "cd3 ({cd3:?}) should be > cd2 ({cd2:?})");
+    }
+
+    #[test]
+    fn repeat_dampening_max_cooldown_cap() {
+        let mut tracker =
+            RepeatDeletionTracker::new(Duration::from_secs(300), Duration::from_secs(3600));
+        let path = PathBuf::from("/tmp/target/debug");
+
+        // Record many deletions to push past max.
+        for _ in 0..20 {
+            tracker.record_deletions(std::slice::from_ref(&path));
+        }
+
+        let cooldown = tracker.cooldown_for(&path).expect("should have cooldown");
+        // Cooldown should not exceed max_cooldown (3600s).
+        assert!(
+            cooldown <= Duration::from_secs(3600),
+            "cooldown {cooldown:?} should be <= 3600s"
+        );
+    }
+
+    #[test]
+    fn repeat_dampening_red_pressure_bypasses() {
+        let mut tracker =
+            RepeatDeletionTracker::new(Duration::from_secs(300), Duration::from_secs(3600));
+        let path = PathBuf::from("/tmp/target/debug");
+        tracker.record_deletions(std::slice::from_ref(&path));
+
+        let candidates = vec![test_candidate("/tmp/target/debug", 0.9)];
+        let (approved, dampened) = tracker.filter_candidates(candidates, PressureLevel::Red);
+        assert_eq!(approved.len(), 1);
+        assert!(dampened.is_empty());
+    }
+
+    #[test]
+    fn repeat_dampening_critical_pressure_bypasses() {
+        let mut tracker =
+            RepeatDeletionTracker::new(Duration::from_secs(300), Duration::from_secs(3600));
+        let path = PathBuf::from("/tmp/target/debug");
+        tracker.record_deletions(std::slice::from_ref(&path));
+
+        let candidates = vec![test_candidate("/tmp/target/debug", 0.9)];
+        let (approved, dampened) = tracker.filter_candidates(candidates, PressureLevel::Critical);
+        assert_eq!(approved.len(), 1);
+        assert!(dampened.is_empty());
+    }
+
+    #[test]
+    fn repeat_dampening_mixed_paths() {
+        let mut tracker =
+            RepeatDeletionTracker::new(Duration::from_secs(300), Duration::from_secs(3600));
+        // Only record deletion for one path.
+        tracker.record_deletions(&[PathBuf::from("/tmp/target/debug")]);
+
+        let candidates = vec![
+            test_candidate("/tmp/target/debug", 0.9),
+            test_candidate("/tmp/node_modules", 0.8),
+            test_candidate("/data/projects/build", 0.7),
+        ];
+        let (approved, dampened) = tracker.filter_candidates(candidates, PressureLevel::Orange);
+        assert_eq!(approved.len(), 2);
+        assert_eq!(dampened.len(), 1);
+        assert_eq!(dampened[0].path, Path::new("/tmp/target/debug"));
+    }
+
+    #[test]
+    fn repeat_dampening_prune_removes_expired() {
+        let mut tracker = RepeatDeletionTracker::new(
+            Duration::from_secs(300),
+            Duration::from_secs(0), // max_cooldown=0 so everything is instantly expired
+        );
+        tracker.record_deletions(&[PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]);
+        assert_eq!(tracker.history.len(), 2);
+
+        // With max_cooldown=0 all entries are "expired" since elapsed > 0.
+        std::thread::sleep(Duration::from_millis(1));
+        tracker.prune_expired();
+        assert!(tracker.history.is_empty());
+    }
+
+    #[test]
+    fn repeat_dampening_cycle_count_increments() {
+        let mut tracker =
+            RepeatDeletionTracker::new(Duration::from_secs(300), Duration::from_secs(3600));
+        let path = PathBuf::from("/tmp/target/debug");
+
+        tracker.record_deletions(std::slice::from_ref(&path));
+        assert_eq!(tracker.history[&path].cycle_count, 1);
+
+        tracker.record_deletions(std::slice::from_ref(&path));
+        assert_eq!(tracker.history[&path].cycle_count, 2);
+
+        tracker.record_deletions(std::slice::from_ref(&path));
+        assert_eq!(tracker.history[&path].cycle_count, 3);
     }
 }
