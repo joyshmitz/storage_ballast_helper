@@ -22,17 +22,12 @@ use crate::daemon::self_monitor::DaemonState;
 /// Additional screens (timeline, explainability, candidates, ballast) will be
 /// added in Phase 3 (bd-xzt.3.*). The enum is non-exhaustive to allow future
 /// extension without breaking downstream matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Screen {
     /// Primary overview: pressure gauges, EWMA trends, ballast, counters.
     /// Provides parity with the legacy dashboard (contracts C-05 through C-18).
+    #[default]
     Overview,
-}
-
-impl Default for Screen {
-    fn default() -> Self {
-        Self::Overview
-    }
 }
 
 // ──────────────────── rate history ────────────────────
@@ -179,7 +174,7 @@ pub enum DashboardMsg {
     /// Terminal was resized.
     Resize { cols: u16, rows: u16 },
     /// Fresh daemon state arrived (None = daemon unreachable).
-    DataUpdate(Option<DaemonState>),
+    DataUpdate(Option<Box<DaemonState>>),
 }
 
 // ──────────────────── commands ────────────────────
@@ -196,7 +191,7 @@ pub enum DashboardCmd {
     /// Terminate the dashboard event loop.
     Quit,
     /// Execute multiple commands.
-    Batch(Vec<DashboardCmd>),
+    Batch(Vec<Self>),
 }
 
 // ──────────────────── tests ────────────────────

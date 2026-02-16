@@ -13,16 +13,11 @@ use crate::cli::dashboard::{self, DashboardConfig as LegacyDashboardConfig};
 /// `NewCockpit` is the canonical modern entrypoint. During the migration it can
 /// intentionally delegate to legacy rendering while we wire model/update/view
 /// internals behind the same external contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DashboardRuntimeMode {
+    #[default]
     NewCockpit,
     LegacyFallback,
-}
-
-impl Default for DashboardRuntimeMode {
-    fn default() -> Self {
-        Self::NewCockpit
-    }
 }
 
 /// Runtime configuration shared by both new and legacy dashboard executors.

@@ -68,7 +68,7 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
                 model.degraded = true;
             }
 
-            model.daemon_state = state;
+            model.daemon_state = state.map(|s| *s);
             DashboardCmd::None
         }
     }
@@ -220,7 +220,7 @@ mod tests {
 
         let cmd = update(
             &mut model,
-            DashboardMsg::DataUpdate(Some(sample_daemon_state())),
+            DashboardMsg::DataUpdate(Some(Box::new(sample_daemon_state()))),
         );
         assert!(!model.degraded);
         assert!(model.daemon_state.is_some());
@@ -234,7 +234,7 @@ mod tests {
         // First make it non-degraded.
         update(
             &mut model,
-            DashboardMsg::DataUpdate(Some(sample_daemon_state())),
+            DashboardMsg::DataUpdate(Some(Box::new(sample_daemon_state()))),
         );
         assert!(!model.degraded);
 
@@ -251,7 +251,7 @@ mod tests {
 
         update(
             &mut model,
-            DashboardMsg::DataUpdate(Some(sample_daemon_state())),
+            DashboardMsg::DataUpdate(Some(Box::new(sample_daemon_state()))),
         );
         assert!(model.rate_histories.contains_key("/"));
         assert_eq!(model.rate_histories["/"].latest(), Some(1024.0));
@@ -264,14 +264,17 @@ mod tests {
         // First update with mount "/".
         update(
             &mut model,
-            DashboardMsg::DataUpdate(Some(sample_daemon_state())),
+            DashboardMsg::DataUpdate(Some(Box::new(sample_daemon_state()))),
         );
         assert!(model.rate_histories.contains_key("/"));
 
         // Second update with no mounts at all.
         let mut empty_state = sample_daemon_state();
         empty_state.pressure.mounts.clear();
-        update(&mut model, DashboardMsg::DataUpdate(Some(empty_state)));
+        update(
+            &mut model,
+            DashboardMsg::DataUpdate(Some(Box::new(empty_state))),
+        );
         assert!(model.rate_histories.is_empty());
     }
 

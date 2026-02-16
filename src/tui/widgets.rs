@@ -7,6 +7,7 @@ pub const SPARK_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '�
 
 /// Render a normalized sparkline from `0.0..=1.0` values.
 #[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn sparkline(values: &[f64]) -> String {
     values
         .iter()
