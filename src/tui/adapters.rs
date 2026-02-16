@@ -86,6 +86,27 @@ pub struct MountSnapshot {
     pub source: SnapshotSource,
 }
 
+/// Schema drift warnings detected during state file ingestion.
+///
+/// Populated by comparing actual JSON keys against expected struct fields.
+/// Enables operators and maintainers to identify version mismatches between
+/// the daemon writing `state.json` and the dashboard reading it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaWarnings {
+    /// Top-level JSON keys not recognized by the current typed model.
+    pub unknown_fields: Vec<String>,
+    /// Fields expected by the typed model but absent from the JSON.
+    pub missing_fields: Vec<String>,
+}
+
+impl SchemaWarnings {
+    /// Whether any drift was detected.
+    #[must_use]
+    pub fn has_drift(&self) -> bool {
+        !self.unknown_fields.is_empty() || !self.missing_fields.is_empty()
+    }
+}
+
 /// Typed data payload consumed by model/update code.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DashboardSnapshot {
@@ -93,6 +114,8 @@ pub struct DashboardSnapshot {
     pub mounts: Vec<MountSnapshot>,
     pub freshness: StateFreshness,
     pub source: SnapshotSource,
+    /// Schema drift detected during deserialization. Empty when no drift.
+    pub warnings: SchemaWarnings,
 }
 
 /// Typed state-file + fallback adapter for the new dashboard runtime.
@@ -128,17 +151,24 @@ impl DashboardStateAdapter {
         ))
     }
 
-    /// Read state-file data with stale detection and filesystem fallback.
+    /// Read state-file data with stale detection, schema drift analysis, and
+    /// filesystem fallback.
     #[must_use]
     pub fn load_snapshot(&self, state_file: &Path, monitor_paths: &[PathBuf]) -> DashboardSnapshot {
-        match self.read_state_outcome(state_file) {
-            StateReadOutcome::Fresh(state) => DashboardSnapshot {
+        let outcome = self.read_state_outcome(state_file);
+        match outcome {
+            StateReadOutcome::Fresh { state, warnings } => DashboardSnapshot {
                 mounts: mounts_from_state(&state),
                 daemon_state: Some(state),
                 freshness: StateFreshness::Fresh,
                 source: SnapshotSource::DaemonState,
+                warnings,
             },
-            StateReadOutcome::Stale { state, age } => {
+            StateReadOutcome::Stale {
+                state,
+                age,
+                warnings,
+            } => {
                 let fallback_mounts = self.collect_fallback_mounts(monitor_paths);
                 let source = fallback_source(&fallback_mounts);
                 DashboardSnapshot {
@@ -146,6 +176,7 @@ impl DashboardStateAdapter {
                     mounts: fallback_mounts,
                     freshness: StateFreshness::Stale { age },
                     source,
+                    warnings,
                 }
             }
             StateReadOutcome::Missing => {
@@ -156,6 +187,7 @@ impl DashboardStateAdapter {
                     mounts: fallback_mounts,
                     freshness: StateFreshness::Missing,
                     source,
+                    warnings: SchemaWarnings::default(),
                 }
             }
             StateReadOutcome::Malformed => {
@@ -166,6 +198,7 @@ impl DashboardStateAdapter {
                     mounts: fallback_mounts,
                     freshness: StateFreshness::Malformed,
                     source,
+                    warnings: SchemaWarnings::default(),
                 }
             }
             StateReadOutcome::ReadError(details) => {
@@ -176,6 +209,7 @@ impl DashboardStateAdapter {
                     mounts: fallback_mounts,
                     freshness: StateFreshness::ReadError(details),
                     source,
+                    warnings: SchemaWarnings::default(),
                 }
             }
         }
@@ -198,6 +232,11 @@ impl DashboardStateAdapter {
             Err(error) => return StateReadOutcome::ReadError(error.to_string()),
         };
 
+        // Detect schema drift: parse as untyped Value first to compare keys.
+        let warnings = detect_schema_drift(&raw);
+
+        // `DaemonState` uses `#[serde(default)]` so that missing fields
+        // get zero-values rather than hard-failing deserialization.
         let Ok(state) = serde_json::from_str::<DaemonState>(&raw) else {
             return StateReadOutcome::Malformed;
         };
@@ -211,9 +250,13 @@ impl DashboardStateAdapter {
             .unwrap_or_default();
 
         if age > self.stale_threshold {
-            StateReadOutcome::Stale { state, age }
+            StateReadOutcome::Stale {
+                state,
+                age,
+                warnings,
+            }
         } else {
-            StateReadOutcome::Fresh(state)
+            StateReadOutcome::Fresh { state, warnings }
         }
     }
 
@@ -244,7 +287,7 @@ impl DashboardStateAdapter {
 impl StateAdapter for DashboardStateAdapter {
     fn read_state(&self, state_file: &Path) -> Option<DaemonState> {
         match self.read_state_outcome(state_file) {
-            StateReadOutcome::Fresh(state) => Some(state),
+            StateReadOutcome::Fresh { state, .. } => Some(state),
             StateReadOutcome::Stale { .. }
             | StateReadOutcome::Missing
             | StateReadOutcome::Malformed
@@ -259,11 +302,60 @@ impl StateAdapter for DashboardStateAdapter {
 
 #[derive(Debug)]
 enum StateReadOutcome {
-    Fresh(DaemonState),
-    Stale { state: DaemonState, age: Duration },
+    Fresh {
+        state: DaemonState,
+        warnings: SchemaWarnings,
+    },
+    Stale {
+        state: DaemonState,
+        age: Duration,
+        warnings: SchemaWarnings,
+    },
     Missing,
     Malformed,
     ReadError(String),
+}
+
+/// Expected top-level keys in `DaemonState`. Used for drift detection.
+const EXPECTED_STATE_KEYS: &[&str] = &[
+    "version",
+    "pid",
+    "started_at",
+    "uptime_seconds",
+    "last_updated",
+    "pressure",
+    "ballast",
+    "last_scan",
+    "counters",
+    "memory_rss_bytes",
+];
+
+/// Compare JSON keys against expected `DaemonState` fields.
+fn detect_schema_drift(raw: &str) -> SchemaWarnings {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return SchemaWarnings::default();
+    };
+    let Some(obj) = value.as_object() else {
+        return SchemaWarnings::default();
+    };
+
+    let actual_keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+    let expected_keys: std::collections::BTreeSet<&str> =
+        EXPECTED_STATE_KEYS.iter().copied().collect();
+
+    let unknown_fields: Vec<String> = actual_keys
+        .difference(&expected_keys)
+        .map(|k| (*k).to_string())
+        .collect();
+    let missing_fields: Vec<String> = expected_keys
+        .difference(&actual_keys)
+        .map(|k| (*k).to_string())
+        .collect();
+
+    SchemaWarnings {
+        unknown_fields,
+        missing_fields,
+    }
 }
 
 fn mounts_from_state(state: &DaemonState) -> Vec<MountSnapshot> {
@@ -533,5 +625,182 @@ mod tests {
             },
             PlatformPaths::default(),
         ))
+    }
+
+    // ──────────────── schema-shielding tests ────────────────
+
+    #[test]
+    fn fresh_state_has_no_schema_warnings() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state_path = tmp.path().join("state.json");
+        write_state_file(&state_path, sample_daemon_state()).expect("write");
+
+        let adapter = DashboardStateAdapter::new(
+            mock_platform(),
+            Duration::from_secs(90),
+            Duration::from_secs(1),
+        );
+        let snapshot = adapter.load_snapshot(&state_path, &[]);
+
+        assert!(!snapshot.warnings.has_drift());
+        assert!(snapshot.warnings.unknown_fields.is_empty());
+        assert!(snapshot.warnings.missing_fields.is_empty());
+    }
+
+    #[test]
+    fn extra_fields_in_json_produce_unknown_warning() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state_path = tmp.path().join("state.json");
+
+        // Write state with an extra top-level field (simulates newer daemon).
+        let mut value: serde_json::Value =
+            serde_json::to_value(sample_daemon_state()).expect("to value");
+        value["new_telemetry_field"] = serde_json::json!({ "fancy": true });
+        std::fs::write(&state_path, serde_json::to_string(&value).expect("json")).expect("write");
+
+        let adapter = DashboardStateAdapter::new(
+            mock_platform(),
+            Duration::from_secs(90),
+            Duration::from_secs(1),
+        );
+        let snapshot = adapter.load_snapshot(&state_path, &[]);
+
+        assert!(snapshot.warnings.has_drift());
+        assert_eq!(
+            snapshot.warnings.unknown_fields,
+            vec!["new_telemetry_field"]
+        );
+        assert!(snapshot.warnings.missing_fields.is_empty());
+        // Despite drift, the state should parse successfully.
+        assert!(snapshot.daemon_state.is_some());
+        assert_eq!(snapshot.freshness, StateFreshness::Fresh);
+    }
+
+    #[test]
+    fn missing_optional_fields_produce_missing_warning() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state_path = tmp.path().join("state.json");
+
+        // Write state missing the `memory_rss_bytes` field (simulates older daemon).
+        let mut value: serde_json::Value =
+            serde_json::to_value(sample_daemon_state()).expect("to value");
+        value.as_object_mut().unwrap().remove("memory_rss_bytes");
+        std::fs::write(&state_path, serde_json::to_string(&value).expect("json")).expect("write");
+
+        let adapter = DashboardStateAdapter::new(
+            mock_platform(),
+            Duration::from_secs(90),
+            Duration::from_secs(1),
+        );
+        let snapshot = adapter.load_snapshot(&state_path, &[]);
+
+        assert!(snapshot.warnings.has_drift());
+        assert!(snapshot.warnings.unknown_fields.is_empty());
+        assert_eq!(snapshot.warnings.missing_fields, vec!["memory_rss_bytes"]);
+        // Parsing still succeeds (serde default kicks in).
+        assert!(snapshot.daemon_state.is_some());
+        let state = snapshot.daemon_state.unwrap();
+        assert_eq!(state.memory_rss_bytes, 0); // Default value
+    }
+
+    #[test]
+    fn minimal_json_object_parses_with_all_defaults() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state_path = tmp.path().join("state.json");
+
+        // Write a near-empty JSON object — every field should default.
+        std::fs::write(&state_path, "{}").expect("write");
+
+        let adapter = DashboardStateAdapter::new(
+            mock_platform(),
+            Duration::from_secs(90),
+            Duration::from_secs(1),
+        );
+        let snapshot = adapter.load_snapshot(&state_path, &[PathBuf::from("/tmp/work")]);
+
+        // Should parse as Fresh (file was just written, so not stale).
+        assert!(snapshot.daemon_state.is_some());
+        let state = snapshot.daemon_state.unwrap();
+        assert_eq!(state.version, "");
+        assert_eq!(state.pid, 0);
+        assert_eq!(state.pressure.mounts.len(), 0);
+        assert_eq!(state.counters.scans, 0);
+
+        // All known fields are missing.
+        assert!(snapshot.warnings.has_drift());
+        assert_eq!(
+            snapshot.warnings.missing_fields.len(),
+            EXPECTED_STATE_KEYS.len()
+        );
+    }
+
+    #[test]
+    fn both_extra_and_missing_fields_reported() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state_path = tmp.path().join("state.json");
+
+        let mut value: serde_json::Value =
+            serde_json::to_value(sample_daemon_state()).expect("to value");
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("counters");
+        obj.insert("future_feature".to_string(), serde_json::json!(42));
+        std::fs::write(&state_path, serde_json::to_string(&value).expect("json")).expect("write");
+
+        let adapter = DashboardStateAdapter::new(
+            mock_platform(),
+            Duration::from_secs(90),
+            Duration::from_secs(1),
+        );
+        let snapshot = adapter.load_snapshot(&state_path, &[]);
+
+        assert!(snapshot.warnings.has_drift());
+        assert_eq!(snapshot.warnings.unknown_fields, vec!["future_feature"]);
+        assert_eq!(snapshot.warnings.missing_fields, vec!["counters"]);
+        assert!(snapshot.daemon_state.is_some());
+    }
+
+    #[test]
+    fn schema_warnings_default_is_no_drift() {
+        let w = SchemaWarnings::default();
+        assert!(!w.has_drift());
+        assert!(w.unknown_fields.is_empty());
+        assert!(w.missing_fields.is_empty());
+    }
+
+    #[test]
+    fn detect_drift_on_non_json_returns_empty() {
+        let w = detect_schema_drift("not valid json");
+        assert!(!w.has_drift());
+    }
+
+    #[test]
+    fn detect_drift_on_json_array_returns_empty() {
+        let w = detect_schema_drift("[1, 2, 3]");
+        assert!(!w.has_drift());
+    }
+
+    #[test]
+    fn stale_state_still_reports_schema_warnings() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state_path = tmp.path().join("state.json");
+
+        let mut value: serde_json::Value =
+            serde_json::to_value(sample_daemon_state()).expect("to value");
+        value["extra_metric"] = serde_json::json!("new");
+        std::fs::write(&state_path, serde_json::to_string(&value).expect("json")).expect("write");
+
+        let stale_mtime = FileTime::from_system_time(SystemTime::now() - Duration::from_secs(3600));
+        set_file_mtime(&state_path, stale_mtime).expect("set stale mtime");
+
+        let adapter = DashboardStateAdapter::new(
+            mock_platform(),
+            Duration::from_secs(90),
+            Duration::from_secs(1),
+        );
+        let snapshot = adapter.load_snapshot(&state_path, &[PathBuf::from("/tmp/work")]);
+
+        assert!(matches!(snapshot.freshness, StateFreshness::Stale { .. }));
+        assert!(snapshot.warnings.has_drift());
+        assert_eq!(snapshot.warnings.unknown_fields, vec!["extra_metric"]);
     }
 }

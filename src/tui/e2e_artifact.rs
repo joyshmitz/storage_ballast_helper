@@ -181,7 +181,7 @@ impl RunSummary {
     /// Derive summary from a list of case artifacts.
     pub fn from_cases(cases: &[TestCaseArtifact]) -> Self {
         let mut s = Self {
-            total: cases.len() as u32,
+            total: u32::try_from(cases.len()).unwrap_or(u32::MAX),
             passed: 0,
             failed: 0,
             timed_out: 0,
@@ -321,6 +321,7 @@ pub struct DiagnosticEntry {
     pub ts: Option<String>,
 }
 
+#[allow(clippy::return_self_not_must_use)]
 impl DiagnosticEntry {
     pub fn info(message: impl Into<String>) -> Self {
         Self {
@@ -370,6 +371,7 @@ pub struct ArtifactCollector {
     case_counter: u32,
 }
 
+#[allow(clippy::return_self_not_must_use)]
 impl ArtifactCollector {
     /// Start a new collection run.
     pub fn new(suite: impl Into<String>) -> Self {
@@ -428,10 +430,13 @@ impl ArtifactCollector {
     /// Finalize into a [`TestRunBundle`], computing summary and status.
     pub fn finalize(self) -> TestRunBundle {
         let finished = SystemTime::now();
-        let elapsed_ms = finished
-            .duration_since(self.started_at)
-            .unwrap_or(Duration::ZERO)
-            .as_millis() as u64;
+        let elapsed_ms = u64::try_from(
+            finished
+                .duration_since(self.started_at)
+                .unwrap_or(Duration::ZERO)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
 
         let summary = RunSummary::from_cases(&self.cases);
         let status = if summary.failed > 0 || summary.timed_out > 0 {
@@ -477,7 +482,8 @@ pub struct CaseBuilder<'a> {
     trace_id: String,
 }
 
-impl<'a> CaseBuilder<'a> {
+#[allow(clippy::return_self_not_must_use)]
+impl CaseBuilder<'_> {
     /// Set the grouping section.
     pub fn section(mut self, section: impl Into<String>) -> Self {
         self.section = Some(section.into());
@@ -568,10 +574,13 @@ impl<'a> CaseBuilder<'a> {
     /// Finalize the case and add it to the collector. Returns the trace ID.
     pub fn finish(self) -> String {
         let finished = SystemTime::now();
-        let elapsed_ms = finished
-            .duration_since(self.started_at)
-            .unwrap_or(Duration::ZERO)
-            .as_millis() as u64;
+        let elapsed_ms = u64::try_from(
+            finished
+                .duration_since(self.started_at)
+                .unwrap_or(Duration::ZERO)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
 
         let status = self.status.unwrap_or_else(|| {
             if self.assertions.iter().all(|a| a.passed) {
@@ -1013,12 +1022,12 @@ mod tests {
 
         let bundle = collector.finalize();
         // stderr counts as diagnostics, so no warning about missing diagnostics.
-        let diag_warnings: Vec<_> = bundle
-            .validation_warnings
-            .iter()
-            .filter(|w| w.contains("no diagnostics"))
-            .collect();
-        assert!(diag_warnings.is_empty());
+        assert!(
+            !bundle
+                .validation_warnings
+                .iter()
+                .any(|w| w.contains("no diagnostics"))
+        );
     }
 
     #[test]
@@ -1033,12 +1042,14 @@ mod tests {
             .finish();
 
         let bundle = collector.finalize();
-        let frame_warnings: Vec<_> = bundle
-            .validation_warnings
-            .iter()
-            .filter(|w| w.contains("no captured frames"))
-            .collect();
-        assert_eq!(frame_warnings.len(), 1);
+        assert_eq!(
+            bundle
+                .validation_warnings
+                .iter()
+                .filter(|w| w.contains("no captured frames"))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1154,7 +1165,11 @@ mod tests {
         let bundle = collector.finalize();
         let name = artifact_filename(&bundle);
         assert!(name.starts_with("naming-"));
-        assert!(name.ends_with(".json"));
+        assert!(
+            std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        );
     }
 
     // ── EnvironmentInfo ──

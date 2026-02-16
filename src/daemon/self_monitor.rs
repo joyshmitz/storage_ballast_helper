@@ -34,7 +34,13 @@ pub const DAEMON_STATE_STALE_THRESHOLD_SECS: u64 = 90;
 // ──────────────────── state file schema ────────────────────
 
 /// Top-level state written to `state.json` for CLI consumption.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// All fields use `#[serde(default)]` so that minor schema evolution
+/// (new fields added by a newer daemon, or old fields removed) does not
+/// hard-fail deserialization. The dashboard adapter layer detects drift
+/// and surfaces warnings rather than crashing.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DaemonState {
     pub version: String,
     pub pid: u32,
@@ -49,7 +55,8 @@ pub struct DaemonState {
 }
 
 /// Current pressure across monitored mounts.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PressureState {
     pub overall: String,
     pub mounts: Vec<MountPressure>,
@@ -59,13 +66,15 @@ pub struct PressureState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MountPressure {
     pub path: String,
+    #[serde(default)]
     pub free_pct: f64,
     pub level: String,
     pub rate_bps: Option<f64>,
 }
 
 /// Current ballast file state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BallastState {
     pub available: usize,
     pub total: usize,
@@ -73,7 +82,8 @@ pub struct BallastState {
 }
 
 /// Last scan summary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LastScanState {
     pub at: Option<String>,
     pub candidates: usize,
@@ -81,14 +91,14 @@ pub struct LastScanState {
 }
 
 /// Cumulative counters since daemon start.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Counters {
     pub scans: u64,
     pub deletions: u64,
     pub bytes_freed: u64,
     pub errors: u64,
     /// Log events silently dropped due to channel back-pressure.
-    #[serde(default)]
     pub dropped_log_events: u64,
 }
 
@@ -467,22 +477,29 @@ fn write_state_atomic(path: &Path, state: &DaemonState) -> std::io::Result<()> {
     }
 
     let json = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
-    {
-        use std::io::Write;
-        let mut opts = OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            opts.mode(0o600);
-        }
-        let mut file = opts.open(&tmp_path)?;
-        file.write_all(json.as_bytes())?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp_path, path)?;
 
-    Ok(())
+    let result = (|| {
+        {
+            use std::io::Write;
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o600);
+            }
+            let mut file = opts.open(&tmp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 // ──────────────────── RSS reading ────────────────────

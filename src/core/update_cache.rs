@@ -75,9 +75,16 @@ impl UpdateMetadataCache {
             )
         })?;
 
-        fs::write(&tmp_path, data)?;
-        fs::rename(&tmp_path, &self.path)?;
-        Ok(())
+        let result = (|| {
+            fs::write(&tmp_path, data)?;
+            fs::rename(&tmp_path, &self.path)?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+        result
     }
 
     /// Remove cache file if present.
