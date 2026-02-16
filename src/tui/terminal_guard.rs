@@ -65,19 +65,21 @@ impl TerminalGuard {
 
     /// Terminal dimensions (columns, rows).
     ///
-    /// Queries the terminal via a temporary `TtyBackend`. Falls back to
-    /// (80, 24) if the query fails (e.g. no tty attached).
+    /// Reads `$COLUMNS`/`$LINES` environment variables set by the shell.
+    /// Falls back to (80, 24) if unavailable (e.g. no tty attached, CI).
     #[must_use]
     pub fn terminal_size() -> (u16, u16) {
-        // Open a temporary backend just for the size query. The RAII guard
-        // restores the terminal immediately on drop.
-        let opts = ftui_tty::TtySessionOptions::default();
-        if let Ok(backend) = TtyBackend::open(80, 24, opts) {
-            if let Ok(size) = ftui_backend::BackendEventSource::size(&backend) {
-                return size;
-            }
-        }
-        (80, 24)
+        let cols = std::env::var("COLUMNS")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(80);
+        let rows = std::env::var("LINES")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(24);
+        (cols, rows)
     }
 }
 
