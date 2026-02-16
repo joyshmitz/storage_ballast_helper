@@ -284,12 +284,6 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
             category: ArtifactCategory::RustTarget,
         },
         ArtifactPattern {
-            name: "cargo-prefix",
-            kind: MatchKind::Prefix("cargo_"),
-            confidence: 0.84,
-            category: ArtifactCategory::RustTarget,
-        },
-        ArtifactPattern {
             name: "target-prefix",
             kind: MatchKind::Prefix("target-"),
             confidence: 0.82,
@@ -412,19 +406,19 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
         ArtifactPattern {
             name: "generic-cache-prefix-hyphen",
             kind: MatchKind::Prefix("cache-"),
-            confidence: 0.60,
+            confidence: 0.45,
             category: ArtifactCategory::CacheDir,
         },
         ArtifactPattern {
             name: "generic-cache-prefix-underscore",
             kind: MatchKind::Prefix("cache_"),
-            confidence: 0.60,
+            confidence: 0.45,
             category: ArtifactCategory::CacheDir,
         },
         ArtifactPattern {
             name: "generic-cache-exact",
             kind: MatchKind::Exact("cache"),
-            confidence: 0.60,
+            confidence: 0.45,
             category: ArtifactCategory::CacheDir,
         },
         ArtifactPattern {
@@ -436,19 +430,19 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
         ArtifactPattern {
             name: "generic-tmp-prefix-hyphen",
             kind: MatchKind::Prefix("tmp-"),
-            confidence: 0.58,
+            confidence: 0.45,
             category: ArtifactCategory::TempDir,
         },
         ArtifactPattern {
             name: "generic-tmp-prefix-underscore",
             kind: MatchKind::Prefix("tmp_"),
-            confidence: 0.58,
+            confidence: 0.45,
             category: ArtifactCategory::TempDir,
         },
         ArtifactPattern {
             name: "generic-tmp-exact",
             kind: MatchKind::Exact("tmp"),
-            confidence: 0.58,
+            confidence: 0.45,
             category: ArtifactCategory::TempDir,
         },
         ArtifactPattern {

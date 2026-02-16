@@ -28,7 +28,7 @@ use crate::ballast::coordinator::BallastPoolCoordinator;
 use crate::ballast::release::BallastReleaseController;
 use crate::core::config::Config;
 use crate::core::errors::{Result, SbhError};
-use crate::daemon::notifications::{NotificationEvent, NotificationManager};
+use crate::daemon::notifications::{NotificationEvent, NotificationManager, NotificationLevel};
 use crate::daemon::policy::PolicyEngine;
 use crate::daemon::self_monitor::{SelfMonitor, ThreadHeartbeat};
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat};
@@ -293,6 +293,7 @@ pub struct MonitoringDaemon {
     last_pressure_level: PressureLevel,
     last_special_scan: HashMap<PathBuf, Instant>,
     last_predictive_warning: Option<Instant>,
+    last_predictive_level: Option<NotificationLevel>,
     last_ewma_confidence: f64,
     last_swap_thrash_warning: Option<Instant>,
     swap_thrash_active: bool,
@@ -596,6 +597,7 @@ impl MonitoringDaemon {
             last_pressure_level: PressureLevel::Green,
             last_special_scan: HashMap::new(),
             last_predictive_warning: None,
+            last_predictive_level: None,
             last_ewma_confidence: 0.0,
             last_swap_thrash_warning: None,
             swap_thrash_active: false,
@@ -1245,14 +1247,38 @@ impl MonitoringDaemon {
             return;
         }
 
+        let minutes = seconds / 60.0;
+        // Determine severity level based on config thresholds.
+        let current_level = if minutes < self.config.pressure.prediction.critical_danger_minutes {
+            NotificationLevel::Critical
+        } else if minutes < self.config.pressure.prediction.imminent_danger_minutes {
+            NotificationLevel::Red
+        } else {
+            NotificationLevel::Warning
+        };
+
         let now = Instant::now();
-        if let Some(last) = self.last_predictive_warning
-            && now.duration_since(last) < Duration::from_secs(300)
-        {
+        let should_notify = match self.last_predictive_level {
+            Some(last_level) => {
+                // Escalate if severity increases (e.g. Warning -> Red)
+                // OR if time cooldown (5 mins) expires.
+                if current_level > last_level {
+                    true
+                } else if let Some(last_time) = self.last_predictive_warning {
+                    now.duration_since(last_time) >= Duration::from_secs(300)
+                } else {
+                    true
+                }
+            }
+            None => true,
+        };
+
+        if !should_notify {
             return;
         }
 
         self.last_predictive_warning = Some(now);
+        self.last_predictive_level = Some(current_level);
         self.notification_manager
             .notify(&NotificationEvent::PredictiveWarning {
                 mount: response.causing_mount.to_string_lossy().to_string(),
