@@ -126,6 +126,15 @@ impl PidPressureController {
         self.target_free_pct = target;
     }
 
+    /// Update all four pressure-level thresholds (e.g., after config reload).
+    /// These drive `classify_with_hysteresis` for level transitions.
+    pub fn set_pressure_thresholds(&mut self, green: f64, yellow: f64, orange: f64, red: f64) {
+        self.green_min_free_pct = green;
+        self.yellow_min_free_pct = yellow;
+        self.orange_min_free_pct = orange;
+        self.red_min_free_pct = red;
+    }
+
     /// Update controller state.
     ///
     /// `predicted_seconds_to_red` comes from EWMA and boosts urgency when time-to-red is short.
@@ -599,5 +608,36 @@ mod tests {
             Instant::now(),
         );
         assert!(response.urgency >= 0.70);
+    }
+
+    #[test]
+    fn set_pressure_thresholds_updates_all_four() {
+        let mut ctrl = PidPressureController::new(
+            0.25,
+            0.08,
+            0.02,
+            100.0,
+            18.0,
+            1.0,
+            20.0,
+            14.0,
+            10.0,
+            6.0,
+            Duration::from_secs(1),
+        );
+
+        // Initial thresholds from constructor.
+        assert!((ctrl.green_min_free_pct - 20.0).abs() < f64::EPSILON);
+        assert!((ctrl.yellow_min_free_pct - 14.0).abs() < f64::EPSILON);
+        assert!((ctrl.orange_min_free_pct - 10.0).abs() < f64::EPSILON);
+        assert!((ctrl.red_min_free_pct - 6.0).abs() < f64::EPSILON);
+
+        // Update all four.
+        ctrl.set_pressure_thresholds(40.0, 25.0, 15.0, 8.0);
+
+        assert!((ctrl.green_min_free_pct - 40.0).abs() < f64::EPSILON);
+        assert!((ctrl.yellow_min_free_pct - 25.0).abs() < f64::EPSILON);
+        assert!((ctrl.orange_min_free_pct - 15.0).abs() < f64::EPSILON);
+        assert!((ctrl.red_min_free_pct - 8.0).abs() < f64::EPSILON);
     }
 }

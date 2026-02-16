@@ -414,7 +414,8 @@ impl SelfMonitor {
         // Check staleness.
         if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&state.last_updated) {
             let age = chrono::Utc::now().signed_duration_since(updated);
-            if age.num_seconds() > 60 {
+            #[allow(clippy::cast_possible_wrap)]
+            if age.num_seconds() > DAEMON_STATE_STALE_THRESHOLD_SECS as i64 {
                 eprintln!(
                     "[SBH-STATUS] WARNING: state file is {}s old — daemon may be stalled",
                     age.num_seconds()

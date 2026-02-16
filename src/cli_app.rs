@@ -23,7 +23,7 @@ use storage_ballast_helper::daemon::service::{
 };
 use storage_ballast_helper::logger::sqlite::SqliteLogger;
 use storage_ballast_helper::logger::stats::{StatsEngine, window_label};
-use storage_ballast_helper::platform::pal::{LinuxPlatform, Platform, ServiceManager};
+use storage_ballast_helper::platform::pal::{ServiceManager, detect_platform};
 use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionPlan};
 use storage_ballast_helper::scanner::patterns::ArtifactPatternRegistry;
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
@@ -2745,7 +2745,7 @@ fn run_status(cli: &Cli, args: &StatusArgs) -> Result<(), CliError> {
 fn render_status(cli: &Cli) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
-    let platform = LinuxPlatform::new();
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
     let version = env!("CARGO_PKG_VERSION");
 
     // Gather filesystem stats for all root paths + standard mounts.
@@ -3529,8 +3529,8 @@ fn build_pressure_check(
 ) -> Option<Box<dyn Fn() -> bool>> {
     let target = target_free?;
     let check_path = root_paths.first()?.clone();
+    let platform = detect_platform().ok()?;
     Some(Box::new(move || {
-        let platform = LinuxPlatform::new();
         platform
             .fs_stats(&check_path)
             .map(|stats| stats.free_pct() >= target)
@@ -3556,7 +3556,7 @@ fn run_interactive_clean(
     let mut bytes_freed: u64 = 0;
     let mut delete_all = false;
 
-    let platform = LinuxPlatform::new();
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
 
     println!("Proceed with deletion? [y/N/a(ll)/s(kip)/q(uit)]");
     println!("  y - delete this item    a - delete all remaining");
@@ -3752,7 +3752,7 @@ fn emit_clean_report_json(
     clippy::cast_sign_loss
 )]
 fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
-    let platform = LinuxPlatform::new();
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
 
     // Determine check path: CLI arg, or cwd.
     let check_path = args
@@ -4108,7 +4108,7 @@ fn run_interactive_emergency(
     let mut bytes_freed: u64 = 0;
     let mut delete_all = false;
 
-    let platform = LinuxPlatform::new();
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
 
     eprintln!("Proceed with deletion? [y/N/a(ll)/s(kip)/q(uit)]");
 

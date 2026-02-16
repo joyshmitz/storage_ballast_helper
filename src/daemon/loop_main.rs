@@ -408,6 +408,8 @@ impl MonitoringDaemon {
                             code: "SBH-3900".to_string(),
                             message: "scanner thread exceeded respawn limit".to_string(),
                         });
+                        eprintln!("[SBH-DAEMON] scanner exceeded respawn limit, shutting down");
+                        break;
                     }
                 }
 
@@ -442,6 +444,8 @@ impl MonitoringDaemon {
                             code: "SBH-3900".to_string(),
                             message: "executor thread exceeded respawn limit".to_string(),
                         });
+                        eprintln!("[SBH-DAEMON] executor exceeded respawn limit, shutting down");
+                        break;
                     }
                 }
             }
@@ -746,6 +750,12 @@ impl MonitoringDaemon {
                     // Propagate pressure thresholds to PID controller.
                     self.pressure_controller
                         .set_target_free_pct(new_config.pressure.yellow_min_free_pct);
+                    self.pressure_controller.set_pressure_thresholds(
+                        new_config.pressure.green_min_free_pct,
+                        new_config.pressure.yellow_min_free_pct,
+                        new_config.pressure.orange_min_free_pct,
+                        new_config.pressure.red_min_free_pct,
+                    );
                     if new_config.pressure.prediction.enabled {
                         self.pressure_controller.set_action_horizon_minutes(
                             new_config.pressure.prediction.action_horizon_minutes,

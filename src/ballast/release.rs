@@ -127,8 +127,8 @@ impl BallastReleaseController {
             return Ok(false);
         }
 
-        // Nothing to replenish if all files are present.
-        if manager.available_count() >= manager.inventory().len()
+        // Nothing to replenish if all configured files are present.
+        if manager.available_count() >= manager.config().file_count
             && self.files_released_since_green == 0
         {
             return Ok(false);
@@ -314,6 +314,46 @@ mod tests {
             .unwrap();
         assert!(!replenished);
         assert_eq!(mgr.available_count(), count_after_first);
+    }
+
+    #[test]
+    fn replenish_detects_externally_deleted_files() {
+        // Regression: available_count() was compared to inventory().len() (always true).
+        // Now compares against config.file_count so external deletions are detected.
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = BallastManager::new(dir.path().to_path_buf(), test_config()).unwrap();
+        mgr.provision(None).unwrap();
+        assert_eq!(mgr.available_count(), 5);
+
+        // Externally delete 3 ballast files (simulates manual rm or filesystem corruption).
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("SBH_BALLAST_FILE_"))
+            })
+            .take(3)
+            .collect();
+        assert_eq!(files.len(), 3, "should find 3 ballast files to delete");
+        for f in &files {
+            std::fs::remove_file(f.path()).unwrap();
+        }
+
+        // Re-scan to update inventory after external deletion.
+        let mut mgr = BallastManager::new(dir.path().to_path_buf(), test_config()).unwrap();
+        assert_eq!(mgr.available_count(), 2); // only 2 of 5 remain
+
+        // Controller with no prior releases should still trigger replenishment.
+        let mut ctrl = BallastReleaseController::new(0);
+        ctrl.green_since = Some(one_hour_ago());
+
+        let replenished = ctrl
+            .maybe_replenish(&mut mgr, PressureLevel::Green, &|| 50.0)
+            .unwrap();
+        assert!(replenished, "should replenish externally-deleted files");
+        assert!(mgr.available_count() > 2);
     }
 
     #[test]
