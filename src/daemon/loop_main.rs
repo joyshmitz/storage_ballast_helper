@@ -13,6 +13,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,9 +39,9 @@ use crate::monitor::fs_stats::FsStatsCollector;
 use crate::monitor::pid::{PidPressureController, PressureLevel, PressureReading};
 use crate::monitor::special_locations::SpecialLocationRegistry;
 use crate::monitor::voi_scheduler::VoiScheduler;
-use crate::platform::pal::{Platform, detect_platform};
+use crate::platform::pal::{MemoryInfo, Platform, detect_platform};
 use crate::scanner::deletion::{DeletionConfig, DeletionExecutor};
-use crate::scanner::patterns::ArtifactPatternRegistry;
+use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry};
 use crate::scanner::protection::ProtectionRegistry;
 use crate::scanner::scoring::{CandidacyScore, ScoringEngine};
 use crate::scanner::walker::{DirectoryWalker, WalkerConfig};
@@ -67,6 +68,14 @@ const SCAN_ENTRY_BUDGET: usize = 100_000;
 /// Maximum wall-clock time for a single scan pass (seconds).
 /// After this deadline, the scanner processes accumulated candidates and returns.
 const SCAN_TIME_BUDGET_SECS: u64 = 60;
+/// Cooldown between repeated swap-thrash warnings while pressure remains.
+const SWAP_THRASH_WARNING_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+/// Swap usage threshold that indicates probable paging thrash.
+const SWAP_THRASH_USED_PCT_THRESHOLD: f64 = 70.0;
+/// Minimum free RAM required before we consider high swap use to be thrashing.
+const SWAP_THRASH_MIN_AVAILABLE_RAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Even under high pressure, avoid deleting extremely fresh temp artifacts.
+const TEMP_FAST_TRACK_MIN_OBSERVED_AGE: Duration = Duration::from_secs(2 * 60);
 
 // ──────────────────── shared executor config ────────────────────
 
@@ -266,6 +275,8 @@ pub struct MonitoringDaemon {
     last_pressure_level: PressureLevel,
     last_special_scan: HashMap<PathBuf, Instant>,
     last_predictive_warning: Option<Instant>,
+    last_swap_thrash_warning: Option<Instant>,
+    swap_thrash_active: bool,
     self_monitor: SelfMonitor,
     policy_engine: Arc<Mutex<PolicyEngine>>,
     scanner_heartbeat: Arc<ThreadHeartbeat>,
@@ -279,6 +290,107 @@ fn compute_primary_path(config: &Config) -> PathBuf {
         .first()
         .cloned()
         .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+fn bytes_to_pct(value: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            (value as f64 * 100.0) / total as f64
+        }
+    }
+}
+
+fn is_swap_thrash_risk(memory: &MemoryInfo) -> bool {
+    if memory.swap_total_bytes == 0 {
+        return false;
+    }
+
+    let swap_used_bytes = memory
+        .swap_total_bytes
+        .saturating_sub(memory.swap_free_bytes);
+    let swap_used_pct = bytes_to_pct(swap_used_bytes, memory.swap_total_bytes);
+    swap_used_pct >= SWAP_THRASH_USED_PCT_THRESHOLD
+        && memory.available_bytes >= SWAP_THRASH_MIN_AVAILABLE_RAM_BYTES
+}
+
+fn normalized_path(path: &Path) -> Cow<'_, str> {
+    let raw = path.to_string_lossy();
+    if std::path::MAIN_SEPARATOR == '\\' {
+        Cow::Owned(raw.replace('\\', "/"))
+    } else {
+        raw
+    }
+}
+
+fn is_tmp_like_path(path: &Path) -> bool {
+    let normalized = normalized_path(path);
+    let text = normalized.as_ref();
+    text == "/tmp"
+        || text.starts_with("/tmp/")
+        || text == "/var/tmp"
+        || text.starts_with("/var/tmp/")
+        || text == "/data/tmp"
+        || text.starts_with("/data/tmp/")
+        || text == "/private/tmp"
+        || text.starts_with("/private/tmp/")
+}
+
+fn should_fast_track_temp_age(
+    pressure_level: PressureLevel,
+    path: &Path,
+    classification: &ArtifactClassification,
+) -> bool {
+    if pressure_level < PressureLevel::Orange {
+        return false;
+    }
+    if classification.category == ArtifactCategory::Unknown || !is_tmp_like_path(path) {
+        return false;
+    }
+    if classification.name_confidence >= 0.85 {
+        return true;
+    }
+
+    matches!(
+        classification.pattern_name.as_ref(),
+        "cargo-target-prefix"
+            | "target-suffix"
+            | "dot-target-prefix"
+            | "underscore-target-prefix"
+            | "frankenterm-prefix"
+            | "cargo-home-prefix"
+            | "dot-cargo-prefix"
+            | "agent-ft-suffix"
+            | "tmp-cargo-home"
+            | "tmp-codex"
+            | "tmp-pijs"
+            | "tmp-ext"
+            | "pi-agent"
+            | "pi-target"
+            | "pi-opus"
+            | "cass-target"
+            | "br-build"
+    )
+}
+
+fn adjusted_candidate_age(
+    observed_age: Duration,
+    min_file_age_minutes: u64,
+    pressure_level: PressureLevel,
+    path: &Path,
+    classification: &ArtifactClassification,
+) -> Duration {
+    if !should_fast_track_temp_age(pressure_level, path, classification) {
+        return observed_age;
+    }
+    if observed_age < TEMP_FAST_TRACK_MIN_OBSERVED_AGE {
+        return observed_age;
+    }
+
+    let min_age = Duration::from_secs(min_file_age_minutes.saturating_mul(60));
+    observed_age.max(min_age)
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
@@ -453,6 +565,8 @@ impl MonitoringDaemon {
             last_pressure_level: PressureLevel::Green,
             last_special_scan: HashMap::new(),
             last_predictive_warning: None,
+            last_swap_thrash_warning: None,
+            swap_thrash_active: false,
             self_monitor,
             scanner_heartbeat,
             executor_heartbeat,
@@ -552,7 +666,10 @@ impl MonitoringDaemon {
             // 6. Check special locations independently.
             self.check_special_locations(&scan_tx, &scan_rx);
 
-            // 7. Watchdog heartbeat.
+            // 7. Detect swap-thrash conditions and alert with cooldown.
+            self.check_swap_thrash();
+
+            // 8. Watchdog heartbeat.
             self.watchdog.maybe_notify(&format!(
                 "pressure={:?} urgency={:.2}",
                 response.level, response.urgency
@@ -1106,6 +1223,48 @@ impl MonitoringDaemon {
                 minutes_remaining: seconds / 60.0,
                 confidence: 0.0, // Placeholder as PressureResponse doesn't carry confidence yet
             });
+    }
+
+    fn check_swap_thrash(&mut self) {
+        let Ok(memory) = self.platform.memory_info() else {
+            return;
+        };
+
+        let now = Instant::now();
+        let thrash_risk = is_swap_thrash_risk(&memory);
+        if !thrash_risk {
+            self.swap_thrash_active = false;
+            return;
+        }
+
+        let should_warn = !self.swap_thrash_active
+            || self
+                .last_swap_thrash_warning
+                .is_none_or(|last| now.duration_since(last) >= SWAP_THRASH_WARNING_COOLDOWN);
+        self.swap_thrash_active = true;
+        if !should_warn {
+            return;
+        }
+        self.last_swap_thrash_warning = Some(now);
+
+        let swap_used_bytes = memory
+            .swap_total_bytes
+            .saturating_sub(memory.swap_free_bytes);
+        let swap_used_pct = bytes_to_pct(swap_used_bytes, memory.swap_total_bytes);
+        let message = format!(
+            "swap thrash risk detected: swap_used_pct={swap_used_pct:.1}, \
+             swap_used_bytes={swap_used_bytes}, swap_total_bytes={}, ram_available_bytes={}",
+            memory.swap_total_bytes, memory.available_bytes
+        );
+
+        self.logger_handle.send(ActivityEvent::Error {
+            code: "SBH-2010".to_string(),
+            message: message.clone(),
+        });
+        self.notification_manager.notify(&NotificationEvent::Error {
+            code: "SBH-2010".to_string(),
+            message,
+        });
     }
 
     // ──────────────────── special locations ────────────────────
@@ -1687,7 +1846,13 @@ fn scanner_thread_main(
             let input = crate::scanner::scoring::CandidateInput {
                 path: entry.path.clone(), // Clone needed for input
                 size_bytes: entry.metadata.content_size_bytes,
-                age,
+                age: adjusted_candidate_age(
+                    age,
+                    current_scanner_config.min_file_age_minutes,
+                    request.pressure_level,
+                    &entry.path,
+                    &classification,
+                ),
                 classification,
                 signals: entry.structural_signals,
                 is_open,
@@ -1800,19 +1965,19 @@ fn executor_thread_main(
 
         // Gate candidates through the policy engine. The lock is held only for
         // the duration of evaluate() (pure computation, no I/O).
-        let approved_candidates = {
-            let mut policy = policy_engine.lock();
-            let decision = policy.evaluate(&batch.candidates, None);
-            if !decision.approved_for_deletion.is_empty() {
-                eprintln!(
-                    "[SBH-EXECUTOR] policy engine approved {}/{} candidates (mode={})",
-                    decision.approved_for_deletion.len(),
-                    batch.candidates.len(),
-                    decision.mode,
-                );
-            }
-            decision.approved_for_deletion
+        let (approved_candidates, policy_mode) = {
+            let decision = policy_engine.lock().evaluate(&batch.candidates, None);
+            (decision.approved_for_deletion, decision.mode)
         };
+
+        if !approved_candidates.is_empty() {
+            eprintln!(
+                "[SBH-EXECUTOR] policy engine approved {}/{} candidates (mode={})",
+                approved_candidates.len(),
+                batch.candidates.len(),
+                policy_mode,
+            );
+        }
 
         if approved_candidates.is_empty() {
             continue;
@@ -1879,7 +2044,8 @@ mod tests {
     use crate::monitor::special_locations::{
         SpecialKind, SpecialLocation, SpecialLocationRegistry,
     };
-    use crate::scanner::patterns::ArtifactClassification;
+    use crate::platform::pal::MemoryInfo;
+    use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification};
     use crate::scanner::scoring::{DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::path::Path;
     use std::time::Duration;
@@ -2193,5 +2359,97 @@ mod tests {
         // Existing queued batch should still be the one currently in the channel.
         let queued = del_rx.recv().expect("prefilled batch still queued");
         assert_eq!(queued.candidates[0].path, Path::new("/tmp/already-queued"));
+    }
+
+    #[test]
+    fn temp_artifact_age_fast_track_applies_under_red_pressure() {
+        let classification = ArtifactClassification {
+            pattern_name: "agent-ft-suffix".into(),
+            category: ArtifactCategory::AgentWorkspace,
+            name_confidence: 0.90,
+            structural_confidence: 0.70,
+            combined_confidence: 0.84,
+        };
+        let adjusted = adjusted_candidate_age(
+            Duration::from_secs(5 * 60),
+            30,
+            PressureLevel::Red,
+            Path::new("/tmp/green-ft"),
+            &classification,
+        );
+        assert_eq!(adjusted, Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn temp_artifact_age_fast_track_skips_non_tmp_or_low_pressure() {
+        let classification = ArtifactClassification {
+            pattern_name: "agent-ft-suffix".into(),
+            category: ArtifactCategory::AgentWorkspace,
+            name_confidence: 0.90,
+            structural_confidence: 0.70,
+            combined_confidence: 0.84,
+        };
+        let base_age = Duration::from_secs(120);
+
+        let low_pressure = adjusted_candidate_age(
+            base_age,
+            30,
+            PressureLevel::Yellow,
+            Path::new("/tmp/green-ft"),
+            &classification,
+        );
+        assert_eq!(low_pressure, base_age);
+
+        let non_tmp = adjusted_candidate_age(
+            base_age,
+            30,
+            PressureLevel::Red,
+            Path::new("/data/projects/green-ft"),
+            &classification,
+        );
+        assert_eq!(non_tmp, base_age);
+    }
+
+    #[test]
+    fn temp_artifact_age_fast_track_keeps_very_fresh_paths() {
+        let classification = ArtifactClassification {
+            pattern_name: "agent-ft-suffix".into(),
+            category: ArtifactCategory::AgentWorkspace,
+            name_confidence: 0.90,
+            structural_confidence: 0.70,
+            combined_confidence: 0.84,
+        };
+        let fresh_age = Duration::from_secs(30);
+        let adjusted = adjusted_candidate_age(
+            fresh_age,
+            30,
+            PressureLevel::Red,
+            Path::new("/tmp/green-ft"),
+            &classification,
+        );
+        assert_eq!(adjusted, fresh_age);
+    }
+
+    #[test]
+    fn swap_thrash_risk_requires_high_swap_and_free_ram() {
+        let risky = MemoryInfo {
+            total_bytes: 128 * 1024 * 1024 * 1024,
+            available_bytes: 24 * 1024 * 1024 * 1024,
+            swap_total_bytes: 64 * 1024 * 1024 * 1024,
+            swap_free_bytes: 8 * 1024 * 1024 * 1024,
+        };
+        assert!(is_swap_thrash_risk(&risky));
+
+        let low_swap = MemoryInfo {
+            swap_free_bytes: 40 * 1024 * 1024 * 1024,
+            ..risky.clone()
+        };
+        assert!(!is_swap_thrash_risk(&low_swap));
+
+        let low_ram = MemoryInfo {
+            available_bytes: 2 * 1024 * 1024 * 1024,
+            ..risky
+        };
+        assert!(!is_swap_thrash_risk(&low_ram));
     }
 }
