@@ -87,12 +87,23 @@ All TUI tests require `--features tui`. Without it, these modules are excluded f
 rch exec "cargo test --lib --features tui tui::test_replay -- --test-threads=4"
 ```
 
+### Test Count Summary
+
+| Category | Count |
+| --- | --- |
+| Library unit (no TUI) | 836 |
+| Library unit (with TUI) | 1,776 |
+| Binary (CLI) | 33 |
+| Integration (all files) | 183 |
+| E2E shell cases | 115+ |
+| **Total automated** | **2,100+** |
+
 ### Binary Tests (CLI)
 
 **Command**: `rch exec "cargo test --bin sbh"`
 
 Tests CLI argument parsing, subcommand routing, dashboard mode resolution,
-and output formatting.
+and output formatting (33 tests).
 
 ### Integration Tests
 
@@ -181,6 +192,18 @@ gate level. HARD failures block merge/release. SOFT failures require waivers.
 
 **Remote compilation:** CPU-intensive stages use `rch exec` by default.
 Use `--local` to skip rch. CI workflows run locally (no rch available).
+
+**CI artifact retention** (`.github/workflows/ci.yml`):
+
+| CI Job | Artifacts | Retention |
+| --- | --- | --- |
+| unit | `unit-test-output.txt`, `bin-test-output.txt` | 14 days |
+| integration | `integration-output.txt` | 14 days |
+| decision-plane | `proof-harness-output.txt`, `decision-plane-e2e-output.txt` | 30 days |
+| e2e | `e2e-output.txt`, per-case logs | 14 days |
+| stress | `stress-output.txt` | 14 days |
+| dashboard | TUI test stage outputs | 14 days |
+| provenance | `ci-metadata.json`, `dependency-tree.txt` | 90 days |
 
 ## Log Artifact Naming Conventions
 
@@ -354,6 +377,59 @@ Installer/update flows should emit phase-level records that include:
 - Use `ArtifactCollector` from `e2e_artifact.rs` for structured output.
 - Every scenario drill should have a corresponding determinism test.
 - Map assertions to contract IDs (C-01..C-18) where applicable.
+
+**DashboardHarness example:**
+```rust
+use super::test_harness::*;
+
+#[test]
+fn my_dashboard_test() {
+    let mut h = DashboardHarness::new();
+    h.startup_with_state(sample_healthy_state());
+    h.tick(); // must tick before first capture_frame
+
+    // Navigate to a screen
+    h.inject_char('e'); // switch to explainability
+    h.tick();
+
+    // Assert on model state
+    assert_eq!(h.screen(), Screen::Explainability);
+    assert!(!h.is_degraded());
+
+    // Capture a frame for artifact collection
+    let fc = capture_frame(&h);
+    assert!(fc.text.contains("Explainability"));
+
+    // Inject keycode (not char) for Enter
+    h.inject_keycode(ftui_core::event::KeyCode::Enter);
+    h.tick();
+
+    // Feed degraded state
+    h.feed_unavailable();
+    h.tick();
+    assert!(h.is_degraded());
+}
+```
+
+**ArtifactCollector example:**
+```rust
+let mut collector = ArtifactCollector::new("my_drill");
+let fc = capture_frame(&h);
+collector.start_case("phase_1")
+    .frame(fc)
+    .assertion("screen is overview", h.screen() == Screen::Overview,
+               "Overview", &format!("{:?}", h.screen()))
+    .finish(CaseStatus::Pass);
+let bundle = collector.finalize();
+bundle.validate_minimum_payload(); // ensures failing cases have diagnostics
+```
+
+**Key patterns:**
+- Always call `h.tick()` before the first `capture_frame(&h)`.
+- Use `inject_keycode(KeyCode::Enter)` for Enter, not `inject_char('\n')`.
+- Extract owned values from `capture_frame` before calling `h.model_mut()`
+  to avoid borrow checker conflicts (`capture_frame` borrows `&h`
+  immutably while `model_mut` needs `&mut`).
 
 ## FrankentUI Code Reuse Compliance (bd-xzt.1.6)
 
