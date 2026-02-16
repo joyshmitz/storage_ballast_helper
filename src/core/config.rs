@@ -693,6 +693,17 @@ impl Config {
             });
         }
 
+        // BallastManager casts file indices to u32 for headers/filenames.
+        if self.ballast.file_count > u32::MAX as usize {
+            return Err(SbhError::InvalidConfig {
+                details: format!(
+                    "ballast.file_count ({}) exceeds maximum ({})",
+                    self.ballast.file_count,
+                    u32::MAX,
+                ),
+            });
+        }
+
         // Ballast files need a 4096-byte header; anything smaller is unusable.
         if self.ballast.file_size_bytes < 4096 {
             return Err(SbhError::InvalidConfig {
@@ -1067,6 +1078,18 @@ mod tests {
         assert!(
             msg.contains("4096"),
             "error should mention header size: {msg}"
+        );
+    }
+
+    #[test]
+    fn ballast_file_count_exceeding_u32_max_rejected() {
+        let mut cfg = Config::default();
+        cfg.ballast.file_count = u32::MAX as usize + 1;
+        let err = cfg.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds maximum"),
+            "error should mention exceeds maximum: {msg}"
         );
     }
 

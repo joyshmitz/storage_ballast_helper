@@ -9,7 +9,7 @@
 //! 3. Parent directory is writable
 //! 4. Directory does not contain .git/ (final safety net)
 //!
-//! Circuit breaker: 3 consecutive failures -> 30s cooldown -> retry 1 -> escalate.
+//! Circuit breaker: 3 consecutive failures -> halt batch (daemon retries next cycle).
 
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
@@ -166,20 +166,18 @@ impl DeletionExecutor {
         let limit = plan.candidates.len().min(self.config.max_batch_size);
 
         for candidate in plan.candidates.iter().take(limit) {
-            // Circuit breaker check.
+            // Circuit breaker: stop immediately on consecutive failures.
+            // The daemon's next scan cycle can retry with fresh candidates.
             if consecutive_failures >= self.config.circuit_breaker_threshold {
                 report.circuit_breaker_tripped = true;
                 self.log_event(ActivityEvent::Error {
                     code: "SBH-2003".to_string(),
                     message: format!(
-                        "circuit breaker tripped after {consecutive_failures} consecutive failures"
+                        "circuit breaker tripped after {consecutive_failures} consecutive failures, \
+                         halting batch"
                     ),
                 });
-
-                // Cooldown then retry once.
-                std::thread::sleep(self.config.circuit_breaker_cooldown);
-                consecutive_failures = 0;
-                // Will attempt next candidate after cooldown.
+                break;
             }
 
             // Pressure check: if pressure has resolved, stop deleting.
@@ -255,12 +253,9 @@ impl DeletionExecutor {
             return Err(SkipReason::PathGone);
         }
 
-        // 2. Parent directory is writable.
+        // 2. Parent directory is writable (effective permission for this process).
         if let Some(parent) = path.parent()
-            && parent
-                .metadata()
-                .map(|m| m.permissions().readonly())
-                .unwrap_or(true)
+            && !is_writable(parent)
         {
             return Err(SkipReason::NotWritable);
         }
@@ -321,6 +316,27 @@ impl DeletionExecutor {
     fn log_dry_run(_candidate: &CandidacyScore) {
         // Dry-run candidates are displayed at the CLI level; no audit event is
         // emitted to avoid polluting the stats engine (ScanCompleted counts, etc.).
+    }
+}
+
+// ──────────────────── writable check ────────────────────
+
+/// Check if the current process can write to the given path.
+///
+/// Uses `access(W_OK)` on Unix which checks effective permissions (owner, group,
+/// ACLs, and mount flags) — more reliable than `permissions().readonly()` which
+/// only checks if any write bit is set.
+fn is_writable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        nix::unistd::access(path, nix::unistd::AccessFlags::W_OK).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        // Fallback: check write bit (same as old behavior).
+        path.metadata()
+            .map(|m| !m.permissions().readonly())
+            .unwrap_or(false)
     }
 }
 
@@ -717,6 +733,74 @@ mod tests {
         let report = executor.execute(&plan, None);
         assert_eq!(report.items_deleted, 1);
         assert_eq!(report.items_skipped, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn circuit_breaker_halts_batch_on_consecutive_failures() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut candidates = Vec::new();
+
+        // Create directories with unremovable subdirs (chmod 000 prevents remove_dir_all).
+        // Preflight passes because the parent of each dir IS writable, but
+        // remove_dir_all fails because the locked subdir can't be traversed.
+        for i in 0..5 {
+            let d = dir.path().join(format!("dir_{i}"));
+            let sub = d.join("locked_sub");
+            fs::create_dir_all(&sub).unwrap();
+            fs::write(sub.join("data.txt"), "x").unwrap();
+            fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+            candidates.push(make_candidate(&d, 100, 0.8));
+        }
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                circuit_breaker_threshold: 3,
+                check_open_files: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(candidates);
+        let report = executor.execute(&plan, None);
+
+        assert!(
+            report.circuit_breaker_tripped,
+            "circuit breaker should have tripped"
+        );
+        // Should have attempted exactly 3 (threshold) before halting.
+        assert_eq!(report.items_failed, 3);
+        // Remaining 2 candidates were never attempted.
+        assert_eq!(report.items_deleted, 0);
+
+        // Restore permissions so tempdir cleanup works.
+        for i in 0..5 {
+            let sub = dir.path().join(format!("dir_{i}")).join("locked_sub");
+            let _ = fs::set_permissions(&sub, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_writable_detects_read_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let readonly_dir = dir.path().join("readonly");
+        fs::create_dir(&readonly_dir).unwrap();
+
+        assert!(is_writable(&readonly_dir), "should be writable initially");
+
+        fs::set_permissions(&readonly_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(
+            !is_writable(&readonly_dir),
+            "should not be writable after chmod 555"
+        );
+
+        // Restore for cleanup.
+        fs::set_permissions(&readonly_dir, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[cfg(target_os = "linux")]
