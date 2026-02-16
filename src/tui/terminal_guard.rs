@@ -65,18 +65,16 @@ impl TerminalGuard {
 
     /// Terminal dimensions (columns, rows).
     ///
-    /// Falls back to (80, 24) if the query fails.
+    /// Queries the terminal via a temporary `TtyBackend`. Falls back to
+    /// (80, 24) if the query fails (e.g. no tty attached).
     #[must_use]
     pub fn terminal_size() -> (u16, u16) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            if let Ok(tty) = std::fs::File::open("/dev/tty") {
-                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-                let ret = unsafe { libc::ioctl(tty.as_raw_fd(), libc::TIOCGWINSZ, &mut ws) };
-                if ret == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
-                    return (ws.ws_col, ws.ws_row);
-                }
+        // Open a temporary backend just for the size query. The RAII guard
+        // restores the terminal immediately on drop.
+        let opts = ftui_tty::TtySessionOptions::default();
+        if let Ok(backend) = TtyBackend::open(80, 24, opts) {
+            if let Ok(size) = ftui_backend::BackendEventSource::size(&backend) {
+                return size;
             }
         }
         (80, 24)
