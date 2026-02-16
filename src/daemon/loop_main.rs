@@ -27,6 +27,7 @@ use crate::ballast::coordinator::BallastPoolCoordinator;
 use crate::ballast::release::BallastReleaseController;
 use crate::core::config::Config;
 use crate::core::errors::{Result, SbhError};
+use crate::daemon::notifications::{NotificationEvent, NotificationManager};
 use crate::daemon::self_monitor::{SelfMonitor, ThreadHeartbeat};
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, spawn_logger};
@@ -184,6 +185,45 @@ impl Default for DaemonArgs {
     }
 }
 
+struct MountMonitor {
+    rate_estimator: DiskRateEstimator,
+    pressure_controller: PidPressureController,
+}
+
+impl MountMonitor {
+    fn new(config: &Config) -> Self {
+        let rate_estimator = DiskRateEstimator::new(
+            config.telemetry.ewma_base_alpha,
+            config.telemetry.ewma_min_alpha,
+            config.telemetry.ewma_max_alpha,
+            config.telemetry.ewma_min_samples,
+        );
+
+        let mut pressure_controller = PidPressureController::new(
+            0.25,  // kp
+            0.08,  // ki
+            0.02,  // kd
+            100.0, // integral_cap
+            config.pressure.green_min_free_pct,
+            1.0, // hysteresis_pct
+            config.pressure.green_min_free_pct,
+            config.pressure.yellow_min_free_pct,
+            config.pressure.orange_min_free_pct,
+            config.pressure.red_min_free_pct,
+            Duration::from_millis(config.pressure.poll_interval_ms),
+        );
+        if config.pressure.prediction.enabled {
+            pressure_controller
+                .set_action_horizon_minutes(config.pressure.prediction.action_horizon_minutes);
+        }
+
+        Self {
+            rate_estimator,
+            pressure_controller,
+        }
+    }
+}
+
 // ──────────────────── main daemon struct ────────────────────
 
 /// The monitoring daemon: orchestrates all sbh components.
@@ -196,22 +236,21 @@ pub struct MonitoringDaemon {
     signal_handler: SignalHandler,
     watchdog: WatchdogHeartbeat,
     fs_collector: FsStatsCollector,
-    rate_estimator: DiskRateEstimator,
-    pressure_controller: PidPressureController,
+    mount_monitors: HashMap<PathBuf, MountMonitor>,
     special_locations: SpecialLocationRegistry,
     ballast_coordinator: BallastPoolCoordinator,
     release_controller: BallastReleaseController,
     scoring_engine: ScoringEngine,
     voi_scheduler: VoiScheduler,
+    notification_manager: NotificationManager,
     shared_executor_config: Arc<SharedExecutorConfig>,
     shared_scoring_config: Arc<RwLock<crate::core::config::ScoringConfig>>,
     shared_scanner_config: Arc<RwLock<crate::core::config::ScannerConfig>>,
     cached_primary_path: PathBuf,
     start_time: Instant,
     last_pressure_level: PressureLevel,
-    #[allow(dead_code)] // Planned: track worst mount point across iterations.
-    last_worst_mount: Option<PathBuf>,
     last_special_scan: HashMap<PathBuf, Instant>,
+    last_predictive_warning: Option<Instant>,
     self_monitor: SelfMonitor,
     scanner_heartbeat: Arc<ThreadHeartbeat>,
     executor_heartbeat: Arc<ThreadHeartbeat>,
@@ -263,61 +302,34 @@ impl MonitoringDaemon {
             Duration::from_millis(config.telemetry.fs_cache_ttl_ms),
         );
 
-        // 5. EWMA rate estimator.
-        let rate_estimator = DiskRateEstimator::new(
-            config.telemetry.ewma_base_alpha,
-            config.telemetry.ewma_min_alpha,
-            config.telemetry.ewma_max_alpha,
-            config.telemetry.ewma_min_samples,
-        );
-
-        // 6. PID pressure controller.
-        let mut pressure_controller = PidPressureController::new(
-            0.25,  // kp
-            0.08,  // ki
-            0.02,  // kd
-            100.0, // integral_cap
-            config.pressure.green_min_free_pct,
-            1.0, // hysteresis_pct
-            config.pressure.green_min_free_pct,
-            config.pressure.yellow_min_free_pct,
-            config.pressure.orange_min_free_pct,
-            config.pressure.red_min_free_pct,
-            Duration::from_millis(config.pressure.poll_interval_ms),
-        );
-        if config.pressure.prediction.enabled {
-            pressure_controller
-                .set_action_horizon_minutes(config.pressure.prediction.action_horizon_minutes);
-        }
-
-        // 7. Discover special locations.
+        // 5. Discover special locations.
         let special_locations = SpecialLocationRegistry::discover(
             platform.as_ref(),
             &[], // custom paths from config can be added later
         )?;
 
-        // 8. Initialize ballast coordinator (multi-volume).
+        // 6. Initialize ballast coordinator (multi-volume).
         let ballast_coordinator = BallastPoolCoordinator::discover(
             &config.ballast,
             &config.scanner.root_paths,
             platform.as_ref(),
         )?;
 
-        // 9. Release controller.
+        // 7. Release controller.
         let release_controller =
             BallastReleaseController::new(config.ballast.replenish_cooldown_minutes);
 
-        // 10. Scoring engine.
+        // 8. Scoring engine.
         let scoring_engine =
             ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
 
-        // 10a. VOI Scheduler.
+        // 9. VOI Scheduler.
         let mut voi_scheduler = VoiScheduler::new(config.scheduler.clone());
         for root in &config.scanner.root_paths {
             voi_scheduler.register_path(root.clone());
         }
 
-        // 10b. Shared executor config (atomics for live reload propagation).
+        // 10. Shared executor config (atomics for live reload propagation).
         let shared_executor_config = Arc::new(SharedExecutorConfig::new(
             config.scanner.dry_run,
             config.scanner.max_delete_batch,
@@ -334,6 +346,9 @@ impl MonitoringDaemon {
         let scanner_heartbeat = ThreadHeartbeat::new("sbh-scanner");
         let executor_heartbeat = ThreadHeartbeat::new("sbh-executor");
 
+        // 13. Notification manager.
+        let notification_manager = NotificationManager::from_config(&config.notifications);
+
         let cached_primary_path = compute_primary_path(&config);
 
         Ok(Self {
@@ -345,20 +360,20 @@ impl MonitoringDaemon {
             signal_handler,
             watchdog,
             fs_collector,
-            rate_estimator,
-            pressure_controller,
+            mount_monitors: HashMap::new(),
             special_locations,
             ballast_coordinator,
             release_controller,
             scoring_engine,
             voi_scheduler,
+            notification_manager,
             shared_executor_config,
             shared_scoring_config,
             shared_scanner_config,
             start_time,
             last_pressure_level: PressureLevel::Green,
-            last_worst_mount: None,
             last_special_scan: HashMap::new(),
+            last_predictive_warning: None,
             self_monitor,
             scanner_heartbeat,
             executor_heartbeat,
@@ -376,6 +391,11 @@ impl MonitoringDaemon {
             version: env!("CARGO_PKG_VERSION").to_string(),
             config_hash,
         });
+        self.notification_manager
+            .notify(&NotificationEvent::DaemonStarted {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                volumes_monitored: self.ballast_coordinator.pool_count(),
+            });
 
         // Provision ballast files (idempotent).
         self.provision_ballast()?;
@@ -632,7 +652,7 @@ impl MonitoringDaemon {
     // ──────────────────── pressure monitoring ────────────────────
 
     fn check_pressure(&mut self) -> Result<crate::monitor::pid::PressureResponse> {
-        // Collect stats for all root paths and find the most-pressured volume.
+        // Collect stats for all root paths.
         let default_paths;
         let paths = if self.config.scanner.root_paths.is_empty() {
             default_paths = [PathBuf::from("/")];
@@ -641,71 +661,89 @@ impl MonitoringDaemon {
             &self.config.scanner.root_paths
         };
 
-        let mut worst_stats = None;
-        let mut worst_free_pct = f64::MAX;
+        // Group paths by mount point to avoid redundant updates.
+        let mut stats_by_mount: HashMap<PathBuf, crate::platform::pal::FsStats> = HashMap::new();
 
         for path in paths {
             if let Ok(stats) = self.fs_collector.collect(path) {
-                let pct = stats.free_pct();
-                if pct < worst_free_pct {
-                    worst_free_pct = pct;
-                    worst_stats = Some(stats);
+                // If multiple paths share a mount, we just need one valid reading.
+                stats_by_mount
+                    .entry(stats.mount_point.clone())
+                    .or_insert(stats);
+            }
+        }
+
+        if stats_by_mount.is_empty() {
+            return Err(crate::core::errors::SbhError::FsStats {
+                path: paths.first().cloned().unwrap_or_else(|| PathBuf::from("/")),
+                details: "no filesystem stats available for any root path".to_string(),
+            });
+        }
+
+        let now = Instant::now();
+        let mut worst_response: Option<crate::monitor::pid::PressureResponse> = None;
+
+        // Update monitors for each active mount.
+        for (mount_path, stats) in stats_by_mount {
+            let monitor = self
+                .mount_monitors
+                .entry(mount_path.clone())
+                .or_insert_with(|| MountMonitor::new(&self.config));
+
+            // Update EWMA rate estimator.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let red_threshold_bytes =
+                (stats.total_bytes as f64 * self.config.pressure.red_min_free_pct / 100.0) as u64;
+
+            let rate_estimate =
+                monitor
+                    .rate_estimator
+                    .update(stats.available_bytes, now, red_threshold_bytes);
+
+            // Predicted time to red threshold.
+            let predicted_seconds = if rate_estimate.seconds_to_threshold.is_finite()
+                && rate_estimate.seconds_to_threshold > 0.0
+            {
+                Some(rate_estimate.seconds_to_threshold)
+            } else {
+                None
+            };
+
+            // Run PID controller.
+            let reading = PressureReading {
+                free_bytes: stats.available_bytes,
+                total_bytes: stats.total_bytes,
+                mount: stats.mount_point.clone(),
+            };
+            let response = monitor
+                .pressure_controller
+                .update(reading, predicted_seconds, now);
+
+            // Track worst response (highest urgency/severity).
+            match worst_response {
+                None => worst_response = Some(response),
+                Some(ref worst) => {
+                    // Critical > Red > ... > Green.
+                    // If levels equal, higher urgency wins.
+                    if response.level > worst.level
+                        || (response.level == worst.level && response.urgency > worst.urgency)
+                    {
+                        worst_response = Some(response);
+                    }
                 }
             }
         }
 
-        let stats = worst_stats.ok_or_else(|| crate::core::errors::SbhError::FsStats {
-            path: paths.first().cloned().unwrap_or_else(|| PathBuf::from("/")),
-            details: "no filesystem stats available for any root path".to_string(),
-        })?;
+        // Clean up monitors for unmounted/disappeared volumes?
+        // For now we keep them; volume churn is rare in typical operation.
 
-        if self.last_worst_mount.as_ref() != Some(&stats.mount_point) {
-            eprintln!(
-                "[SBH-DAEMON] worst pressure mount switched to {}, resetting controller state",
-                stats.mount_point.display()
-            );
-            self.rate_estimator = DiskRateEstimator::new(
-                self.config.telemetry.ewma_base_alpha,
-                self.config.telemetry.ewma_min_alpha,
-                self.config.telemetry.ewma_max_alpha,
-                self.config.telemetry.ewma_min_samples,
-            );
-            self.pressure_controller.reset();
-            self.last_worst_mount = Some(stats.mount_point.clone());
-        }
-
-        // Update EWMA rate estimator.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let red_threshold_bytes =
-            (stats.total_bytes as f64 * self.config.pressure.red_min_free_pct / 100.0) as u64;
-        let now = Instant::now();
-        let rate_estimate =
-            self.rate_estimator
-                .update(stats.available_bytes, now, red_threshold_bytes);
-
-        // Predicted time to red threshold.
-        let predicted_seconds = if rate_estimate.seconds_to_threshold.is_finite()
-            && rate_estimate.seconds_to_threshold > 0.0
-        {
-            Some(rate_estimate.seconds_to_threshold)
-        } else {
-            None
-        };
-
-        // Run PID controller.
-        let reading = PressureReading {
-            free_bytes: stats.available_bytes,
-            total_bytes: stats.total_bytes,
-            mount: stats.mount_point,
-        };
-        let response = self
-            .pressure_controller
-            .update(reading, predicted_seconds, now);
-
-        Ok(response)
+        worst_response.ok_or_else(|| crate::core::errors::SbhError::FsStats {
+            path: PathBuf::from("/"),
+            details: "internal error: stats collected but no response generated".to_string(),
+        })
     }
 
-    fn log_pressure_change(&self, response: &crate::monitor::pid::PressureResponse) {
+    fn log_pressure_change(&mut self, response: &crate::monitor::pid::PressureResponse) {
         let primary_path = self.primary_path();
         // Best-effort: collect fresh stats for the log entry.
         let (free_pct, mount, total, free) =
@@ -726,12 +764,20 @@ impl MonitoringDaemon {
             to: format!("{:?}", response.level),
             free_pct,
             rate_bps: None,
-            mount_point: mount,
+            mount_point: mount.clone(),
             total_bytes: total,
             free_bytes: free,
             ewma_rate: None,
             pid_output: Some(response.urgency),
         });
+
+        self.notification_manager
+            .notify(&NotificationEvent::PressureChanged {
+                from: format!("{:?}", self.last_pressure_level),
+                to: format!("{:?}", response.level),
+                mount,
+                free_pct,
+            });
     }
 
     // ──────────────────── pressure response ────────────────────
@@ -741,6 +787,8 @@ impl MonitoringDaemon {
         response: &crate::monitor::pid::PressureResponse,
         scan_tx: &Sender<ScanRequest>,
     ) {
+        self.check_predictive_warning(response);
+
         // Determine scan targets: routine maintenance (Green) scans everything;
         // elevated pressure targets only the causing volume to maximize ROI.
         let scan_paths = if response.level == PressureLevel::Green {
@@ -794,6 +842,12 @@ impl MonitoringDaemon {
                             .replenish_for_mount(&mount_path, Some(&free_check))
                             && report.files_created > 0
                         {
+                            self.notification_manager.notify(
+                                &NotificationEvent::BallastReplenished {
+                                    mount: mount_path.to_string_lossy().to_string(),
+                                    files_replenished: report.files_created,
+                                },
+                            );
                             // One file replenished globally per tick is sufficient.
                             break;
                         }
@@ -860,8 +914,15 @@ impl MonitoringDaemon {
             .release_controller
             .files_to_release(response, available);
 
-        if count > 0 {
-            self.ballast_coordinator.release_for_mount(mount, count)?;
+        if count > 0
+            && let Some(report) = self.ballast_coordinator.release_for_mount(mount, count)?
+        {
+            self.notification_manager
+                .notify(&NotificationEvent::BallastReleased {
+                    mount: mount.to_string_lossy().to_string(),
+                    files_released: report.files_released,
+                    bytes_freed: report.bytes_freed,
+                });
         }
         Ok(())
     }
@@ -905,6 +966,33 @@ impl MonitoringDaemon {
         };
         // For forced scans, block briefly to ensure delivery.
         let _ = scan_tx.send_timeout(request, Duration::from_millis(100));
+    }
+
+    fn check_predictive_warning(&mut self, response: &crate::monitor::pid::PressureResponse) {
+        let Some(seconds) = response.predicted_seconds else {
+            return;
+        };
+
+        let warning_horizon_secs = self.config.pressure.prediction.warning_horizon_minutes * 60.0;
+
+        if seconds > warning_horizon_secs {
+            return;
+        }
+
+        let now = Instant::now();
+        if let Some(last) = self.last_predictive_warning
+            && now.duration_since(last) < Duration::from_secs(300)
+        {
+            return;
+        }
+
+        self.last_predictive_warning = Some(now);
+        self.notification_manager
+            .notify(&NotificationEvent::PredictiveWarning {
+                mount: response.causing_mount.to_string_lossy().to_string(),
+                minutes_remaining: seconds / 60.0,
+                confidence: 0.0, // Placeholder as PressureResponse doesn't carry confidence yet
+            });
     }
 
     // ──────────────────── special locations ────────────────────
@@ -989,20 +1077,22 @@ impl MonitoringDaemon {
                     );
                     self.release_controller.reset();
 
-                    // Propagate pressure thresholds to PID controller.
-                    // Target must be green_min (the recovery level), consistent with init.
-                    self.pressure_controller
-                        .set_target_free_pct(new_config.pressure.green_min_free_pct);
-                    self.pressure_controller.set_pressure_thresholds(
-                        new_config.pressure.green_min_free_pct,
-                        new_config.pressure.yellow_min_free_pct,
-                        new_config.pressure.orange_min_free_pct,
-                        new_config.pressure.red_min_free_pct,
-                    );
-                    if new_config.pressure.prediction.enabled {
-                        self.pressure_controller.set_action_horizon_minutes(
-                            new_config.pressure.prediction.action_horizon_minutes,
+                    // Propagate pressure thresholds to all active PID controllers.
+                    for monitor in self.mount_monitors.values_mut() {
+                        monitor
+                            .pressure_controller
+                            .set_target_free_pct(new_config.pressure.green_min_free_pct);
+                        monitor.pressure_controller.set_pressure_thresholds(
+                            new_config.pressure.green_min_free_pct,
+                            new_config.pressure.yellow_min_free_pct,
+                            new_config.pressure.orange_min_free_pct,
+                            new_config.pressure.red_min_free_pct,
                         );
+                        if new_config.pressure.prediction.enabled {
+                            monitor.pressure_controller.set_action_horizon_minutes(
+                                new_config.pressure.prediction.action_horizon_minutes,
+                            );
+                        }
                     }
 
                     // Propagate executor-critical settings via shared atomics.
@@ -1126,6 +1216,11 @@ impl MonitoringDaemon {
             reason: "clean shutdown".to_string(),
             uptime_secs,
         });
+        self.notification_manager
+            .notify(&NotificationEvent::DaemonStopped {
+                reason: "clean shutdown".to_string(),
+                uptime_secs,
+            });
 
         // 4. Shutdown logger thread.
         self.logger_handle.shutdown();

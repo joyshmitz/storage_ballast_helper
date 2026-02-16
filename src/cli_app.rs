@@ -1518,7 +1518,11 @@ fn run_blame(cli: &Cli, args: &BlameArgs) -> Result<(), CliError> {
             Ok(abs) => Some(abs),
             Err(e) => {
                 if output_mode(cli) == OutputMode::Human {
-                    eprintln!("Warning: skipping invalid configured path {}: {}", p.display(), e);
+                    eprintln!(
+                        "Warning: skipping invalid configured path {}: {}",
+                        p.display(),
+                        e
+                    );
                 }
                 None
             }
@@ -2815,7 +2819,7 @@ fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
     let request = DashboardRuntimeRequest {
         refresh_ms: normalize_refresh_ms(args.refresh_ms),
         state_file: config.paths.state_file.clone(),
-        monitor_paths: config.scanner.root_paths.clone(),
+        monitor_paths: config.scanner.root_paths,
         selection: resolve_dashboard_runtime(args),
     };
 
@@ -5261,15 +5265,19 @@ mod tests {
             DashboardRuntimeSelection::Legacy
         );
 
-        let mut new_args = DashboardArgs::default();
-        new_args.new_dashboard = true;
+        let new_args = DashboardArgs {
+            new_dashboard: true,
+            ..DashboardArgs::default()
+        };
         assert_eq!(
             resolve_dashboard_runtime(&new_args),
             DashboardRuntimeSelection::New
         );
 
-        let mut legacy_args = DashboardArgs::default();
-        legacy_args.legacy_dashboard = true;
+        let legacy_args = DashboardArgs {
+            legacy_dashboard: true,
+            ..DashboardArgs::default()
+        };
         assert_eq!(
             resolve_dashboard_runtime(&legacy_args),
             DashboardRuntimeSelection::Legacy

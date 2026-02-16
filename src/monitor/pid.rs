@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Coarse pressure state exposed to scanners/cleanup pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PressureLevel {
     Green,
     Yellow,
@@ -278,7 +278,16 @@ fn response_policy(
     #[allow(clippy::cast_possible_truncation)]
     let base_ms = base_poll.as_millis().min(u128::from(u64::MAX)) as u64;
     match level {
-        PressureLevel::Green => (Duration::from_millis(base_ms.max(1)), 0, 2),
+        PressureLevel::Green => {
+            let batch = if urgency > 0.8 {
+                10
+            } else if urgency > 0.5 {
+                5
+            } else {
+                2
+            };
+            (Duration::from_millis(base_ms.max(1)), 0, batch)
+        }
         PressureLevel::Yellow => (
             Duration::from_millis((base_ms / 2).max(500)),
             usize::from(urgency > 0.55),

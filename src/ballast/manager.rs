@@ -159,7 +159,7 @@ impl BallastManager {
             .read(true)
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .mode(0o600)
             .open(&lock_path)
             .map_err(|e| SbhError::io(&lock_path, e))?;

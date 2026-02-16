@@ -633,8 +633,8 @@ mod tests {
         let mut s = scheduler_with_paths(&["/data"]);
         let now = Instant::now();
 
-        // Record some scans.
-        for i in 0..5 {
+        // Bootstrap: reach min_observations_for_forecast (3) so errors get tracked.
+        for i in 0..3 {
             s.record_scan_result(
                 &PathBuf::from("/data"),
                 1_000_000,
@@ -644,14 +644,23 @@ mod tests {
                 now + Duration::from_secs(i),
             );
         }
+        // Flush bootstrap errors so we start clean.
+        s.end_window();
 
         // Simulate 3 bad windows (default fallback_trigger_windows=3).
-        for _ in 0..3 {
-            // Corrupt the forecast to create high error.
+        // Each window: corrupt forecast → record scan with tiny actual → end_window.
+        for i in 0..3 {
             if let Some(stats) = s.path_stats.get_mut(&PathBuf::from("/data")) {
                 stats.forecast_reclaim = 100_000_000.0; // wildly wrong
-                stats.last_actual_reclaim = 1; // actual was tiny
             }
+            s.record_scan_result(
+                &PathBuf::from("/data"),
+                1, // tiny actual → huge forecast error
+                1,
+                0,
+                100.0,
+                now + Duration::from_secs(10 + i),
+            );
             s.end_window();
         }
 
@@ -670,12 +679,7 @@ mod tests {
         let mut s = scheduler_with_paths(&["/data"]);
         let now = Instant::now();
 
-        // Force into fallback.
-        s.calibration.fallback_active = true;
-        s.calibration.consecutive_bad_windows = 5;
-        assert!(s.is_fallback_active());
-
-        // Record scans with good accuracy.
+        // Bootstrap: converge EWMA to a stable value before entering fallback.
         for i in 0..10 {
             s.record_scan_result(
                 &PathBuf::from("/data"),
@@ -686,10 +690,25 @@ mod tests {
                 now + Duration::from_secs(i),
             );
         }
+        // Flush bootstrap errors.
+        s.end_window();
+
+        // Force into fallback.
+        s.calibration.fallback_active = true;
+        s.calibration.consecutive_bad_windows = 5;
+        assert!(s.is_fallback_active());
 
         // Simulate 5 good windows (default recovery_trigger_windows=5).
-        for _ in 0..5 {
-            // Forecast should be close to actual now (EWMA converged).
+        // Each window: record a scan with value close to the converged EWMA → low error.
+        for i in 0..5 {
+            s.record_scan_result(
+                &PathBuf::from("/data"),
+                1000,
+                5,
+                0,
+                100.0,
+                now + Duration::from_secs(20 + i),
+            );
             s.end_window();
         }
 

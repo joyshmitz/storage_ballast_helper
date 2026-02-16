@@ -160,14 +160,11 @@ fn execute_cmd(
     timers: &mut Vec<(u64, Instant)>,
 ) {
     match cmd {
-        DashboardCmd::None => {}
+        DashboardCmd::None | DashboardCmd::ScheduleTick(_) | DashboardCmd::FetchTelemetry => {}
         DashboardCmd::FetchData => {
             let state = read_state_file(state_file);
             let inner_cmd = update::update(model, DashboardMsg::DataUpdate(state));
             execute_cmd(model, state_file, inner_cmd, timers);
-        }
-        DashboardCmd::ScheduleTick(_) => {
-            // Tick scheduling is handled by the poll timeout in the main loop.
         }
         DashboardCmd::Quit => {
             model.quit = true;
@@ -176,9 +173,6 @@ fn execute_cmd(
             for c in cmds {
                 execute_cmd(model, state_file, c, timers);
             }
-        }
-        DashboardCmd::FetchTelemetry => {
-            // Stub: telemetry query adapters land in bd-xzt.2.4.
         }
         DashboardCmd::ScheduleNotificationExpiry { id, after } => {
             timers.push((id, Instant::now() + after));
