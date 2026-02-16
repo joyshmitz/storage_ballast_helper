@@ -177,6 +177,21 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
             model.frame_times.push(duration_ms);
             DashboardCmd::None
         }
+
+        DashboardMsg::TelemetryBallast(result) => {
+            model.ballast_source = result.source;
+            model.ballast_partial = result.partial;
+            model.ballast_diagnostics = result.diagnostics;
+            model.ballast_volumes = result.data;
+            // Clamp cursor to valid range after data refresh.
+            if model.ballast_volumes.is_empty() {
+                model.ballast_selected = 0;
+                model.ballast_detail = false;
+            } else if model.ballast_selected >= model.ballast_volumes.len() {
+                model.ballast_selected = model.ballast_volumes.len() - 1;
+            }
+            DashboardCmd::None
+        }
     }
 }
 

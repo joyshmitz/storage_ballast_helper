@@ -172,6 +172,52 @@ impl CandidatesSortOrder {
     }
 }
 
+// ──────────────────── ballast volume ────────────────────
+
+/// Per-volume ballast inventory snapshot for the ballast screen (S5).
+///
+/// A TUI-friendly projection of `PoolInventory` from the coordinator module.
+/// String fields are used instead of `PathBuf`/enums for render simplicity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BallastVolume {
+    /// Mount point this pool manages.
+    pub mount_point: String,
+    /// Directory containing ballast files.
+    pub ballast_dir: String,
+    /// Filesystem type (ext4, xfs, btrfs, etc.).
+    pub fs_type: String,
+    /// Provisioning strategy (fallocate, random_data, skip).
+    pub strategy: String,
+    /// Ballast files currently available (not released).
+    pub files_available: usize,
+    /// Total ballast files configured for this volume.
+    pub files_total: usize,
+    /// Bytes reclaimable by releasing available files.
+    pub releasable_bytes: u64,
+    /// Whether this volume was skipped during provisioning.
+    pub skipped: bool,
+    /// Reason the volume was skipped, if applicable.
+    pub skip_reason: Option<String>,
+}
+
+impl BallastVolume {
+    /// Status level for display badges.
+    #[must_use]
+    pub fn status_level(&self) -> &'static str {
+        if self.skipped {
+            "SKIPPED"
+        } else if self.files_total == 0 {
+            "UNCONFIGURED"
+        } else if self.files_available == 0 {
+            "CRITICAL"
+        } else if self.files_available.saturating_mul(2) < self.files_total {
+            "LOW"
+        } else {
+            "OK"
+        }
+    }
+}
+
 // ──────────────────── timeline filter ────────────────────
 
 /// Severity-level filter for the timeline screen (S2).
@@ -467,6 +513,20 @@ pub struct DashboardModel {
     /// Sort order for the candidates list.
     pub candidates_sort: CandidatesSortOrder,
 
+    // ── Ballast screen (S5) state ──
+    /// Per-volume ballast inventory for the ballast screen.
+    pub ballast_volumes: Vec<BallastVolume>,
+    /// Cursor position in the volumes list.
+    pub ballast_selected: usize,
+    /// Whether the detail pane is expanded for the selected volume.
+    pub ballast_detail: bool,
+    /// Backend that sourced the current ballast data.
+    pub ballast_source: DataSource,
+    /// Whether the ballast data is known to be incomplete.
+    pub ballast_partial: bool,
+    /// Diagnostic message from the data source.
+    pub ballast_diagnostics: String,
+
     // ── Diagnostics screen (S7) state ──
     /// Toggle for verbose diagnostics output.
     pub diagnostics_verbose: bool,
@@ -525,6 +585,12 @@ impl DashboardModel {
             candidates_partial: false,
             candidates_diagnostics: String::new(),
             candidates_sort: CandidatesSortOrder::default(),
+            ballast_volumes: Vec::new(),
+            ballast_selected: 0,
+            ballast_detail: false,
+            ballast_source: DataSource::None,
+            ballast_partial: false,
+            ballast_diagnostics: String::new(),
             diagnostics_verbose: false,
             frame_times: RateHistory::new(60),
             missed_ticks: 0,
@@ -584,6 +650,7 @@ impl DashboardModel {
         let max = self.timeline_filtered_events().len().saturating_sub(1);
         if self.timeline_selected < max {
             self.timeline_selected += 1;
+            self.timeline_follow = false;
             true
         } else {
             false
@@ -714,6 +781,41 @@ impl DashboardModel {
         self.candidates_list.get(self.candidates_selected)
     }
 
+    // ── Ballast (S5) methods ──
+
+    /// Move the ballast cursor up. Returns `true` if the cursor moved.
+    pub fn ballast_cursor_up(&mut self) -> bool {
+        if self.ballast_selected > 0 {
+            self.ballast_selected -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move the ballast cursor down. Returns `true` if the cursor moved.
+    pub fn ballast_cursor_down(&mut self) -> bool {
+        if !self.ballast_volumes.is_empty()
+            && self.ballast_selected < self.ballast_volumes.len() - 1
+        {
+            self.ballast_selected += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Toggle the detail pane for the selected volume.
+    pub fn ballast_toggle_detail(&mut self) {
+        self.ballast_detail = !self.ballast_detail;
+    }
+
+    /// Get the currently selected volume, if any.
+    #[must_use]
+    pub fn ballast_selected_volume(&self) -> Option<&BallastVolume> {
+        self.ballast_volumes.get(self.ballast_selected)
+    }
+
     // ── Diagnostics (S7) methods ──
 
     /// Toggle verbose diagnostics mode.
@@ -772,6 +874,8 @@ pub enum DashboardMsg {
     TelemetryDecisions(TelemetryResult<Vec<DecisionEvidence>>),
     /// Candidate ranking data arrived from the telemetry adapter.
     TelemetryCandidates(TelemetryResult<Vec<DecisionEvidence>>),
+    /// Per-volume ballast inventory arrived.
+    TelemetryBallast(TelemetryResult<Vec<BallastVolume>>),
     /// Frame metrics reported by the runtime after each render cycle.
     FrameMetrics { duration_ms: f64 },
 }
@@ -1428,6 +1532,124 @@ mod tests {
         assert_eq!(model.candidates_list[0].decision_id, 1); // /test/1
         assert_eq!(model.candidates_list[1].decision_id, 2); // /test/2
         assert_eq!(model.candidates_list[2].decision_id, 3); // /test/3
+    }
+
+    // ── Ballast state tests ──
+
+    fn sample_volume(mount: &str, available: usize, total: usize) -> BallastVolume {
+        BallastVolume {
+            mount_point: mount.to_string(),
+            ballast_dir: format!("{mount}/.sbh/ballast"),
+            fs_type: "ext4".to_string(),
+            strategy: "fallocate".to_string(),
+            files_available: available,
+            files_total: total,
+            releasable_bytes: available as u64 * 1_073_741_824,
+            skipped: false,
+            skip_reason: None,
+        }
+    }
+
+    #[test]
+    fn new_model_ballast_defaults() {
+        let model = test_model();
+        assert!(model.ballast_volumes.is_empty());
+        assert_eq!(model.ballast_selected, 0);
+        assert!(!model.ballast_detail);
+        assert_eq!(model.ballast_source, DataSource::None);
+        assert!(!model.ballast_partial);
+    }
+
+    #[test]
+    fn ballast_cursor_down_moves() {
+        let mut model = test_model();
+        model.ballast_volumes = vec![sample_volume("/", 3, 5), sample_volume("/data", 2, 5)];
+        assert!(model.ballast_cursor_down());
+        assert_eq!(model.ballast_selected, 1);
+    }
+
+    #[test]
+    fn ballast_cursor_down_clamps_at_end() {
+        let mut model = test_model();
+        model.ballast_volumes = vec![sample_volume("/", 3, 5)];
+        assert!(!model.ballast_cursor_down());
+        assert_eq!(model.ballast_selected, 0);
+    }
+
+    #[test]
+    fn ballast_cursor_up_moves() {
+        let mut model = test_model();
+        model.ballast_volumes = vec![sample_volume("/", 3, 5), sample_volume("/data", 2, 5)];
+        model.ballast_selected = 1;
+        assert!(model.ballast_cursor_up());
+        assert_eq!(model.ballast_selected, 0);
+    }
+
+    #[test]
+    fn ballast_cursor_up_clamps_at_start() {
+        let mut model = test_model();
+        model.ballast_volumes = vec![sample_volume("/", 3, 5)];
+        assert!(!model.ballast_cursor_up());
+        assert_eq!(model.ballast_selected, 0);
+    }
+
+    #[test]
+    fn ballast_toggle_detail() {
+        let mut model = test_model();
+        model.ballast_toggle_detail();
+        assert!(model.ballast_detail);
+        model.ballast_toggle_detail();
+        assert!(!model.ballast_detail);
+    }
+
+    #[test]
+    fn ballast_selected_volume_returns_correct() {
+        let mut model = test_model();
+        model.ballast_volumes = vec![sample_volume("/", 3, 5), sample_volume("/data", 2, 5)];
+        model.ballast_selected = 1;
+        let v = model.ballast_selected_volume().unwrap();
+        assert_eq!(v.mount_point, "/data");
+    }
+
+    #[test]
+    fn ballast_selected_volume_none_when_empty() {
+        let model = test_model();
+        assert!(model.ballast_selected_volume().is_none());
+    }
+
+    #[test]
+    fn ballast_cursor_empty_volumes() {
+        let mut model = test_model();
+        assert!(!model.ballast_cursor_down());
+        assert!(!model.ballast_cursor_up());
+    }
+
+    #[test]
+    fn ballast_volume_status_levels() {
+        let ok = sample_volume("/", 4, 5);
+        assert_eq!(ok.status_level(), "OK");
+
+        let low = sample_volume("/data", 2, 5);
+        assert_eq!(low.status_level(), "LOW");
+
+        let critical = BallastVolume {
+            files_available: 0,
+            ..sample_volume("/tmp", 0, 5)
+        };
+        assert_eq!(critical.status_level(), "CRITICAL");
+
+        let skipped = BallastVolume {
+            skipped: true,
+            skip_reason: Some("tmpfs unsupported".to_string()),
+            ..sample_volume("/run", 0, 0)
+        };
+        assert_eq!(skipped.status_level(), "SKIPPED");
+
+        let unconfigured = BallastVolume {
+            files_total: 0,
+            ..sample_volume("/mnt", 0, 0)
+        };
+        assert_eq!(unconfigured.status_level(), "UNCONFIGURED");
     }
 
     // ── Diagnostics state tests ──

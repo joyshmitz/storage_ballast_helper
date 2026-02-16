@@ -229,6 +229,10 @@ impl DashboardStateAdapter {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return StateReadOutcome::Missing;
             }
+            // Binary garbage / invalid UTF-8 is malformed content, not a read error.
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return StateReadOutcome::Malformed;
+            }
             Err(error) => return StateReadOutcome::ReadError(error.to_string()),
         };
 
