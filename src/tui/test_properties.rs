@@ -710,6 +710,268 @@ proptest! {
         prop_assert_eq!(model.terminal_size, (cols, rows));
         assert_model_invariants(&model);
     }
+
+    // ── scheduler / command invariants ──
+
+    /// Tick always produces a Batch containing FetchData and ScheduleTick,
+    /// regardless of which screen is active.
+    #[test]
+    fn tick_always_produces_fetch_and_schedule(screen in arb_screen()) {
+        let mut model = fresh_model();
+        model.screen = screen;
+        let cmd = update::update(&mut model, DashboardMsg::Tick);
+        match cmd {
+            super::model::DashboardCmd::Batch(ref cmds) => {
+                let has_fetch = cmds.iter().any(|c| {
+                    matches!(c, super::model::DashboardCmd::FetchData)
+                });
+                let has_schedule = cmds.iter().any(|c| {
+                    matches!(c, super::model::DashboardCmd::ScheduleTick(_))
+                });
+                prop_assert!(has_fetch, "Tick on {screen:?} missing FetchData");
+                prop_assert!(has_schedule, "Tick on {screen:?} missing ScheduleTick");
+            }
+            _ => prop_assert!(false, "Tick on {screen:?} did not return Batch"),
+        }
+    }
+
+    /// FetchTelemetry is included in Tick only on telemetry-backed screens
+    /// (Timeline, Explainability, Candidates, Ballast).
+    #[test]
+    fn tick_telemetry_screen_dependent(screen in arb_screen()) {
+        let mut model = fresh_model();
+        model.screen = screen;
+        let cmd = update::update(&mut model, DashboardMsg::Tick);
+
+        let has_telemetry = if let super::model::DashboardCmd::Batch(ref cmds) = cmd {
+            cmds.iter().any(|c| matches!(c, super::model::DashboardCmd::FetchTelemetry))
+        } else {
+            false
+        };
+
+        let should_have = matches!(
+            screen,
+            Screen::Timeline | Screen::Explainability | Screen::Candidates | Screen::Ballast
+        );
+        prop_assert_eq!(has_telemetry, should_have);
+    }
+
+    /// Tick never produces Quit, ExecutePreferenceAction, or
+    /// ScheduleNotificationExpiry commands.
+    #[test]
+    fn tick_never_produces_invalid_commands(screen in arb_screen()) {
+        let mut model = fresh_model();
+        model.screen = screen;
+        let cmd = update::update(&mut model, DashboardMsg::Tick);
+
+        fn check_no_invalid(cmd: &super::model::DashboardCmd) -> bool {
+            match cmd {
+                super::model::DashboardCmd::Quit => false,
+                super::model::DashboardCmd::ExecutePreferenceAction(_) => false,
+                super::model::DashboardCmd::ScheduleNotificationExpiry { .. } => false,
+                super::model::DashboardCmd::Batch(cmds) => cmds.iter().all(|c| check_no_invalid(c)),
+                _ => true,
+            }
+        }
+        prop_assert!(check_no_invalid(&cmd), "Tick on {screen:?} produced invalid command");
+    }
+
+    // ── overlay invariants ──
+
+    /// When an overlay is active, number-key screen navigation does not
+    /// change the current screen.
+    #[test]
+    fn overlay_blocks_number_key_navigation(
+        screen in arb_screen(),
+        overlay in prop_oneof![Just(Overlay::Help), Just(Overlay::Voi)],
+        number in 1u8..=7
+    ) {
+        let mut model = fresh_model();
+        model.screen = screen;
+        model.active_overlay = Some(overlay);
+
+        update::update(&mut model, DashboardMsg::Key(KeyEvent {
+            code: KeyCode::Char((b'0' + number) as char),
+            modifiers: Modifiers::NONE,
+            kind: KeyEventKind::Press,
+        }));
+
+        prop_assert_eq!(model.screen, screen);
+    }
+
+    // ── history invariants ──
+
+    /// navigate_to only grows history when moving to a different screen,
+    /// and navigate_back only shrinks it.
+    #[test]
+    fn history_grows_and_shrinks_consistently(
+        targets in prop::collection::vec(arb_screen(), 1..20)
+    ) {
+        let mut model = fresh_model();
+        let mut expected_depth = 0usize;
+
+        for target in &targets {
+            let before = model.screen;
+            if model.navigate_to(*target) {
+                expected_depth += 1;
+                prop_assert_eq!(model.screen_history.len(), expected_depth);
+                prop_assert_eq!(*model.screen_history.last().unwrap(), before);
+            }
+        }
+
+        // Pop everything back.
+        while model.navigate_back() {
+            expected_depth -= 1;
+            prop_assert_eq!(model.screen_history.len(), expected_depth);
+        }
+        prop_assert_eq!(expected_depth, 0);
+    }
+
+    // ── detail pane invariants ──
+
+    /// When telemetry data shrinks to empty, the detail pane closes.
+    #[test]
+    fn detail_pane_closes_when_data_emptied(variant in 0u8..3) {
+        let mut model = fresh_model();
+        let empty_result = || TelemetryResult {
+            data: vec![],
+            source: DataSource::Sqlite,
+            partial: false,
+            diagnostics: String::new(),
+        };
+
+        match variant {
+            0 => {
+                // Explainability
+                model.explainability_decisions = vec![sample_decision(1)];
+                model.explainability_detail = true;
+                update::update(&mut model, DashboardMsg::TelemetryDecisions(empty_result()));
+                prop_assert!(!model.explainability_detail,
+                    "explainability detail should close when data emptied");
+            }
+            1 => {
+                // Candidates
+                model.candidates_list = vec![sample_decision(2)];
+                model.candidates_detail = true;
+                update::update(&mut model, DashboardMsg::TelemetryCandidates(empty_result()));
+                prop_assert!(!model.candidates_detail,
+                    "candidates detail should close when data emptied");
+            }
+            _ => {
+                // Ballast
+                model.ballast_volumes = vec![sample_ballast_volume()];
+                model.ballast_detail = true;
+                update::update(&mut model, DashboardMsg::TelemetryBallast(TelemetryResult {
+                    data: vec![],
+                    source: DataSource::Sqlite,
+                    partial: false,
+                    diagnostics: String::new(),
+                }));
+                prop_assert!(!model.ballast_detail,
+                    "ballast detail should close when data emptied");
+            }
+        }
+        assert_model_invariants(&model);
+    }
+
+    // ── auto-follow invariants ──
+
+    /// Timeline auto-follow jumps to the last event only when enabled.
+    #[test]
+    fn timeline_follow_jumps_only_when_enabled(
+        events in prop::collection::vec(arb_timeline_event(), 2..20),
+        follow in any::<bool>()
+    ) {
+        let mut model = fresh_model();
+        model.timeline_follow = follow;
+        model.timeline_selected = 0;
+
+        let event_count = events.len();
+        update::update(&mut model, DashboardMsg::TelemetryTimeline(TelemetryResult {
+            data: events,
+            source: DataSource::Sqlite,
+            partial: false,
+            diagnostics: String::new(),
+        }));
+
+        if follow {
+            // With the default SeverityFilter::All, all events pass.
+            prop_assert_eq!(model.timeline_selected, event_count.saturating_sub(1),
+                "follow mode should jump to last event");
+        }
+        // When !follow, cursor is clamped but not necessarily at the end.
+        prop_assert!(model.timeline_selected < event_count,
+            "cursor {0} >= event count {event_count}", model.timeline_selected);
+    }
+
+    // ── backpressure stress ──
+
+    /// Rapid tick sequences don't cause unbounded growth in any collection.
+    #[test]
+    fn rapid_ticks_no_unbounded_growth(
+        count in 50usize..500,
+        screen in arb_screen()
+    ) {
+        let mut model = fresh_model();
+        model.screen = screen;
+        for _ in 0..count {
+            let _ = update::update(&mut model, DashboardMsg::Tick);
+        }
+        // Tick counter wraps (u64, so won't overflow in practice but test the mechanism).
+        // Collections must remain bounded.
+        assert_model_invariants(&model);
+        prop_assert!(model.frame_times.len() <= 60);
+        for (_, rh) in &model.rate_histories {
+            prop_assert!(rh.len() <= 30);
+        }
+    }
+}
+
+// ──────────────────── test helpers ────────────────────
+
+fn sample_decision(id: u64) -> DecisionEvidence {
+    DecisionEvidence {
+        decision_id: id,
+        timestamp: String::new(),
+        path: format!("/test/{id}"),
+        size_bytes: 1000,
+        age_secs: 60,
+        action: "delete".to_owned(),
+        effective_action: None,
+        policy_mode: "live".to_owned(),
+        factors: FactorBreakdown {
+            location: 0.5,
+            name: 0.5,
+            age: 0.5,
+            size: 0.5,
+            structure: 0.5,
+            pressure_multiplier: 1.0,
+        },
+        total_score: 1.5,
+        posterior_abandoned: 0.7,
+        expected_loss_keep: 20.0,
+        expected_loss_delete: 30.0,
+        calibration_score: 0.75,
+        vetoed: false,
+        veto_reason: None,
+        guard_status: None,
+        summary: String::new(),
+        raw_json: None,
+    }
+}
+
+fn sample_ballast_volume() -> BallastVolume {
+    BallastVolume {
+        mount_point: "/mnt/test".to_owned(),
+        ballast_dir: "/mnt/test/.sbh/ballast".to_owned(),
+        fs_type: "ext4".to_owned(),
+        strategy: "fallocate".to_owned(),
+        files_available: 5,
+        files_total: 10,
+        releasable_bytes: 5_368_709_120,
+        skipped: false,
+        skip_reason: None,
+    }
 }
 
 // ──────────────────── non-proptest invariant tests ────────────────────
