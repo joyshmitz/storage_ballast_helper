@@ -132,6 +132,22 @@ impl PidPressureController {
         self.target_free_pct = target;
     }
 
+    /// Disable prediction-based urgency boost (set thresholds to infinity).
+    ///
+    /// Call when `prediction.enabled` is toggled to `false` during config reload,
+    /// so the PID controller stops boosting urgency based on stale thresholds.
+    pub fn disable_urgency_boost(&mut self) {
+        self.urgency_thresholds = [f64::MAX; 3];
+    }
+
+    /// Update the base poll interval (e.g., after config reload).
+    ///
+    /// This affects the dt fallback (when timestamps are unavailable) and the
+    /// response policy scan intervals.
+    pub fn set_base_poll_interval(&mut self, interval: Duration) {
+        self.base_poll_interval = interval;
+    }
+
     /// Update all four pressure-level thresholds (e.g., after config reload).
     /// These drive `classify_with_hysteresis` for level transitions.
     pub fn set_pressure_thresholds(&mut self, green: f64, yellow: f64, orange: f64, red: f64) {

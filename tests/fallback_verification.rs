@@ -306,6 +306,8 @@ fn legacy_config_preserves_all_fields() {
             PathBuf::from("/tmp"),
         ],
         mode: DashboardRuntimeMode::LegacyFallback,
+        sqlite_db: None,
+        jsonl_log: None,
     };
 
     let legacy = cfg.as_legacy_config();
@@ -325,6 +327,8 @@ fn legacy_config_empty_monitor_paths() {
         refresh: Duration::from_secs(1),
         monitor_paths: vec![],
         mode: DashboardRuntimeMode::LegacyFallback,
+        sqlite_db: None,
+        jsonl_log: None,
     };
 
     let legacy = cfg.as_legacy_config();

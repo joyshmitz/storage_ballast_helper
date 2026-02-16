@@ -5,9 +5,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use storage_ballast_helper::core::config::ScoringConfig;
-    use storage_ballast_helper::scanner::patterns::{
-        ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, StructuralSignals,
-    };
+    use storage_ballast_helper::scanner::patterns::{ArtifactPatternRegistry, StructuralSignals};
     use storage_ballast_helper::scanner::scoring::{CandidateInput, DecisionAction, ScoringEngine};
 
     fn default_engine() -> ScoringEngine {
@@ -35,7 +33,7 @@ mod tests {
         );
 
         let input = CandidateInput {
-            path: path.clone(),
+            path,
             size_bytes: 4096,
             age: Duration::from_secs(24 * 3600), // Old
             classification,
@@ -71,7 +69,7 @@ mod tests {
         assert_eq!(classification.pattern_name, "generic-cache-exact");
 
         let input = CandidateInput {
-            path: path.clone(),
+            path,
             size_bytes: 4096,
             age: Duration::from_secs(24 * 3600),
             classification,

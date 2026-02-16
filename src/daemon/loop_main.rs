@@ -1611,10 +1611,17 @@ impl MonitoringDaemon {
                             new_config.pressure.orange_min_free_pct,
                             new_config.pressure.red_min_free_pct,
                         );
+                        monitor
+                            .pressure_controller
+                            .set_base_poll_interval(Duration::from_millis(
+                                new_config.pressure.poll_interval_ms,
+                            ));
                         if new_config.pressure.prediction.enabled {
                             monitor.pressure_controller.set_action_horizon_minutes(
                                 new_config.pressure.prediction.action_horizon_minutes,
                             );
+                        } else {
+                            monitor.pressure_controller.disable_urgency_boost();
                         }
                     }
 
@@ -1655,6 +1662,10 @@ impl MonitoringDaemon {
                     self.policy_engine
                         .lock()
                         .update_config(new_config.policy.clone());
+
+                    // Propagate notification config (channels, webhook URLs, cooldowns).
+                    self.notification_manager
+                        .update_config(&new_config.notifications);
 
                     self.logger_handle.send(ActivityEvent::ConfigReloaded {
                         details: format!("config hash: {old_hash} -> {new_hash}"),

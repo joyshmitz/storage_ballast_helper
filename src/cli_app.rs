@@ -2932,7 +2932,7 @@ fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
         selection,
         _reason: reason,
         sqlite_db: Some(config.paths.sqlite_db.clone()),
-        jsonl_log: Some(config.paths.jsonl_log.clone()),
+        jsonl_log: Some(config.paths.jsonl_log),
     };
 
     run_dashboard_runtime(cli, &request)

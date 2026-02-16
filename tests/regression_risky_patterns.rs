@@ -1,13 +1,12 @@
+#![allow(missing_docs)]
+
 #[cfg(test)]
 mod tests {
-    use sbh::core::config::ScoringConfig;
-    use sbh::scanner::patterns::{
-        ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, StructuralSignals,
-    };
-    use sbh::scanner::scoring::{CandidateInput, DecisionAction, ScoringEngine};
-    use std::borrow::Cow;
     use std::path::PathBuf;
     use std::time::Duration;
+    use storage_ballast_helper::core::config::ScoringConfig;
+    use storage_ballast_helper::scanner::patterns::{ArtifactPatternRegistry, StructuralSignals};
+    use storage_ballast_helper::scanner::scoring::{CandidateInput, DecisionAction, ScoringEngine};
 
     fn default_engine() -> ScoringEngine {
         ScoringEngine::from_config(&ScoringConfig::default(), 4) // 4 hours min age
@@ -35,7 +34,7 @@ mod tests {
         );
 
         let input = CandidateInput {
-            path: path.clone(),
+            path,
             size_bytes: 4096,
             age: Duration::from_secs(24 * 3600), // Old
             classification,
@@ -70,7 +69,7 @@ mod tests {
         assert!(classification.name_confidence <= 0.45);
 
         let input = CandidateInput {
-            path: path.clone(),
+            path,
             size_bytes: 4096,
             age: Duration::from_secs(24 * 3600),
             classification,

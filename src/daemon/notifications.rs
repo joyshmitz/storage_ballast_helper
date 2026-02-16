@@ -684,6 +684,11 @@ impl NotificationManager {
         }
     }
 
+    /// Replace this manager's configuration (e.g., after SIGHUP config reload).
+    pub fn update_config(&mut self, config: &NotificationConfig) {
+        *self = Self::from_config(config);
+    }
+
     /// Create a disabled (no-op) manager.
     #[must_use]
     pub fn disabled() -> Self {

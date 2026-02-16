@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -16,7 +18,7 @@ mod tests {
 
         let tmpl_class = registry.classify(Path::new("tmpl"), StructuralSignals::default());
 
-        println!("tmpl classification: {:?}", tmpl_class);
+        println!("tmpl classification: {tmpl_class:?}");
 
         // Should be Unknown or have very low confidence.
 
