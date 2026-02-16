@@ -405,13 +405,17 @@ impl Default for UpdateConfig {
         let home_dir = env::var_os("HOME").map_or_else(
             || {
                 eprintln!(
-                    "[SBH-CONFIG] WARNING: HOME not set, falling back to /tmp for update paths"
+                    "[SBH-CONFIG] WARNING: HOME not set, falling back to /var/lib/sbh for update paths"
                 );
-                PathBuf::from("/tmp")
+                PathBuf::from("/var/lib/sbh")
             },
             PathBuf::from,
         );
-        let data_dir = home_dir.join(".local").join("share").join("sbh");
+        let data_dir = if home_dir == Path::new("/var/lib/sbh") {
+            home_dir
+        } else {
+            home_dir.join(".local").join("share").join("sbh")
+        };
         Self {
             enabled: true,
             metadata_cache_ttl_seconds: 30 * 60,
@@ -427,14 +431,21 @@ impl Default for PathsConfig {
         let home_dir = env::var_os("HOME").map_or_else(
             || {
                 eprintln!(
-                    "[SBH-CONFIG] WARNING: HOME not set, falling back to /tmp for data paths"
+                    "[SBH-CONFIG] WARNING: HOME not set, falling back to /var/lib/sbh for data paths"
                 );
-                PathBuf::from("/tmp")
+                PathBuf::from("/var/lib/sbh")
             },
             PathBuf::from,
         );
-        let cfg = home_dir.join(".config").join("sbh").join("config.toml");
-        let data = home_dir.join(".local").join("share").join("sbh");
+        let (cfg, data) = if home_dir == Path::new("/var/lib/sbh") {
+            // Systemd service without HOME: use /etc/sbh and /var/lib/sbh directly.
+            (PathBuf::from("/etc/sbh/config.toml"), home_dir)
+        } else {
+            (
+                home_dir.join(".config").join("sbh").join("config.toml"),
+                home_dir.join(".local").join("share").join("sbh"),
+            )
+        };
         Self {
             config_file: cfg,
             ballast_dir: data.join("ballast"),
@@ -454,10 +465,25 @@ impl Config {
 
     /// Load config from default or explicit path, then apply env overrides.
     ///
+    /// Resolution order for config file path:
+    /// 1. Explicit `path` argument (from `--config` CLI flag)
+    /// 2. `SBH_CONFIG` environment variable
+    /// 3. Default path (`~/.config/sbh/config.toml`)
+    ///
     /// Missing config file is not an error when loading from default path; defaults are used.
     pub fn load(path: Option<&Path>) -> Result<Self> {
-        let path_buf = path.map_or_else(Self::default_path, Path::to_path_buf);
-        let is_explicit_path = path.is_some();
+        // Check SBH_CONFIG env var if no explicit path was given.
+        let env_config = if path.is_none() {
+            env::var_os("SBH_CONFIG").map(PathBuf::from)
+        } else {
+            None
+        };
+
+        let path_buf = path.map_or_else(
+            || env_config.clone().unwrap_or_else(Self::default_path),
+            Path::to_path_buf,
+        );
+        let is_explicit_path = path.is_some() || env_config.is_some();
 
         let mut cfg = if path_buf.exists() {
             let raw = fs::read_to_string(&path_buf).map_err(|source| SbhError::Io {

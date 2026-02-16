@@ -1103,6 +1103,24 @@ fn extract_and_install(
         return Err(format!("failed to copy new binary to temp location: {e}"));
     }
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ =
+            std::fs::set_permissions(&temp_install_path, std::fs::Permissions::from_mode(0o755));
+    }
+
+    // Verify the new binary works *before* moving it into place (check noexec, library linkage).
+    if let Err(e) = verify_binary_execution(&temp_install_path) {
+        let _ = std::fs::remove_file(&temp_install_path);
+        let _ = std::fs::remove_dir_all(&extract_dir);
+        // Restore backup if we moved it.
+        if backup_path.exists() {
+            let _ = std::fs::rename(&backup_path, install_path);
+        }
+        return Err(format!("new binary failed self-test: {e}"));
+    }
+
     if let Err(e) = std::fs::rename(&temp_install_path, install_path) {
         // Rollback: restore from backup if it exists.
         if backup_path.exists() {
@@ -1126,6 +1144,18 @@ fn extract_and_install(
     // That's acceptable; it's a temp file in the bin dir.
     let _ = std::fs::remove_file(&backup_path);
     let _ = std::fs::remove_dir_all(&extract_dir);
+    Ok(())
+}
+
+fn verify_binary_execution(path: &Path) -> std::result::Result<(), String> {
+    let output = Command::new(path)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("failed to execute binary: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!("binary exited with status {}", output.status));
+    }
     Ok(())
 }
 

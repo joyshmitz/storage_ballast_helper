@@ -295,10 +295,10 @@ fn parse_proc_mounts(raw: &str) -> Vec<MountPoint> {
             eprintln!("[sbh] warning: skipping malformed /proc/self/mounts line: {line}");
             continue;
         }
-        let mount_path = unescape_mount_field(fields[1]);
+        let mount_path = unescape_mount_path(fields[1]);
         let fs_type = fields[2].to_string();
         mounts.push(MountPoint {
-            path: PathBuf::from(mount_path),
+            path: mount_path,
             device: fields[0].to_string(),
             is_ram_backed: is_ram_fs(&fs_type),
             fs_type,
@@ -314,49 +314,6 @@ fn parse_proc_mounts(raw: &str) -> Vec<MountPoint> {
     mounts
 }
 
-fn parse_meminfo(raw: &str) -> Result<MemoryInfo> {
-    let mut values = HashMap::<&str, u64>::new();
-    for line in raw.lines() {
-        let mut parts = line.split(':');
-        let Some(key) = parts.next() else {
-            continue;
-        };
-        let Some(rest) = parts.next() else {
-            continue;
-        };
-        let mut tokens = rest.split_whitespace();
-        let first_token = tokens.next().ok_or_else(|| SbhError::MountParse {
-            details: format!("invalid /proc/meminfo line: {line}"),
-        })?;
-        let raw_value = first_token
-            .parse::<u64>()
-            .map_err(|error| SbhError::MountParse {
-                details: format!("invalid meminfo value in line {line:?}: {error}"),
-            })?;
-        let multiplier = meminfo_unit_multiplier(tokens.next(), line)?;
-        values.insert(key.trim(), raw_value.saturating_mul(multiplier));
-    }
-
-    Ok(MemoryInfo {
-        total_bytes: *values.get("MemTotal").unwrap_or(&0),
-        available_bytes: *values.get("MemAvailable").unwrap_or(&0),
-        swap_total_bytes: *values.get("SwapTotal").unwrap_or(&0),
-        swap_free_bytes: *values.get("SwapFree").unwrap_or(&0),
-    })
-}
-
-fn meminfo_unit_multiplier(unit: Option<&str>, line: &str) -> Result<u64> {
-    match unit {
-        Some("kB" | "KB" | "KiB") => Ok(1024_u64),
-        Some("mB" | "MB" | "MiB") => Ok(1024_u64 * 1024),
-        Some("gB" | "GB" | "GiB") => Ok(1024_u64 * 1024 * 1024),
-        None => Ok(1),
-        Some(other) => Err(SbhError::MountParse {
-            details: format!("unsupported meminfo unit in line {line:?}: {other}"),
-        }),
-    }
-}
-
 fn find_mount<'a>(path: &Path, mounts: &'a [MountPoint]) -> Option<&'a MountPoint> {
     mounts
         .iter()
@@ -365,34 +322,103 @@ fn find_mount<'a>(path: &Path, mounts: &'a [MountPoint]) -> Option<&'a MountPoin
 }
 
 fn is_ram_fs(fs_type: &str) -> bool {
-    matches!(fs_type, "tmpfs" | "ramfs" | "devtmpfs")
+    matches!(
+        fs_type.to_ascii_lowercase().as_str(),
+        "tmpfs" | "ramfs" | "devtmpfs"
+    )
 }
 
-/// Decode octal escape sequences (`\NNN`) used by the Linux kernel in
-/// `/proc/mounts` and `/etc/mtab` for special characters in paths.
+fn parse_meminfo(raw: &str) -> Result<MemoryInfo> {
+    let mut values = HashMap::<String, u64>::new();
+
+    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Some((key, rest)) = line.split_once(':') else {
+            return Err(SbhError::MountParse {
+                details: format!("invalid meminfo line (missing ':'): {line}"),
+            });
+        };
+        let mut parts = rest.split_whitespace();
+        let Some(value_raw) = parts.next() else {
+            return Err(SbhError::MountParse {
+                details: format!("missing meminfo value in line: {line}"),
+            });
+        };
+        let value = value_raw
+            .parse::<u64>()
+            .map_err(|err| SbhError::MountParse {
+                details: format!("invalid meminfo numeric value in line {line:?}: {err}"),
+            })?;
+
+        let bytes = match parts.next() {
+            None => value,
+            Some("kB") => value.saturating_mul(1024),
+            Some(unit) => {
+                return Err(SbhError::MountParse {
+                    details: format!("unsupported meminfo unit in line {line:?}: {unit}"),
+                });
+            }
+        };
+        values.insert(key.trim().to_string(), bytes);
+    }
+
+    let required = |key: &str| {
+        values
+            .get(key)
+            .copied()
+            .ok_or_else(|| SbhError::MountParse {
+                details: format!("missing required meminfo field: {key}"),
+            })
+    };
+
+    Ok(MemoryInfo {
+        total_bytes: required("MemTotal")?,
+        available_bytes: required("MemAvailable")?,
+        swap_total_bytes: required("SwapTotal")?,
+        swap_free_bytes: required("SwapFree")?,
+    })
+}
+
+#[cfg(test)]
 fn unescape_mount_field(raw: &str) -> String {
-    let mut result = String::with_capacity(raw.len());
-    let bytes = raw.as_bytes();
+    unescape_mount_path(raw).to_string_lossy().into_owned()
+}
+
+/// Decode octal escape sequences (`\NNN`) used by the Linux kernel.
+/// Returns a PathBuf via OsString to preserve raw bytes (e.g. invalid UTF-8).
+fn unescape_mount_path(raw: &str) -> PathBuf {
+    let mut bytes = Vec::with_capacity(raw.len());
+    let raw_bytes = raw.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 3 < bytes.len() {
-            let a = bytes[i + 1];
-            let b = bytes[i + 2];
-            let c = bytes[i + 3];
+    while i < raw_bytes.len() {
+        if raw_bytes[i] == b'\\' && i + 3 < raw_bytes.len() {
+            let a = raw_bytes[i + 1];
+            let b = raw_bytes[i + 2];
+            let c = raw_bytes[i + 3];
             if (b'0'..=b'7').contains(&a)
                 && (b'0'..=b'7').contains(&b)
                 && (b'0'..=b'7').contains(&c)
             {
                 let val = (a - b'0') * 64 + (b - b'0') * 8 + (c - b'0');
-                result.push(char::from(val));
+                bytes.push(val);
                 i += 4;
                 continue;
             }
         }
-        result.push(char::from(bytes[i]));
+        bytes.push(raw_bytes[i]);
         i += 1;
     }
-    result
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        // Fallback for non-Unix (though this code is only used on Linux)
+        let s = String::from_utf8_lossy(&bytes).into_owned();
+        PathBuf::from(s)
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +427,7 @@ mod tests {
 
     use super::{
         MountPoint, find_mount, is_ram_fs, parse_meminfo, parse_proc_mounts, unescape_mount_field,
+        unescape_mount_path,
     };
     use std::path::Path;
 
@@ -503,6 +530,27 @@ mod tests {
         // No escapes passes through.
         assert_eq!(unescape_mount_field("/mnt/simple"), "/mnt/simple");
         // Trailing backslash without enough digits passes through.
-        assert_eq!(unescape_mount_field("/mnt/a\\04"), "/mnt/a\\04");
+        assert_eq!(
+            unescape_mount_path("/mnt/a\\04").to_string_lossy(),
+            "/mnt/a\\04"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unescape_mount_path_handles_invalid_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // \377 is 0xFF, which is invalid in UTF-8.
+        let raw = "/mnt/bad\\377byte";
+        let path = unescape_mount_path(raw);
+        let bytes = path.as_os_str().as_bytes();
+
+        // Should produce bytes: '/', 'm', 'n', 't', '/', 'b', 'a', 'd', 0xFF, 'b', 'y', 't', 'e'
+        let expected = b"/mnt/bad\xffbyte";
+        assert_eq!(bytes, expected);
+
+        // Lossy string conversion should replace 0xFF with replacement char.
+        assert_eq!(path.to_string_lossy(), "/mnt/bad\u{FFFD}byte");
     }
 }

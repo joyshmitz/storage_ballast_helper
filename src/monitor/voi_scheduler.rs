@@ -125,8 +125,9 @@ impl PathStats {
 
     /// Time since last scan (or infinity if never scanned).
     fn staleness(&self, now: Instant) -> f64 {
-        self.last_scanned
-            .map_or(f64::INFINITY, |t| now.duration_since(t).as_secs_f64())
+        self.last_scanned.map_or(f64::INFINITY, |t| {
+            now.saturating_duration_since(t).as_secs_f64()
+        })
     }
 
     /// False-positive rate.

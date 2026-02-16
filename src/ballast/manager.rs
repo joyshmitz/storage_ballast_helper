@@ -284,7 +284,6 @@ impl BallastManager {
 
     /// Verify integrity of all expected ballast files.
     pub fn verify(&mut self) -> Result<VerifyReport> {
-        let _lock = self.acquire_lock()?;
         let mut report = VerifyReport {
             files_checked: 0,
             files_ok: 0,

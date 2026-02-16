@@ -3597,16 +3597,16 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     // Count protected directories encountered.
     let protected_count = walker.protection().read().list_protections().len();
 
-    // Collect open files for is_open detection.
-    let open_files = collect_open_files();
-    let mut open_checker = OpenPathCache::new(&open_files);
-
     // Classify and score each entry.
+    // Optimize: Score first with is_open=false, then filter, then check open files on survivors.
+    // Also apply CLI min_score override to the engine config.
     let registry = ArtifactPatternRegistry::default();
-    let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
+    let mut scoring_config = config.scoring.clone();
+    scoring_config.min_score = args.min_score;
+    let engine = ScoringEngine::from_config(&scoring_config, config.scanner.min_file_age_minutes);
     let now = SystemTime::now();
 
-    let scored: Vec<CandidacyScore> = entries
+    let mut scored: Vec<CandidacyScore> = entries
         .iter()
         .map(|entry| {
             let classification = registry.classify(&entry.path, entry.structural_signals);
@@ -3619,13 +3619,20 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                 age,
                 classification,
                 signals: entry.structural_signals,
-                is_open: open_checker.is_path_open(&entry.path),
+                is_open: false, // Deferred check
                 excluded: false,
             };
             engine.score_candidate(&candidate, 0.0)
         })
         .filter(|score| !score.vetoed && score.total_score >= args.min_score)
         .collect();
+
+    // Filter open files from survivors.
+    if !scored.is_empty() {
+        let open_files = collect_open_files();
+        let mut open_checker = OpenPathCache::new(&open_files);
+        scored.retain(|c| !open_checker.is_path_open(&c.path));
+    }
 
     let scan_elapsed = start.elapsed();
 

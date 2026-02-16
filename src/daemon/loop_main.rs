@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
 use parking_lot::RwLock;
 
 use crate::ballast::coordinator::BallastPoolCoordinator;
@@ -47,11 +47,25 @@ use crate::scanner::walker::{DirectoryWalker, WalkerConfig};
 // ──────────────────── channel capacities ────────────────────
 
 /// Monitor → Scanner: bounded(2). Allows one buffered request while scanner
-/// processes another. Monitor drops the request if the channel is full and
-/// retries next tick with fresh urgency, bounding data staleness.
+/// processes another. Under urgent pressure we replace one stale queued request
+/// with the latest signal so high-priority actions are not starved.
 const SCANNER_CHANNEL_CAP: usize = 2;
 /// Scanner → Executor: bounded(64). Natural backpressure — scanner blocks on send.
 const EXECUTOR_CHANNEL_CAP: usize = 64;
+/// Candidate count threshold for dispatching a deletion batch before walk completion.
+const EARLY_DISPATCH_MULTIPLIER: usize = 4;
+/// Max time to wait before dispatching first non-empty deletion batch during a scan.
+const EARLY_DISPATCH_MAX_WAIT: Duration = Duration::from_secs(10);
+
+/// Maximum entries to process in a single scan pass.
+/// Prevents the scanner from taking hours on massive directory trees (e.g. 500GB+
+/// of nested cargo targets). When the budget is reached, whatever candidates have
+/// been found so far are sent to the executor. The next scan request will continue.
+const SCAN_ENTRY_BUDGET: usize = 100_000;
+
+/// Maximum wall-clock time for a single scan pass (seconds).
+/// After this deadline, the scanner processes accumulated candidates and returns.
+const SCAN_TIME_BUDGET_SECS: u64 = 60;
 
 // ──────────────────── shared executor config ────────────────────
 
@@ -265,6 +279,67 @@ fn compute_primary_path(config: &Config) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !paths.iter().any(|existing| existing == &candidate) {
+        paths.push(candidate);
+    }
+}
+
+fn ballast_discovery_paths(
+    config: &Config,
+    special_locations: &SpecialLocationRegistry,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(config.scanner.root_paths.len() + 4);
+    for root in &config.scanner.root_paths {
+        push_unique_path(&mut paths, root.clone());
+    }
+    for location in special_locations.all() {
+        push_unique_path(&mut paths, location.path.clone());
+    }
+    if let Some(parent) = config.paths.state_file.parent() {
+        push_unique_path(&mut paths, parent.to_path_buf());
+    }
+    if let Some(parent) = config.paths.ballast_dir.parent() {
+        push_unique_path(&mut paths, parent.to_path_buf());
+    }
+    paths
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanEnqueueStatus {
+    Queued,
+    ReplacedStale,
+    DeferredFull,
+    Disconnected,
+}
+
+fn enqueue_scan_request(
+    scan_tx: &Sender<ScanRequest>,
+    scan_rx: &Receiver<ScanRequest>,
+    request: ScanRequest,
+    replace_on_full: bool,
+) -> ScanEnqueueStatus {
+    match scan_tx.try_send(request) {
+        Ok(()) => ScanEnqueueStatus::Queued,
+        Err(TrySendError::Full(request)) => {
+            if !replace_on_full {
+                return ScanEnqueueStatus::DeferredFull;
+            }
+
+            match scan_rx.try_recv() {
+                Ok(_) => match scan_tx.try_send(request) {
+                    Ok(()) => ScanEnqueueStatus::ReplacedStale,
+                    Err(TrySendError::Full(_)) => ScanEnqueueStatus::DeferredFull,
+                    Err(TrySendError::Disconnected(_)) => ScanEnqueueStatus::Disconnected,
+                },
+                Err(TryRecvError::Empty) => ScanEnqueueStatus::DeferredFull,
+                Err(TryRecvError::Disconnected) => ScanEnqueueStatus::Disconnected,
+            }
+        }
+        Err(TrySendError::Disconnected(_)) => ScanEnqueueStatus::Disconnected,
+    }
+}
+
 impl MonitoringDaemon {
     /// Build and initialize the daemon from configuration.
     #[allow(clippy::too_many_lines)]
@@ -309,11 +384,9 @@ impl MonitoringDaemon {
         )?;
 
         // 6. Initialize ballast coordinator (multi-volume).
-        let ballast_coordinator = BallastPoolCoordinator::discover(
-            &config.ballast,
-            &config.scanner.root_paths,
-            platform.as_ref(),
-        )?;
+        let discovery_paths = ballast_discovery_paths(&config, &special_locations);
+        let ballast_coordinator =
+            BallastPoolCoordinator::discover(&config.ballast, &discovery_paths, platform.as_ref())?;
 
         // 7. Release controller.
         let release_controller =
@@ -468,10 +541,10 @@ impl MonitoringDaemon {
             }
 
             // 5. Handle pressure response.
-            self.handle_pressure(&response, &scan_tx);
+            self.handle_pressure(&response, &scan_tx, &scan_rx);
 
             // 6. Check special locations independently.
-            self.check_special_locations(&scan_tx);
+            self.check_special_locations(&scan_tx, &scan_rx);
 
             // 7. Watchdog heartbeat.
             self.watchdog.maybe_notify(&format!(
@@ -798,6 +871,7 @@ impl MonitoringDaemon {
         &mut self,
         response: &crate::monitor::pid::PressureResponse,
         scan_tx: &Sender<ScanRequest>,
+        scan_rx: &Receiver<ScanRequest>,
     ) {
         self.check_predictive_warning(response);
 
@@ -870,7 +944,7 @@ impl MonitoringDaemon {
                 // we MUST start scanning even if the current static level is Green.
                 // 0.8 corresponds to ~high urgency threshold (e.g. < 5 mins to saturation).
                 if response.urgency > 0.8 {
-                    self.send_scan_request(scan_tx, response, paths_to_scan);
+                    self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
                 }
             }
             PressureLevel::Yellow => {
@@ -879,22 +953,22 @@ impl MonitoringDaemon {
                 if response.release_ballast_files > 0 {
                     let _ = self.release_ballast(&response.causing_mount, response);
                 }
-                self.send_scan_request(scan_tx, response, paths_to_scan);
+                self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
             }
             PressureLevel::Orange => {
                 // Start scanning + gentle cleanup + early ballast release.
                 let _ = self.release_ballast(&response.causing_mount, response);
-                self.send_scan_request(scan_tx, response, paths_to_scan);
+                self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
             }
             PressureLevel::Red => {
                 // Release ballast + aggressive scan + delete.
                 let _ = self.release_ballast(&response.causing_mount, response);
-                self.send_scan_request(scan_tx, response, paths_to_scan);
+                self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
             }
             PressureLevel::Critical => {
                 // Emergency: release all ballast + delete everything safe.
                 let _ = self.release_ballast(&response.causing_mount, response);
-                self.send_scan_request(scan_tx, response, paths_to_scan);
+                self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
 
                 let primary = self.primary_path();
                 let actual_free_pct = self
@@ -943,6 +1017,7 @@ impl MonitoringDaemon {
     fn send_scan_request(
         &self,
         scan_tx: &Sender<ScanRequest>,
+        scan_rx: &Receiver<ScanRequest>,
         response: &crate::monitor::pid::PressureResponse,
         paths: Vec<PathBuf>,
     ) {
@@ -954,12 +1029,20 @@ impl MonitoringDaemon {
             config_update: None,
         };
 
-        // Non-blocking send: if the channel is full, the newest request is dropped.
-        // With capacity=2 this means at most 1 buffered request while scanner processes
-        // another. The next monitor iteration (typically 5-10s later) will send a fresh
-        // request with current urgency, so data staleness is bounded.
-        if let Err(TrySendError::Full(_)) = scan_tx.try_send(request) {
-            eprintln!("[SBH-DAEMON] scan channel full, request deferred to next tick");
+        let replace_on_full = response.level >= PressureLevel::Red || response.urgency >= 0.90;
+        match enqueue_scan_request(scan_tx, scan_rx, request, replace_on_full) {
+            ScanEnqueueStatus::Queued => {}
+            ScanEnqueueStatus::ReplacedStale => {
+                eprintln!(
+                    "[SBH-DAEMON] scan channel saturated, replaced stale queued request with urgent update"
+                );
+            }
+            ScanEnqueueStatus::DeferredFull => {
+                eprintln!("[SBH-DAEMON] scan channel full, request deferred to next tick");
+            }
+            ScanEnqueueStatus::Disconnected => {
+                eprintln!("[SBH-DAEMON] scan channel disconnected, dropping scan request");
+            }
         }
     }
 
@@ -1009,10 +1092,15 @@ impl MonitoringDaemon {
 
     // ──────────────────── special locations ────────────────────
 
-    fn check_special_locations(&mut self, scan_tx: &Sender<ScanRequest>) {
+    fn check_special_locations(
+        &mut self,
+        scan_tx: &Sender<ScanRequest>,
+        scan_rx: &Receiver<ScanRequest>,
+    ) {
         let now = Instant::now();
+        let locations = self.special_locations.all().to_vec();
 
-        for location in self.special_locations.all() {
+        for location in &locations {
             let last_scan = self.last_special_scan.get(&location.path).copied();
             if !location.scan_due(last_scan, now) {
                 continue;
@@ -1064,18 +1152,62 @@ impl MonitoringDaemon {
                     _ => 40,
                 };
 
+                // Try immediate ballast release for the pressured mount.
+                // If that mount has no pool (common for /dev/shm tmpfs), fall back to the
+                // non-empty pool with highest releasable bytes to buy recovery time.
+                let release_mount = if self.ballast_coordinator.has_pool(&stats.mount_point) {
+                    Some(stats.mount_point.clone())
+                } else {
+                    self.ballast_coordinator
+                        .inventory()
+                        .into_iter()
+                        .filter(|item| !item.skipped && item.files_available > 0)
+                        .max_by_key(|item| item.releasable_bytes)
+                        .map(|item| item.mount_point)
+                };
+
+                if let Some(mount) = release_mount {
+                    let release_response = crate::monitor::pid::PressureResponse {
+                        level: pressure_level,
+                        urgency,
+                        scan_interval: Duration::from_secs(0),
+                        release_ballast_files: 0,
+                        max_delete_batch,
+                        fallback_active: false,
+                        causing_mount: mount.clone(),
+                        predicted_seconds: None,
+                    };
+                    let _ = self.release_ballast(&mount, &release_response);
+                }
+
+                let mut scan_paths = Vec::with_capacity(self.config.scanner.root_paths.len() + 1);
+                scan_paths.push(location.path.clone());
+                for root in &self.config.scanner.root_paths {
+                    if root != &location.path {
+                        scan_paths.push(root.clone());
+                    }
+                }
+
                 let request = ScanRequest {
-                    paths: self.config.scanner.root_paths.clone(),
+                    paths: scan_paths,
                     urgency,
                     pressure_level,
                     max_delete_batch,
                     config_update: None,
                 };
 
-                if let Err(TrySendError::Full(_)) = scan_tx.try_send(request) {
-                    eprintln!(
-                        "[SBH-DAEMON] scan channel full (special location trigger), deferred"
-                    );
+                match enqueue_scan_request(scan_tx, scan_rx, request, true) {
+                    ScanEnqueueStatus::Queued | ScanEnqueueStatus::ReplacedStale => {}
+                    ScanEnqueueStatus::DeferredFull => {
+                        eprintln!(
+                            "[SBH-DAEMON] scan channel full (special location trigger), deferred"
+                        );
+                    }
+                    ScanEnqueueStatus::Disconnected => {
+                        eprintln!(
+                            "[SBH-DAEMON] scan channel disconnected (special location trigger)"
+                        );
+                    }
                 }
             }
         }
@@ -1130,7 +1262,23 @@ impl MonitoringDaemon {
                         new_config.ballast.replenish_cooldown_minutes,
                     );
                     self.release_controller.reset();
-                    self.ballast_coordinator.update_config(&new_config.ballast);
+                    let discovery_paths =
+                        ballast_discovery_paths(&new_config, &self.special_locations);
+                    match BallastPoolCoordinator::discover(
+                        &new_config.ballast,
+                        &discovery_paths,
+                        self.platform.as_ref(),
+                    ) {
+                        Ok(coordinator) => {
+                            self.ballast_coordinator = coordinator;
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "[SBH-DAEMON] ballast coordinator rediscovery failed during reload: {err}"
+                            );
+                            self.ballast_coordinator.update_config(&new_config.ballast);
+                        }
+                    }
 
                     // Propagate pressure thresholds to all active PID controllers.
                     for monitor in self.mount_monitors.values_mut() {
@@ -1289,6 +1437,50 @@ impl MonitoringDaemon {
 
 // ──────────────────── scanner thread ────────────────────
 
+fn dispatch_top_candidates(
+    scored: &mut Vec<CandidacyScore>,
+    request: &ScanRequest,
+    del_tx: &Sender<DeletionBatch>,
+) -> bool {
+    if scored.is_empty() {
+        return true;
+    }
+
+    scored.sort_by(|a, b| {
+        b.total_score
+            .partial_cmp(&a.total_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let max_batch = request.max_delete_batch.max(1);
+    let overflow = if scored.len() > max_batch {
+        scored.split_off(max_batch)
+    } else {
+        Vec::new()
+    };
+
+    let batch = DeletionBatch {
+        candidates: std::mem::replace(scored, overflow),
+        pressure_level: request.pressure_level,
+        urgency: request.urgency,
+    };
+
+    // Non-blocking send preserves scanner progress and avoids deadlock when
+    // executor is slow. If channel is full, re-queue candidates locally so the
+    // scanner can retry later in this pass.
+    match del_tx.try_send(batch) {
+        Ok(()) => true,
+        Err(TrySendError::Full(mut deferred)) => {
+            eprintln!(
+                "[SBH-SCANNER] executor channel full, deferring {} candidates",
+                deferred.candidates.len()
+            );
+            scored.append(&mut deferred.candidates);
+            true
+        }
+        Err(TrySendError::Disconnected(_)) => false, // Channel closed, exit
+    }
+}
+
 /// Scanner thread: receives scan requests, walks directories, scores candidates,
 /// and sends deletion batches to the executor.
 ///
@@ -1372,6 +1564,12 @@ fn scanner_thread_main(
         let mut paths_scanned = 0;
         let mut candidates_found = 0;
         let mut scored: Vec<CandidacyScore> = Vec::with_capacity(1024);
+        let mut scanner_should_exit = false;
+        let dispatch_threshold = request
+            .max_delete_batch
+            .max(1)
+            .saturating_mul(EARLY_DISPATCH_MULTIPLIER);
+        let mut next_dispatch_deadline = scan_start + EARLY_DISPATCH_MAX_WAIT;
 
         // Snapshot open files once per scan for fast filtering.
         // We use the ancestor-set approach which is O(1) per candidate check
@@ -1393,9 +1591,42 @@ fn scanner_thread_main(
             );
         }
 
-        // Process entries.
-        for entry in rx {
+        // Scan budget: absolute deadline for this scan pass.
+        let scan_deadline = scan_start + Duration::from_secs(SCAN_TIME_BUDGET_SECS);
+
+        // Process entries with timeout to handle walker deadlocks.
+        // The walker can deadlock when both worker threads block on a full work queue
+        // (bounded channel). Using recv_timeout ensures the budget check fires even
+        // when no entries are flowing.
+        loop {
+            let entry = match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(entry) => entry,
+                Err(RecvTimeoutError::Timeout) => {
+                    // No entries for 2 seconds — check if budget is exhausted.
+                    if Instant::now() >= scan_deadline {
+                        eprintln!(
+                            "[SBH-SCANNER] scan timed out ({paths_scanned} entries, \
+                             {candidates_found} candidates, {:.1}s) — walker may be stuck",
+                            scan_start.elapsed().as_secs_f64()
+                        );
+                        break;
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
             paths_scanned += 1;
+
+            // Budget check: stop processing if we've exceeded entry count or time limits.
+            if paths_scanned >= SCAN_ENTRY_BUDGET || Instant::now() >= scan_deadline {
+                eprintln!(
+                    "[SBH-SCANNER] scan budget reached ({paths_scanned} entries, \
+                     {candidates_found} candidates, {:.1}s) — dispatching partial results",
+                    scan_start.elapsed().as_secs_f64()
+                );
+                break;
+            }
+
             let age = entry.metadata.modified.elapsed().unwrap_or(Duration::ZERO);
 
             // Classify.
@@ -1441,6 +1672,19 @@ fn scanner_thread_main(
             {
                 stat.false_positives += 1;
             }
+
+            // Do not wait for full walk completion before sending the first deletion batch.
+            // On very large trees this starts reclaim work earlier and avoids long periods with
+            // zero deletion progress while the scanner is still traversing.
+            let should_dispatch = !scored.is_empty()
+                && (scored.len() >= dispatch_threshold || Instant::now() >= next_dispatch_deadline);
+            if should_dispatch {
+                if !dispatch_top_candidates(&mut scored, &request, del_tx) {
+                    scanner_should_exit = true;
+                    break;
+                }
+                next_dispatch_deadline = Instant::now() + EARLY_DISPATCH_MAX_WAIT;
+            }
         }
 
         #[allow(clippy::cast_possible_truncation)]
@@ -1460,29 +1704,25 @@ fn scanner_thread_main(
             root_stats: root_stats_map.into_values().collect(),
         });
 
-        // Send scored candidates to executor.
-        if !scored.is_empty() {
-            // Sort by score descending.
-            scored.sort_by(|a, b| {
-                b.total_score
-                    .partial_cmp(&a.total_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            // Limit to max_delete_batch.
-            scored.truncate(request.max_delete_batch);
-
-            let batch = DeletionBatch {
-                candidates: scored,
-                pressure_level: request.pressure_level,
-                urgency: request.urgency,
-            };
-
-            // This blocks if executor is slow — correct behavior (backpressure).
-            if del_tx.send(batch).is_err() {
-                // Channel closed, exit.
+        // Flush remaining candidates in bounded batches.
+        while !scored.is_empty() {
+            let pending_before = scored.len();
+            if !dispatch_top_candidates(&mut scored, &request, del_tx) {
+                scanner_should_exit = true;
                 break;
             }
+            // No progress means executor channel stayed full; avoid busy-loop.
+            if scored.len() >= pending_before {
+                eprintln!(
+                    "[SBH-SCANNER] executor backlog persisted at scan end; {} candidates will be rediscovered on next pass",
+                    scored.len()
+                );
+                break;
+            }
+        }
+
+        if scanner_should_exit {
+            break;
         }
     }
 }
@@ -1559,7 +1799,47 @@ fn executor_thread_main(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::config::Config;
     use crate::monitor::pid::PressureLevel;
+    use crate::monitor::special_locations::{
+        SpecialKind, SpecialLocation, SpecialLocationRegistry,
+    };
+    use crate::scanner::patterns::ArtifactClassification;
+    use crate::scanner::scoring::{DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors};
+    use std::path::Path;
+    use std::time::Duration;
+
+    fn test_candidate(path: &str, total_score: f64) -> CandidacyScore {
+        CandidacyScore {
+            path: PathBuf::from(path),
+            total_score,
+            factors: ScoreFactors {
+                location: 0.0,
+                name: 0.0,
+                age: 0.0,
+                size: 0.0,
+                structure: 0.0,
+                pressure_multiplier: 1.0,
+            },
+            vetoed: false,
+            veto_reason: None,
+            classification: ArtifactClassification::unknown(),
+            size_bytes: 1,
+            age: Duration::from_secs(60),
+            decision: DecisionOutcome {
+                action: DecisionAction::Delete,
+                posterior_abandoned: 0.9,
+                expected_loss_keep: 0.9,
+                expected_loss_delete: 0.1,
+                calibration_score: 1.0,
+                fallback_active: false,
+            },
+            ledger: EvidenceLedger {
+                terms: Vec::new(),
+                summary: "test".to_string(),
+            },
+        }
+    }
 
     #[test]
     fn thread_health_allows_initial_respawns() {
@@ -1674,9 +1954,99 @@ mod tests {
     }
 
     #[test]
-    fn scanner_channel_defers_when_full() {
-        let (tx, _rx) = bounded::<ScanRequest>(SCANNER_CHANNEL_CAP);
+    fn scanner_channel_defers_when_full_without_replacement() {
+        let (tx, rx) = bounded::<ScanRequest>(SCANNER_CHANNEL_CAP);
 
+        let make_request = |urgency: f64| ScanRequest {
+            paths: vec![],
+            urgency,
+            pressure_level: PressureLevel::Critical,
+            max_delete_batch: 40,
+            config_update: None,
+        };
+
+        // Fill the channel to capacity.
+        tx.try_send(make_request(0.1)).unwrap();
+        tx.try_send(make_request(0.2)).unwrap();
+
+        let status = enqueue_scan_request(&tx, &rx, make_request(0.95), false);
+        assert_eq!(status, ScanEnqueueStatus::DeferredFull);
+
+        // Queue should retain the original oldest request.
+        let first = rx.recv().unwrap();
+        assert_eq!(first.urgency.to_bits(), 0.1_f64.to_bits());
+    }
+
+    #[test]
+    fn scanner_channel_replaces_stale_request_when_priority() {
+        let (tx, rx) = bounded::<ScanRequest>(SCANNER_CHANNEL_CAP);
+
+        let make_request = |urgency: f64| ScanRequest {
+            paths: vec![],
+            urgency,
+            pressure_level: PressureLevel::Critical,
+            max_delete_batch: 40,
+            config_update: None,
+        };
+
+        // Fill queue with stale requests.
+        tx.try_send(make_request(0.1))
+            .expect("should buffer within capacity");
+        tx.try_send(make_request(0.2))
+            .expect("should buffer within capacity");
+
+        // Priority enqueue should evict oldest and queue new request.
+        let status = enqueue_scan_request(&tx, &rx, make_request(1.0), true);
+        assert_eq!(status, ScanEnqueueStatus::ReplacedStale);
+
+        let queued_first = rx.recv().unwrap();
+        let queued_second = rx.recv().unwrap();
+        assert_eq!(queued_first.urgency.to_bits(), 0.2_f64.to_bits());
+        assert_eq!(queued_second.urgency.to_bits(), 1.0_f64.to_bits());
+    }
+
+    #[test]
+    fn ballast_discovery_paths_include_special_and_runtime_mount_hints() {
+        let mut cfg = Config::default();
+        cfg.scanner.root_paths = vec![PathBuf::from("/data/projects"), PathBuf::from("/tmp")];
+        cfg.paths.state_file = PathBuf::from("/var/lib/sbh/state.json");
+        cfg.paths.ballast_dir = PathBuf::from("/var/lib/sbh/ballast");
+
+        let special = SpecialLocationRegistry::new(vec![
+            SpecialLocation {
+                path: PathBuf::from("/dev/shm"),
+                kind: SpecialKind::DevShm,
+                buffer_pct: 20,
+                scan_interval: Duration::from_secs(3),
+                priority: 255,
+            },
+            // Duplicate root should be deduped.
+            SpecialLocation {
+                path: PathBuf::from("/tmp"),
+                kind: SpecialKind::Tmpfs,
+                buffer_pct: 15,
+                scan_interval: Duration::from_secs(5),
+                priority: 200,
+            },
+        ]);
+
+        let paths = ballast_discovery_paths(&cfg, &special);
+        assert!(paths.contains(&PathBuf::from("/data/projects")));
+        assert!(paths.contains(&PathBuf::from("/tmp")));
+        assert!(paths.contains(&PathBuf::from("/dev/shm")));
+        assert!(paths.contains(&PathBuf::from("/var/lib/sbh")));
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|path| path.as_path() == Path::new("/tmp"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn scanner_channel_reports_full_via_try_send_for_raw_channel_behavior() {
+        let (tx, _rx) = bounded::<ScanRequest>(SCANNER_CHANNEL_CAP);
         let make_request = || ScanRequest {
             paths: vec![],
             urgency: 0.9,
@@ -1684,15 +2054,69 @@ mod tests {
             max_delete_batch: 40,
             config_update: None,
         };
-
-        // Fill the channel to capacity.
         for _ in 0..SCANNER_CHANNEL_CAP {
             tx.try_send(make_request())
                 .expect("should buffer within capacity");
         }
 
-        // One more should fail — channel is full.
         let result = tx.try_send(make_request());
         assert!(matches!(result, Err(TrySendError::Full(_))));
+    }
+
+    #[test]
+    fn dispatch_top_candidates_retains_overflow_after_send() {
+        let request = ScanRequest {
+            paths: vec![PathBuf::from("/tmp")],
+            urgency: 1.0,
+            pressure_level: PressureLevel::Critical,
+            max_delete_batch: 1,
+            config_update: None,
+        };
+        let (del_tx, del_rx) = bounded::<DeletionBatch>(4);
+        let mut scored = vec![
+            test_candidate("/tmp/low", 0.1),
+            test_candidate("/tmp/high", 0.9),
+            test_candidate("/tmp/mid", 0.5),
+        ];
+
+        assert!(dispatch_top_candidates(&mut scored, &request, &del_tx));
+        let batch = del_rx.recv().expect("batch should be dispatched");
+        assert_eq!(batch.candidates.len(), 1);
+        assert_eq!(batch.candidates[0].path, Path::new("/tmp/high"));
+        assert_eq!(scored.len(), 2);
+        assert!(scored.iter().any(|c| c.path == Path::new("/tmp/mid")));
+        assert!(scored.iter().any(|c| c.path == Path::new("/tmp/low")));
+    }
+
+    #[test]
+    fn dispatch_top_candidates_requeues_when_executor_full() {
+        let request = ScanRequest {
+            paths: vec![PathBuf::from("/tmp")],
+            urgency: 1.0,
+            pressure_level: PressureLevel::Critical,
+            max_delete_batch: 1,
+            config_update: None,
+        };
+        let (del_tx, del_rx) = bounded::<DeletionBatch>(1);
+        del_tx
+            .send(DeletionBatch {
+                candidates: vec![test_candidate("/tmp/already-queued", 0.2)],
+                pressure_level: PressureLevel::Critical,
+                urgency: 0.5,
+            })
+            .expect("prefill channel");
+
+        let mut scored = vec![test_candidate("/tmp/a", 0.4), test_candidate("/tmp/b", 0.6)];
+        let before = scored.len();
+        assert!(dispatch_top_candidates(&mut scored, &request, &del_tx));
+
+        // Channel remained full, so scanner should still retain all candidates.
+        assert_eq!(scored.len(), before);
+        assert!(scored.iter().any(|c| c.path == Path::new("/tmp/a")));
+        assert!(scored.iter().any(|c| c.path == Path::new("/tmp/b")));
+
+        // Existing queued batch should still be the one currently in the channel.
+        let queued = del_rx.recv().expect("prefilled batch still queued");
+        assert_eq!(queued.candidates[0].path, Path::new("/tmp/already-queued"));
     }
 }

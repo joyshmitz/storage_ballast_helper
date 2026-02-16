@@ -465,9 +465,10 @@ fn parse_last_scan_instant(timestamp: &str) -> Option<Instant> {
 
 /// Write state.json atomically: write to .tmp, then rename.
 ///
-/// Sets 0o600 permissions on the temp file (Unix only) so the final
-/// state.json is owner-only readable, preventing information leak on
-/// multi-user systems.
+/// Sets 0o644 permissions on the temp file (Unix only) so the state file is
+/// world-readable. The state file contains only operational telemetry (pressure
+/// levels, uptime, counters) and must be readable by the CLI running as a
+/// non-root user (e.g. `sbh status` run by ubuntu while daemon runs as root).
 fn write_state_atomic(path: &Path, state: &DaemonState) -> std::io::Result<()> {
     let tmp_path = path.with_extension("json.tmp");
 
@@ -486,7 +487,7 @@ fn write_state_atomic(path: &Path, state: &DaemonState) -> std::io::Result<()> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt as _;
-                opts.mode(0o600);
+                opts.mode(0o644);
             }
             let mut file = opts.open(&tmp_path)?;
             file.write_all(json.as_bytes())?;
@@ -683,8 +684,8 @@ mod tests {
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            mode, 0o600,
-            "state.json should be owner-only (0600), got {mode:o}"
+            mode, 0o644,
+            "state.json should be world-readable (0644) for CLI access, got {mode:o}"
         );
     }
 

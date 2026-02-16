@@ -90,6 +90,14 @@ pub struct PoolInventory {
     pub skip_reason: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct SkippedPoolInfo {
+    ballast_dir: PathBuf,
+    fs_type: String,
+    strategy: ProvisionStrategy,
+    reason: String,
+}
+
 /// Aggregated provision report across all volumes.
 #[derive(Debug, Clone)]
 pub struct MultiProvisionReport {
@@ -119,6 +127,7 @@ impl MultiProvisionReport {
 /// Release targets the exact volume under pressure.
 pub struct BallastPoolCoordinator {
     pools: HashMap<PathBuf, BallastPool>,
+    skipped_pools: HashMap<PathBuf, SkippedPoolInfo>,
 }
 
 impl BallastPoolCoordinator {
@@ -131,6 +140,7 @@ impl BallastPoolCoordinator {
     ) -> Result<Self> {
         let mounts = platform.mount_points()?;
         let mut pools = HashMap::new();
+        let mut skipped_pools = HashMap::new();
 
         // Deduplicate watched paths by mount point.
         let mut seen_mounts = HashMap::<PathBuf, MountPoint>::new();
@@ -144,6 +154,18 @@ impl BallastPoolCoordinator {
 
         for (mount_path, mount) in &seen_mounts {
             let mount_str = mount_path.to_string_lossy();
+            let strategy = provision_strategy(&mount.fs_type);
+            let mut skip_with = |reason: String| {
+                skipped_pools.insert(
+                    mount_path.clone(),
+                    SkippedPoolInfo {
+                        ballast_dir: mount_path.join(BALLAST_SUBDIR),
+                        fs_type: mount.fs_type.clone(),
+                        strategy,
+                        reason,
+                    },
+                );
+            };
 
             // Warn about non-UTF-8 mount paths that may cause config-matching issues.
             if mount_path.to_str().is_none() {
@@ -154,30 +176,38 @@ impl BallastPoolCoordinator {
 
             // Check override: explicitly disabled?
             if !config.is_volume_enabled(&mount_str) {
+                skip_with("disabled via ballast volume override".to_string());
                 continue;
             }
 
             // Skip RAM-backed (tmpfs/ramfs) — ballast on RAM defeats the purpose.
             if mount.is_ram_backed || RAM_FILESYSTEMS.contains(&mount.fs_type.as_str()) {
+                skip_with("ram-backed filesystem (ballast disabled)".to_string());
                 continue;
             }
 
             // Skip network filesystems — unreliable for ballast.
             if NETWORK_FILESYSTEMS.contains(&mount.fs_type.as_str()) {
+                skip_with("network filesystem (ballast disabled)".to_string());
                 continue;
             }
 
             // Check read-only via platform. Skip volumes where fs_stats fails
             // (e.g. permission denied) rather than aborting discovery for all.
-            let Ok(stats) = platform.fs_stats(mount_path) else {
-                continue;
+            let stats = match platform.fs_stats(mount_path) {
+                Ok(stats) => stats,
+                Err(err) => {
+                    skip_with(format!("failed to stat filesystem: {err}"));
+                    continue;
+                }
             };
             if stats.is_readonly {
+                skip_with("read-only filesystem".to_string());
                 continue;
             }
 
-            let strategy = provision_strategy(&mount.fs_type);
             if strategy == ProvisionStrategy::Skip {
+                skip_with("filesystem strategy marked as skip".to_string());
                 continue;
             }
 
@@ -195,7 +225,13 @@ impl BallastPoolCoordinator {
                 overrides: BTreeMap::new(),
             };
 
-            let manager = BallastManager::new(ballast_dir.clone(), pool_config)?;
+            let manager = match BallastManager::new(ballast_dir.clone(), pool_config) {
+                Ok(manager) => manager,
+                Err(err) => {
+                    skip_with(format!("failed to initialize ballast manager: {err}"));
+                    continue;
+                }
+            };
 
             pools.insert(
                 mount_path.clone(),
@@ -209,7 +245,10 @@ impl BallastPoolCoordinator {
             );
         }
 
-        Ok(Self { pools })
+        Ok(Self {
+            pools,
+            skipped_pools,
+        })
     }
 
     /// Provision all pools (idempotent: skips existing valid files).
@@ -315,7 +354,8 @@ impl BallastPoolCoordinator {
 
     /// Get inventory snapshot across all pools.
     pub fn inventory(&self) -> Vec<PoolInventory> {
-        self.pools
+        let mut inventory: Vec<PoolInventory> = self
+            .pools
             .values()
             .map(|pool| PoolInventory {
                 mount_point: pool.mount_point.clone(),
@@ -328,7 +368,26 @@ impl BallastPoolCoordinator {
                 skipped: false,
                 skip_reason: None,
             })
-            .collect()
+            .collect();
+
+        inventory.extend(
+            self.skipped_pools
+                .iter()
+                .map(|(mount_point, skipped)| PoolInventory {
+                    mount_point: mount_point.clone(),
+                    ballast_dir: skipped.ballast_dir.clone(),
+                    fs_type: skipped.fs_type.clone(),
+                    strategy: skipped.strategy,
+                    files_available: 0,
+                    files_total: 0,
+                    releasable_bytes: 0,
+                    skipped: true,
+                    skip_reason: Some(skipped.reason.clone()),
+                }),
+        );
+
+        inventory.sort_by(|left, right| left.mount_point.cmp(&right.mount_point));
+        inventory
     }
 
     /// Total releasable bytes across all pools.
@@ -601,6 +660,16 @@ mod tests {
         assert_eq!(coordinator.pool_count(), 1);
         assert!(coordinator.has_pool(dir_data.path()));
         assert!(!coordinator.has_pool(dir_scratch.path()));
+        let inv = coordinator.inventory();
+        assert_eq!(inv.len(), 2);
+        assert!(inv.iter().any(|item| {
+            item.mount_point == dir_scratch.path()
+                && item.skipped
+                && item
+                    .skip_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("disabled"))
+        }));
     }
 
     #[test]
@@ -922,5 +991,14 @@ mod tests {
 
         let coordinator = BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
         assert_eq!(coordinator.pool_count(), 0);
+        let inv = coordinator.inventory();
+        assert_eq!(inv.len(), 1);
+        assert!(inv[0].skipped);
+        assert!(
+            inv[0]
+                .skip_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("read-only"))
+        );
     }
 }

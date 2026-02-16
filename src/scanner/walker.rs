@@ -325,8 +325,20 @@ fn process_directory(
             }
 
             in_flight.fetch_add(1, Ordering::Release);
-            if work_tx.send((child_path, depth + 1, root_dev)).is_err() {
-                in_flight.fetch_sub(1, Ordering::Release);
+            // Use send_timeout to prevent deadlock when both worker threads
+            // are inside process_directory and the work queue is full.
+            // With bounded(1024) and parallelism=2, both workers can block
+            // on send() simultaneously, creating a classic deadlock.
+            match work_tx.send_timeout(
+                (child_path, depth + 1, root_dev),
+                Duration::from_millis(100),
+            ) {
+                Ok(()) => {}
+                Err(_) => {
+                    // Queue full or disconnected — skip this subdirectory.
+                    // The next scan pass will pick it up if needed.
+                    in_flight.fetch_sub(1, Ordering::Release);
+                }
             }
         }
     }
@@ -485,10 +497,23 @@ fn collect_open_files_linux() -> HashSet<(u64, u64)> {
     open
 }
 
+/// Maximum time to spend scanning /proc for open file ancestors.
+/// On agent swarms with many processes, /proc scanning can take minutes.
+/// A 5-second budget captures enough data for reliable veto decisions.
+const OPEN_FILES_SCAN_BUDGET: Duration = Duration::from_secs(5);
+
+/// Maximum number of PIDs to scan before bailing out.
+/// Prevents pathological O(n * m) behavior on swarm machines with hundreds of agents.
+const OPEN_FILES_MAX_PIDS: usize = 500;
+
 /// Collect absolute open-path ancestors for open file descriptors under `root_paths`.
 ///
 /// For each open file path, all ancestors are inserted, allowing O(1) subtree-open
 /// checks with `is_path_open_by_ancestor`.
+///
+/// This function is budgeted: it will stop scanning /proc after `OPEN_FILES_SCAN_BUDGET`
+/// or `OPEN_FILES_MAX_PIDS` processes, whichever comes first. Partial results are still
+/// useful for veto decisions (most open files are captured within the first few hundred PIDs).
 pub fn collect_open_path_ancestors(root_paths: &[PathBuf]) -> HashSet<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -504,6 +529,7 @@ pub fn collect_open_path_ancestors(root_paths: &[PathBuf]) -> HashSet<PathBuf> {
 #[cfg(target_os = "linux")]
 fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> HashSet<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
+    use std::time::Instant;
 
     let mut ancestors = HashSet::with_capacity(4096);
     let Ok(proc_dir) = fs::read_dir("/proc") else {
@@ -519,12 +545,27 @@ fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> HashSet<PathBuf>
             .collect()
     };
 
+    let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
+    let mut pids_scanned: usize = 0;
+
     for proc_entry in proc_dir.flatten() {
+        // Budget checks: stop if we've exceeded time or PID limits.
+        if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
+            eprintln!(
+                "[SBH-SCANNER] open-files scan budget reached ({pids_scanned} PIDs, \
+                 {} ancestors) — partial results used for veto",
+                ancestors.len()
+            );
+            break;
+        }
+
         let pid_name = proc_entry.file_name();
         let pid_bytes = pid_name.as_bytes();
         if pid_bytes.is_empty() || !pid_bytes.iter().all(u8::is_ascii_digit) {
             continue;
         }
+
+        pids_scanned += 1;
 
         let Ok(fd_entries) = fs::read_dir(proc_entry.path().join("fd")) else {
             continue;
@@ -548,7 +589,9 @@ fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> HashSet<PathBuf>
 
             let mut current = Some(target.as_path());
             while let Some(path) = current {
-                ancestors.insert(path.to_path_buf());
+                if !ancestors.insert(path.to_path_buf()) {
+                    break; // Already seen this ancestor chain — skip rest.
+                }
                 let Some(parent) = path.parent() else {
                     break;
                 };

@@ -190,7 +190,7 @@ impl PidPressureController {
             }
         }
 
-        self.level = classify_with_hysteresis(
+        let new_level = classify_with_hysteresis(
             self.level,
             free_pct,
             self.hysteresis_pct,
@@ -199,6 +199,12 @@ impl PidPressureController {
             self.orange_min_free_pct,
             self.red_min_free_pct,
         );
+
+        // Reset integral on level change to prevent windup from previous state.
+        if new_level != self.level {
+            self.integral = 0.0;
+        }
+        self.level = new_level;
 
         let (scan_interval, release_ballast_files, max_delete_batch) =
             response_policy(self.base_poll_interval, self.level, urgency);
@@ -685,5 +691,66 @@ mod tests {
         assert!((ctrl.yellow_min_free_pct - 25.0).abs() < f64::EPSILON);
         assert!((ctrl.orange_min_free_pct - 15.0).abs() < f64::EPSILON);
         assert!((ctrl.red_min_free_pct - 8.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn integral_resets_on_level_change() {
+        let mut pid = PidPressureController::new(
+            0.25,
+            0.08,
+            0.02,
+            100.0,
+            18.0,
+            1.0,
+            20.0,
+            14.0,
+            10.0,
+            6.0,
+            Duration::from_secs(1),
+        );
+        let t0 = Instant::now();
+
+        // 1. Establish Green state with some integral accumulation (target=18%, current=50%)
+        // Error = 18 - 50 = -32. Integral should become negative.
+        pid.update(
+            PressureReading {
+                free_bytes: 50,
+                total_bytes: 100,
+                mount: PathBuf::from("/"),
+            },
+            None,
+            t0,
+        );
+        assert!(pid.integral < 0.0);
+        let integral_before = pid.integral;
+
+        // 2. Drop to Yellow (current=12%). Level changes Green -> Yellow.
+        // This should trigger the reset logic.
+        let response = pid.update(
+            PressureReading {
+                free_bytes: 12,
+                total_bytes: 100,
+                mount: PathBuf::from("/"),
+            },
+            None,
+            t0 + Duration::from_secs(1),
+        );
+
+        assert_eq!(response.level, PressureLevel::Yellow);
+        // Integral accumulates the new error first, then resets to 0.0 on level change.
+        // This clears the windup from the previous state. The fresh error (18 - 12 = 6)
+        // will be accumulated on the NEXT update call, starting from a clean slate.
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                pid.integral, 0.0,
+                "integral should be reset to zero on level change"
+            );
+            assert_ne!(
+                pid.integral,
+                integral_before + 6.0,
+                "integral should not carry over from previous level"
+            );
+        }
     }
 }

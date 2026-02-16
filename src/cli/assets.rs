@@ -847,22 +847,20 @@ fn download_and_verify(entry: &AssetEntry, cache: &AssetCache) -> io::Result<u64
         .arg(&partial)
         .arg(&entry.url)
         .status()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to execute curl: {e}")))?;
+        .map_err(|e| {
+            io::Error::other(format!("failed to execute curl: {e}"))
+        })?;
 
     if !status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("download failed (status {status})"),
-        ));
+        return Err(io::Error::other(format!(
+            "download failed (status {status})"
+        )));
     }
 
     if !partial.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!(
-                "download failed; file missing at {}",
-                partial.display()
-            ),
+            format!("download failed; file missing at {}", partial.display()),
         ));
     }
 
