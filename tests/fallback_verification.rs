@@ -129,14 +129,14 @@ fn write_state_file(path: &std::path::Path, state: &DaemonState) {
 // ══════════════════════════════════════════════════════════════════
 
 #[test]
-fn dashboard_mode_default_is_legacy() {
-    assert_eq!(DashboardMode::default(), DashboardMode::Legacy);
+fn dashboard_mode_default_is_new() {
+    assert_eq!(DashboardMode::default(), DashboardMode::New);
 }
 
 #[test]
 fn dashboard_config_default_is_safe() {
     let cfg = DashboardConfig::default();
-    assert_eq!(cfg.mode, DashboardMode::Legacy);
+    assert_eq!(cfg.mode, DashboardMode::New);
     assert!(!cfg.kill_switch);
 }
 

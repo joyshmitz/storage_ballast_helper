@@ -2780,7 +2780,7 @@ impl std::fmt::Display for DashboardSelectionReason {
             Self::CliFlagNew => f.write_str("--new-dashboard (CLI flag)"),
             Self::EnvVarMode => f.write_str("SBH_DASHBOARD_MODE (env)"),
             Self::ConfigFileMode => f.write_str("dashboard.mode (config)"),
-            Self::HardcodedDefault => f.write_str("hardcoded default (legacy)"),
+            Self::HardcodedDefault => f.write_str("hardcoded default (new)"),
         }
     }
 }
@@ -2803,7 +2803,7 @@ struct DashboardRuntimeRequest {
 /// 4. `--new-dashboard` CLI flag → New
 /// 5. `SBH_DASHBOARD_MODE` env var → parsed mode
 /// 6. `dashboard.mode` config field → configured mode
-/// 7. Hardcoded default → Legacy
+/// 7. Hardcoded default → New
 fn resolve_dashboard_runtime(
     args: &DashboardArgs,
     config: &Config,
@@ -2872,7 +2872,7 @@ fn resolve_dashboard_runtime(
 
     // 7. Hardcoded default.
     (
-        DashboardRuntimeSelection::Legacy,
+        DashboardRuntimeSelection::New,
         DashboardSelectionReason::HardcodedDefault,
     )
 }
@@ -3009,9 +3009,10 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     continue;
                 };
 
-                // Skip pseudo-filesystems with zero capacity (squashfs, proc,
-                // sysfs, etc.) — they don't represent real storage pressure.
-                if stats.total_bytes == 0 {
+                // Skip pseudo/virtual/read-only filesystems (squashfs snap
+                // mounts, proc, sysfs, etc.) — they can't fill up and don't
+                // represent actionable storage pressure.
+                if stats.total_bytes == 0 || stats.is_readonly {
                     continue;
                 }
 
@@ -3107,8 +3108,8 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 let Ok(stats) = platform.fs_stats(&mount.path) else {
                     continue;
                 };
-                // Skip pseudo-filesystems with zero capacity.
-                if stats.total_bytes == 0 {
+                // Skip pseudo/virtual/read-only filesystems.
+                if stats.total_bytes == 0 || stats.is_readonly {
                     continue;
                 }
                 let free_pct = stats.free_pct();
@@ -5386,7 +5387,7 @@ mod tests {
 
         let defaults = DashboardArgs::default();
         let (sel, reason) = resolve_dashboard_runtime(&defaults, &cfg);
-        assert_eq!(sel, DashboardRuntimeSelection::Legacy);
+        assert_eq!(sel, DashboardRuntimeSelection::New);
         assert_eq!(reason, DashboardSelectionReason::HardcodedDefault);
 
         let new_args = DashboardArgs {
@@ -5407,18 +5408,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_dashboard_runtime_config_mode_new() {
+    fn resolve_dashboard_runtime_config_mode_legacy() {
         use storage_ballast_helper::core::config::{DashboardConfig, DashboardMode};
         let cfg = Config {
             dashboard: DashboardConfig {
-                mode: DashboardMode::New,
+                mode: DashboardMode::Legacy,
                 kill_switch: false,
             },
             ..Config::default()
         };
         let args = DashboardArgs::default();
         let (sel, reason) = resolve_dashboard_runtime(&args, &cfg);
-        assert_eq!(sel, DashboardRuntimeSelection::New);
+        assert_eq!(sel, DashboardRuntimeSelection::Legacy);
         assert_eq!(reason, DashboardSelectionReason::ConfigFileMode);
     }
 
@@ -5484,7 +5485,7 @@ mod tests {
         );
         assert_eq!(
             DashboardSelectionReason::HardcodedDefault.to_string(),
-            "hardcoded default (legacy)"
+            "hardcoded default (new)"
         );
     }
 

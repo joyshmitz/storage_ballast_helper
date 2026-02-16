@@ -234,9 +234,9 @@ pub struct UpdateConfig {
 #[serde(rename_all = "lowercase")]
 pub enum DashboardMode {
     /// Use the legacy crossterm-based dashboard (pre-overhaul).
-    #[default]
     Legacy,
     /// Use the new FrankentUI-based cockpit (post-overhaul).
+    #[default]
     New,
 }
 
@@ -275,7 +275,7 @@ impl std::str::FromStr for DashboardMode {
 /// 3. `--new-dashboard` CLI flag → New
 /// 4. `SBH_DASHBOARD_MODE` env var → parsed mode
 /// 5. `dashboard.mode` config field → configured mode
-/// 6. Hardcoded default → Legacy
+/// 6. Hardcoded default → New
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct DashboardConfig {
@@ -288,7 +288,7 @@ pub struct DashboardConfig {
 impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
-            mode: DashboardMode::Legacy,
+            mode: DashboardMode::New,
             kill_switch: false,
         }
     }
@@ -1362,9 +1362,9 @@ mod tests {
     // ── Dashboard rollout config ─────────────────────────────────
 
     #[test]
-    fn dashboard_mode_default_is_legacy() {
+    fn dashboard_mode_default_is_new() {
         let cfg = Config::default();
-        assert_eq!(cfg.dashboard.mode, super::DashboardMode::Legacy);
+        assert_eq!(cfg.dashboard.mode, super::DashboardMode::New);
         assert!(!cfg.dashboard.kill_switch);
     }
 
@@ -1413,7 +1413,7 @@ kill_switch = true
     fn dashboard_config_defaults_when_absent_from_toml() {
         let toml_str = "[pressure]\npoll_interval_ms = 500\n";
         let cfg: Config = toml::from_str(toml_str).expect("should parse");
-        assert_eq!(cfg.dashboard.mode, super::DashboardMode::Legacy);
+        assert_eq!(cfg.dashboard.mode, super::DashboardMode::New);
         assert!(!cfg.dashboard.kill_switch);
     }
 }
