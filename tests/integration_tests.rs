@@ -1449,7 +1449,7 @@ fn e2e_scenario_1_burst_growth_shadow_safe() {
     // Phase 4: Verify decision records contain recommendations.
     let mut builder = DecisionRecordBuilder::new();
     for candidate in &scored {
-        let record = builder.build(candidate, PolicyMode::Shadow, None, None);
+        let record = builder.build(candidate, PolicyMode::Shadow, None, None, None);
         assert!(!record.trace_id.is_empty());
         assert!(record.decision_id > 0);
         // Trace should show observe mode.
@@ -1457,7 +1457,7 @@ fn e2e_scenario_1_burst_growth_shadow_safe() {
     }
 
     // Phase 5: Verify explain output is non-empty.
-    let sample = builder.build(&scored[0], PolicyMode::Shadow, None, None);
+    let sample = builder.build(&scored[0], PolicyMode::Shadow, None, None, None);
     let explanation = format_explain(&sample, ExplainLevel::L3);
     assert!(
         !explanation.is_empty(),
@@ -1507,7 +1507,7 @@ fn e2e_scenario_2_canary_bounded_impact() {
     // Build trace records and verify canary policy mode.
     let mut builder = DecisionRecordBuilder::new();
     for candidate in &scored {
-        let record = builder.build(candidate, PolicyMode::Canary, None, None);
+        let record = builder.build(candidate, PolicyMode::Canary, None, None, None);
         assert_eq!(record.policy_mode, PolicyMode::Canary);
         // Each trace_id should be unique and sequential.
         assert!(record.trace_id.starts_with("sbh-"));
@@ -1602,7 +1602,7 @@ fn e2e_scenario_4_index_corruption_full_scan() {
     // Decision records should capture the full-scan context.
     let mut builder = DecisionRecordBuilder::new();
     for candidate in &scored {
-        let record = builder.build(candidate, PolicyMode::Shadow, None, None);
+        let record = builder.build(candidate, PolicyMode::Shadow, None, None, None);
         assert!(!record.trace_id.is_empty());
         // Explain should contain factor contributions.
         let explain = format_explain(&record, ExplainLevel::L2);
@@ -1725,7 +1725,7 @@ fn e2e_scenario_6_progressive_recovery() {
 
     // Phase 4: Verify the full lifecycle is traceable.
     let mut builder = DecisionRecordBuilder::new();
-    let record = builder.build(&scored[0], PolicyMode::Shadow, None, None);
+    let record = builder.build(&scored[0], PolicyMode::Shadow, None, None, None);
     let explanation = format_explain(&record, ExplainLevel::L3);
     assert!(!explanation.is_empty());
 }

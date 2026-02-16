@@ -575,7 +575,7 @@ fn decision_record_json_roundtrip_across_modes() {
         PolicyMode::Canary,
         PolicyMode::DryRun,
     ] {
-        let record = builder.build(&candidate, mode, None, None);
+        let record = builder.build(&candidate, mode, None, None, None);
         let json = record.to_json_compact();
         let parsed: crate::scanner::decision_record::DecisionRecord =
             serde_json::from_str(&json).unwrap();
@@ -588,7 +588,7 @@ fn decision_record_json_roundtrip_across_modes() {
 fn explain_levels_are_cumulative() {
     let mut builder = DecisionRecordBuilder::new();
     let candidate = make_scored_candidate(DecisionAction::Delete, 2.0);
-    let record = builder.build(&candidate, PolicyMode::Live, None, None);
+    let record = builder.build(&candidate, PolicyMode::Live, None, None, None);
 
     let l0 = format_explain(&record, ExplainLevel::L0);
     let l1 = format_explain(&record, ExplainLevel::L1);
@@ -665,7 +665,7 @@ fn property_decision_record_never_panics_on_serialize() {
 
         for c in &candidates {
             let scored = engine.score_candidate(c, urgency);
-            let record = builder.build(&scored, PolicyMode::Live, None, None);
+            let record = builder.build(&scored, PolicyMode::Live, None, None, None);
 
             // These must never panic.
             let _json = record.to_json_compact();

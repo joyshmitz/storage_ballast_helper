@@ -770,6 +770,18 @@ mod tests {
         let (_tmp, script_path) = write_test_script(
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"custom tool version\"\n  exit 0\nfi\nexit 0\n",
         );
+        // Guard: skip if temp scripts cannot be executed (e.g. noexec /tmp).
+        if std::process::Command::new(&script_path)
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!(
+                "skipping: temp script not executable (noexec mount?): {}",
+                script_path.display()
+            );
+            return;
+        }
         let version = probe_version(&script_path.to_string_lossy());
         assert_eq!(version, Some("custom tool version".to_string()));
     }

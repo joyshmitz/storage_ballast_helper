@@ -1409,7 +1409,13 @@ fn benchmark_decision_record_serialization() {
     let iterations = fast_or_full(50, 500);
     let mut builder = DecisionRecordBuilder::new();
     let candidate = make_scored(DecisionAction::Delete, 2.5);
-    let record = builder.build(&candidate, PolicyMode::Live, Some(&good_guard()), None);
+    let record = builder.build(
+        &candidate,
+        PolicyMode::Live,
+        Some(&good_guard()),
+        None,
+        None,
+    );
 
     let report = benchmark_operation("decision_record_json", iterations, || {
         let json = record.to_json_compact();
@@ -1582,7 +1588,7 @@ fn invariant_all_records_serialize_and_roundtrip() {
 
         let mut builder = DecisionRecordBuilder::new();
         for s in &scored {
-            let record = builder.build(s, PolicyMode::Live, None, None);
+            let record = builder.build(s, PolicyMode::Live, None, None, None);
 
             // Compact JSON roundtrip.
             let json = record.to_json_compact();
