@@ -37,7 +37,7 @@ impl FsStatsCollector {
 
     pub fn collect(&self, path: &Path) -> Result<FsStats> {
         let mounts = self.platform.mount_points()?;
-        let lookup_path = resolve_lookup_path(path);
+        let lookup_path = crate::core::paths::resolve_absolute_path(path);
         let mount = find_mount(&lookup_path, &mounts).ok_or_else(|| SbhError::FsStats {
             path: path.to_path_buf(),
             details: "path does not belong to known mount".to_string(),
@@ -50,8 +50,10 @@ impl FsStatsCollector {
             return Ok(HashMap::new());
         }
         let mounts = self.platform.mount_points()?;
-        let resolved_paths: Vec<PathBuf> =
-            paths.iter().map(|path| resolve_lookup_path(path)).collect();
+        let resolved_paths: Vec<PathBuf> = paths
+            .iter()
+            .map(|path| crate::core::paths::resolve_absolute_path(path))
+            .collect();
         let mut mounts_needed = HashSet::<PathBuf>::new();
         for (path, resolved_path) in paths.iter().zip(&resolved_paths) {
             let Some(mount) = find_mount(resolved_path, &mounts) else {
@@ -129,16 +131,6 @@ fn find_mount<'a>(path: &Path, mounts: &'a [MountPoint]) -> Option<&'a MountPoin
         .iter()
         .filter(|mount| path.starts_with(&mount.path))
         .max_by_key(|mount| mount.path.as_os_str().len())
-}
-
-fn resolve_lookup_path(path: &Path) -> PathBuf {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
-    };
-
-    std::fs::canonicalize(&absolute).unwrap_or(absolute)
 }
 
 #[cfg(test)]

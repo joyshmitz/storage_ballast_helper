@@ -222,9 +222,6 @@ fn project_time(rate: f64, accel: f64, distance_bytes: f64) -> f64 {
     }
     let root = discriminant.sqrt();
     let numerator = -rate + root;
-    if numerator <= 0.0 {
-        return distance_bytes / rate;
-    }
     let t = numerator / accel;
     if t.is_finite() && t > 0.0 {
         t

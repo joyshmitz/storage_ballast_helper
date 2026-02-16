@@ -443,22 +443,10 @@ pub fn is_path_open<S: std::hash::BuildHasher>(
     path: &Path,
     open_files: &HashSet<PathBuf, S>,
 ) -> bool {
-    let normalized = normalize_path_for_open_check(path);
-    open_files.iter().any(|open| {
-        open.starts_with(path)
-            || normalized
-                .as_ref()
-                .is_some_and(|normalized_path| open.starts_with(normalized_path))
-    })
-}
-
-fn normalize_path_for_open_check(path: &Path) -> Option<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?.join(path)
-    };
-    Some(fs::canonicalize(&absolute).unwrap_or(absolute))
+    let normalized = crate::core::paths::resolve_absolute_path(path);
+    open_files
+        .iter()
+        .any(|open| open.starts_with(path) || open.starts_with(&normalized))
 }
 
 #[cfg(test)]

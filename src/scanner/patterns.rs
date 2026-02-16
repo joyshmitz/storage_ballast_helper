@@ -31,6 +31,20 @@ pub struct StructuralSignals {
     pub mostly_object_files: bool,
 }
 
+impl StructuralSignals {
+    /// Returns true if the signals strongly indicate a build artifact directory
+    /// (e.g., Rust target with incremental/deps/fingerprint markers, or mostly
+    /// object files).
+    #[must_use]
+    pub fn has_strong_signal(&self) -> bool {
+        // Two or more Rust-specific markers = strong signal.
+        let rust_markers = u8::from(self.has_incremental)
+            + u8::from(self.has_deps)
+            + u8::from(self.has_fingerprint);
+        rust_markers >= 2 || self.mostly_object_files || (self.has_build && self.has_deps)
+    }
+}
+
 /// Classification output for one path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArtifactClassification {

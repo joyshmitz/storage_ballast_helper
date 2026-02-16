@@ -35,7 +35,10 @@ use crate::monitor::pid::{PidPressureController, PressureLevel, PressureReading}
 use crate::monitor::special_locations::SpecialLocationRegistry;
 use crate::platform::pal::{Platform, detect_platform};
 use crate::scanner::deletion::{DeletionConfig, DeletionExecutor};
+use crate::scanner::patterns::ArtifactPatternRegistry;
+use crate::scanner::protection::ProtectionRegistry;
 use crate::scanner::scoring::{CandidacyScore, ScoringEngine};
+use crate::scanner::walker::{DirectoryWalker, WalkerConfig};
 
 // ──────────────────── channel capacities ────────────────────
 
@@ -80,9 +83,11 @@ pub struct ScanRequest {
     pub urgency: f64,
     pub pressure_level: PressureLevel,
     pub max_delete_batch: usize,
-    /// When config is reloaded, this carries the updated scoring config
-    /// so the scanner thread can rebuild its scoring engine.
-    pub scoring_config_update: Option<(crate::core::config::ScoringConfig, u64)>,
+    /// When config is reloaded, this carries the updated scoring and scanner config.
+    pub config_update: Option<(
+        crate::core::config::ScoringConfig,
+        crate::core::config::ScannerConfig,
+    )>,
 }
 
 /// Scored candidates ready for deletion.
@@ -580,6 +585,13 @@ impl MonitoringDaemon {
                             .unwrap_or(0.0)
                     },
                 );
+
+                // Predictive Safety Net: if urgency is high (prediction says we will crash soon),
+                // we MUST start scanning even if the current static level is Green.
+                // 0.8 corresponds to ~high urgency threshold (e.g. < 5 mins to saturation).
+                if response.urgency > 0.8 {
+                    self.send_scan_request(scan_tx, response);
+                }
             }
             PressureLevel::Yellow => {
                 // Increase scan frequency (handled by PID interval).
@@ -638,7 +650,7 @@ impl MonitoringDaemon {
             urgency: response.urgency,
             pressure_level: response.level,
             max_delete_batch: response.max_delete_batch,
-            scoring_config_update: None,
+            config_update: None,
         };
 
         // Latest-wins: if the channel is full, drop old events.
@@ -658,7 +670,7 @@ impl MonitoringDaemon {
             urgency: response.urgency.max(0.5), // at least moderate urgency for forced scans
             pressure_level: response.level,
             max_delete_batch: response.max_delete_batch,
-            scoring_config_update: None,
+            config_update: None,
         };
         // For forced scans, block briefly to ensure delivery.
         let _ = scan_tx.send_timeout(request, Duration::from_millis(100));
@@ -762,15 +774,15 @@ impl MonitoringDaemon {
                         );
                     }
 
-                    // Propagate scoring config to scanner thread (I3/I4).
+                    // Propagate scoring and scanner config to scanner thread.
                     let config_update = ScanRequest {
                         paths: Vec::new(),
                         urgency: 0.0,
                         pressure_level: PressureLevel::Green,
                         max_delete_batch: 0,
-                        scoring_config_update: Some((
+                        config_update: Some((
                             new_config.scoring.clone(),
-                            new_config.scanner.min_file_age_minutes,
+                            new_config.scanner.clone(),
                         )),
                     };
                     let _ = scan_tx.try_send(config_update);
@@ -802,7 +814,7 @@ impl MonitoringDaemon {
         heartbeat: Arc<ThreadHeartbeat>,
     ) -> Result<thread::JoinHandle<()>> {
         let scoring_config = self.config.scoring.clone();
-        let min_file_age = self.config.scanner.min_file_age_minutes;
+        let scanner_config = self.config.scanner.clone();
 
         thread::Builder::new()
             .name("sbh-scanner".to_string())
@@ -812,7 +824,7 @@ impl MonitoringDaemon {
                     &del_tx,
                     &logger,
                     &scoring_config,
-                    min_file_age,
+                    &scanner_config,
                     &heartbeat,
                 );
             })
@@ -885,98 +897,127 @@ impl MonitoringDaemon {
 /// Scanner thread: receives scan requests, walks directories, scores candidates,
 /// and sends deletion batches to the executor.
 ///
-/// The walker module (bd-1w9) provides the actual directory traversal.
-/// Until it's built, this thread performs a simplified scan using std::fs.
+/// Uses `DirectoryWalker` to perform parallel, depth-limited, safe traversals
+/// and `ScoringEngine` to rank candidates.
+#[allow(clippy::too_many_lines)]
 fn scanner_thread_main(
     scan_rx: &Receiver<ScanRequest>,
     del_tx: &Sender<DeletionBatch>,
     logger: &ActivityLoggerHandle,
     scoring_config: &crate::core::config::ScoringConfig,
-    min_file_age: u64,
+    scanner_config: &crate::core::config::ScannerConfig,
     heartbeat: &Arc<ThreadHeartbeat>,
 ) {
-    let mut engine = ScoringEngine::from_config(scoring_config, min_file_age);
+    let mut current_scoring_config = scoring_config.clone();
+    let mut current_scanner_config = scanner_config.clone();
+
+    // Initialize scoring engine.
+    let mut engine = ScoringEngine::from_config(
+        &current_scoring_config,
+        current_scanner_config.min_file_age_minutes,
+    );
+    // Initialize pattern registry (default built-ins).
+    let pattern_registry = ArtifactPatternRegistry::default();
 
     while let Ok(request) = scan_rx.recv() {
-        // Rebuild scoring engine if config was updated.
-        if let Some((ref new_cfg, new_min_age)) = request.scoring_config_update {
-            engine = ScoringEngine::from_config(new_cfg, new_min_age);
+        // Handle config updates.
+        if let Some((new_scoring, new_scanner)) = request.config_update {
+            current_scoring_config = new_scoring;
+            current_scanner_config = new_scanner;
+            engine = ScoringEngine::from_config(
+                &current_scoring_config,
+                current_scanner_config.min_file_age_minutes,
+            );
         }
+
+        // If no paths to scan, skip.
+        if request.paths.is_empty() {
+            continue;
+        }
+
         heartbeat.beat();
         let scan_start = Instant::now();
-        let mut candidates_found: usize = 0;
-        let mut paths_scanned: usize = 0;
 
-        // Simplified scan: walk root paths and score candidates.
-        // The full walker (bd-1w9) will replace this with proper depth-limited,
-        // ignore-respecting traversal and structural marker collection.
-        let mut scored: Vec<CandidacyScore> = Vec::new();
+        // Configure walker.
+        let walker_config = WalkerConfig {
+            root_paths: request.paths.clone(),
+            max_depth: current_scanner_config.max_depth,
+            follow_symlinks: current_scanner_config.follow_symlinks,
+            cross_devices: current_scanner_config.cross_devices,
+            parallelism: current_scanner_config.parallelism,
+            excluded_paths: current_scanner_config
+                .excluded_paths
+                .iter()
+                .cloned()
+                .collect(),
+        };
 
-        for root in &request.paths {
-            if !root.exists() || !root.is_dir() {
+        // Initialize protection registry (reload from config + markers are discovered during walk).
+        let protection =
+            match ProtectionRegistry::new(Some(&current_scanner_config.protected_paths)) {
+                Ok(p) => p,
+                Err(e) => {
+                    logger.send(ActivityEvent::Error {
+                        code: "SBH-1001".to_string(),
+                        message: format!("protection registry init failed: {e}"),
+                    });
+                    continue;
+                }
+            };
+
+        let walker = DirectoryWalker::new(walker_config, protection);
+
+        // Perform the walk (blocking).
+        // TODO: For very large trees, this might block too long without heartbeats.
+        // Consider making walker yield periodically or run in chunks.
+        let entries = match walker.walk() {
+            Ok(e) => e,
+            Err(e) => {
+                logger.send(ActivityEvent::Error {
+                    code: e.code().to_string(),
+                    message: format!("walker failed: {e}"),
+                });
+                continue;
+            }
+        };
+
+        let paths_scanned = entries.len();
+        let mut candidates_found = 0;
+        let mut scored: Vec<CandidacyScore> = Vec::with_capacity(paths_scanned / 10);
+
+        // Snapshot open files once per scan for fast filtering.
+        let open_files = crate::scanner::walker::collect_open_files();
+
+        // Process entries.
+        for entry in entries {
+            let age = entry.metadata.modified.elapsed().unwrap_or(Duration::ZERO);
+
+            // Classify.
+            let classification = pattern_registry.classify(&entry.path, entry.structural_signals);
+
+            // Skip unknown artifacts to save scoring cycles.
+            if classification.category == crate::scanner::patterns::ArtifactCategory::Unknown {
                 continue;
             }
 
-            // Shallow scan of top-level entries in each root path.
-            let Ok(entries) = std::fs::read_dir(root) else {
-                continue;
+            let is_open = crate::scanner::walker::is_path_open(&entry.path, &open_files);
+
+            let input = crate::scanner::scoring::CandidateInput {
+                path: entry.path,
+                size_bytes: entry.metadata.size_bytes,
+                age,
+                classification,
+                signals: entry.structural_signals,
+                is_open,
+                excluded: false, // Walker already filters excluded paths.
             };
 
-            for entry in entries.flatten() {
-                paths_scanned += 1;
-                let path = entry.path();
-
-                // Quick classification for known artifact patterns.
-                let Ok(meta) = entry.metadata() else {
-                    continue;
-                };
-
-                let name = entry.file_name().to_string_lossy().to_lowercase();
-                let is_candidate = name.contains("target")
-                    || name.starts_with(".target")
-                    || name.starts_with("_target_")
-                    || name.starts_with(".tmp_target")
-                    || name.starts_with("cargo-target-")
-                    || name.starts_with("cargo_")
-                    || name.starts_with("pi_agent_")
-                    || name.starts_with("pi_target_")
-                    || name.starts_with("pi_opus_")
-                    || name.starts_with("cass-target")
-                    || name.starts_with("br-build");
-
-                if !is_candidate {
-                    continue;
-                }
-
-                let age = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.elapsed().ok())
-                    .unwrap_or_default();
-                let size = if meta.is_dir() {
-                    // Estimate directory size (rough, for scoring).
-                    dir_size_estimate(&path)
-                } else {
-                    meta.len()
-                };
-
-                let input = crate::scanner::scoring::CandidateInput {
-                    path: path.clone(),
-                    size_bytes: size,
-                    age,
-                    classification: classify_by_name(&name),
-                    signals: detect_structural_signals(&path),
-                    is_open: false,
-                    excluded: false,
-                };
-
-                let score = engine.score_candidate(&input, request.urgency);
-                if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
-                    && !score.vetoed
-                {
-                    candidates_found += 1;
-                    scored.push(score);
-                }
+            let score = engine.score_candidate(&input, request.urgency);
+            if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
+                && !score.vetoed
+            {
+                candidates_found += 1;
+                scored.push(score);
             }
         }
 
@@ -1069,111 +1110,6 @@ fn executor_thread_main(
     }
 }
 
-// ──────────────────── scanning helpers ────────────────────
-
-/// Quick structural signal detection for a directory.
-fn detect_structural_signals(
-    path: &std::path::Path,
-) -> crate::scanner::patterns::StructuralSignals {
-    use crate::scanner::patterns::StructuralSignals;
-
-    if !path.is_dir() {
-        return StructuralSignals::default();
-    }
-
-    let mut signals = StructuralSignals::default();
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return signals;
-    };
-
-    for entry in entries.flatten().take(50) {
-        // Cap at 50 entries to avoid slow scans.
-        let name = entry.file_name().to_string_lossy().to_lowercase();
-        match name.as_str() {
-            "incremental" => signals.has_incremental = true,
-            "deps" => signals.has_deps = true,
-            "build" => signals.has_build = true,
-            ".fingerprint" => signals.has_fingerprint = true,
-            ".git" => signals.has_git = true,
-            "cargo.toml" => signals.has_cargo_toml = true,
-            _ => {}
-        }
-    }
-
-    signals
-}
-
-/// Quick name-based artifact classification.
-fn classify_by_name(name: &str) -> crate::scanner::patterns::ArtifactClassification {
-    use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification};
-
-    let (category, confidence) = if name.contains("target") || name.starts_with("cargo-target") {
-        (ArtifactCategory::RustTarget, 0.85)
-    } else if name == "node_modules" {
-        (ArtifactCategory::NodeModules, 0.95)
-    } else if name == "__pycache__"
-        || std::path::Path::new(name)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("pyc"))
-    {
-        (ArtifactCategory::PythonCache, 0.90)
-    } else if name.starts_with("pi_agent_")
-        || name.starts_with("pi_target_")
-        || name.starts_with("pi_opus_")
-        || name.starts_with("cass-target")
-    {
-        (ArtifactCategory::AgentWorkspace, 0.80)
-    } else {
-        (ArtifactCategory::Unknown, 0.30)
-    };
-
-    ArtifactClassification {
-        pattern_name: name.to_string(),
-        category,
-        name_confidence: confidence,
-        structural_confidence: confidence,
-        combined_confidence: confidence,
-    }
-}
-
-/// Bounded recursive directory size estimate.
-///
-/// Walks up to `MAX_DEPTH` levels deep and `MAX_ENTRIES` total to avoid
-/// spending too long on huge trees. Returns a lower bound on actual size.
-fn dir_size_estimate(path: &std::path::Path) -> u64 {
-    const MAX_DEPTH: usize = 4;
-    const MAX_ENTRIES: usize = 500;
-
-    let mut total: u64 = 0;
-    let mut entries_seen: usize = 0;
-    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(path.to_path_buf(), 0)];
-
-    while let Some((dir, depth)) = stack.pop() {
-        if entries_seen >= MAX_ENTRIES {
-            break;
-        }
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            entries_seen += 1;
-            if entries_seen > MAX_ENTRIES {
-                break;
-            }
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if meta.is_file() {
-                total = total.saturating_add(meta.len());
-            } else if meta.is_dir() && depth < MAX_DEPTH {
-                stack.push((entry.path(), depth + 1));
-            }
-        }
-    }
-
-    total
-}
-
 // ──────────────────── tests ────────────────────
 
 #[cfg(test)]
@@ -1197,7 +1133,7 @@ mod tests {
             urgency: 0.7,
             pressure_level: PressureLevel::Orange,
             max_delete_batch: 10,
-            scoring_config_update: None,
+            config_update: None,
         };
         assert_eq!(request.paths.len(), 2);
         assert_eq!(request.urgency.to_bits(), 0.7_f64.to_bits());
@@ -1212,93 +1148,6 @@ mod tests {
     }
 
     #[test]
-    fn structural_signals_detects_rust_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("target");
-        std::fs::create_dir_all(target.join("incremental")).unwrap();
-        std::fs::create_dir_all(target.join("deps")).unwrap();
-        std::fs::create_dir_all(target.join("build")).unwrap();
-        std::fs::create_dir_all(target.join(".fingerprint")).unwrap();
-
-        let signals = detect_structural_signals(&target);
-        assert!(signals.has_incremental);
-        assert!(signals.has_deps);
-        assert!(signals.has_build);
-        assert!(signals.has_fingerprint);
-        assert!(!signals.has_git);
-    }
-
-    #[test]
-    fn structural_signals_detects_git() {
-        let dir = tempfile::tempdir().unwrap();
-        let project = dir.path().join("project");
-        std::fs::create_dir_all(project.join(".git")).unwrap();
-
-        let signals = detect_structural_signals(&project);
-        assert!(signals.has_git);
-    }
-
-    #[test]
-    fn classify_by_name_identifies_rust_target() {
-        let c = classify_by_name("target");
-        assert_eq!(
-            c.category,
-            crate::scanner::patterns::ArtifactCategory::RustTarget
-        );
-        assert!(c.combined_confidence >= 0.80);
-    }
-
-    #[test]
-    fn classify_by_name_identifies_node_modules() {
-        let c = classify_by_name("node_modules");
-        assert_eq!(
-            c.category,
-            crate::scanner::patterns::ArtifactCategory::NodeModules
-        );
-    }
-
-    #[test]
-    fn classify_by_name_identifies_agent_workspace() {
-        let c = classify_by_name("pi_agent_test");
-        assert_eq!(
-            c.category,
-            crate::scanner::patterns::ArtifactCategory::AgentWorkspace
-        );
-    }
-
-    #[test]
-    fn dir_size_estimate_sums_children() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
-        std::fs::write(dir.path().join("b.txt"), "world").unwrap();
-
-        let size = dir_size_estimate(dir.path());
-        assert!(size >= 10); // at least the bytes we wrote
-    }
-
-    #[test]
-    fn dir_size_estimate_recurses_into_subdirs() {
-        let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("sub").join("deep");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(dir.path().join("top.txt"), "12345").unwrap();
-        std::fs::write(sub.join("nested.txt"), "1234567890").unwrap();
-
-        let size = dir_size_estimate(dir.path());
-        // Should include both files: 5 + 10 = 15 bytes minimum.
-        assert!(
-            size >= 15,
-            "recursive estimate should include nested files, got {size}"
-        );
-    }
-
-    #[test]
-    fn dir_size_estimate_handles_nonexistent() {
-        let size = dir_size_estimate(std::path::Path::new("/nonexistent/path"));
-        assert_eq!(size, 0);
-    }
-
-    #[test]
     fn scanner_and_executor_channel_integration() {
         // Test that scanner → executor channel works correctly.
         let (scan_tx, scan_rx) = bounded::<ScanRequest>(SCANNER_CHANNEL_CAP);
@@ -1310,7 +1159,7 @@ mod tests {
             urgency: 0.5,
             pressure_level: PressureLevel::Orange,
             max_delete_batch: 10,
-            scoring_config_update: None,
+            config_update: None,
         };
         scan_tx.send(request).unwrap();
         let received = scan_rx.recv().unwrap();
@@ -1338,7 +1187,7 @@ mod tests {
                 urgency: 0.1,
                 pressure_level: PressureLevel::Green,
                 max_delete_batch: 5,
-                scoring_config_update: None,
+                config_update: None,
             })
             .unwrap();
         }
@@ -1349,7 +1198,7 @@ mod tests {
             urgency: 0.9,
             pressure_level: PressureLevel::Critical,
             max_delete_batch: 40,
-            scoring_config_update: None,
+            config_update: None,
         });
         assert!(matches!(result, Err(TrySendError::Full(_))));
     }
