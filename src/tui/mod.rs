@@ -36,6 +36,8 @@ mod test_properties;
 #[cfg(test)]
 mod test_replay;
 #[cfg(test)]
+mod test_scenario_drills;
+#[cfg(test)]
 mod test_snapshot_golden;
 #[cfg(test)]
 mod test_stress;

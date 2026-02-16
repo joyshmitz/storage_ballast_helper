@@ -2361,7 +2361,7 @@ fn set_toml_value(root: &mut toml::Value, dot_path: &str, raw_value: &str) -> Re
     let table = current
         .as_table_mut()
         .ok_or_else(|| CliError::User("parent is not a table".to_string()))?;
-    let key = parts.last().unwrap();
+    let key = &parts[parts.len() - 1];
     table.insert((*key).to_string(), parse_toml_value(raw_value));
 
     Ok(())
