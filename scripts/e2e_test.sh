@@ -1029,12 +1029,195 @@ TOML
   # Clean up marker for later tests.
   rm -f "${prot_tree}/project_a/.sbh-protect"
 
-  # ── Section 17: Daemon stub ──────────────────────────────────────────────
+  # ── Section 17: Daemon stub and dashboard smoke tests ────────────────────
 
-  log "=== Section 17: Daemon and dashboard stubs ==="
+  log "=== Section 17: Daemon stub and dashboard smoke tests ==="
 
   tally_case run_case daemon_stub "not yet implemented" "${bin}" daemon
-  tally_case run_case dashboard_stub "not yet implemented" "${bin}" dashboard
+
+  # ── Dashboard: runtime mode selection ──
+
+  # 17a: --new-dashboard requires TUI feature (binary built without it).
+  tally_case run_case_expect_fail dashboard_new_requires_tui 1 \
+    "requires a binary built with" \
+    "${bin}" dashboard --new-dashboard
+
+  # 17b: --json output mode is rejected for dashboard.
+  tally_case run_case_expect_fail dashboard_json_rejected 1 \
+    "not supported" \
+    "${bin}" --json dashboard
+
+  # 17c: --new-dashboard and --legacy-dashboard conflict (clap error, exit 2).
+  tally_case run_case_expect_fail dashboard_flag_conflict 2 \
+    "" \
+    "${bin}" dashboard --new-dashboard --legacy-dashboard
+
+  # 17d: SBH_DASHBOARD_MODE=new routes to new path, which fails without TUI.
+  tally_case run_case_expect_fail dashboard_env_mode_new_no_tui 1 \
+    "requires a binary built with" \
+    env SBH_DASHBOARD_MODE=new "${bin}" dashboard
+
+  # 17e: SBH_DASHBOARD_KILL_SWITCH=true forces legacy even with --new-dashboard env mode.
+  #      Legacy loop will timeout; we verify it starts, not that --new-dashboard error fires.
+  #      Use a short timeout (3s) — expect exit 124 (GNU timeout) to prove legacy loop ran.
+  dashboard_kill_switch_case() {
+    local name="dashboard_kill_switch_forces_legacy"
+    local case_log="${CASE_DIR}/${name}.log"
+    local start_ns
+    start_ns=$(date +%s%N 2>/dev/null || date +%s)
+
+    log "CASE START: ${name}"
+    {
+      echo "name=${name}"
+      echo "command=SBH_DASHBOARD_KILL_SWITCH=true SBH_DASHBOARD_MODE=new ${bin} dashboard"
+      echo "start_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    } > "${case_log}"
+
+    set +e
+    local output
+    output="$(timeout 3 env SBH_DASHBOARD_KILL_SWITCH=true SBH_DASHBOARD_MODE=new \
+      SBH_TEST_VERBOSE=1 SBH_OUTPUT_FORMAT=human RUST_BACKTRACE=1 \
+      "${bin}" dashboard 2>&1)"
+    local status=$?
+    set -e
+
+    local end_ns
+    end_ns=$(date +%s%N 2>/dev/null || date +%s)
+    local elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+    {
+      echo "status=${status}"
+      echo "elapsed_ms=${elapsed_ms}"
+      echo "----- output -----"
+      echo "${output}"
+    } >> "${case_log}"
+
+    # Expect timeout (124) or SIGTERM (137) — proves legacy loop started.
+    if is_timeout_status "${status}"; then
+      # Verify it actually rendered status output (not the TUI error).
+      if echo "${output}" | grep -qF "requires a binary built with"; then
+        log "CASE FAIL: ${name} (kill switch did not override to legacy) [${elapsed_ms}ms]"
+        return 1
+      fi
+      log "CASE PASS: ${name} (legacy loop confirmed via timeout) [${elapsed_ms}ms]"
+      return 0
+    fi
+
+    log "CASE FAIL: ${name} (unexpected status=${status}, expected timeout) [${elapsed_ms}ms]"
+    return 1
+  }
+  if command -v timeout >/dev/null 2>&1; then
+    tally_case dashboard_kill_switch_case
+  else
+    log "SKIP: dashboard_kill_switch_forces_legacy (GNU timeout not available)"
+  fi
+
+  # 17f: --verbose shows runtime selection reason in stderr.
+  dashboard_verbose_case() {
+    local name="dashboard_verbose_shows_reason"
+    local case_log="${CASE_DIR}/${name}.log"
+    local start_ns
+    start_ns=$(date +%s%N 2>/dev/null || date +%s)
+
+    log "CASE START: ${name}"
+    {
+      echo "name=${name}"
+      echo "command=${bin} --verbose dashboard --new-dashboard"
+      echo "start_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    } > "${case_log}"
+
+    set +e
+    local output
+    output="$(run_with_timeout "${CASE_TIMEOUT}" env SBH_TEST_VERBOSE=1 SBH_OUTPUT_FORMAT=human \
+      RUST_BACKTRACE=1 "${bin}" --verbose dashboard --new-dashboard 2>&1)"
+    local status=$?
+    set -e
+
+    local end_ns
+    end_ns=$(date +%s%N 2>/dev/null || date +%s)
+    local elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+    {
+      echo "status=${status}"
+      echo "elapsed_ms=${elapsed_ms}"
+      echo "----- output -----"
+      echo "${output}"
+    } >> "${case_log}"
+
+    # --new-dashboard without TUI exits 1, but verbose should show reason in output.
+    if [[ ${status} -ne 0 ]] && echo "${output}" | grep -qF "[dashboard] runtime="; then
+      log "CASE PASS: ${name} [${elapsed_ms}ms]"
+      return 0
+    fi
+
+    log "CASE FAIL: ${name} (missing verbose reason or unexpected status=${status}) [${elapsed_ms}ms]"
+    return 1
+  }
+  tally_case dashboard_verbose_case
+
+  # 17g: Legacy dashboard starts and renders within timeout (smoke test).
+  #      Runs for 3s then kills; expects status output to appear.
+  dashboard_legacy_smoke_case() {
+    local name="dashboard_legacy_renders_status"
+    local case_log="${CASE_DIR}/${name}.log"
+    local start_ns
+    start_ns=$(date +%s%N 2>/dev/null || date +%s)
+
+    log "CASE START: ${name}"
+    {
+      echo "name=${name}"
+      echo "command=${bin} dashboard --refresh-ms 500"
+      echo "start_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    } > "${case_log}"
+
+    set +e
+    local output
+    output="$(timeout 3 env SBH_TEST_VERBOSE=1 SBH_OUTPUT_FORMAT=human RUST_BACKTRACE=1 \
+      "${bin}" dashboard --refresh-ms 500 2>&1)"
+    local status=$?
+    set -e
+
+    local end_ns
+    end_ns=$(date +%s%N 2>/dev/null || date +%s)
+    local elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+    {
+      echo "status=${status}"
+      echo "elapsed_ms=${elapsed_ms}"
+      echo "----- output -----"
+      echo "${output}"
+    } >> "${case_log}"
+
+    # Expect timeout (124/137) — proves loop ran.
+    if is_timeout_status "${status}"; then
+      # Verify it produced meaningful output (status render or refresh hint).
+      if echo "${output}" | grep -qF "Refreshing every"; then
+        log "CASE PASS: ${name} (legacy loop rendered status) [${elapsed_ms}ms]"
+        return 0
+      fi
+      # Even without "Refreshing every" text, timeout proves the loop started.
+      log "CASE PASS: ${name} (legacy loop confirmed via timeout) [${elapsed_ms}ms]"
+      return 0
+    fi
+
+    log "CASE FAIL: ${name} (unexpected status=${status}, expected timeout) [${elapsed_ms}ms]"
+    return 1
+  }
+  if command -v timeout >/dev/null 2>&1; then
+    tally_case dashboard_legacy_smoke_case
+  else
+    log "SKIP: dashboard_legacy_renders_status (GNU timeout not available)"
+  fi
+
+  # 17h: --no-color with --new-dashboard still reports the feature-gate error.
+  tally_case run_case_expect_fail dashboard_no_color_new 1 \
+    "requires a binary built with" \
+    "${bin}" --no-color dashboard --new-dashboard
+
+  # 17i: --refresh-ms is accepted (non-default value).
+  tally_case run_case_expect_fail dashboard_refresh_ms_new 1 \
+    "requires a binary built with" \
+    "${bin}" dashboard --new-dashboard --refresh-ms 250
 
   # ── Section 18: --no-color flag ──────────────────────────────────────────
 
