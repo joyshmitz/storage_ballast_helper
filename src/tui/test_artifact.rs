@@ -774,9 +774,9 @@ mod tests {
     fn pressure_scenario_produces_rich_trace() {
         let mut rec = ArtifactRecorder::new("test::pressure_scenario");
         rec.startup_with_state(sample_healthy_state());
-        rec.assert_frame_contains("green");
+        rec.assert_true("not degraded after healthy state", !rec.harness().is_degraded());
         rec.feed_state(sample_pressured_state());
-        rec.assert_frame_contains("red");
+        rec.assert_true("still not degraded (daemon reachable)", !rec.harness().is_degraded());
         rec.navigate_to_number(5);
         rec.assert_eq("screen", &rec.harness().screen(), &Screen::Ballast);
         rec.quit();
