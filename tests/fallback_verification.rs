@@ -25,9 +25,7 @@ use storage_ballast_helper::tui::adapters::{
     DashboardStateAdapter, SchemaWarnings, SnapshotSource, StateFreshness,
 };
 #[cfg(feature = "tui")]
-use storage_ballast_helper::tui::model::{
-    DashboardModel, DashboardMsg, NotificationLevel, Screen,
-};
+use storage_ballast_helper::tui::model::{DashboardModel, DashboardMsg, NotificationLevel, Screen};
 #[cfg(feature = "tui")]
 use storage_ballast_helper::tui::preferences::{self, LoadOutcome, UserPreferences};
 #[cfg(feature = "tui")]
@@ -355,10 +353,7 @@ fn model_transitions_fresh_to_degraded_to_recovered() {
 
     // 1. Fresh data arrives.
     let state = sample_daemon_state();
-    update(
-        &mut model,
-        DashboardMsg::DataUpdate(Some(Box::new(state))),
-    );
+    update(&mut model, DashboardMsg::DataUpdate(Some(Box::new(state))));
     assert!(!model.degraded);
     assert_eq!(model.adapter_reads, 1);
     assert_eq!(model.adapter_errors, 0);
@@ -374,10 +369,7 @@ fn model_transitions_fresh_to_degraded_to_recovered() {
 
     // 3. Data recovers.
     let state2 = sample_daemon_state();
-    update(
-        &mut model,
-        DashboardMsg::DataUpdate(Some(Box::new(state2))),
-    );
+    update(&mut model, DashboardMsg::DataUpdate(Some(Box::new(state2))));
     assert!(!model.degraded);
     assert_eq!(model.adapter_reads, 2);
     assert_eq!(model.adapter_errors, 1);
@@ -410,20 +402,14 @@ fn model_rate_histories_pruned_on_mount_removal() {
         level: "yellow".to_string(),
         rate_bps: Some(2048.0),
     });
-    update(
-        &mut model,
-        DashboardMsg::DataUpdate(Some(Box::new(state))),
-    );
+    update(&mut model, DashboardMsg::DataUpdate(Some(Box::new(state))));
     assert_eq!(model.rate_histories.len(), 2);
     assert!(model.rate_histories.contains_key("/"));
     assert!(model.rate_histories.contains_key("/data"));
 
     // Feed data with only one mount — /data removed.
     let state2 = sample_daemon_state(); // only has "/"
-    update(
-        &mut model,
-        DashboardMsg::DataUpdate(Some(Box::new(state2))),
-    );
+    update(&mut model, DashboardMsg::DataUpdate(Some(Box::new(state2))));
     assert_eq!(model.rate_histories.len(), 1);
     assert!(model.rate_histories.contains_key("/"));
     assert!(!model.rate_histories.contains_key("/data"));
@@ -436,10 +422,7 @@ fn model_handles_none_rate_bps_gracefully() {
 
     let mut state = sample_daemon_state();
     state.pressure.mounts[0].rate_bps = None;
-    update(
-        &mut model,
-        DashboardMsg::DataUpdate(Some(Box::new(state))),
-    );
+    update(&mut model, DashboardMsg::DataUpdate(Some(Box::new(state))));
 
     // rate_bps=None should push 0.0 into history.
     assert!(model.rate_histories.contains_key("/"));
@@ -481,10 +464,7 @@ fn model_error_notification_is_ephemeral() {
 
     // Expiry removes the notification.
     let notif_id = model.notifications[0].id;
-    update(
-        &mut model,
-        DashboardMsg::NotificationExpired(notif_id),
-    );
+    update(&mut model, DashboardMsg::NotificationExpired(notif_id));
     assert!(model.notifications.is_empty());
 }
 
@@ -627,11 +607,8 @@ fn adapter_schema_drift_does_not_block_model_update() {
         "future_telemetry".to_string(),
         serde_json::json!({"fancy": true}),
     );
-    fs::write(
-        &state_path,
-        serde_json::to_string(&value).expect("json"),
-    )
-    .expect("write drifted state");
+    fs::write(&state_path, serde_json::to_string(&value).expect("json"))
+        .expect("write drifted state");
 
     let adapter = DashboardStateAdapter::new(
         mock_platform(),
@@ -735,7 +712,10 @@ fn preference_save_then_load_roundtrip() {
     let outcome = preferences::load(&pref_path);
     match outcome {
         LoadOutcome::Loaded { prefs, report } => {
-            assert!(report.is_clean(), "validation should pass for default prefs");
+            assert!(
+                report.is_clean(),
+                "validation should pass for default prefs"
+            );
             assert_eq!(prefs, original);
         }
         other => panic!("expected Loaded, got {other:?}"),
@@ -762,10 +742,7 @@ fn model_survives_rapid_state_oscillation() {
             // Fresh.
             let mut state = sample_daemon_state();
             state.pressure.mounts[0].free_pct = 50.0 - f64::from(i);
-            update(
-                &mut model,
-                DashboardMsg::DataUpdate(Some(Box::new(state))),
-            );
+            update(&mut model, DashboardMsg::DataUpdate(Some(Box::new(state))));
         }
     }
 
@@ -804,10 +781,7 @@ fn model_overlays_work_during_degraded_state() {
     assert!(model.degraded);
 
     // Help overlay should still work.
-    update(
-        &mut model,
-        DashboardMsg::ToggleOverlay(Overlay::Help),
-    );
+    update(&mut model, DashboardMsg::ToggleOverlay(Overlay::Help));
     assert_eq!(model.active_overlay, Some(Overlay::Help));
 
     update(&mut model, DashboardMsg::CloseOverlay);
@@ -903,8 +877,7 @@ fn future_daemon_state_parses_with_unknown_fields_ignored() {
         "cluster_mode": false
     });
 
-    let state: DaemonState =
-        serde_json::from_value(json).expect("future state should parse");
+    let state: DaemonState = serde_json::from_value(json).expect("future state should parse");
     assert_eq!(state.version, "99.0.0");
     assert_eq!(state.pid, 9999);
     assert_eq!(state.pressure.mounts.len(), 1);
@@ -919,8 +892,7 @@ fn old_daemon_state_parses_with_missing_fields_defaulted() {
         "pid": 1
     });
 
-    let state: DaemonState =
-        serde_json::from_value(json).expect("old state should parse");
+    let state: DaemonState = serde_json::from_value(json).expect("old state should parse");
     assert_eq!(state.version, "0.1.0");
     assert_eq!(state.pid, 1);
     assert_eq!(state.uptime_seconds, 0);
@@ -1023,11 +995,7 @@ fn adapter_stale_plus_drift_snapshot_is_usable() {
     // State with schema drift.
     let mut value = serde_json::to_value(sample_daemon_state()).expect("to value");
     value["experimental_feature"] = serde_json::json!(true);
-    fs::write(
-        &state_path,
-        serde_json::to_string(&value).expect("json"),
-    )
-    .expect("write");
+    fs::write(&state_path, serde_json::to_string(&value).expect("json")).expect("write");
 
     // Make it stale.
     let stale_mtime = filetime::FileTime::from_system_time(

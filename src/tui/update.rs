@@ -334,9 +334,8 @@ fn apply_input_action(model: &mut DashboardModel, action: InputAction) -> Dashbo
             DashboardCmd::None
         }
         InputAction::IncidentPlaybookNavigate => {
-            let severity = super::incident::IncidentSeverity::from_daemon_state(
-                model.daemon_state.as_ref(),
-            );
+            let severity =
+                super::incident::IncidentSeverity::from_daemon_state(model.daemon_state.as_ref());
             let entries = super::incident::playbook_for_severity(severity);
             if let Some(entry) = entries.get(model.incident_playbook_selected) {
                 let target = entry.target;
@@ -352,9 +351,8 @@ fn apply_input_action(model: &mut DashboardModel, action: InputAction) -> Dashbo
             DashboardCmd::None
         }
         InputAction::IncidentPlaybookDown => {
-            let severity = super::incident::IncidentSeverity::from_daemon_state(
-                model.daemon_state.as_ref(),
-            );
+            let severity =
+                super::incident::IncidentSeverity::from_daemon_state(model.daemon_state.as_ref());
             let entry_count = super::incident::playbook_for_severity(severity).len();
             if entry_count > 0 && model.incident_playbook_selected < entry_count - 1 {
                 model.incident_playbook_selected += 1;
@@ -2493,10 +2491,7 @@ mod tests {
         let mut state = sample_daemon_state();
         state.pressure.mounts[0].rate_bps = None;
 
-        update(
-            &mut model,
-            DashboardMsg::DataUpdate(Some(Box::new(state))),
-        );
+        update(&mut model, DashboardMsg::DataUpdate(Some(Box::new(state))));
         assert_eq!(model.rate_histories.len(), 1);
         let history = model.rate_histories.get("/").unwrap();
         assert_eq!(history.latest(), Some(0.0)); // None → 0.0 fallback

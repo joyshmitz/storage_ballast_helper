@@ -30,16 +30,16 @@ mod test_fault_injection;
 #[cfg(test)]
 mod test_harness;
 #[cfg(test)]
+mod test_operator_benchmark;
+#[cfg(test)]
 mod test_properties;
 #[cfg(test)]
 mod test_replay;
 #[cfg(test)]
-mod test_stress;
-#[cfg(test)]
 mod test_snapshot_golden;
 #[cfg(test)]
-mod test_unit_coverage;
+mod test_stress;
 #[cfg(test)]
-mod test_operator_benchmark;
+mod test_unit_coverage;
 
 pub use runtime::{DashboardRuntimeConfig, DashboardRuntimeMode, run_dashboard};

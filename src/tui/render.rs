@@ -93,7 +93,9 @@ pub fn render(model: &DashboardModel) -> String {
         Screen::Candidates => render_candidates(model, &theme, &mut out),
         Screen::Diagnostics => render_diagnostics(model, &theme, &mut out),
         Screen::Ballast => render_ballast(model, &theme, &mut out),
-        screen @ Screen::LogSearch => render_screen_stub(model, screen_label(screen), &theme, &mut out),
+        screen @ Screen::LogSearch => {
+            render_screen_stub(model, screen_label(screen), &theme, &mut out);
+        }
     }
 
     // Notification toasts (O4).

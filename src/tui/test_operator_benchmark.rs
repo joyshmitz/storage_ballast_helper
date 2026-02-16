@@ -21,10 +21,12 @@
 
 use ftui_core::event::KeyCode;
 
-use super::incident::{IncidentSeverity, playbook_for_severity, incident_hints};
+use super::incident::{IncidentSeverity, incident_hints, playbook_for_severity};
 use super::model::{ConfirmAction, Overlay, Screen};
 use super::preferences::HintVerbosity;
-use super::test_harness::{DashboardHarness, HarnessStep, sample_healthy_state, sample_pressured_state};
+use super::test_harness::{
+    DashboardHarness, HarnessStep, sample_healthy_state, sample_pressured_state,
+};
 
 // ──────────────────── benchmark result types ────────────────────
 
@@ -91,7 +93,10 @@ fn benchmark_pressure_triage() -> BenchmarkResult {
     // Operator uses quick-release shortcut from overview.
     h.inject_char('x'); // IncidentQuickRelease: jumps to ballast + opens confirmation
     assert_eq!(h.screen(), Screen::Ballast);
-    assert_eq!(h.overlay(), Some(Overlay::Confirmation(ConfirmAction::BallastRelease)));
+    assert_eq!(
+        h.overlay(),
+        Some(Overlay::Confirmation(ConfirmAction::BallastRelease))
+    );
 
     // Operator confirms (or reviews and cancels — both count).
     h.inject_keycode(KeyCode::Escape); // close confirmation to review first
@@ -100,7 +105,11 @@ fn benchmark_pressure_triage() -> BenchmarkResult {
     // Operator verifies ballast state is visible.
     assert_eq!(h.screen(), Screen::Ballast);
 
-    BenchmarkResult::new("Pressure triage (overview → ballast release)", 8, count_actions(&h, start))
+    BenchmarkResult::new(
+        "Pressure triage (overview → ballast release)",
+        8,
+        count_actions(&h, start),
+    )
 }
 
 /// Scenario 2: Explainability query — operator wants to understand why a
@@ -128,7 +137,11 @@ fn benchmark_explainability_query() -> BenchmarkResult {
     h.inject_char('j'); // cursor down to first decision
     h.inject_keycode(KeyCode::Enter); // toggle detail view
 
-    BenchmarkResult::new("Explainability query (decision drill-down)", 6, count_actions(&h, start))
+    BenchmarkResult::new(
+        "Explainability query (decision drill-down)",
+        6,
+        count_actions(&h, start),
+    )
 }
 
 /// Scenario 3: Ballast diagnosis — operator checks per-volume ballast status,
@@ -154,7 +167,11 @@ fn benchmark_ballast_diagnosis() -> BenchmarkResult {
     // Volume list is immediately visible. Operator drills into detail.
     h.inject_keycode(KeyCode::Enter); // toggle detail on first volume
 
-    BenchmarkResult::new("Ballast diagnosis (per-volume inventory)", 5, count_actions(&h, start))
+    BenchmarkResult::new(
+        "Ballast diagnosis (per-volume inventory)",
+        5,
+        count_actions(&h, start),
+    )
 }
 
 /// Scenario 4: Cleanup candidate review — operator reviews the scan results,
@@ -185,7 +202,11 @@ fn benchmark_candidate_review() -> BenchmarkResult {
     h.inject_char('s'); // cycle sort to size-first
     h.inject_char('d'); // close detail
 
-    BenchmarkResult::new("Candidate review (scan results + scoring)", 7, count_actions(&h, start))
+    BenchmarkResult::new(
+        "Candidate review (scan results + scoring)",
+        7,
+        count_actions(&h, start),
+    )
 }
 
 /// Scenario 5: Full incident response — pressure spike arrives, operator
@@ -224,7 +245,10 @@ fn benchmark_full_incident_response() -> BenchmarkResult {
 
     // Step 3: Quick-release from ballast screen.
     h.inject_char('x'); // opens confirmation overlay
-    assert_eq!(h.overlay(), Some(Overlay::Confirmation(ConfirmAction::BallastRelease)));
+    assert_eq!(
+        h.overlay(),
+        Some(Overlay::Confirmation(ConfirmAction::BallastRelease))
+    );
     h.inject_keycode(KeyCode::Escape); // review, then close confirmation
 
     // Step 4: Check explainability.
@@ -239,7 +263,11 @@ fn benchmark_full_incident_response() -> BenchmarkResult {
     h.inject_char('1'); // Navigate to S1
     assert_eq!(h.screen(), Screen::Overview);
 
-    BenchmarkResult::new("Full incident response (complete triage cycle)", 14, count_actions(&h, start))
+    BenchmarkResult::new(
+        "Full incident response (complete triage cycle)",
+        14,
+        count_actions(&h, start),
+    )
 }
 
 /// Scenario 6: Status check under degraded mode — daemon is unreachable,
@@ -291,7 +319,11 @@ fn benchmark_help_discovery() -> BenchmarkResult {
     h.inject_char(':'); // open command palette
     assert_eq!(h.overlay(), Some(Overlay::CommandPalette));
 
-    BenchmarkResult::new("Help discovery (keybindings + palette)", 3, count_actions(&h, start))
+    BenchmarkResult::new(
+        "Help discovery (keybindings + palette)",
+        3,
+        count_actions(&h, start),
+    )
 }
 
 /// Scenario 8: Timeline event investigation — operator filters timeline
@@ -362,7 +394,11 @@ fn benchmark_cross_screen_correlation() -> BenchmarkResult {
     h.inject_char('4'); // Navigate back to S4
     assert_eq!(h.screen(), Screen::Candidates);
 
-    BenchmarkResult::new("Cross-screen correlation (candidates → explain → timeline)", 10, count_actions(&h, start))
+    BenchmarkResult::new(
+        "Cross-screen correlation (candidates → explain → timeline)",
+        10,
+        count_actions(&h, start),
+    )
 }
 
 // ──────────────────── incident module validation ────────────────────
@@ -389,15 +425,18 @@ fn validate_hints_screen_context() {
         Screen::Overview,
         HintVerbosity::Full,
     );
-    assert!(!overview_hints.is_empty(), "high severity should show hints on overview");
+    assert!(
+        !overview_hints.is_empty(),
+        "high severity should show hints on overview"
+    );
 
     // Ballast screen should have release-related hints.
-    let ballast_hints = incident_hints(
-        IncidentSeverity::High,
-        Screen::Ballast,
-        HintVerbosity::Full,
+    let ballast_hints =
+        incident_hints(IncidentSeverity::High, Screen::Ballast, HintVerbosity::Full);
+    assert!(
+        !ballast_hints.is_empty(),
+        "high severity should show hints on ballast"
     );
-    assert!(!ballast_hints.is_empty(), "high severity should show hints on ballast");
 
     // Normal severity should have no hints.
     let normal_hints = incident_hints(
@@ -405,7 +444,10 @@ fn validate_hints_screen_context() {
         Screen::Overview,
         HintVerbosity::Full,
     );
-    assert!(normal_hints.is_empty(), "normal severity should not show hints");
+    assert!(
+        normal_hints.is_empty(),
+        "normal severity should not show hints"
+    );
 
     // Off verbosity disables all hints regardless of severity.
     let off_hints = incident_hints(
@@ -413,7 +455,10 @@ fn validate_hints_screen_context() {
         Screen::Overview,
         HintVerbosity::Off,
     );
-    assert!(off_hints.is_empty(), "off verbosity should suppress all hints");
+    assert!(
+        off_hints.is_empty(),
+        "off verbosity should suppress all hints"
+    );
 }
 
 // ──────────────────── confidence validation ────────────────────
@@ -428,7 +473,11 @@ fn validate_navigation_completeness() {
     for screen_num in 1u8..=7 {
         h.navigate_to_number(screen_num);
         let expected = Screen::from_number(screen_num).unwrap();
-        assert_eq!(h.screen(), expected, "screen {screen_num} unreachable by number key");
+        assert_eq!(
+            h.screen(),
+            expected,
+            "screen {screen_num} unreachable by number key"
+        );
         h.navigate_to_number(1); // return to overview
     }
 
@@ -439,7 +488,11 @@ fn validate_navigation_completeness() {
         visited.insert(h.screen());
         h.navigate_next();
     }
-    assert_eq!(visited.len(), 7, "bracket navigation must visit all 7 screens");
+    assert_eq!(
+        visited.len(),
+        7,
+        "bracket navigation must visit all 7 screens"
+    );
 
     // Verify Esc cascades correctly (no orphan states) — use fresh harness.
     let mut h2 = DashboardHarness::default();
@@ -469,7 +522,11 @@ fn validate_overlay_isolation() {
 
     // Navigation keys should be consumed (not leak through).
     h.inject_char('3');
-    assert_eq!(h.screen(), Screen::Overview, "navigation should not leak through help overlay");
+    assert_eq!(
+        h.screen(),
+        Screen::Overview,
+        "navigation should not leak through help overlay"
+    );
 
     // Close overlay, then navigate should work.
     h.inject_keycode(KeyCode::Escape);
@@ -696,7 +753,10 @@ mod tests {
         h.run_script(&steps);
 
         // If we got here without panicking, error rate is zero.
-        assert!(h.frame_count() >= steps.len(), "all steps should produce frames");
+        assert!(
+            h.frame_count() >= steps.len(),
+            "all steps should produce frames"
+        );
         // Verify no quit was triggered accidentally.
         assert!(!h.is_quit(), "workflow should not trigger accidental quit");
     }
@@ -708,7 +768,10 @@ mod tests {
         // Run the full incident response twice, verify identical outcomes.
         let r1 = benchmark_full_incident_response();
         let r2 = benchmark_full_incident_response();
-        assert_eq!(r1.new_steps, r2.new_steps, "benchmark results must be deterministic");
+        assert_eq!(
+            r1.new_steps, r2.new_steps,
+            "benchmark results must be deterministic"
+        );
         assert_eq!(r1.baseline_steps, r2.baseline_steps);
     }
 
@@ -766,7 +829,10 @@ mod tests {
             Some(Overlay::Confirmation(ConfirmAction::BallastRelease)),
             "quick release should open confirmation overlay",
         );
-        assert!(h_manual.overlay().is_none(), "manual navigation should not open overlay");
+        assert!(
+            h_manual.overlay().is_none(),
+            "manual navigation should not open overlay"
+        );
     }
 
     // ── Playbook coverage validation ──

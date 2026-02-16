@@ -60,7 +60,11 @@ fn assert_golden(label: &str, frame: &str, expected_digest: &str) {
         eprintln!("━━━ GOLDEN MISMATCH: {label} ━━━");
         eprintln!("Expected digest: {expected_digest}");
         eprintln!("Actual digest:   {actual}");
-        eprintln!("━━━ Full frame ({} bytes, {} lines) ━━━", frame.len(), frame.lines().count());
+        eprintln!(
+            "━━━ Full frame ({} bytes, {} lines) ━━━",
+            frame.len(),
+            frame.lines().count()
+        );
         eprintln!("{frame}");
         eprintln!("━━━ END ━━━");
         panic!(
@@ -237,23 +241,31 @@ fn overview_healthy_wide_structure() {
     let model = model_healthy_at(120, 40);
     let frame = render_frame(&model);
 
-    assert_contains_all(&frame, "overview/healthy/wide", &[
-        "SBH Dashboard (NORMAL)",
-        "S1 Overview",
-        "120x40",
-        "GREEN",
-        "pressure",
-        "ballast",
-        "counters",
-        "overview-layout=",
-        "ewma",
-        "activity",
-        "actions",
-        "ok:OK",
-        "pid=1234",
-        "1h 00m",
-    ]);
-    assert_contains_none(&frame, "overview/healthy/wide", &["DEGRADED", "RED", "CRITICAL"]);
+    assert_contains_all(
+        &frame,
+        "overview/healthy/wide",
+        &[
+            "SBH Dashboard (NORMAL)",
+            "S1 Overview",
+            "120x40",
+            "GREEN",
+            "pressure",
+            "ballast",
+            "counters",
+            "overview-layout=",
+            "ewma",
+            "activity",
+            "actions",
+            "ok:OK",
+            "pid=1234",
+            "1h 00m",
+        ],
+    );
+    assert_contains_none(
+        &frame,
+        "overview/healthy/wide",
+        &["DEGRADED", "RED", "CRITICAL"],
+    );
 }
 
 #[test]
@@ -261,15 +273,19 @@ fn overview_healthy_narrow_structure() {
     let model = model_healthy_at(80, 24);
     let frame = render_frame(&model);
 
-    assert_contains_all(&frame, "overview/healthy/narrow", &[
-        "SBH Dashboard (NORMAL)",
-        "S1 Overview",
-        "80x24",
-        "GREEN",
-        "pressure",
-        "ballast",
-        "Narrow",
-    ]);
+    assert_contains_all(
+        &frame,
+        "overview/healthy/narrow",
+        &[
+            "SBH Dashboard (NORMAL)",
+            "S1 Overview",
+            "80x24",
+            "GREEN",
+            "pressure",
+            "ballast",
+            "Narrow",
+        ],
+    );
 }
 
 #[test]
@@ -277,17 +293,21 @@ fn overview_pressured_wide_structure() {
     let model = model_pressured_at(120, 40);
     let frame = render_frame(&model);
 
-    assert_contains_all(&frame, "overview/pressured/wide", &[
-        "SBH Dashboard (NORMAL)",
-        "S1 Overview",
-        "RED",
-        "/data",
-        "/home",
-        "3.5",
-        "released=8",
-        "errors=2",
-        "5.0 GB",
-    ]);
+    assert_contains_all(
+        &frame,
+        "overview/pressured/wide",
+        &[
+            "SBH Dashboard (NORMAL)",
+            "S1 Overview",
+            "RED",
+            "/data",
+            "/home",
+            "3.5",
+            "released=8",
+            "errors=2",
+            "5.0 GB",
+        ],
+    );
 }
 
 #[test]
@@ -295,12 +315,16 @@ fn overview_degraded_structure() {
     let model = model_at(120, 40);
     let frame = render_frame(&model);
 
-    assert_contains_all(&frame, "overview/degraded", &[
-        "SBH Dashboard (DEGRADED)",
-        "S1 Overview",
-        "DEGRADED",
-        "UNKNOWN",
-    ]);
+    assert_contains_all(
+        &frame,
+        "overview/degraded",
+        &[
+            "SBH Dashboard (DEGRADED)",
+            "S1 Overview",
+            "DEGRADED",
+            "UNKNOWN",
+        ],
+    );
     assert_contains_none(&frame, "overview/degraded", &["GREEN", "RED"]);
 }
 
@@ -314,13 +338,17 @@ fn timeline_empty_wide_structure() {
     navigate_to(&mut model, Screen::Timeline);
     let frame = render_frame(&model);
 
-    assert_contains_all(&frame, "timeline/empty/wide", &[
-        "S2 Timeline",
-        "filter=",
-        "data-source=",
-        "events=0/0",
-        "telemetry enabled",
-    ]);
+    assert_contains_all(
+        &frame,
+        "timeline/empty/wide",
+        &[
+            "S2 Timeline",
+            "filter=",
+            "data-source=",
+            "events=0/0",
+            "telemetry enabled",
+        ],
+    );
 }
 
 #[test]
@@ -329,11 +357,11 @@ fn timeline_empty_narrow_structure() {
     navigate_to(&mut model, Screen::Timeline);
     let frame = render_frame(&model);
 
-    assert_contains_all(&frame, "timeline/empty/narrow", &[
-        "S2 Timeline",
-        "80x24",
-        "events=0/0",
-    ]);
+    assert_contains_all(
+        &frame,
+        "timeline/empty/narrow",
+        &["S2 Timeline", "80x24", "events=0/0"],
+    );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -346,13 +374,17 @@ fn explainability_empty_wide_structure() {
     navigate_to(&mut model, Screen::Explainability);
     let frame = render_frame(&model);
 
-    assert_contains_all(&frame, "explain/empty/wide", &[
-        "S3 Explain",
-        "data-source=",
-        "decisions=0",
-        "telemetry enabled",
-        "GREEN",
-    ]);
+    assert_contains_all(
+        &frame,
+        "explain/empty/wide",
+        &[
+            "S3 Explain",
+            "data-source=",
+            "decisions=0",
+            "telemetry enabled",
+            "GREEN",
+        ],
+    );
 }
 
 #[test]
@@ -361,11 +393,11 @@ fn explainability_empty_narrow_structure() {
     navigate_to(&mut model, Screen::Explainability);
     let frame = render_frame(&model);
 
-    assert_contains_all(&frame, "explain/empty/narrow", &[
-        "S3 Explain",
-        "80x24",
-        "decisions=0",
-    ]);
+    assert_contains_all(
+        &frame,
+        "explain/empty/narrow",
+        &["S3 Explain", "80x24", "decisions=0"],
+    );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -378,14 +410,18 @@ fn candidates_empty_wide_structure() {
     navigate_to(&mut model, Screen::Candidates);
     let frame = render_frame(&model);
 
-    assert_contains_all(&frame, "candidates/empty/wide", &[
-        "S4 Candidates",
-        "data-source=",
-        "candidates=0",
-        "telemetry enabled",
-        "sort=",
-        "GREEN",
-    ]);
+    assert_contains_all(
+        &frame,
+        "candidates/empty/wide",
+        &[
+            "S4 Candidates",
+            "data-source=",
+            "candidates=0",
+            "telemetry enabled",
+            "sort=",
+            "GREEN",
+        ],
+    );
 }
 
 #[test]
@@ -394,11 +430,11 @@ fn candidates_empty_narrow_structure() {
     navigate_to(&mut model, Screen::Candidates);
     let frame = render_frame(&model);
 
-    assert_contains_all(&frame, "candidates/empty/narrow", &[
-        "S4 Candidates",
-        "80x24",
-        "candidates=0",
-    ]);
+    assert_contains_all(
+        &frame,
+        "candidates/empty/narrow",
+        &["S4 Candidates", "80x24", "candidates=0"],
+    );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -411,12 +447,11 @@ fn ballast_healthy_wide_structure() {
     navigate_to(&mut model, Screen::Ballast);
     let frame = render_frame(&model);
 
-    assert_contains_all(&frame, "ballast/healthy/wide", &[
-        "S5 Ballast",
-        "10/10 available",
-        "0 released",
-        "OK",
-    ]);
+    assert_contains_all(
+        &frame,
+        "ballast/healthy/wide",
+        &["S5 Ballast", "10/10 available", "0 released", "OK"],
+    );
 }
 
 #[test]
@@ -425,12 +460,11 @@ fn ballast_pressured_wide_structure() {
     navigate_to(&mut model, Screen::Ballast);
     let frame = render_frame(&model);
 
-    assert_contains_all(&frame, "ballast/pressured/wide", &[
-        "S5 Ballast",
-        "2/10 available",
-        "8 released",
-        "LOW",
-    ]);
+    assert_contains_all(
+        &frame,
+        "ballast/pressured/wide",
+        &["S5 Ballast", "2/10 available", "8 released", "LOW"],
+    );
 }
 
 #[test]
@@ -439,11 +473,11 @@ fn ballast_healthy_narrow_structure() {
     navigate_to(&mut model, Screen::Ballast);
     let frame = render_frame(&model);
 
-    assert_contains_all(&frame, "ballast/healthy/narrow", &[
-        "S5 Ballast",
-        "80x24",
-        "10/10 available",
-    ]);
+    assert_contains_all(
+        &frame,
+        "ballast/healthy/narrow",
+        &["S5 Ballast", "80x24", "10/10 available"],
+    );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -456,13 +490,17 @@ fn diagnostics_healthy_wide_structure() {
     navigate_to(&mut model, Screen::Diagnostics);
     let frame = render_frame(&model);
 
-    assert_contains_all(&frame, "diagnostics/healthy/wide", &[
-        "S7 Diagnostics",
-        "Dashboard Health",
-        "NORMAL",
-        "Data Adapters",
-        "state-adapter",
-    ]);
+    assert_contains_all(
+        &frame,
+        "diagnostics/healthy/wide",
+        &[
+            "S7 Diagnostics",
+            "Dashboard Health",
+            "NORMAL",
+            "Data Adapters",
+            "state-adapter",
+        ],
+    );
 }
 
 #[test]
@@ -471,10 +509,11 @@ fn diagnostics_healthy_narrow_structure() {
     navigate_to(&mut model, Screen::Diagnostics);
     let frame = render_frame(&model);
 
-    assert_contains_all(&frame, "diagnostics/healthy/narrow", &[
-        "S7 Diagnostics",
-        "80x24",
-    ]);
+    assert_contains_all(
+        &frame,
+        "diagnostics/healthy/narrow",
+        &["S7 Diagnostics", "80x24"],
+    );
 }
 
 #[test]
@@ -483,10 +522,11 @@ fn diagnostics_degraded_structure() {
     navigate_to(&mut model, Screen::Diagnostics);
     let frame = render_frame(&model);
 
-    assert_contains_all(&frame, "diagnostics/degraded", &[
-        "S7 Diagnostics",
-        "DEGRADED",
-    ]);
+    assert_contains_all(
+        &frame,
+        "diagnostics/degraded",
+        &["S7 Diagnostics", "DEGRADED"],
+    );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -696,7 +736,10 @@ fn golden_digest_overview_healthy_wide() {
     eprintln!("Frame ({} lines):\n{frame}", frame.lines().count());
 
     // Verify frame is non-trivial.
-    assert!(frame.lines().count() >= 5, "Overview should render at least 5 lines");
+    assert!(
+        frame.lines().count() >= 5,
+        "Overview should render at least 5 lines"
+    );
     assert!(frame.contains("S1 Overview"));
 }
 
@@ -708,7 +751,10 @@ fn golden_digest_timeline_healthy_wide() {
     let digest = frame_digest(&frame);
 
     eprintln!("timeline_healthy_wide digest: {digest}");
-    assert!(frame.lines().count() >= 5, "Timeline should render at least 5 lines");
+    assert!(
+        frame.lines().count() >= 5,
+        "Timeline should render at least 5 lines"
+    );
     assert!(frame.contains("S2 Timeline"));
 }
 
@@ -720,7 +766,10 @@ fn golden_digest_explainability_healthy_wide() {
     let digest = frame_digest(&frame);
 
     eprintln!("explainability_healthy_wide digest: {digest}");
-    assert!(frame.lines().count() >= 5, "Explainability should render at least 5 lines");
+    assert!(
+        frame.lines().count() >= 5,
+        "Explainability should render at least 5 lines"
+    );
     assert!(frame.contains("S3 Explain"));
 }
 
@@ -732,7 +781,10 @@ fn golden_digest_candidates_healthy_wide() {
     let digest = frame_digest(&frame);
 
     eprintln!("candidates_healthy_wide digest: {digest}");
-    assert!(frame.lines().count() >= 5, "Candidates should render at least 5 lines");
+    assert!(
+        frame.lines().count() >= 5,
+        "Candidates should render at least 5 lines"
+    );
     assert!(frame.contains("S4 Candidates"));
 }
 
@@ -744,7 +796,10 @@ fn golden_digest_ballast_healthy_wide() {
     let digest = frame_digest(&frame);
 
     eprintln!("ballast_healthy_wide digest: {digest}");
-    assert!(frame.lines().count() >= 5, "Ballast should render at least 5 lines");
+    assert!(
+        frame.lines().count() >= 5,
+        "Ballast should render at least 5 lines"
+    );
     assert!(frame.contains("S5 Ballast"));
 }
 
@@ -756,7 +811,10 @@ fn golden_digest_diagnostics_healthy_wide() {
     let digest = frame_digest(&frame);
 
     eprintln!("diagnostics_healthy_wide digest: {digest}");
-    assert!(frame.lines().count() >= 5, "Diagnostics should render at least 5 lines");
+    assert!(
+        frame.lines().count() >= 5,
+        "Diagnostics should render at least 5 lines"
+    );
     assert!(frame.contains("S7 Diagnostics"));
 }
 
@@ -861,5 +919,8 @@ fn pressured_badges_show_danger_labels() {
     let model = model_pressured_at(120, 40);
     let frame = render_frame(&model);
 
-    assert!(frame.contains("RED"), "Pressured overview should show RED label");
+    assert!(
+        frame.contains("RED"),
+        "Pressured overview should show RED label"
+    );
 }

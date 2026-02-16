@@ -51,7 +51,9 @@ impl IncidentSeverity {
     /// Returns `Normal` when no state is available (degraded mode).
     #[must_use]
     pub fn from_daemon_state(state: Option<&DaemonState>) -> Self {
-        state.map_or(Self::Normal, |s| Self::from_pressure_level(&s.pressure.overall))
+        state.map_or(Self::Normal, |s| {
+            Self::from_pressure_level(&s.pressure.overall)
+        })
     }
 
     /// Human-readable label for display.
@@ -255,7 +257,9 @@ pub fn incident_banner(severity: IncidentSeverity) -> Option<String> {
         _ => return None,
     };
 
-    Some(format!("{prefix} — Press [!] for incident playbook, [x] to release ballast"))
+    Some(format!(
+        "{prefix} — Press [!] for incident playbook, [x] to release ballast"
+    ))
 }
 
 // ──────────────────── feature gate ────────────────────
