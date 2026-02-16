@@ -485,20 +485,40 @@ impl Config {
         );
         let is_explicit_path = path.is_some() || env_config.is_some();
 
-        let mut cfg = if path_buf.exists() {
-            let raw = fs::read_to_string(&path_buf).map_err(|source| SbhError::Io {
-                path: path_buf.clone(),
+        // System-wide fallback: when no explicit path is given and user-level
+        // config doesn't exist, try /etc/sbh/config.toml before using defaults.
+        // This allows `sbh status` (run as a regular user) to find the same
+        // config that the systemd daemon uses.
+        let system_config = PathBuf::from("/etc/sbh/config.toml");
+        let (effective_path, is_system_fallback) =
+            if !is_explicit_path && !path_buf.exists() && system_config.exists() {
+                (system_config, true)
+            } else {
+                (path_buf, false)
+            };
+
+        let mut cfg = if effective_path.exists() {
+            let raw = fs::read_to_string(&effective_path).map_err(|source| SbhError::Io {
+                path: effective_path.clone(),
                 source,
             })?;
             let parsed: Self = toml::from_str(&raw)?;
+            if is_system_fallback {
+                eprintln!(
+                    "[SBH-CONFIG] Using system config at {}",
+                    effective_path.display()
+                );
+            }
             parsed
         } else if is_explicit_path {
-            return Err(SbhError::MissingConfig { path: path_buf });
+            return Err(SbhError::MissingConfig {
+                path: effective_path,
+            });
         } else {
             Self::default()
         };
 
-        cfg.paths.config_file = path_buf;
+        cfg.paths.config_file = effective_path;
         cfg.apply_env_overrides()?;
         cfg.normalize_paths();
         cfg.validate()?;

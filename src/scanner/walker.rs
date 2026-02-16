@@ -330,7 +330,7 @@ fn process_directory(
             // With bounded(1024) and parallelism=2, both workers can block
             // on send() simultaneously, creating a classic deadlock.
             match work_tx.send_timeout(
-                (child_path, depth + 1, root_dev),
+                (child_path.clone(), depth + 1, root_dev),
                 Duration::from_millis(100),
             ) {
                 Ok(()) => {}
@@ -338,6 +338,10 @@ fn process_directory(
                     // Queue full or disconnected — skip this subdirectory.
                     // The next scan pass will pick it up if needed.
                     in_flight.fetch_sub(1, Ordering::Release);
+                    eprintln!(
+                        "[SBH-WALKER] work queue full, skipping subdirectory: {}",
+                        child_path.display()
+                    );
                 }
             }
         }
@@ -466,6 +470,7 @@ pub fn collect_open_files() -> HashSet<(u64, u64)> {
 fn collect_open_files_linux() -> HashSet<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
+    use std::time::Instant;
 
     let mut open = HashSet::with_capacity(4096);
 
@@ -473,7 +478,18 @@ fn collect_open_files_linux() -> HashSet<(u64, u64)> {
         return open;
     };
 
+    let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
+    let mut pids_scanned: usize = 0;
+
     for proc_entry in proc_dir.flatten() {
+        // Budget checks: stop if we've exceeded time or PID limits.
+        if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
+            // We do not log here to avoid spamming stderr every batch.
+            // The logic fails conservative (partial set = some open files might be missed),
+            // but this prevents the daemon from hanging the system.
+            break;
+        }
+
         let pid_name = proc_entry.file_name();
         let pid_bytes = pid_name.as_bytes();
 
@@ -481,6 +497,8 @@ fn collect_open_files_linux() -> HashSet<(u64, u64)> {
         if pid_bytes.is_empty() || !pid_bytes.iter().all(u8::is_ascii_digit) {
             continue;
         }
+
+        pids_scanned += 1;
 
         let Ok(fd_entries) = fs::read_dir(proc_entry.path().join("fd")) else {
             continue;

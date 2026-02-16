@@ -3009,6 +3009,12 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     continue;
                 };
 
+                // Skip pseudo-filesystems with zero capacity (squashfs, proc,
+                // sysfs, etc.) — they don't represent real storage pressure.
+                if stats.total_bytes == 0 {
+                    continue;
+                }
+
                 let free_pct = stats.free_pct();
                 let level = pressure_level_str(free_pct, &config);
                 if pressure_severity(level) > pressure_severity(overall_level) {
@@ -3101,6 +3107,10 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 let Ok(stats) = platform.fs_stats(&mount.path) else {
                     continue;
                 };
+                // Skip pseudo-filesystems with zero capacity.
+                if stats.total_bytes == 0 {
+                    continue;
+                }
                 let free_pct = stats.free_pct();
                 let level = pressure_level_str(free_pct, &config);
                 if pressure_severity(level) > pressure_severity(overall_level) {
