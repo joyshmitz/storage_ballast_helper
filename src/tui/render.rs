@@ -2,10 +2,16 @@
 
 #![allow(missing_docs)]
 
-use super::layout::{OverviewPane, PanePriority, build_overview_layout};
-use super::model::{DashboardModel, NotificationLevel, Screen};
+use super::layout::{
+    OverviewPane, PanePriority, TimelinePane, build_overview_layout, build_timeline_layout,
+};
+use super::model::{DashboardModel, NotificationLevel, Screen, SeverityFilter};
 use super::theme::{AccessibilityProfile, Theme, ThemePalette};
-use super::widgets::{gauge, sparkline, status_badge};
+use super::widgets::{
+    extract_time, gauge, human_bytes, human_duration, human_rate, section_header, sparkline,
+    status_badge, trend_label,
+};
+use crate::tui::telemetry::{DataSource, DecisionEvidence, TimelineEvent};
 
 /// Stable render entrypoint for screen dispatch.
 ///
@@ -38,9 +44,11 @@ pub fn render(model: &DashboardModel) -> String {
         let _ = writeln!(out, "[overlay: {overlay:?}]");
     }
 
-    // Screen-specific content (stubs until bd-xzt.3.*).
+    // Screen-specific content.
     match model.screen {
         Screen::Overview => render_overview(model, theme, &mut out),
+        Screen::Timeline => render_timeline(model, theme, &mut out),
+        Screen::Explainability => render_explainability(model, theme, &mut out),
         screen => render_screen_stub(screen_label(screen), theme, &mut out),
     }
 
@@ -102,17 +110,24 @@ fn render_overview(model: &DashboardModel, theme: Theme, out: &mut String) {
             OverviewPane::BallastQuick => render_ballast_quick(model, theme),
             OverviewPane::ExtendedCounters => render_extended_counters(model),
         };
-        let _ = writeln!(
-            out,
-            "[{} {} @{},{} {}x{}] {}",
-            placement.pane.id(),
-            pane_priority_label(placement.priority),
-            placement.rect.col,
-            placement.rect.row,
-            placement.rect.width,
-            placement.rect.height,
-            content,
-        );
+        // First line shares the pane header; continuation lines are indented.
+        let mut lines = content.lines();
+        if let Some(first) = lines.next() {
+            let _ = writeln!(
+                out,
+                "[{} {} @{},{} {}x{}] {}",
+                placement.pane.id(),
+                pane_priority_label(placement.priority),
+                placement.rect.col,
+                placement.rect.row,
+                placement.rect.width,
+                placement.rect.height,
+                first,
+            );
+            for line in lines {
+                let _ = writeln!(out, "  {line}");
+            }
+        }
     }
 }
 
@@ -125,6 +140,8 @@ fn pane_priority_label(priority: PanePriority) -> &'static str {
 }
 
 fn render_pressure_summary(model: &DashboardModel, theme: Theme, pane_width: u16) -> String {
+    use std::fmt::Write as _;
+
     if let Some(ref state) = model.daemon_state {
         let worst_free_pct = state
             .pressure
@@ -138,11 +155,38 @@ fn render_pressure_summary(model: &DashboardModel, theme: Theme, pane_width: u16
             theme.palette.for_pressure_level(&state.pressure.overall),
             theme.accessibility,
         );
-        let used_gauge = gauge(100.0 - worst_free_pct, gauge_width_for(pane_width));
-        format!(
-            "pressure {badge} worst-free={worst_free_pct:.1}% used={used_gauge} mounts={}",
+        let gauge_w = gauge_width_for(pane_width);
+        let mut out = format!(
+            "pressure {badge} worst-free={worst_free_pct:.1}% mounts={}",
             state.pressure.mounts.len(),
-        )
+        );
+
+        // Per-mount detail rows matching legacy dashboard parity.
+        for mount in &state.pressure.mounts {
+            let used_pct = 100.0 - mount.free_pct;
+            let g = gauge(used_pct, gauge_w);
+            let level = mount.level.to_ascii_uppercase();
+            let rate_warn = match mount.rate_bps {
+                Some(r) if r > 0.0 && mount.free_pct > 0.0 => " \u{26a0}",
+                _ => "",
+            };
+            let _ = write!(
+                out,
+                "\n  {:<14} {} ({:.1}% free) [{level}]{rate_warn}",
+                mount.path, g, mount.free_pct,
+            );
+        }
+        out
+    } else if model.degraded && !model.monitor_paths.is_empty() {
+        let badge = status_badge("DEGRADED", theme.palette.warning, theme.accessibility);
+        let mut out = format!(
+            "pressure {badge} live-fs-stats paths={}",
+            model.monitor_paths.len(),
+        );
+        for path in &model.monitor_paths {
+            let _ = write!(out, "\n  {}", path.display());
+        }
+        out
     } else {
         let badge = status_badge("UNKNOWN", theme.palette.muted, theme.accessibility);
         format!("pressure {badge} daemon-state-unavailable")
@@ -156,8 +200,10 @@ fn gauge_width_for(pane_width: u16) -> usize {
 fn render_action_lane(model: &DashboardModel) -> String {
     if let Some(ref state) = model.daemon_state {
         format!(
-            "actions scans={} deleted={} bytes-freed={}",
-            state.counters.scans, state.counters.deletions, state.counters.bytes_freed,
+            "actions scans={} deleted={} freed={}",
+            state.counters.scans,
+            state.counters.deletions,
+            human_bytes(state.counters.bytes_freed),
         )
     } else {
         String::from("actions awaiting daemon connection")
@@ -165,39 +211,43 @@ fn render_action_lane(model: &DashboardModel) -> String {
 }
 
 fn render_ewma_trend(model: &DashboardModel) -> String {
+    use std::fmt::Write as _;
+
     if model.rate_histories.is_empty() {
         return String::from("ewma no-rate-data");
     }
 
-    let mut series: Vec<(&str, String)> = model
-        .rate_histories
-        .iter()
-        .map(|(path, history)| {
-            let normalized = history.normalized();
-            let trace = sparkline(&normalized);
-            let latest = history.latest().unwrap_or(0.0);
-            (path.as_str(), format!("{path}:{trace}({latest:+.0}B/s)"))
-        })
-        .collect();
-    series.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let mut sorted: Vec<_> = model.rate_histories.iter().collect();
+    sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
 
-    let joined = series
-        .into_iter()
-        .map(|(_, line)| line)
-        .take(3)
-        .collect::<Vec<_>>()
-        .join(" | ");
-    format!("ewma {joined}")
+    let mut out = format!("ewma {} mounts", sorted.len());
+    for (path, history) in &sorted {
+        let normalized = history.normalized();
+        let trace = sparkline(&normalized);
+        let latest = history.latest().unwrap_or(0.0);
+        let rate_str = human_rate(latest);
+        let trend = trend_label(latest);
+        let alert = if latest > 1_000_000.0 {
+            " \u{26a0}"
+        } else {
+            ""
+        };
+        let _ = write!(out, "\n  {path:<14} {trace} {rate_str} {trend}{alert}");
+    }
+    out
 }
 
 fn render_recent_activity(model: &DashboardModel) -> String {
     if let Some(ref state) = model.daemon_state {
+        let at_str = state
+            .last_scan
+            .at
+            .as_deref()
+            .map(extract_time)
+            .unwrap_or("never");
         format!(
-            "activity last-scan={} candidates={} deleted={} errors={}",
-            state.last_scan.at.as_deref().unwrap_or("never"),
-            state.last_scan.candidates,
-            state.last_scan.deleted,
-            state.counters.errors,
+            "activity last-scan={at_str} candidates={} deleted={} errors={}",
+            state.last_scan.candidates, state.last_scan.deleted, state.counters.errors,
         )
     } else {
         String::from("activity unavailable while degraded")
@@ -227,11 +277,283 @@ fn render_ballast_quick(model: &DashboardModel, theme: Theme) -> String {
 fn render_extended_counters(model: &DashboardModel) -> String {
     if let Some(ref state) = model.daemon_state {
         format!(
-            "counters errors={} dropped-log-events={} rss={}B",
-            state.counters.errors, state.counters.dropped_log_events, state.memory_rss_bytes,
+            "counters errors={} dropped-log-events={} rss={} pid={} uptime={}",
+            state.counters.errors,
+            state.counters.dropped_log_events,
+            human_bytes(state.memory_rss_bytes),
+            state.pid,
+            human_duration(state.uptime_seconds),
         )
     } else {
         String::from("counters unavailable")
+    }
+}
+
+// ──────────────────── S3: Explainability ────────────────────
+
+fn render_explainability(model: &DashboardModel, theme: Theme, out: &mut String) {
+    use std::fmt::Write as _;
+    let width = usize::from(model.terminal_size.0).max(40);
+
+    // ── Data-source header ──
+    let source_label = match model.explainability_source {
+        DataSource::Sqlite => "SQLite",
+        DataSource::Jsonl => "JSONL",
+        DataSource::None => "none",
+    };
+    let health_badge = if model.explainability_source == DataSource::None {
+        status_badge("NO DATA", theme.palette.muted, theme.accessibility)
+    } else if model.explainability_partial {
+        status_badge("PARTIAL", theme.palette.warning, theme.accessibility)
+    } else {
+        status_badge("OK", theme.palette.success, theme.accessibility)
+    };
+
+    let _ = writeln!(
+        out,
+        "data-source={source_label} {health_badge} decisions={}",
+        model.explainability_decisions.len(),
+    );
+
+    if !model.explainability_diagnostics.is_empty() {
+        let _ = writeln!(out, "  diag: {}", model.explainability_diagnostics);
+    }
+
+    // ── Policy mode indicator ──
+    if let Some(ref state) = model.daemon_state {
+        let pressure_badge = status_badge(
+            &state.pressure.overall.to_ascii_uppercase(),
+            theme.palette.for_pressure_level(&state.pressure.overall),
+            theme.accessibility,
+        );
+        let _ = writeln!(
+            out,
+            "pressure={pressure_badge} scans={} deletions={} errors={}",
+            state.counters.scans, state.counters.deletions, state.counters.errors,
+        );
+    }
+
+    // ── Empty state ──
+    if model.explainability_decisions.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "No decision evidence available. The daemon must be running with"
+        );
+        let _ = writeln!(
+            out,
+            "telemetry enabled to populate this screen."
+        );
+        let _ = writeln!(out, "Press r to force refresh, or check daemon status with key 1.");
+        return;
+    }
+
+    // ── Decisions list ──
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", section_header("Recent Decisions", width));
+
+    for (i, decision) in model.explainability_decisions.iter().enumerate() {
+        let cursor = if i == model.explainability_selected {
+            ">"
+        } else {
+            " "
+        };
+        let action_badge = action_badge(&decision.action, theme);
+        let veto_marker = if decision.vetoed { " VETOED" } else { "" };
+        let path_short = truncate_path(&decision.path, 40);
+        let time = extract_time(&decision.timestamp);
+        let _ = writeln!(
+            out,
+            "{cursor} #{:<4} {time} {action_badge}{veto_marker}  score={:.2}  P(abn)={:.2}  {}  {}",
+            decision.decision_id,
+            decision.total_score,
+            decision.posterior_abandoned,
+            human_bytes(decision.size_bytes),
+            path_short,
+        );
+    }
+
+    // ── Detail pane (expanded for selected decision) ──
+    if model.explainability_detail {
+        if let Some(decision) = model.explainability_selected_decision() {
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "{}",
+                section_header("Decision Detail", width)
+            );
+            render_decision_detail(decision, theme, width, out);
+        }
+    } else {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Press Enter to expand detail for selected decision");
+    }
+
+    // ── Navigation hint ──
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close detail  r refresh"
+    );
+}
+
+fn render_decision_detail(
+    decision: &DecisionEvidence,
+    theme: Theme,
+    width: usize,
+    out: &mut String,
+) {
+    use std::fmt::Write as _;
+
+    // ── Identity ──
+    let _ = writeln!(out, "  decision-id: #{}", decision.decision_id);
+    let _ = writeln!(out, "  timestamp:   {}", decision.timestamp);
+    let _ = writeln!(out, "  path:        {}", decision.path);
+    let _ = writeln!(
+        out,
+        "  size:        {} ({} bytes)",
+        human_bytes(decision.size_bytes),
+        decision.size_bytes
+    );
+    let _ = writeln!(
+        out,
+        "  age:         {}",
+        human_duration(decision.age_secs)
+    );
+
+    // ── Action & Policy ──
+    let action_badge = action_badge(&decision.action, theme);
+    let _ = writeln!(out, "  action:      {action_badge}");
+    if let Some(ref effective) = decision.effective_action {
+        let eff_badge = action_badge(effective, theme);
+        let _ = writeln!(out, "  effective:   {eff_badge}");
+    }
+    let _ = writeln!(out, "  policy-mode: {}", decision.policy_mode);
+
+    // ── Veto ──
+    if decision.vetoed {
+        let veto_badge = status_badge("VETOED", theme.palette.danger, theme.accessibility);
+        let _ = writeln!(out, "  veto:        {veto_badge}");
+        if let Some(ref reason) = decision.veto_reason {
+            let _ = writeln!(out, "  veto-reason: {reason}");
+        }
+    }
+
+    // ── Guard status ──
+    if let Some(ref guard) = decision.guard_status {
+        let _ = writeln!(out, "  guard:       {guard}");
+    }
+
+    // ── Factor breakdown ──
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{}",
+        section_header("Factor Breakdown", width)
+    );
+    let bar_width = (width / 3).clamp(10, 30);
+    render_factor_bar(out, "location ", decision.factors.location, bar_width, theme);
+    render_factor_bar(out, "name     ", decision.factors.name, bar_width, theme);
+    render_factor_bar(out, "age      ", decision.factors.age, bar_width, theme);
+    render_factor_bar(out, "size     ", decision.factors.size, bar_width, theme);
+    render_factor_bar(out, "structure", decision.factors.structure, bar_width, theme);
+    let _ = writeln!(
+        out,
+        "  pressure-multiplier: {:.2}x",
+        decision.factors.pressure_multiplier
+    );
+    let _ = writeln!(out, "  total-score: {:.4}", decision.total_score);
+
+    // ── Bayesian decision ──
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{}",
+        section_header("Bayesian Decision", width)
+    );
+    let _ = writeln!(
+        out,
+        "  P(abandoned):     {:.4}",
+        decision.posterior_abandoned
+    );
+    let _ = writeln!(
+        out,
+        "  E[loss|keep]:     {:.2}",
+        decision.expected_loss_keep
+    );
+    let _ = writeln!(
+        out,
+        "  E[loss|delete]:   {:.2}",
+        decision.expected_loss_delete
+    );
+    let _ = writeln!(
+        out,
+        "  calibration:      {:.4}",
+        decision.calibration_score
+    );
+
+    // ── Uncertainty indicator ──
+    let confidence_level = if decision.calibration_score >= 0.85 {
+        "HIGH"
+    } else if decision.calibration_score >= 0.60 {
+        "MODERATE"
+    } else {
+        "LOW"
+    };
+    let confidence_palette = if decision.calibration_score >= 0.85 {
+        theme.palette.success
+    } else if decision.calibration_score >= 0.60 {
+        theme.palette.warning
+    } else {
+        theme.palette.danger
+    };
+    let confidence_badge =
+        status_badge(confidence_level, confidence_palette, theme.accessibility);
+    let _ = writeln!(out, "  confidence:       {confidence_badge}");
+
+    // ── Summary ──
+    if !decision.summary.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "  summary: {}", decision.summary);
+    }
+}
+
+/// Render a horizontal bar for a single scoring factor (0.0..=1.0).
+fn render_factor_bar(out: &mut String, label: &str, value: f64, width: usize, _theme: Theme) {
+    use std::fmt::Write as _;
+    let clamped = value.clamp(0.0, 1.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let filled = (clamped * width as f64).round() as usize;
+    let empty = width.saturating_sub(filled);
+    let _ = writeln!(
+        out,
+        "  {label} [{}{} ] {:.2}",
+        "█".repeat(filled),
+        "░".repeat(empty),
+        value,
+    );
+}
+
+fn action_badge(action: &str, theme: Theme) -> String {
+    let (palette, label) = match action {
+        "delete" => (theme.palette.danger, "DELETE"),
+        "keep" => (theme.palette.success, "KEEP"),
+        "review" => (theme.palette.warning, "REVIEW"),
+        _ => (theme.palette.muted, action),
+    };
+    status_badge(label, palette, theme.accessibility)
+}
+
+/// Truncate a path string for display, keeping the tail end.
+fn truncate_path(path: &str, max_len: usize) -> &str {
+    if path.len() <= max_len {
+        path
+    } else {
+        let start = path.len() - max_len;
+        // Find the next '/' boundary to avoid cutting mid-component.
+        path[start..]
+            .find('/')
+            .map_or(&path[start..], |idx| &path[start + idx..])
     }
 }
 
@@ -367,6 +689,51 @@ mod tests {
         assert!(frame.contains("toast#"));
     }
 
+    fn multi_mount_state() -> DaemonState {
+        DaemonState {
+            version: String::from("0.1.0"),
+            pid: 4567,
+            started_at: String::from("2026-02-16T00:00:00Z"),
+            uptime_seconds: 7200,
+            last_updated: String::from("2026-02-16T02:00:00Z"),
+            pressure: PressureState {
+                overall: String::from("yellow"),
+                mounts: vec![
+                    MountPressure {
+                        path: String::from("/"),
+                        free_pct: 22.5,
+                        level: String::from("green"),
+                        rate_bps: Some(-500.0),
+                    },
+                    MountPressure {
+                        path: String::from("/data"),
+                        free_pct: 8.3,
+                        level: String::from("yellow"),
+                        rate_bps: Some(2_000_000.0),
+                    },
+                ],
+            },
+            ballast: BallastState {
+                available: 1,
+                total: 4,
+                released: 3,
+            },
+            last_scan: LastScanState {
+                at: Some(String::from("2026-02-16T01:45:30.123Z")),
+                candidates: 42,
+                deleted: 7,
+            },
+            counters: Counters {
+                scans: 200,
+                deletions: 15,
+                bytes_freed: 2_147_483_648,
+                errors: 3,
+                dropped_log_events: 1,
+            },
+            memory_rss_bytes: 104_857_600,
+        }
+    }
+
     #[test]
     fn overview_uses_layout_and_pressure_priority() {
         let mut model = DashboardModel::new(
@@ -388,5 +755,324 @@ mod tests {
         assert!(frame.contains("[pressure-summary p0"));
         assert!(frame.contains("RED"));
         assert!(frame.contains("ballast"));
+    }
+
+    #[test]
+    fn pressure_shows_per_mount_detail() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.daemon_state = Some(multi_mount_state());
+
+        let frame = render(&model);
+        // Both mounts appear with their paths.
+        assert!(frame.contains("/data"));
+        assert!(frame.contains("[GREEN]"));
+        assert!(frame.contains("[YELLOW]"));
+        // Mount with positive rate + free > 0 shows warning.
+        assert!(frame.contains("\u{26a0}"));
+        // Per-mount gauge present.
+        assert!(frame.contains("22.5% free"));
+        assert!(frame.contains("8.3% free"));
+    }
+
+    #[test]
+    fn ewma_shows_all_mounts_with_trend_labels() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        for mount in ["/", "/data", "/home", "/var"] {
+            let h = model
+                .rate_histories
+                .entry(mount.to_string())
+                .or_insert_with(|| super::super::model::RateHistory::new(30));
+            h.push(500.0);
+        }
+
+        let frame = render(&model);
+        // All 4 mounts visible (no longer capped at 3).
+        assert!(frame.contains("ewma 4 mounts"));
+        assert!(frame.contains("/home"));
+        assert!(frame.contains("/var"));
+        // Smart rate formatting present.
+        assert!(frame.contains("B/s"));
+        // Trend label present.
+        assert!(frame.contains("(stable)"));
+    }
+
+    #[test]
+    fn action_lane_formats_freed_bytes() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.daemon_state = Some(multi_mount_state());
+
+        let frame = render(&model);
+        // 2_147_483_648 bytes = 2.0 GB
+        assert!(frame.contains("freed=2.0 GB"));
+    }
+
+    #[test]
+    fn recent_activity_extracts_time() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.daemon_state = Some(multi_mount_state());
+
+        let frame = render(&model);
+        // Time portion extracted from "2026-02-16T01:45:30.123Z".
+        assert!(frame.contains("last-scan=01:45:30"));
+        assert!(!frame.contains("2026-02-16T01:45:30"));
+    }
+
+    #[test]
+    fn counters_show_human_rss_and_uptime() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.daemon_state = Some(multi_mount_state());
+
+        let frame = render(&model);
+        // 104_857_600 bytes = 100.0 MB
+        assert!(frame.contains("rss=100.0 MB"));
+        // PID visible.
+        assert!(frame.contains("pid=4567"));
+        // 7200 seconds = 2h 00m
+        assert!(frame.contains("uptime=2h 00m"));
+    }
+
+    #[test]
+    fn degraded_pressure_lists_monitor_paths() {
+        let model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![PathBuf::from("/"), PathBuf::from("/data")],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        assert!(model.degraded);
+        assert!(model.daemon_state.is_none());
+
+        let frame = render(&model);
+        assert!(frame.contains("DEGRADED"));
+        assert!(frame.contains("paths=2"));
+    }
+
+    // ── S3 Explainability screen tests ──
+
+    use crate::tui::telemetry::FactorBreakdown;
+
+    fn sample_decision(id: u64, action: &str, vetoed: bool) -> crate::tui::telemetry::DecisionEvidence {
+        crate::tui::telemetry::DecisionEvidence {
+            decision_id: id,
+            timestamp: String::from("2026-02-16T03:15:42Z"),
+            path: String::from("/data/projects/test-proj/target/debug"),
+            size_bytes: 524_288_000,
+            age_secs: 7200,
+            action: action.to_string(),
+            effective_action: Some(action.to_string()),
+            policy_mode: String::from("live"),
+            factors: FactorBreakdown {
+                location: 0.80,
+                name: 0.75,
+                age: 0.90,
+                size: 0.60,
+                structure: 0.85,
+                pressure_multiplier: 1.3,
+            },
+            total_score: 2.15,
+            posterior_abandoned: 0.87,
+            expected_loss_keep: 26.1,
+            expected_loss_delete: 13.0,
+            calibration_score: 0.82,
+            vetoed,
+            veto_reason: if vetoed { Some(String::from("contains .git")) } else { None },
+            guard_status: Some(String::from("Pass")),
+            summary: String::from("High-confidence build artifact, scored above threshold"),
+            raw_json: None,
+        }
+    }
+
+    #[test]
+    fn explainability_empty_shows_no_data_message() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Explainability;
+
+        let frame = render(&model);
+        assert!(frame.contains("[S3 Explain]"));
+        assert!(frame.contains("NO DATA") || frame.contains("no data"));
+        assert!(frame.contains("No decision evidence available"));
+    }
+
+    #[test]
+    fn explainability_shows_decisions_list() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Explainability;
+        model.explainability_decisions = vec![
+            sample_decision(42, "delete", false),
+            sample_decision(43, "keep", false),
+        ];
+        model.explainability_source = crate::tui::telemetry::DataSource::Sqlite;
+
+        let frame = render(&model);
+        assert!(frame.contains("[S3 Explain]"));
+        assert!(frame.contains("data-source=SQLite"));
+        assert!(frame.contains("decisions=2"));
+        assert!(frame.contains("#42"));
+        assert!(frame.contains("#43"));
+        assert!(frame.contains("DELETE"));
+        assert!(frame.contains("KEEP"));
+        assert!(frame.contains("Recent Decisions"));
+    }
+
+    #[test]
+    fn explainability_shows_veto_marker() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Explainability;
+        model.explainability_decisions = vec![sample_decision(99, "delete", true)];
+
+        let frame = render(&model);
+        assert!(frame.contains("VETOED"));
+    }
+
+    #[test]
+    fn explainability_detail_shows_factor_breakdown() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 40),
+        );
+        model.screen = Screen::Explainability;
+        model.explainability_decisions = vec![sample_decision(42, "delete", false)];
+        model.explainability_detail = true;
+
+        let frame = render(&model);
+        assert!(frame.contains("Decision Detail"));
+        assert!(frame.contains("Factor Breakdown"));
+        assert!(frame.contains("location"));
+        assert!(frame.contains("0.80"));
+        assert!(frame.contains("Bayesian Decision"));
+        assert!(frame.contains("P(abandoned)"));
+        assert!(frame.contains("0.8700"));
+        assert!(frame.contains("calibration"));
+    }
+
+    #[test]
+    fn explainability_detail_shows_veto_reason() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 40),
+        );
+        model.screen = Screen::Explainability;
+        model.explainability_decisions = vec![sample_decision(99, "delete", true)];
+        model.explainability_detail = true;
+
+        let frame = render(&model);
+        assert!(frame.contains("VETOED"));
+        assert!(frame.contains("contains .git"));
+    }
+
+    #[test]
+    fn explainability_shows_confidence_badge() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 40),
+        );
+        model.screen = Screen::Explainability;
+        model.explainability_decisions = vec![sample_decision(42, "delete", false)];
+        model.explainability_detail = true;
+
+        let frame = render(&model);
+        // calibration_score = 0.82 => MODERATE confidence
+        assert!(frame.contains("MODERATE"));
+    }
+
+    #[test]
+    fn explainability_partial_data_shows_warning() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Explainability;
+        model.explainability_decisions = vec![sample_decision(1, "keep", false)];
+        model.explainability_source = crate::tui::telemetry::DataSource::Jsonl;
+        model.explainability_partial = true;
+        model.explainability_diagnostics = "SQLite unavailable, using JSONL fallback".into();
+
+        let frame = render(&model);
+        assert!(frame.contains("PARTIAL"));
+        assert!(frame.contains("JSONL"));
+        assert!(frame.contains("SQLite unavailable"));
+    }
+
+    #[test]
+    fn explainability_cursor_indicator() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Explainability;
+        model.explainability_decisions = vec![
+            sample_decision(1, "delete", false),
+            sample_decision(2, "keep", false),
+        ];
+        model.explainability_selected = 1;
+
+        let frame = render(&model);
+        // Second decision should have the cursor marker
+        let lines: Vec<&str> = frame.lines().collect();
+        let cursor_line = lines.iter().find(|l| l.contains("#2") && l.contains('>'));
+        assert!(cursor_line.is_some(), "cursor should be on decision #2");
+    }
+
+    #[test]
+    fn truncate_path_preserves_short_paths() {
+        assert_eq!(truncate_path("/short/path", 40), "/short/path");
+    }
+
+    #[test]
+    fn truncate_path_truncates_long_paths_at_boundary() {
+        let long = "/very/long/deeply/nested/project/target/debug/build/artifact";
+        let truncated = truncate_path(long, 30);
+        assert!(truncated.len() <= 35); // might be slightly longer due to boundary
+        assert!(truncated.starts_with('/'));
     }
 }

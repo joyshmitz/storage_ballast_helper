@@ -150,6 +150,13 @@ impl BallastManager {
         self.inventory.len()
     }
 
+    /// Update configuration at runtime.
+    pub fn update_config(&mut self, config: BallastConfig) {
+        self.config = config;
+        // Re-scan inventory to reflect new file count limits.
+        self.scan_existing();
+    }
+
     // ──────────────────── locking ────────────────────
 
     #[cfg(unix)]

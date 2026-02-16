@@ -217,6 +217,156 @@ fn build_wide_layout(cols: u16, rows: u16) -> OverviewLayout {
     }
 }
 
+// ──────────────────── timeline layout (S2) ────────────────────
+
+/// Panes for the timeline screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelinePane {
+    /// Filter bar showing active severity filter and follow-mode indicator.
+    FilterBar,
+    /// Scrollable event list (main area).
+    EventList,
+    /// Detail panel for the selected event (shown in wide layout).
+    EventDetail,
+    /// Status footer with event count and data-source indicator.
+    StatusFooter,
+}
+
+impl TimelinePane {
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::FilterBar => "tl-filter-bar",
+            Self::EventList => "tl-event-list",
+            Self::EventDetail => "tl-event-detail",
+            Self::StatusFooter => "tl-status-footer",
+        }
+    }
+}
+
+/// Placement for a timeline pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimelinePlacement {
+    pub pane: TimelinePane,
+    pub priority: PanePriority,
+    pub rect: PaneRect,
+    pub visible: bool,
+}
+
+impl TimelinePlacement {
+    #[must_use]
+    pub const fn new(
+        pane: TimelinePane,
+        priority: PanePriority,
+        rect: PaneRect,
+        visible: bool,
+    ) -> Self {
+        Self {
+            pane,
+            priority,
+            rect,
+            visible,
+        }
+    }
+}
+
+/// Complete timeline layout plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineLayout {
+    pub class: LayoutClass,
+    pub placements: Vec<TimelinePlacement>,
+}
+
+/// Build pane placements for the timeline screen.
+#[must_use]
+pub fn build_timeline_layout(cols: u16, rows: u16) -> TimelineLayout {
+    match classify_layout(cols) {
+        LayoutClass::Narrow => build_narrow_timeline(cols, rows),
+        LayoutClass::Wide => build_wide_timeline(cols, rows),
+    }
+}
+
+fn build_narrow_timeline(cols: u16, rows: u16) -> TimelineLayout {
+    let w = cols.max(1);
+    // Filter bar: 1 row, event list: remaining, status: 1 row.
+    let footer_row = rows.saturating_sub(1);
+    let list_height = footer_row.saturating_sub(1).max(1);
+
+    let placements = vec![
+        TimelinePlacement::new(
+            TimelinePane::FilterBar,
+            PanePriority::P0,
+            PaneRect::new(0, 0, w, 1),
+            true,
+        ),
+        TimelinePlacement::new(
+            TimelinePane::EventList,
+            PanePriority::P0,
+            PaneRect::new(0, 1, w, list_height),
+            true,
+        ),
+        // Detail panel hidden in narrow layout.
+        TimelinePlacement::new(
+            TimelinePane::EventDetail,
+            PanePriority::P2,
+            PaneRect::new(0, 0, 0, 0),
+            false,
+        ),
+        TimelinePlacement::new(
+            TimelinePane::StatusFooter,
+            PanePriority::P0,
+            PaneRect::new(0, footer_row, w, 1),
+            true,
+        ),
+    ];
+
+    TimelineLayout {
+        class: LayoutClass::Narrow,
+        placements,
+    }
+}
+
+fn build_wide_timeline(cols: u16, rows: u16) -> TimelineLayout {
+    let full_width = cols.max(1);
+    let (list_width, detail_width) = split_columns(full_width, 1);
+    let detail_col = list_width.saturating_add(1);
+    let footer_row = rows.saturating_sub(1);
+    let body_height = footer_row.saturating_sub(1).max(1);
+    let detail_visible = rows >= 10;
+
+    let placements = vec![
+        TimelinePlacement::new(
+            TimelinePane::FilterBar,
+            PanePriority::P0,
+            PaneRect::new(0, 0, full_width, 1),
+            true,
+        ),
+        TimelinePlacement::new(
+            TimelinePane::EventList,
+            PanePriority::P0,
+            PaneRect::new(0, 1, list_width, body_height),
+            true,
+        ),
+        TimelinePlacement::new(
+            TimelinePane::EventDetail,
+            PanePriority::P1,
+            PaneRect::new(detail_col, 1, detail_width, body_height),
+            detail_visible,
+        ),
+        TimelinePlacement::new(
+            TimelinePane::StatusFooter,
+            PanePriority::P0,
+            PaneRect::new(0, footer_row, full_width, 1),
+            true,
+        ),
+    ];
+
+    TimelineLayout {
+        class: LayoutClass::Wide,
+        placements,
+    }
+}
+
 fn split_columns(cols: u16, gutter: u16) -> (u16, u16) {
     let usable = cols.saturating_sub(gutter);
     let left = (usable.saturating_mul(3) / 5).max(1);
@@ -260,5 +410,67 @@ mod tests {
             .find(|p| p.pane == OverviewPane::ActionLane)
             .expect("action pane");
         assert!(action.rect.col > pressure.rect.col);
+    }
+
+    // ── Timeline layout ──
+
+    #[test]
+    fn narrow_timeline_hides_detail_panel() {
+        let layout = build_timeline_layout(80, 24);
+        assert_eq!(layout.class, LayoutClass::Narrow);
+        let detail = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == TimelinePane::EventDetail);
+        assert!(detail.is_some_and(|p| !p.visible));
+    }
+
+    #[test]
+    fn narrow_timeline_has_filter_list_and_footer() {
+        let layout = build_timeline_layout(80, 24);
+        let filter = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == TimelinePane::FilterBar);
+        assert!(filter.is_some_and(|p| p.visible));
+        let list = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == TimelinePane::EventList);
+        assert!(list.is_some_and(|p| p.visible && p.rect.height > 0));
+        let footer = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == TimelinePane::StatusFooter);
+        assert!(footer.is_some_and(|p| p.visible));
+    }
+
+    #[test]
+    fn wide_timeline_shows_detail_panel() {
+        let layout = build_timeline_layout(140, 30);
+        assert_eq!(layout.class, LayoutClass::Wide);
+        let detail = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == TimelinePane::EventDetail)
+            .expect("detail pane");
+        assert!(detail.visible);
+        assert!(detail.rect.col > 0);
+    }
+
+    #[test]
+    fn timeline_pane_ids_are_unique() {
+        let panes = [
+            TimelinePane::FilterBar,
+            TimelinePane::EventList,
+            TimelinePane::EventDetail,
+            TimelinePane::StatusFooter,
+        ];
+        let ids: Vec<_> = panes.iter().map(|p| p.id()).collect();
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 }

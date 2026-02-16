@@ -276,6 +276,14 @@ impl DashboardHarness {
         self.model.notifications.len()
     }
 
+    /// Contextual help model derived from current screen/overlay state.
+    pub fn contextual_help(&self) -> super::input::ContextualHelp {
+        super::input::contextual_help(super::input::InputContext {
+            screen: self.model.screen,
+            active_overlay: self.model.active_overlay,
+        })
+    }
+
     /// Screen navigation history depth.
     pub fn history_depth(&self) -> usize {
         self.model.screen_history.len()
@@ -584,6 +592,23 @@ mod tests {
 
         h.inject_char('?');
         assert!(h.overlay().is_none());
+    }
+
+    #[test]
+    fn contextual_help_tracks_screen_and_overlay_context() {
+        let mut h = DashboardHarness::default();
+
+        let overview_help = h.contextual_help();
+        assert_eq!(overview_help.title, "Global Navigation");
+        assert!(overview_help.screen_hint.contains("Overview"));
+
+        h.navigate_to_number(7);
+        let diagnostics_help = h.contextual_help();
+        assert!(diagnostics_help.screen_hint.contains("frame health"));
+
+        h.open_help();
+        let overlay_help = h.contextual_help();
+        assert_eq!(overlay_help.title, "Help Overlay");
     }
 
     // ── Data update flows ──

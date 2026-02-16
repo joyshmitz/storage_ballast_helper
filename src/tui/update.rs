@@ -13,6 +13,7 @@ use ftui_core::event::KeyCode;
 use super::model::{
     DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, Overlay, RateHistory, Screen,
 };
+use crate::tui::telemetry::DataSource;
 
 /// Apply a message to the model and return the next command for the runtime.
 ///
@@ -22,10 +23,15 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
     match msg {
         DashboardMsg::Tick => {
             model.tick = model.tick.wrapping_add(1);
-            DashboardCmd::Batch(vec![
+            let mut cmds = vec![
                 DashboardCmd::FetchData,
                 DashboardCmd::ScheduleTick(model.refresh),
-            ])
+            ];
+            // Request telemetry data when on a screen that needs it.
+            if matches!(model.screen, Screen::Explainability) {
+                cmds.push(DashboardCmd::FetchTelemetry);
+            }
+            DashboardCmd::Batch(cmds)
         }
 
         DashboardMsg::Key(key) => {
@@ -109,6 +115,21 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
                 id,
                 after: std::time::Duration::from_secs(10),
             }
+        }
+
+        DashboardMsg::TelemetryDecisions(result) => {
+            model.explainability_source = result.source;
+            model.explainability_partial = result.partial;
+            model.explainability_diagnostics = result.diagnostics;
+            model.explainability_decisions = result.data;
+            // Clamp cursor to valid range after data refresh.
+            if model.explainability_decisions.is_empty() {
+                model.explainability_selected = 0;
+                model.explainability_detail = false;
+            } else if model.explainability_selected >= model.explainability_decisions.len() {
+                model.explainability_selected = model.explainability_decisions.len() - 1;
+            }
+            DashboardCmd::None
         }
     }
 }
@@ -222,7 +243,47 @@ fn handle_global_key(model: &mut DashboardModel, key: ftui_core::event::KeyEvent
         // r: force refresh (bypass timer).
         KeyCode::Char('r') => DashboardCmd::FetchData,
 
-        // Unhandled keys are no-ops.
+        // ── Screen-specific keys ──
+        _ => handle_screen_key(model, key),
+    }
+}
+
+/// Dispatch screen-specific keys that are not global navigation.
+fn handle_screen_key(model: &mut DashboardModel, key: ftui_core::event::KeyEvent) -> DashboardCmd {
+    match model.screen {
+        Screen::Explainability => handle_explainability_key(model, key),
+        _ => DashboardCmd::None,
+    }
+}
+
+/// Handle keys specific to the Explainability screen (S3).
+fn handle_explainability_key(
+    model: &mut DashboardModel,
+    key: ftui_core::event::KeyEvent,
+) -> DashboardCmd {
+    match key.code {
+        // Up/k: move cursor up in the decisions list.
+        KeyCode::Up | KeyCode::Char('k') => {
+            model.explainability_cursor_up();
+            DashboardCmd::None
+        }
+        // Down/j: move cursor down in the decisions list.
+        KeyCode::Down | KeyCode::Char('j') => {
+            model.explainability_cursor_down();
+            DashboardCmd::None
+        }
+        // Enter/Space: toggle detail pane for selected decision.
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            model.explainability_toggle_detail();
+            DashboardCmd::None
+        }
+        // d: close detail pane (if open).
+        KeyCode::Char('d') => {
+            if model.explainability_detail {
+                model.explainability_detail = false;
+            }
+            DashboardCmd::None
+        }
         _ => DashboardCmd::None,
     }
 }
@@ -807,5 +868,210 @@ mod tests {
         update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('1'))));
         assert_eq!(model.screen, Screen::Overview);
         assert_eq!(model.screen_history.len(), 7);
+    }
+
+    // ── S3 Explainability key handling tests ──
+
+    use crate::tui::telemetry::{DecisionEvidence, FactorBreakdown, TelemetryResult};
+
+    fn sample_decision(id: u64) -> DecisionEvidence {
+        DecisionEvidence {
+            decision_id: id,
+            timestamp: String::from("2026-02-16T03:15:42Z"),
+            path: String::from("/data/projects/test/target"),
+            size_bytes: 100_000,
+            age_secs: 3600,
+            action: String::from("delete"),
+            effective_action: Some(String::from("delete")),
+            policy_mode: String::from("live"),
+            factors: FactorBreakdown {
+                location: 0.8,
+                name: 0.7,
+                age: 0.9,
+                size: 0.5,
+                structure: 0.8,
+                pressure_multiplier: 1.2,
+            },
+            total_score: 2.0,
+            posterior_abandoned: 0.85,
+            expected_loss_keep: 25.0,
+            expected_loss_delete: 15.0,
+            calibration_score: 0.80,
+            vetoed: false,
+            veto_reason: None,
+            guard_status: None,
+            summary: String::from("test decision"),
+            raw_json: None,
+        }
+    }
+
+    #[test]
+    fn explainability_j_k_navigate_cursor() {
+        let mut model = test_model();
+        model.screen = Screen::Explainability;
+        model.explainability_decisions = vec![
+            sample_decision(1),
+            sample_decision(2),
+            sample_decision(3),
+        ];
+        assert_eq!(model.explainability_selected, 0);
+
+        // j moves down
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('j'))));
+        assert_eq!(model.explainability_selected, 1);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('j'))));
+        assert_eq!(model.explainability_selected, 2);
+
+        // j at bottom is clamped
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('j'))));
+        assert_eq!(model.explainability_selected, 2);
+
+        // k moves up
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('k'))));
+        assert_eq!(model.explainability_selected, 1);
+
+        // k at top is clamped
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('k'))));
+        assert_eq!(model.explainability_selected, 0);
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('k'))));
+        assert_eq!(model.explainability_selected, 0);
+    }
+
+    #[test]
+    fn explainability_arrows_navigate_cursor() {
+        let mut model = test_model();
+        model.screen = Screen::Explainability;
+        model.explainability_decisions = vec![sample_decision(1), sample_decision(2)];
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Down)));
+        assert_eq!(model.explainability_selected, 1);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Up)));
+        assert_eq!(model.explainability_selected, 0);
+    }
+
+    #[test]
+    fn explainability_enter_toggles_detail() {
+        let mut model = test_model();
+        model.screen = Screen::Explainability;
+        model.explainability_decisions = vec![sample_decision(1)];
+        assert!(!model.explainability_detail);
+
+        update(
+            &mut model,
+            DashboardMsg::Key(make_key(KeyCode::Enter)),
+        );
+        assert!(model.explainability_detail);
+
+        update(
+            &mut model,
+            DashboardMsg::Key(make_key(KeyCode::Enter)),
+        );
+        assert!(!model.explainability_detail);
+    }
+
+    #[test]
+    fn explainability_d_closes_detail() {
+        let mut model = test_model();
+        model.screen = Screen::Explainability;
+        model.explainability_decisions = vec![sample_decision(1)];
+        model.explainability_detail = true;
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('d'))));
+        assert!(!model.explainability_detail);
+    }
+
+    #[test]
+    fn explainability_keys_noop_on_other_screens() {
+        let mut model = test_model();
+        model.screen = Screen::Overview;
+
+        // j/k should be no-ops on overview (unhandled keys).
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('j'))));
+        assert_eq!(model.explainability_selected, 0);
+    }
+
+    #[test]
+    fn telemetry_decisions_msg_updates_model() {
+        let mut model = test_model();
+        let result = TelemetryResult {
+            data: vec![sample_decision(10), sample_decision(20)],
+            source: crate::tui::telemetry::DataSource::Sqlite,
+            partial: false,
+            diagnostics: String::new(),
+        };
+
+        let cmd = update(&mut model, DashboardMsg::TelemetryDecisions(result));
+        assert!(matches!(cmd, DashboardCmd::None));
+        assert_eq!(model.explainability_decisions.len(), 2);
+        assert_eq!(model.explainability_source, crate::tui::telemetry::DataSource::Sqlite);
+        assert!(!model.explainability_partial);
+    }
+
+    #[test]
+    fn telemetry_decisions_clamps_cursor() {
+        let mut model = test_model();
+        model.explainability_selected = 5; // out of range
+
+        let result = TelemetryResult {
+            data: vec![sample_decision(1), sample_decision(2)],
+            source: crate::tui::telemetry::DataSource::Sqlite,
+            partial: false,
+            diagnostics: String::new(),
+        };
+
+        update(&mut model, DashboardMsg::TelemetryDecisions(result));
+        assert_eq!(model.explainability_selected, 1); // clamped to last
+    }
+
+    #[test]
+    fn telemetry_decisions_empty_resets_state() {
+        let mut model = test_model();
+        model.explainability_selected = 3;
+        model.explainability_detail = true;
+
+        let result = TelemetryResult {
+            data: vec![],
+            source: crate::tui::telemetry::DataSource::None,
+            partial: true,
+            diagnostics: String::from("no data available"),
+        };
+
+        update(&mut model, DashboardMsg::TelemetryDecisions(result));
+        assert_eq!(model.explainability_selected, 0);
+        assert!(!model.explainability_detail);
+        assert!(model.explainability_partial);
+    }
+
+    #[test]
+    fn tick_on_explainability_requests_telemetry() {
+        let mut model = test_model();
+        model.screen = Screen::Explainability;
+
+        let cmd = update(&mut model, DashboardMsg::Tick);
+        // Should be a Batch containing FetchTelemetry.
+        if let DashboardCmd::Batch(cmds) = cmd {
+            let has_telemetry = cmds
+                .iter()
+                .any(|c| matches!(c, DashboardCmd::FetchTelemetry));
+            assert!(has_telemetry, "Tick on S3 should include FetchTelemetry");
+        } else {
+            panic!("Expected Batch command from Tick");
+        }
+    }
+
+    #[test]
+    fn tick_on_overview_does_not_request_telemetry() {
+        let mut model = test_model();
+        model.screen = Screen::Overview;
+
+        let cmd = update(&mut model, DashboardMsg::Tick);
+        if let DashboardCmd::Batch(cmds) = cmd {
+            let has_telemetry = cmds
+                .iter()
+                .any(|c| matches!(c, DashboardCmd::FetchTelemetry));
+            assert!(!has_telemetry, "Tick on S1 should not include FetchTelemetry");
+        }
     }
 }

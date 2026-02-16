@@ -361,11 +361,7 @@ pub fn default_preferences_path() -> Option<PathBuf> {
         return Some(PathBuf::from(path));
     }
 
-    home_dir().map(|home| {
-        home.join(".config")
-            .join("sbh")
-            .join("preferences.json")
-    })
+    home_dir().map(|home| home.join(".config").join("sbh").join("preferences.json"))
 }
 
 /// Load preferences from a file path.
@@ -469,10 +465,7 @@ impl DebouncedWriter {
     /// Attempt to flush if the debounce interval has elapsed. Returns
     /// `Some(Ok(path))` if a write happened, `Some(Err(e))` if it failed,
     /// or `None` if no write was needed yet.
-    pub fn try_flush(
-        &mut self,
-        prefs: &UserPreferences,
-    ) -> Option<io::Result<PathBuf>> {
+    pub fn try_flush(&mut self, prefs: &UserPreferences) -> Option<io::Result<PathBuf>> {
         if !self.pending {
             return None;
         }
@@ -490,10 +483,7 @@ impl DebouncedWriter {
     }
 
     /// Force an immediate write, bypassing debounce. Used on shutdown.
-    pub fn force_flush(
-        &mut self,
-        prefs: &UserPreferences,
-    ) -> Option<io::Result<PathBuf>> {
+    pub fn force_flush(&mut self, prefs: &UserPreferences) -> Option<io::Result<PathBuf>> {
         if !self.pending {
             return None;
         }
@@ -532,9 +522,7 @@ pub fn merge(persisted: &UserPreferences, overrides: &SessionOverrides) -> UserP
         density: overrides.density.unwrap_or(persisted.density),
         contrast: overrides.contrast.unwrap_or(persisted.contrast),
         motion: overrides.motion.unwrap_or(persisted.motion),
-        hint_verbosity: overrides
-            .hint_verbosity
-            .unwrap_or(persisted.hint_verbosity),
+        hint_verbosity: overrides.hint_verbosity.unwrap_or(persisted.hint_verbosity),
         notification_timeout_secs: overrides
             .notification_timeout_secs
             .unwrap_or(persisted.notification_timeout_secs),
@@ -575,9 +563,7 @@ impl ResolvedPreferences {
             contrast: prefs.contrast.resolve(env_contrast),
             motion: prefs.motion.resolve(env_motion),
             hint_verbosity: prefs.hint_verbosity,
-            notification_timeout: Duration::from_secs(u64::from(
-                prefs.notification_timeout_secs,
-            )),
+            notification_timeout: Duration::from_secs(u64::from(prefs.notification_timeout_secs)),
             show_help_on_start: prefs.show_help_on_start,
         }
     }
@@ -684,10 +670,7 @@ mod tests {
 
     #[test]
     fn start_screen_resolve_explicit() {
-        assert_eq!(
-            StartScreen::Diagnostics.resolve(None),
-            Screen::Diagnostics,
-        );
+        assert_eq!(StartScreen::Diagnostics.resolve(None), Screen::Diagnostics,);
     }
 
     #[test]
@@ -700,10 +683,7 @@ mod tests {
 
     #[test]
     fn start_screen_resolve_remember_without_last() {
-        assert_eq!(
-            StartScreen::Remember.resolve(None),
-            Screen::Overview,
-        );
+        assert_eq!(StartScreen::Remember.resolve(None), Screen::Overview,);
     }
 
     // ── Contrast/motion resolution ──
@@ -806,7 +786,10 @@ mod tests {
         save(&prefs, &path).unwrap();
         let outcome = load(&path);
         match outcome {
-            LoadOutcome::Loaded { prefs: loaded, report } => {
+            LoadOutcome::Loaded {
+                prefs: loaded,
+                report,
+            } => {
                 assert_eq!(loaded, prefs);
                 assert!(report.is_clean());
             }
@@ -872,8 +855,7 @@ mod tests {
     fn debounced_writer_first_save_immediate() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prefs.json");
-        let mut writer = DebouncedWriter::new(path.clone())
-            .with_debounce(Duration::ZERO);
+        let mut writer = DebouncedWriter::new(path.clone()).with_debounce(Duration::ZERO);
         writer.request_save();
         let result = writer.try_flush(&UserPreferences::default());
         assert!(result.is_some());
@@ -885,8 +867,7 @@ mod tests {
     fn debounced_writer_respects_debounce() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prefs.json");
-        let mut writer = DebouncedWriter::new(path)
-            .with_debounce(Duration::from_secs(60));
+        let mut writer = DebouncedWriter::new(path).with_debounce(Duration::from_secs(60));
 
         // First write goes through.
         writer.request_save();
@@ -902,8 +883,7 @@ mod tests {
     fn debounced_writer_force_flush_bypasses_debounce() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prefs.json");
-        let mut writer = DebouncedWriter::new(path)
-            .with_debounce(Duration::from_secs(60));
+        let mut writer = DebouncedWriter::new(path).with_debounce(Duration::from_secs(60));
 
         // First write.
         writer.request_save();
@@ -963,7 +943,11 @@ mod tests {
 
     #[test]
     fn hint_verbosity_serde() {
-        for v in [HintVerbosity::Full, HintVerbosity::Minimal, HintVerbosity::Off] {
+        for v in [
+            HintVerbosity::Full,
+            HintVerbosity::Minimal,
+            HintVerbosity::Off,
+        ] {
             let json = serde_json::to_string(&v).unwrap();
             let back: HintVerbosity = serde_json::from_str(&json).unwrap();
             assert_eq!(v, back);
@@ -986,10 +970,12 @@ mod tests {
     #[test]
     fn load_outcome_is_ok_variants() {
         assert!(LoadOutcome::Missing.is_ok());
-        assert!(!LoadOutcome::Corrupt {
-            details: String::new(),
-            defaults: UserPreferences::default(),
-        }
-        .is_ok());
+        assert!(
+            !LoadOutcome::Corrupt {
+                details: String::new(),
+                defaults: UserPreferences::default(),
+            }
+            .is_ok()
+        );
     }
 }

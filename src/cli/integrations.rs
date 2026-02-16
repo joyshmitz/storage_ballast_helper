@@ -521,16 +521,8 @@ fn inject_json_hook(path: &Path, tool: AiTool) -> std::io::Result<()> {
     let contents = fs::read_to_string(path)?;
     let snippet = integration_snippet(tool).trim();
 
-    // Validate the file looks like a JSON object (starts with `{`, ends with `}`).
-    // We use a structural check rather than strict serde_json parsing because many
-    // editors produce non-standard JSON (trailing commas, comments) that we should tolerate.
-    let trimmed = contents.trim();
-    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "config file does not contain a JSON object",
-        ));
-    }
+    // We rely on find_root_close_brace to validate the structure and find the insertion point.
+    // This allows us to handle JSONC files with comments or whitespace before/after the root object.
 
     // I30: Find the root-level closing `}` by tracking nesting depth and string
     // context, rather than rfind('}') which can match inside string values.

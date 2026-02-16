@@ -23,6 +23,8 @@ pub mod widgets;
 #[cfg(test)]
 mod test_artifact;
 #[cfg(test)]
+mod test_fault_injection;
+#[cfg(test)]
 mod test_harness;
 
 pub use runtime::{DashboardRuntimeConfig, DashboardRuntimeMode, run_dashboard};

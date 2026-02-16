@@ -227,7 +227,7 @@ fn classify_with_hysteresis(
 ) -> PressureLevel {
     match current {
         PressureLevel::Green => {
-            if free_pct < yellow_min {
+            if free_pct < green_min {
                 PressureLevel::Yellow
             } else {
                 PressureLevel::Green
@@ -236,7 +236,7 @@ fn classify_with_hysteresis(
         PressureLevel::Yellow => {
             if free_pct >= green_min + hysteresis {
                 PressureLevel::Green
-            } else if free_pct < orange_min {
+            } else if free_pct < yellow_min {
                 PressureLevel::Orange
             } else {
                 PressureLevel::Yellow
@@ -245,7 +245,7 @@ fn classify_with_hysteresis(
         PressureLevel::Orange => {
             if free_pct >= yellow_min + hysteresis {
                 PressureLevel::Yellow
-            } else if free_pct < red_min {
+            } else if free_pct < orange_min {
                 PressureLevel::Red
             } else {
                 PressureLevel::Orange
@@ -254,7 +254,7 @@ fn classify_with_hysteresis(
         PressureLevel::Red => {
             if free_pct >= orange_min + hysteresis {
                 PressureLevel::Orange
-            } else if free_pct < (red_min / 2.0) {
+            } else if free_pct < red_min {
                 PressureLevel::Critical
             } else {
                 PressureLevel::Red

@@ -283,7 +283,13 @@ impl ScoringEngine {
 }
 
 fn factor_location(path: &Path) -> f64 {
-    let text = path.to_string_lossy();
+    let raw = path.to_string_lossy();
+    let text = if std::path::MAIN_SEPARATOR == '\\' {
+        std::borrow::Cow::Owned(raw.replace('\\', "/"))
+    } else {
+        raw
+    };
+
     if text.starts_with("/tmp") || text.starts_with("/var/tmp") || text.starts_with("/dev/shm") {
         0.95
     } else if text.contains("/data/projects/") && text.contains("/target") {
@@ -605,7 +611,10 @@ fn is_system_path(path: &Path) -> bool {
 
     // Explicitly allow specific subdirectories that would otherwise be caught
     // by parent protections.
-    if path.starts_with("/var/tmp") || path.starts_with("/dev/shm") {
+    // Note: We must NOT allow the root itself (e.g. /var/tmp) to be deleted.
+    if (path.starts_with("/var/tmp") && path != Path::new("/var/tmp"))
+        || (path.starts_with("/dev/shm") && path != Path::new("/dev/shm"))
+    {
         return false;
     }
 
@@ -704,6 +713,27 @@ mod tests {
                 "system path {system_dir} should be hard-vetoed"
             );
         }
+    }
+
+    #[test]
+    fn var_tmp_root_is_vetoed() {
+        let engine = default_engine();
+        let score = engine.score_candidate(
+            &CandidateInput {
+                path: PathBuf::from("/var/tmp"),
+                size_bytes: 4096,
+                age: Duration::from_secs(24 * 3600 * 30), // Old
+                classification: classification(0.0, ArtifactCategory::Unknown), // No pattern
+                signals: StructuralSignals::default(),
+                is_open: false,
+                excluded: false,
+            },
+            0.5,
+        );
+        // This assertion expects the BUG to be present (i.e. we expect it NOT to be vetoed currently)
+        // enabling us to confirm the behavior before fixing it.
+        // Wait, I should write the assertion for the DESIRED behavior, run it, see it fail.
+        assert!(score.vetoed, "root /var/tmp should be hard-vetoed");
     }
 
     #[test]

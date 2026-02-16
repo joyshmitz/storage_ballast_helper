@@ -377,6 +377,24 @@ impl BallastPoolCoordinator {
         };
         self.release_for_mount(&mount.path, count)
     }
+
+    /// Propagate configuration updates to all pools.
+    pub fn update_config(&mut self, config: &BallastConfig) {
+        for (mount_path, pool) in &mut self.pools {
+            let mount_str = mount_path.to_string_lossy();
+            let file_count = config.effective_file_count(&mount_str);
+            let file_size_bytes = config.effective_file_size_bytes(&mount_str);
+
+            let pool_config = BallastConfig {
+                file_count,
+                file_size_bytes,
+                replenish_cooldown_minutes: config.replenish_cooldown_minutes,
+                auto_provision: config.auto_provision,
+                overrides: std::collections::BTreeMap::new(),
+            };
+            pool.manager.update_config(pool_config);
+        }
+    }
 }
 
 // ──────────────────── helpers ────────────────────

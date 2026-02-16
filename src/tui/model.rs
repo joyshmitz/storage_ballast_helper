@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 use ftui_core::event::KeyEvent;
 
 use crate::daemon::self_monitor::DaemonState;
+use crate::tui::telemetry::{
+    DataSource, DecisionEvidence, EventFilter, TelemetryResult, TimelineEvent,
+};
 
 // ──────────────────── screens ────────────────────
 
@@ -125,6 +128,79 @@ pub enum ConfirmAction {
     BallastRelease,
     /// Release all ballast files on the selected mount.
     BallastReleaseAll,
+}
+
+// ──────────────────── timeline filter ────────────────────
+
+/// Severity-level filter for the timeline screen (S2).
+///
+/// Cycles through `All → Info → Warning → Critical → All` via the `f` key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SeverityFilter {
+    /// Show all events regardless of severity.
+    #[default]
+    All,
+    /// Show only informational events.
+    Info,
+    /// Show only warning events.
+    Warning,
+    /// Show only critical events.
+    Critical,
+}
+
+impl SeverityFilter {
+    /// Advance to the next filter in the cycle.
+    #[must_use]
+    pub const fn cycle(self) -> Self {
+        match self {
+            Self::All => Self::Info,
+            Self::Info => Self::Warning,
+            Self::Warning => Self::Critical,
+            Self::Critical => Self::All,
+        }
+    }
+
+    /// Human-readable label for status bar display.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Critical => "critical",
+        }
+    }
+
+    /// Convert to an [`EventFilter`] for adapter queries.
+    #[must_use]
+    pub fn to_event_filter(self) -> EventFilter {
+        match self {
+            Self::All => EventFilter::default(),
+            Self::Info => EventFilter {
+                severities: vec!["info".to_owned()],
+                ..EventFilter::default()
+            },
+            Self::Warning => EventFilter {
+                severities: vec!["warning".to_owned()],
+                ..EventFilter::default()
+            },
+            Self::Critical => EventFilter {
+                severities: vec!["critical".to_owned()],
+                ..EventFilter::default()
+            },
+        }
+    }
+
+    /// Check whether a severity string passes this filter.
+    #[must_use]
+    pub fn matches(self, severity: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Info => severity == "info",
+            Self::Warning => severity == "warning",
+            Self::Critical => severity == "critical",
+        }
+    }
 }
 
 // ──────────────────── notifications ────────────────────
@@ -278,6 +354,36 @@ pub struct DashboardModel {
     pub notifications: Vec<Notification>,
     /// Monotonic counter for notification IDs.
     pub next_notification_id: u64,
+
+    // ── Timeline screen (S2) state ──
+    /// Cached timeline events for the timeline screen.
+    pub timeline_events: Vec<TimelineEvent>,
+    /// Active severity filter for the timeline view.
+    pub timeline_filter: SeverityFilter,
+    /// Cursor position in the filtered event list.
+    pub timeline_selected: usize,
+    /// Follow mode: auto-scroll to newest events on data arrival.
+    pub timeline_follow: bool,
+    /// Backend that sourced the current timeline data.
+    pub timeline_source: DataSource,
+    /// Whether the timeline data is known to be incomplete.
+    pub timeline_partial: bool,
+    /// Diagnostic message from the telemetry adapter.
+    pub timeline_diagnostics: String,
+
+    // ── Explainability screen (S3) state ──
+    /// Cached decision evidence for the explainability screen.
+    pub explainability_decisions: Vec<DecisionEvidence>,
+    /// Cursor position in the decisions list.
+    pub explainability_selected: usize,
+    /// Whether the detail pane is expanded for the selected decision.
+    pub explainability_detail: bool,
+    /// Backend that sourced the current decision data.
+    pub explainability_source: DataSource,
+    /// Whether the decision data is known to be incomplete.
+    pub explainability_partial: bool,
+    /// Diagnostic message from the telemetry adapter.
+    pub explainability_diagnostics: String,
 }
 
 impl DashboardModel {
@@ -305,6 +411,19 @@ impl DashboardModel {
             quit: false,
             notifications: Vec::new(),
             next_notification_id: 0,
+            timeline_events: Vec::new(),
+            timeline_filter: SeverityFilter::default(),
+            timeline_selected: 0,
+            timeline_follow: true,
+            timeline_source: DataSource::None,
+            timeline_partial: false,
+            timeline_diagnostics: String::new(),
+            explainability_decisions: Vec::new(),
+            explainability_selected: 0,
+            explainability_detail: false,
+            explainability_source: DataSource::None,
+            explainability_partial: false,
+            explainability_diagnostics: String::new(),
         }
     }
 
@@ -330,6 +449,98 @@ impl DashboardModel {
         self.screen_history.push(self.screen);
         self.screen = target;
         true
+    }
+
+    // ── Timeline (S2) methods ──
+
+    /// Events filtered by the current severity filter.
+    #[must_use]
+    pub fn timeline_filtered_events(&self) -> Vec<&TimelineEvent> {
+        self.timeline_events
+            .iter()
+            .filter(|e| self.timeline_filter.matches(&e.severity))
+            .collect()
+    }
+
+    /// Move the timeline cursor up. Returns `true` if the cursor moved.
+    pub fn timeline_cursor_up(&mut self) -> bool {
+        if self.timeline_selected > 0 {
+            self.timeline_selected -= 1;
+            self.timeline_follow = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move the timeline cursor down. Returns `true` if the cursor moved.
+    pub fn timeline_cursor_down(&mut self) -> bool {
+        let max = self.timeline_filtered_events().len().saturating_sub(1);
+        if self.timeline_selected < max {
+            self.timeline_selected += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Cycle the severity filter to the next level and reset the cursor.
+    pub fn timeline_cycle_filter(&mut self) {
+        self.timeline_filter = self.timeline_filter.cycle();
+        self.timeline_selected = 0;
+    }
+
+    /// Toggle follow mode (auto-scroll on new data).
+    pub fn timeline_toggle_follow(&mut self) {
+        self.timeline_follow = !self.timeline_follow;
+        if self.timeline_follow {
+            // Jump to latest
+            let count = self.timeline_filtered_events().len();
+            self.timeline_selected = count.saturating_sub(1);
+        }
+    }
+
+    /// Get the currently selected timeline event, if any.
+    #[must_use]
+    pub fn timeline_selected_event(&self) -> Option<&TimelineEvent> {
+        let filtered = self.timeline_filtered_events();
+        filtered.get(self.timeline_selected).copied()
+    }
+
+    // ── Explainability (S3) methods ──
+
+    /// Move the explainability cursor up. Returns `true` if the cursor moved.
+    pub fn explainability_cursor_up(&mut self) -> bool {
+        if self.explainability_selected > 0 {
+            self.explainability_selected -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move the explainability cursor down. Returns `true` if the cursor moved.
+    pub fn explainability_cursor_down(&mut self) -> bool {
+        if !self.explainability_decisions.is_empty()
+            && self.explainability_selected < self.explainability_decisions.len() - 1
+        {
+            self.explainability_selected += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Toggle the detail pane for the selected decision.
+    pub fn explainability_toggle_detail(&mut self) {
+        self.explainability_detail = !self.explainability_detail;
+    }
+
+    /// Get the currently selected decision, if any.
+    #[must_use]
+    pub fn explainability_selected_decision(&self) -> Option<&DecisionEvidence> {
+        self.explainability_decisions
+            .get(self.explainability_selected)
     }
 
     /// Go back to the previous screen. Returns `true` if history was non-empty.
@@ -370,6 +581,10 @@ pub enum DashboardMsg {
     NotificationExpired(u64),
     /// An error event to surface to the operator.
     Error(DashboardError),
+    /// Timeline events arrived from the telemetry adapter.
+    TelemetryTimeline(TelemetryResult<Vec<TimelineEvent>>),
+    /// Decision evidence arrived from the telemetry adapter.
+    TelemetryDecisions(TelemetryResult<Vec<DecisionEvidence>>),
 }
 
 // ──────────────────── commands ────────────────────
@@ -574,5 +789,289 @@ mod tests {
         let h = RateHistory::new(10);
         assert_eq!(h.latest(), None);
         assert!(h.normalized().is_empty());
+    }
+
+    // ── SeverityFilter ──
+
+    #[test]
+    fn severity_filter_cycles_through_all_levels() {
+        let f = SeverityFilter::All;
+        assert_eq!(f.cycle(), SeverityFilter::Info);
+        assert_eq!(f.cycle().cycle(), SeverityFilter::Warning);
+        assert_eq!(f.cycle().cycle().cycle(), SeverityFilter::Critical);
+        assert_eq!(f.cycle().cycle().cycle().cycle(), SeverityFilter::All);
+    }
+
+    #[test]
+    fn severity_filter_labels() {
+        assert_eq!(SeverityFilter::All.label(), "all");
+        assert_eq!(SeverityFilter::Info.label(), "info");
+        assert_eq!(SeverityFilter::Warning.label(), "warning");
+        assert_eq!(SeverityFilter::Critical.label(), "critical");
+    }
+
+    #[test]
+    fn severity_filter_matches_correctly() {
+        assert!(SeverityFilter::All.matches("info"));
+        assert!(SeverityFilter::All.matches("warning"));
+        assert!(SeverityFilter::All.matches("critical"));
+        assert!(SeverityFilter::Info.matches("info"));
+        assert!(!SeverityFilter::Info.matches("warning"));
+        assert!(SeverityFilter::Critical.matches("critical"));
+        assert!(!SeverityFilter::Critical.matches("info"));
+    }
+
+    #[test]
+    fn severity_filter_to_event_filter() {
+        let ef = SeverityFilter::All.to_event_filter();
+        assert!(ef.is_empty());
+
+        let ef = SeverityFilter::Warning.to_event_filter();
+        assert_eq!(ef.severities, vec!["warning"]);
+        assert!(ef.event_types.is_empty());
+    }
+
+    // ── Timeline state ──
+
+    fn make_event(severity: &str, event_type: &str) -> TimelineEvent {
+        TimelineEvent {
+            timestamp: "2026-01-01T00:00:00Z".to_owned(),
+            event_type: event_type.to_owned(),
+            severity: severity.to_owned(),
+            path: None,
+            size_bytes: None,
+            score: None,
+            pressure_level: None,
+            free_pct: None,
+            success: None,
+            error_code: None,
+            error_message: None,
+            duration_ms: None,
+            details: None,
+        }
+    }
+
+    #[test]
+    fn timeline_defaults() {
+        let model = test_model();
+        assert!(model.timeline_events.is_empty());
+        assert_eq!(model.timeline_filter, SeverityFilter::All);
+        assert_eq!(model.timeline_selected, 0);
+        assert!(model.timeline_follow);
+        assert_eq!(model.timeline_source, DataSource::None);
+    }
+
+    #[test]
+    fn timeline_cursor_navigation() {
+        let mut model = test_model();
+        model.timeline_events = vec![
+            make_event("info", "scan"),
+            make_event("warning", "pressure_change"),
+            make_event("critical", "artifact_delete"),
+        ];
+
+        assert!(!model.timeline_cursor_up()); // already at 0
+        assert!(model.timeline_cursor_down());
+        assert_eq!(model.timeline_selected, 1);
+        assert!(!model.timeline_follow); // manual nav disables follow
+
+        assert!(model.timeline_cursor_down());
+        assert_eq!(model.timeline_selected, 2);
+        assert!(!model.timeline_cursor_down()); // at end
+    }
+
+    #[test]
+    fn timeline_filter_narrows_events() {
+        let mut model = test_model();
+        model.timeline_events = vec![
+            make_event("info", "scan"),
+            make_event("warning", "pressure_change"),
+            make_event("critical", "artifact_delete"),
+        ];
+
+        assert_eq!(model.timeline_filtered_events().len(), 3);
+
+        model.timeline_filter = SeverityFilter::Warning;
+        assert_eq!(model.timeline_filtered_events().len(), 1);
+        assert_eq!(
+            model.timeline_filtered_events()[0].event_type,
+            "pressure_change"
+        );
+    }
+
+    #[test]
+    fn timeline_cycle_filter_resets_cursor() {
+        let mut model = test_model();
+        model.timeline_events = vec![
+            make_event("info", "a"),
+            make_event("warning", "b"),
+        ];
+        model.timeline_selected = 1;
+
+        model.timeline_cycle_filter();
+        assert_eq!(model.timeline_filter, SeverityFilter::Info);
+        assert_eq!(model.timeline_selected, 0);
+    }
+
+    #[test]
+    fn timeline_toggle_follow_jumps_to_latest() {
+        let mut model = test_model();
+        model.timeline_events = vec![
+            make_event("info", "a"),
+            make_event("info", "b"),
+            make_event("info", "c"),
+        ];
+        model.timeline_follow = false;
+        model.timeline_selected = 0;
+
+        model.timeline_toggle_follow();
+        assert!(model.timeline_follow);
+        assert_eq!(model.timeline_selected, 2); // jumped to last
+    }
+
+    #[test]
+    fn timeline_selected_event_returns_correct_item() {
+        let mut model = test_model();
+        model.timeline_events = vec![
+            make_event("info", "first"),
+            make_event("warning", "second"),
+        ];
+
+        assert_eq!(
+            model.timeline_selected_event().map(|e| &e.event_type),
+            Some(&"first".to_owned())
+        );
+
+        model.timeline_selected = 1;
+        assert_eq!(
+            model.timeline_selected_event().map(|e| &e.event_type),
+            Some(&"second".to_owned())
+        );
+    }
+
+    #[test]
+    fn timeline_selected_event_with_filter() {
+        let mut model = test_model();
+        model.timeline_events = vec![
+            make_event("info", "a"),
+            make_event("warning", "b"),
+            make_event("critical", "c"),
+        ];
+        model.timeline_filter = SeverityFilter::Critical;
+        model.timeline_selected = 0;
+
+        assert_eq!(
+            model.timeline_selected_event().map(|e| &e.event_type),
+            Some(&"c".to_owned())
+        );
+    }
+
+    // ── Explainability state tests ──
+
+    fn sample_decision(id: u64) -> crate::tui::telemetry::DecisionEvidence {
+        crate::tui::telemetry::DecisionEvidence {
+            decision_id: id,
+            timestamp: String::new(),
+            path: String::from("/test"),
+            size_bytes: 1000,
+            age_secs: 60,
+            action: String::from("delete"),
+            effective_action: None,
+            policy_mode: String::from("live"),
+            factors: crate::tui::telemetry::FactorBreakdown {
+                location: 0.5,
+                name: 0.5,
+                age: 0.5,
+                size: 0.5,
+                structure: 0.5,
+                pressure_multiplier: 1.0,
+            },
+            total_score: 1.5,
+            posterior_abandoned: 0.7,
+            expected_loss_keep: 20.0,
+            expected_loss_delete: 30.0,
+            calibration_score: 0.75,
+            vetoed: false,
+            veto_reason: None,
+            guard_status: None,
+            summary: String::new(),
+            raw_json: None,
+        }
+    }
+
+    #[test]
+    fn new_model_explainability_defaults() {
+        let model = test_model();
+        assert!(model.explainability_decisions.is_empty());
+        assert_eq!(model.explainability_selected, 0);
+        assert!(!model.explainability_detail);
+        assert_eq!(
+            model.explainability_source,
+            crate::tui::telemetry::DataSource::None
+        );
+    }
+
+    #[test]
+    fn explainability_cursor_down_moves() {
+        let mut model = test_model();
+        model.explainability_decisions = vec![sample_decision(1), sample_decision(2)];
+        assert!(model.explainability_cursor_down());
+        assert_eq!(model.explainability_selected, 1);
+    }
+
+    #[test]
+    fn explainability_cursor_down_clamps_at_end() {
+        let mut model = test_model();
+        model.explainability_decisions = vec![sample_decision(1)];
+        assert!(!model.explainability_cursor_down());
+        assert_eq!(model.explainability_selected, 0);
+    }
+
+    #[test]
+    fn explainability_cursor_up_moves() {
+        let mut model = test_model();
+        model.explainability_decisions = vec![sample_decision(1), sample_decision(2)];
+        model.explainability_selected = 1;
+        assert!(model.explainability_cursor_up());
+        assert_eq!(model.explainability_selected, 0);
+    }
+
+    #[test]
+    fn explainability_cursor_up_clamps_at_start() {
+        let mut model = test_model();
+        model.explainability_decisions = vec![sample_decision(1)];
+        assert!(!model.explainability_cursor_up());
+        assert_eq!(model.explainability_selected, 0);
+    }
+
+    #[test]
+    fn explainability_toggle_detail() {
+        let mut model = test_model();
+        model.explainability_toggle_detail();
+        assert!(model.explainability_detail);
+        model.explainability_toggle_detail();
+        assert!(!model.explainability_detail);
+    }
+
+    #[test]
+    fn explainability_selected_decision_returns_correct() {
+        let mut model = test_model();
+        model.explainability_decisions = vec![sample_decision(10), sample_decision(20)];
+        model.explainability_selected = 1;
+        let d = model.explainability_selected_decision().unwrap();
+        assert_eq!(d.decision_id, 20);
+    }
+
+    #[test]
+    fn explainability_selected_decision_none_when_empty() {
+        let model = test_model();
+        assert!(model.explainability_selected_decision().is_none());
+    }
+
+    #[test]
+    fn explainability_cursor_empty_decisions() {
+        let mut model = test_model();
+        assert!(!model.explainability_cursor_down());
+        assert!(!model.explainability_cursor_up());
     }
 }
