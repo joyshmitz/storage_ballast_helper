@@ -2759,6 +2759,32 @@ enum DashboardRuntimeSelection {
     New,
 }
 
+/// Explains *why* a particular runtime was selected (for diagnostics / verbose output).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DashboardSelectionReason {
+    KillSwitchEnv,
+    KillSwitchConfig,
+    CliFlagLegacy,
+    CliFlagNew,
+    EnvVarMode,
+    ConfigFileMode,
+    HardcodedDefault,
+}
+
+impl std::fmt::Display for DashboardSelectionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KillSwitchEnv => f.write_str("SBH_DASHBOARD_KILL_SWITCH=true (env)"),
+            Self::KillSwitchConfig => f.write_str("dashboard.kill_switch=true (config)"),
+            Self::CliFlagLegacy => f.write_str("--legacy-dashboard (CLI flag)"),
+            Self::CliFlagNew => f.write_str("--new-dashboard (CLI flag)"),
+            Self::EnvVarMode => f.write_str("SBH_DASHBOARD_MODE (env)"),
+            Self::ConfigFileMode => f.write_str("dashboard.mode (config)"),
+            Self::HardcodedDefault => f.write_str("hardcoded default (legacy)"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(not(feature = "tui"), allow(dead_code))]
 struct DashboardRuntimeRequest {
@@ -2766,16 +2792,89 @@ struct DashboardRuntimeRequest {
     state_file: PathBuf,
     monitor_paths: Vec<PathBuf>,
     selection: DashboardRuntimeSelection,
+    reason: DashboardSelectionReason,
 }
 
-fn resolve_dashboard_runtime(args: &DashboardArgs) -> DashboardRuntimeSelection {
-    if args.legacy_dashboard {
-        DashboardRuntimeSelection::Legacy
-    } else if args.new_dashboard {
-        DashboardRuntimeSelection::New
-    } else {
-        DashboardRuntimeSelection::Legacy
+/// Resolve dashboard runtime using priority chain:
+///
+/// 1. `SBH_DASHBOARD_KILL_SWITCH=true` env var → Legacy
+/// 2. `dashboard.kill_switch=true` config field → Legacy
+/// 3. `--legacy-dashboard` CLI flag → Legacy
+/// 4. `--new-dashboard` CLI flag → New
+/// 5. `SBH_DASHBOARD_MODE` env var → parsed mode
+/// 6. `dashboard.mode` config field → configured mode
+/// 7. Hardcoded default → Legacy
+fn resolve_dashboard_runtime(
+    args: &DashboardArgs,
+    config: &Config,
+) -> (DashboardRuntimeSelection, DashboardSelectionReason) {
+    use storage_ballast_helper::core::config::DashboardMode;
+
+    // 1. Env var kill switch (highest priority — emergency override).
+    if std::env::var("SBH_DASHBOARD_KILL_SWITCH")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(false)
+    {
+        return (
+            DashboardRuntimeSelection::Legacy,
+            DashboardSelectionReason::KillSwitchEnv,
+        );
     }
+
+    // 2. Config kill switch.
+    if config.dashboard.kill_switch {
+        return (
+            DashboardRuntimeSelection::Legacy,
+            DashboardSelectionReason::KillSwitchConfig,
+        );
+    }
+
+    // 3. CLI flag: --legacy-dashboard.
+    if args.legacy_dashboard {
+        return (
+            DashboardRuntimeSelection::Legacy,
+            DashboardSelectionReason::CliFlagLegacy,
+        );
+    }
+
+    // 4. CLI flag: --new-dashboard.
+    if args.new_dashboard {
+        return (
+            DashboardRuntimeSelection::New,
+            DashboardSelectionReason::CliFlagNew,
+        );
+    }
+
+    // 5. Env var mode override (checked at config load time but re-check raw env here
+    //    to distinguish source from config-file).
+    if let Ok(raw) = std::env::var("SBH_DASHBOARD_MODE")
+        && let Ok(mode) = raw.parse::<DashboardMode>()
+    {
+        let selection = match mode {
+            DashboardMode::Legacy => DashboardRuntimeSelection::Legacy,
+            DashboardMode::New => DashboardRuntimeSelection::New,
+        };
+        return (selection, DashboardSelectionReason::EnvVarMode);
+    }
+
+    // 6. Config file mode.
+    let selection = match config.dashboard.mode {
+        DashboardMode::Legacy => DashboardRuntimeSelection::Legacy,
+        DashboardMode::New => DashboardRuntimeSelection::New,
+    };
+    // Distinguish config-file from hardcoded default by checking if the config
+    // actually has a dashboard section that differs from the default.
+    if config.dashboard.mode != DashboardMode::default() {
+        return (selection, DashboardSelectionReason::ConfigFileMode);
+    }
+
+    // 7. Hardcoded default.
+    (
+        DashboardRuntimeSelection::Legacy,
+        DashboardSelectionReason::HardcodedDefault,
+    )
 }
 
 fn run_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Result<(), CliError> {
@@ -2816,11 +2915,18 @@ fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
 
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let (selection, reason) = resolve_dashboard_runtime(args, &config);
+
+    if cli.verbose {
+        eprintln!("[dashboard] runtime={selection:?}, reason={reason}");
+    }
+
     let request = DashboardRuntimeRequest {
         refresh_ms: normalize_refresh_ms(args.refresh_ms),
         state_file: config.paths.state_file.clone(),
         monitor_paths: config.scanner.root_paths,
-        selection: resolve_dashboard_runtime(args),
+        selection,
+        reason,
     };
 
     run_dashboard_runtime(cli, &request)
@@ -5259,28 +5365,109 @@ mod tests {
 
     #[test]
     fn resolve_dashboard_runtime_prefers_explicit_flags() {
+        let cfg = Config::default();
+
         let defaults = DashboardArgs::default();
-        assert_eq!(
-            resolve_dashboard_runtime(&defaults),
-            DashboardRuntimeSelection::Legacy
-        );
+        let (sel, reason) = resolve_dashboard_runtime(&defaults, &cfg);
+        assert_eq!(sel, DashboardRuntimeSelection::Legacy);
+        assert_eq!(reason, DashboardSelectionReason::HardcodedDefault);
 
         let new_args = DashboardArgs {
             new_dashboard: true,
             ..DashboardArgs::default()
         };
-        assert_eq!(
-            resolve_dashboard_runtime(&new_args),
-            DashboardRuntimeSelection::New
-        );
+        let (sel, reason) = resolve_dashboard_runtime(&new_args, &cfg);
+        assert_eq!(sel, DashboardRuntimeSelection::New);
+        assert_eq!(reason, DashboardSelectionReason::CliFlagNew);
 
         let legacy_args = DashboardArgs {
             legacy_dashboard: true,
             ..DashboardArgs::default()
         };
+        let (sel, reason) = resolve_dashboard_runtime(&legacy_args, &cfg);
+        assert_eq!(sel, DashboardRuntimeSelection::Legacy);
+        assert_eq!(reason, DashboardSelectionReason::CliFlagLegacy);
+    }
+
+    #[test]
+    fn resolve_dashboard_runtime_config_mode_new() {
+        use storage_ballast_helper::core::config::{DashboardConfig, DashboardMode};
+        let cfg = Config {
+            dashboard: DashboardConfig {
+                mode: DashboardMode::New,
+                kill_switch: false,
+            },
+            ..Config::default()
+        };
+        let args = DashboardArgs::default();
+        let (sel, reason) = resolve_dashboard_runtime(&args, &cfg);
+        assert_eq!(sel, DashboardRuntimeSelection::New);
+        assert_eq!(reason, DashboardSelectionReason::ConfigFileMode);
+    }
+
+    #[test]
+    fn resolve_dashboard_runtime_kill_switch_overrides_new_flag() {
+        use storage_ballast_helper::core::config::DashboardConfig;
+        let cfg = Config {
+            dashboard: DashboardConfig {
+                kill_switch: true,
+                ..DashboardConfig::default()
+            },
+            ..Config::default()
+        };
+        let args = DashboardArgs {
+            new_dashboard: true,
+            ..DashboardArgs::default()
+        };
+        let (sel, reason) = resolve_dashboard_runtime(&args, &cfg);
+        assert_eq!(sel, DashboardRuntimeSelection::Legacy);
+        assert_eq!(reason, DashboardSelectionReason::KillSwitchConfig);
+    }
+
+    #[test]
+    fn resolve_dashboard_runtime_kill_switch_overrides_config_mode() {
+        use storage_ballast_helper::core::config::{DashboardConfig, DashboardMode};
+        let cfg = Config {
+            dashboard: DashboardConfig {
+                mode: DashboardMode::New,
+                kill_switch: true,
+            },
+            ..Config::default()
+        };
+        let args = DashboardArgs::default();
+        let (sel, reason) = resolve_dashboard_runtime(&args, &cfg);
+        assert_eq!(sel, DashboardRuntimeSelection::Legacy);
+        assert_eq!(reason, DashboardSelectionReason::KillSwitchConfig);
+    }
+
+    #[test]
+    fn resolve_dashboard_runtime_cli_flag_overrides_config() {
+        use storage_ballast_helper::core::config::{DashboardConfig, DashboardMode};
+        let cfg = Config {
+            dashboard: DashboardConfig {
+                mode: DashboardMode::New,
+                kill_switch: false,
+            },
+            ..Config::default()
+        };
+        let args = DashboardArgs {
+            legacy_dashboard: true,
+            ..DashboardArgs::default()
+        };
+        let (sel, reason) = resolve_dashboard_runtime(&args, &cfg);
+        assert_eq!(sel, DashboardRuntimeSelection::Legacy);
+        assert_eq!(reason, DashboardSelectionReason::CliFlagLegacy);
+    }
+
+    #[test]
+    fn dashboard_selection_reason_display() {
         assert_eq!(
-            resolve_dashboard_runtime(&legacy_args),
-            DashboardRuntimeSelection::Legacy
+            DashboardSelectionReason::KillSwitchEnv.to_string(),
+            "SBH_DASHBOARD_KILL_SWITCH=true (env)"
+        );
+        assert_eq!(
+            DashboardSelectionReason::HardcodedDefault.to_string(),
+            "hardcoded default (legacy)"
         );
     }
 
@@ -5292,6 +5479,7 @@ mod tests {
             state_file: PathBuf::from("/tmp/state.json"),
             monitor_paths: vec![PathBuf::from("/tmp")],
             selection: DashboardRuntimeSelection::New,
+            reason: DashboardSelectionReason::CliFlagNew,
         };
 
         let err_text = run_new_dashboard_runtime(&request)

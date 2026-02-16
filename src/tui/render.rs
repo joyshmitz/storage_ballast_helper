@@ -3,7 +3,7 @@
 #![allow(missing_docs)]
 
 use super::layout::{
-    build_overview_layout, build_timeline_layout, OverviewPane, PanePriority, TimelinePane,
+    OverviewPane, PanePriority, TimelinePane, build_overview_layout, build_timeline_layout,
 };
 use super::model::{
     BallastVolume, DashboardModel, NotificationLevel, PreferenceProfileMode, Screen,

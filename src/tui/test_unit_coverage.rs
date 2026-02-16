@@ -1140,3 +1140,532 @@ fn palette_preference_lookup_is_deterministic() {
     let second_ids: Vec<&str> = second.iter().map(|entry| entry.id).collect();
     assert_eq!(first_ids, second_ids);
 }
+
+// ════════════════════════════════════════════════════════════
+// § 25  MODEL: palette_reset direct unit test
+// ════════════════════════════════════════════════════════════
+
+#[test]
+fn palette_reset_clears_query_and_cursor() {
+    let mut model = test_model();
+    model.palette_query = "nav.overview".to_owned();
+    model.palette_selected = 3;
+
+    model.palette_reset();
+
+    assert!(model.palette_query.is_empty());
+    assert_eq!(model.palette_selected, 0);
+}
+
+#[test]
+fn palette_reset_noop_when_already_empty() {
+    let mut model = test_model();
+    model.palette_reset();
+    assert!(model.palette_query.is_empty());
+    assert_eq!(model.palette_selected, 0);
+}
+
+// ════════════════════════════════════════════════════════════
+// § 26  MODEL: BallastVolume status_level UNCONFIGURED case
+// ════════════════════════════════════════════════════════════
+
+#[test]
+fn ballast_volume_unconfigured_status() {
+    let vol = BallastVolume {
+        mount_point: "/mnt/new".to_owned(),
+        ballast_dir: "/mnt/new/.sbh/ballast".to_owned(),
+        fs_type: "ext4".into(),
+        strategy: "fallocate".into(),
+        files_available: 0,
+        files_total: 0,
+        releasable_bytes: 0,
+        skipped: false,
+        skip_reason: None,
+    };
+    assert_eq!(vol.status_level(), "UNCONFIGURED");
+}
+
+#[test]
+fn ballast_volume_low_status_boundary() {
+    // files_available * 2 < files_total → LOW
+    let vol = sample_volume("/", 2, 5);
+    assert_eq!(vol.status_level(), "LOW");
+
+    // Exactly half → not LOW (2*3 = 6 > 5)
+    let vol = sample_volume("/", 3, 5);
+    assert_eq!(vol.status_level(), "OK");
+}
+
+// ════════════════════════════════════════════════════════════
+// § 27  MODEL: RateHistory empty stats and wrapped normalized
+// ════════════════════════════════════════════════════════════
+
+#[test]
+fn rate_history_empty_stats_returns_none() {
+    let rh = RateHistory::new(10);
+    assert!(rh.stats().is_none());
+}
+
+#[test]
+fn rate_history_normalized_after_wrap() {
+    let mut rh = RateHistory::new(3);
+    // Push 5 values into a capacity-3 buffer → wraps
+    rh.push(10.0);
+    rh.push(20.0);
+    rh.push(30.0);
+    rh.push(40.0);
+    rh.push(50.0);
+
+    let norm = rh.normalized();
+    assert_eq!(norm.len(), 3);
+    // After wrap, chronological order should be: 30.0, 40.0, 50.0
+    // normalized uses midpoint(val/max_abs, 1.0)
+    // 30/50 = 0.6 → midpoint(0.6, 1.0) = 0.8
+    // 40/50 = 0.8 → midpoint(0.8, 1.0) = 0.9
+    // 50/50 = 1.0 → midpoint(1.0, 1.0) = 1.0
+    // Values should be monotonically increasing
+    assert!(
+        norm[0] <= norm[1],
+        "norm[0]={} should <= norm[1]={}",
+        norm[0],
+        norm[1]
+    );
+    assert!(
+        norm[1] <= norm[2],
+        "norm[1]={} should <= norm[2]={}",
+        norm[1],
+        norm[2]
+    );
+    assert!(
+        (norm[2] - 1.0).abs() < 0.01,
+        "last value should be ~1.0, got {}",
+        norm[2]
+    );
+}
+
+// ════════════════════════════════════════════════════════════
+// § 28  UPDATE: SetHintVerbosity dispatch via palette
+// ════════════════════════════════════════════════════════════
+
+#[test]
+fn palette_set_hint_verbosity_minimal() {
+    use super::model::PreferenceAction;
+    use super::preferences::HintVerbosity;
+
+    let mut model = test_model();
+    model.active_overlay = Some(Overlay::CommandPalette);
+
+    // Type "pref.hints.minimal" into palette
+    for c in "pref.hints.minimal".chars() {
+        update::update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(c))));
+    }
+
+    // Execute
+    let cmd = update::update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+
+    assert!(
+        matches!(
+            cmd,
+            DashboardCmd::ExecutePreferenceAction(PreferenceAction::SetHintVerbosity(
+                HintVerbosity::Minimal
+            ))
+        ),
+        "Expected SetHintVerbosity(Minimal), got {cmd:?}"
+    );
+    assert!(
+        model.active_overlay.is_none(),
+        "palette should close after execute"
+    );
+}
+
+#[test]
+fn palette_set_hint_verbosity_off() {
+    use super::model::PreferenceAction;
+    use super::preferences::HintVerbosity;
+
+    let mut model = test_model();
+    model.active_overlay = Some(Overlay::CommandPalette);
+
+    for c in "pref.hints.off".chars() {
+        update::update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(c))));
+    }
+
+    let cmd = update::update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+
+    assert!(
+        matches!(
+            cmd,
+            DashboardCmd::ExecutePreferenceAction(PreferenceAction::SetHintVerbosity(
+                HintVerbosity::Off
+            ))
+        ),
+        "Expected SetHintVerbosity(Off), got {cmd:?}"
+    );
+}
+
+// ════════════════════════════════════════════════════════════
+// § 29  UPDATE: ResetPreferencesToPersisted dispatch via palette
+// ════════════════════════════════════════════════════════════
+
+#[test]
+fn palette_reset_to_persisted() {
+    use super::model::PreferenceAction;
+
+    let mut model = test_model();
+    model.active_overlay = Some(Overlay::CommandPalette);
+
+    for c in "pref.reset.persisted".chars() {
+        update::update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(c))));
+    }
+
+    let cmd = update::update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+
+    assert!(
+        matches!(
+            cmd,
+            DashboardCmd::ExecutePreferenceAction(PreferenceAction::ResetToPersisted)
+        ),
+        "Expected ResetToPersisted, got {cmd:?}"
+    );
+    assert!(model.active_overlay.is_none());
+}
+
+// ════════════════════════════════════════════════════════════
+// § 30  UPDATE: LogSearch screen key passthrough
+// ════════════════════════════════════════════════════════════
+
+#[test]
+fn logsearch_screen_keys_are_noop() {
+    let mut model = test_model();
+    model.screen = Screen::LogSearch;
+
+    // j, k, f keys should all produce None on LogSearch
+    for key_code in [KeyCode::Char('j'), KeyCode::Char('k'), KeyCode::Char('f')] {
+        let cmd = update::update(&mut model, DashboardMsg::Key(make_key(key_code)));
+        assert!(
+            matches!(cmd, DashboardCmd::None),
+            "Key {key_code:?} on LogSearch should produce None, got {cmd:?}"
+        );
+    }
+    // Screen should remain on LogSearch
+    assert_eq!(model.screen, Screen::LogSearch);
+}
+
+#[test]
+fn overview_screen_keys_are_noop() {
+    let mut model = test_model();
+    model.screen = Screen::Overview;
+
+    // Overview has no screen-specific keys
+    for key_code in [KeyCode::Char('j'), KeyCode::Char('k'), KeyCode::Char('s')] {
+        let cmd = update::update(&mut model, DashboardMsg::Key(make_key(key_code)));
+        assert!(
+            matches!(cmd, DashboardCmd::None),
+            "Key {key_code:?} on Overview should produce None, got {cmd:?}"
+        );
+    }
+}
+
+// ════════════════════════════════════════════════════════════
+// § 31  INPUT: Help/Voi overlay key consumption
+// ════════════════════════════════════════════════════════════
+
+#[test]
+fn help_overlay_consumes_non_toggle_keys() {
+    let ctx = InputContext {
+        screen: Screen::Overview,
+        active_overlay: Some(Overlay::Help),
+    };
+
+    // Number keys, j, k should all be consumed without action
+    for key_code in [
+        KeyCode::Char('j'),
+        KeyCode::Char('k'),
+        KeyCode::Char('3'),
+        KeyCode::Char('s'),
+    ] {
+        let res = input::resolve_key_event(&make_key(key_code), ctx);
+        assert!(
+            res.consumed,
+            "Key {key_code:?} should be consumed by Help overlay"
+        );
+        assert!(
+            res.action.is_none(),
+            "Key {key_code:?} should produce no action on Help overlay, got {:?}",
+            res.action
+        );
+    }
+}
+
+#[test]
+fn help_overlay_toggle_key_resolves() {
+    let ctx = InputContext {
+        screen: Screen::Overview,
+        active_overlay: Some(Overlay::Help),
+    };
+    let res = input::resolve_key_event(&make_key(KeyCode::Char('?')), ctx);
+    assert!(res.consumed);
+    assert_eq!(res.action, Some(InputAction::ToggleOverlay(Overlay::Help)));
+}
+
+#[test]
+fn voi_overlay_consumes_non_toggle_keys() {
+    let ctx = InputContext {
+        screen: Screen::Overview,
+        active_overlay: Some(Overlay::Voi),
+    };
+
+    for key_code in [
+        KeyCode::Char('j'),
+        KeyCode::Char('k'),
+        KeyCode::Char('1'),
+        KeyCode::Char('q'),
+    ] {
+        let res = input::resolve_key_event(&make_key(key_code), ctx);
+        assert!(
+            res.consumed,
+            "Key {key_code:?} should be consumed by Voi overlay"
+        );
+        assert!(
+            res.action.is_none(),
+            "Key {key_code:?} should produce no action on Voi overlay, got {:?}",
+            res.action
+        );
+    }
+}
+
+#[test]
+fn voi_overlay_toggle_key_resolves() {
+    let ctx = InputContext {
+        screen: Screen::Overview,
+        active_overlay: Some(Overlay::Voi),
+    };
+    let res = input::resolve_key_event(&make_key(KeyCode::Char('v')), ctx);
+    assert!(res.consumed);
+    assert_eq!(res.action, Some(InputAction::ToggleOverlay(Overlay::Voi)));
+}
+
+#[test]
+fn help_overlay_esc_closes() {
+    let ctx = InputContext {
+        screen: Screen::Overview,
+        active_overlay: Some(Overlay::Help),
+    };
+    let res = input::resolve_key_event(&make_key(KeyCode::Escape), ctx);
+    assert!(res.consumed);
+    assert_eq!(res.action, Some(InputAction::CloseOverlay));
+}
+
+#[test]
+fn voi_overlay_ctrl_c_quits() {
+    let ctx = InputContext {
+        screen: Screen::Overview,
+        active_overlay: Some(Overlay::Voi),
+    };
+    let res = input::resolve_key_event(&make_key_ctrl(KeyCode::Char('c')), ctx);
+    assert!(res.consumed);
+    assert_eq!(res.action, Some(InputAction::Quit));
+}
+
+// ════════════════════════════════════════════════════════════
+// § 32  INPUT: Fuzzy subsequence edge cases
+// ════════════════════════════════════════════════════════════
+
+#[test]
+fn palette_search_non_matching_non_blank() {
+    let results = input::search_palette_actions("xyz_nope", 10);
+    assert!(results.is_empty(), "Non-matching query should return empty");
+}
+
+#[test]
+fn palette_route_non_matching_returns_none() {
+    assert!(input::route_palette_query("definitely_no_match_here_zzzz").is_none());
+}
+
+// ════════════════════════════════════════════════════════════
+// § 33  UPDATE: TelemetryTimeline with follow=false cursor
+// ════════════════════════════════════════════════════════════
+
+fn sample_timeline_event(ts: &str, severity: &str) -> super::telemetry::TimelineEvent {
+    super::telemetry::TimelineEvent {
+        timestamp: ts.into(),
+        event_type: "pressure_change".into(),
+        severity: severity.into(),
+        path: None,
+        size_bytes: None,
+        score: None,
+        pressure_level: None,
+        free_pct: None,
+        success: None,
+        error_code: None,
+        error_message: None,
+        duration_ms: None,
+        details: None,
+    }
+}
+
+#[test]
+fn timeline_follow_false_preserves_cursor() {
+    let mut model = test_model();
+    model.timeline_follow = false;
+
+    // Set initial events and cursor at position 1
+    model.timeline_events = vec![
+        sample_timeline_event("2026-01-01T00:00:00Z", "info"),
+        sample_timeline_event("2026-01-01T00:00:01Z", "info"),
+    ];
+    model.timeline_selected = 1;
+
+    // Push new events via TelemetryTimeline with follow=false
+    let result = TelemetryResult {
+        data: vec![
+            sample_timeline_event("2026-01-01T00:00:00Z", "info"),
+            sample_timeline_event("2026-01-01T00:00:01Z", "info"),
+            sample_timeline_event("2026-01-01T00:00:02Z", "warning"),
+        ],
+        source: DataSource::Sqlite,
+        partial: false,
+        diagnostics: String::new(),
+    };
+
+    update::update(&mut model, DashboardMsg::TelemetryTimeline(result));
+    // With follow=false, cursor should stay at 1 (not jump to latest=2)
+    assert_eq!(model.timeline_selected, 1);
+}
+
+#[test]
+fn timeline_follow_true_jumps_to_latest() {
+    let mut model = test_model();
+    model.timeline_follow = true;
+    model.timeline_selected = 0;
+
+    let result = TelemetryResult {
+        data: vec![
+            sample_timeline_event("2026-01-01T00:00:00Z", "info"),
+            sample_timeline_event("2026-01-01T00:00:01Z", "info"),
+            sample_timeline_event("2026-01-01T00:00:02Z", "warning"),
+        ],
+        source: DataSource::Sqlite,
+        partial: false,
+        diagnostics: String::new(),
+    };
+
+    update::update(&mut model, DashboardMsg::TelemetryTimeline(result));
+    // With follow=true, cursor should jump to latest (index 2)
+    assert_eq!(model.timeline_selected, 2);
+}
+
+// ════════════════════════════════════════════════════════════
+// § 34  WIDGETS: human_bytes TB range
+// ════════════════════════════════════════════════════════════
+
+#[test]
+fn human_bytes_terabyte_range() {
+    // 1 TB
+    let result = widgets::human_bytes(1_099_511_627_776);
+    assert!(
+        result.contains("GB"),
+        "1 TB should display as GB, got: {result}"
+    );
+    // 10 TB
+    let result = widgets::human_bytes(10_995_116_277_760);
+    assert!(
+        result.contains("GB"),
+        "10 TB should display as GB, got: {result}"
+    );
+}
+
+// ════════════════════════════════════════════════════════════
+// § 35  UPDATE: TelemetryCandidates sort application
+// ════════════════════════════════════════════════════════════
+
+fn sample_decision_evidence(
+    id: u64,
+    path: &str,
+    score: f64,
+    size: u64,
+    age: u64,
+) -> super::telemetry::DecisionEvidence {
+    use super::telemetry::FactorBreakdown;
+    super::telemetry::DecisionEvidence {
+        decision_id: id,
+        timestamp: String::new(),
+        path: path.to_owned(),
+        size_bytes: size,
+        age_secs: age,
+        action: "delete".into(),
+        effective_action: None,
+        policy_mode: "live".into(),
+        factors: FactorBreakdown {
+            location: 0.5,
+            name: 0.5,
+            age: 0.5,
+            size: 0.5,
+            structure: 0.5,
+            pressure_multiplier: 1.0,
+        },
+        total_score: score,
+        posterior_abandoned: 0.7,
+        expected_loss_keep: 20.0,
+        expected_loss_delete: 10.0,
+        calibration_score: 0.9,
+        vetoed: false,
+        veto_reason: None,
+        guard_status: None,
+        summary: String::new(),
+        raw_json: None,
+    }
+}
+
+#[test]
+fn telemetry_candidates_applies_sort_on_update() {
+    use super::model::CandidatesSortOrder;
+
+    let mut model = test_model();
+    // Set sort to Path (alphabetical)
+    model.candidates_sort = CandidatesSortOrder::Path;
+
+    let result = TelemetryResult {
+        data: vec![
+            sample_decision_evidence(1, "/zzz/target", 0.9, 1_000_000, 3600),
+            sample_decision_evidence(2, "/aaa/target", 0.5, 500_000, 7200),
+        ],
+        source: DataSource::Sqlite,
+        partial: false,
+        diagnostics: String::new(),
+    };
+
+    update::update(&mut model, DashboardMsg::TelemetryCandidates(result));
+
+    // After update, candidates should be sorted by path (ascending)
+    assert_eq!(model.candidates_list.len(), 2);
+    assert!(
+        model.candidates_list[0].path <= model.candidates_list[1].path,
+        "Candidates should be sorted by path: '{}' should come before '{}'",
+        model.candidates_list[0].path,
+        model.candidates_list[1].path
+    );
+}
+
+#[test]
+fn telemetry_candidates_cursor_clamped_on_shrink() {
+    let mut model = test_model();
+    model.candidates_list = vec![
+        sample_decision_evidence(1, "/a", 1.0, 100, 10),
+        sample_decision_evidence(2, "/b", 0.5, 200, 20),
+        sample_decision_evidence(3, "/c", 0.3, 300, 30),
+    ];
+    model.candidates_selected = 2; // last item
+
+    // Update with fewer candidates
+    let result = TelemetryResult {
+        data: vec![sample_decision_evidence(1, "/a", 1.0, 100, 10)],
+        source: DataSource::Sqlite,
+        partial: false,
+        diagnostics: String::new(),
+    };
+
+    update::update(&mut model, DashboardMsg::TelemetryCandidates(result));
+    assert_eq!(model.candidates_list.len(), 1);
+    assert_eq!(model.candidates_selected, 0); // clamped
+}

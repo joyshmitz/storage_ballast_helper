@@ -227,10 +227,10 @@ fn resolve_global_key(key: &KeyEvent) -> InputResolution {
         KeyCode::Char('c') if key.ctrl() => InputResolution::action(InputAction::Quit),
         KeyCode::Char('q') => InputResolution::action(InputAction::Quit),
         KeyCode::Escape => InputResolution::action(InputAction::BackOrQuit),
-        KeyCode::Char(c @ '1'..='7') => Screen::from_number(c as u8 - b'0').map_or_else(
-            InputResolution::passthrough,
-            |screen| InputResolution::action(InputAction::Navigate(screen)),
-        ),
+        KeyCode::Char(c @ '1'..='7') => Screen::from_number(c as u8 - b'0')
+            .map_or_else(InputResolution::passthrough, |screen| {
+                InputResolution::action(InputAction::Navigate(screen))
+            }),
         KeyCode::Char('[') => InputResolution::action(InputAction::NavigatePrev),
         KeyCode::Char(']') => InputResolution::action(InputAction::NavigateNext),
         KeyCode::Char('?') => InputResolution::action(InputAction::OpenOverlay(Overlay::Help)),
@@ -877,5 +877,287 @@ mod tests {
         };
         let res = resolve_key_event(&ctrl(KeyCode::Char('c')), ctx);
         assert_eq!(res.action, Some(InputAction::Quit));
+    }
+
+    // ── Confirmation overlay resolution ──
+
+    #[test]
+    fn confirmation_overlay_esc_closes() {
+        let ctx = InputContext {
+            screen: Screen::Ballast,
+            active_overlay: Some(Overlay::Confirmation(
+                crate::tui::model::ConfirmAction::BallastRelease,
+            )),
+        };
+        let res = resolve_key_event(&key(KeyCode::Escape), ctx);
+        assert_eq!(res.action, Some(InputAction::CloseOverlay));
+        assert!(res.consumed);
+    }
+
+    #[test]
+    fn confirmation_overlay_ctrl_c_quits() {
+        let ctx = InputContext {
+            screen: Screen::Ballast,
+            active_overlay: Some(Overlay::Confirmation(
+                crate::tui::model::ConfirmAction::BallastReleaseAll,
+            )),
+        };
+        let res = resolve_key_event(&ctrl(KeyCode::Char('c')), ctx);
+        assert_eq!(res.action, Some(InputAction::Quit));
+    }
+
+    #[test]
+    fn confirmation_overlay_consumes_unmapped_keys() {
+        let ctx = InputContext {
+            screen: Screen::Ballast,
+            active_overlay: Some(Overlay::Confirmation(
+                crate::tui::model::ConfirmAction::BallastRelease,
+            )),
+        };
+        let res = resolve_key_event(&key(KeyCode::Char('q')), ctx);
+        assert!(res.consumed);
+        assert!(res.action.is_none()); // consumed but no action
+    }
+
+    // ── Voi overlay resolution ──
+
+    #[test]
+    fn voi_overlay_v_toggles() {
+        let ctx = InputContext {
+            screen: Screen::Overview,
+            active_overlay: Some(Overlay::Voi),
+        };
+        let res = resolve_key_event(&key(KeyCode::Char('v')), ctx);
+        assert_eq!(res.action, Some(InputAction::ToggleOverlay(Overlay::Voi)));
+    }
+
+    #[test]
+    fn voi_overlay_consumes_unmapped_keys() {
+        let ctx = InputContext {
+            screen: Screen::Overview,
+            active_overlay: Some(Overlay::Voi),
+        };
+        let res = resolve_key_event(&key(KeyCode::Char('j')), ctx);
+        assert!(res.consumed);
+        assert!(res.action.is_none());
+    }
+
+    // ── All screen helps ──
+
+    #[test]
+    fn screen_help_covers_all_screens() {
+        let screens = [
+            Screen::Overview,
+            Screen::Timeline,
+            Screen::Explainability,
+            Screen::Candidates,
+            Screen::Ballast,
+            Screen::LogSearch,
+            Screen::Diagnostics,
+        ];
+        for screen in screens {
+            let help = contextual_help(InputContext {
+                screen,
+                active_overlay: None,
+            });
+            assert_eq!(help.title, "Global Navigation");
+            assert!(!help.screen_hint.is_empty());
+            assert!(!help.bindings.is_empty());
+        }
+    }
+
+    #[test]
+    fn overlay_help_covers_all_overlays() {
+        let overlays = [
+            Overlay::CommandPalette,
+            Overlay::Help,
+            Overlay::Voi,
+            Overlay::Confirmation(crate::tui::model::ConfirmAction::BallastRelease),
+        ];
+        for overlay in overlays {
+            let help = contextual_help(InputContext {
+                screen: Screen::Overview,
+                active_overlay: Some(overlay),
+            });
+            assert!(!help.title.is_empty());
+            assert!(!help.bindings.is_empty());
+        }
+    }
+
+    // ── normalize edge cases ──
+
+    #[test]
+    fn normalize_trims_and_lowercases() {
+        assert_eq!(super::normalize("  FoO  "), "foo");
+        assert_eq!(super::normalize(""), "");
+        assert_eq!(super::normalize("   "), "");
+        assert_eq!(super::normalize("ALL_CAPS"), "all_caps");
+    }
+
+    // ── Fuzzy subsequence matching ──
+
+    #[test]
+    fn fuzzy_subsequence_empty_needle_matches() {
+        assert!(super::is_fuzzy_subsequence("anything", ""));
+    }
+
+    #[test]
+    fn fuzzy_subsequence_exact_match() {
+        assert!(super::is_fuzzy_subsequence("hello", "hello"));
+    }
+
+    #[test]
+    fn fuzzy_subsequence_partial_match() {
+        assert!(super::is_fuzzy_subsequence("nav.ballast", "nbl"));
+        assert!(super::is_fuzzy_subsequence("nav.diagnostics", "ndi"));
+    }
+
+    #[test]
+    fn fuzzy_subsequence_no_match() {
+        assert!(!super::is_fuzzy_subsequence("abc", "abd"));
+        assert!(!super::is_fuzzy_subsequence("short", "shortx"));
+    }
+
+    // ── match_score tiers ──
+
+    #[test]
+    fn match_score_exact_id_is_highest() {
+        let action = &super::PALETTE_ACTIONS[0]; // nav.overview
+        let score = super::match_score(action, "nav.overview").unwrap();
+        assert_eq!(score, 70);
+    }
+
+    #[test]
+    fn match_score_exact_title() {
+        let action = &super::PALETTE_ACTIONS[0]; // title: "Go to Overview"
+        let score = super::match_score(action, "go to overview").unwrap();
+        assert_eq!(score, 60);
+    }
+
+    #[test]
+    fn match_score_exact_shortcut() {
+        let action = &super::PALETTE_ACTIONS[0]; // shortcut: "1"
+        let score = super::match_score(action, "1").unwrap();
+        assert_eq!(score, 50);
+    }
+
+    #[test]
+    fn match_score_id_prefix() {
+        let action = &super::PALETTE_ACTIONS[0]; // nav.overview
+        let score = super::match_score(action, "nav.").unwrap();
+        assert_eq!(score, 40);
+    }
+
+    #[test]
+    fn match_score_title_prefix() {
+        let action = &super::PALETTE_ACTIONS[0]; // "Go to Overview"
+        let score = super::match_score(action, "go to").unwrap();
+        assert_eq!(score, 30);
+    }
+
+    #[test]
+    fn match_score_id_substring() {
+        let action = &super::PALETTE_ACTIONS[0]; // nav.overview
+        let score = super::match_score(action, "overview").unwrap();
+        // "overview" is id substring (20) AND title substring (10). ID sub wins.
+        assert_eq!(score, 20);
+    }
+
+    #[test]
+    fn match_score_title_substring() {
+        let action = &super::PALETTE_ACTIONS[14]; // action.quit, title: "Quit dashboard"
+        let score = super::match_score(action, "dashboard").unwrap();
+        assert_eq!(score, 10);
+    }
+
+    #[test]
+    fn match_score_fuzzy_subsequence() {
+        let action = &super::PALETTE_ACTIONS[0]; // nav.overview
+        let score = super::match_score(action, "nvo").unwrap();
+        assert_eq!(score, 5);
+    }
+
+    #[test]
+    fn match_score_no_match_returns_none() {
+        let action = &super::PALETTE_ACTIONS[0];
+        assert!(super::match_score(action, "zzzzz").is_none());
+    }
+
+    // ── Global key coverage ──
+
+    #[test]
+    fn bracket_keys_navigate_prev_next() {
+        let ctx = InputContext::default();
+        let prev = resolve_key_event(&key(KeyCode::Char('[')), ctx);
+        let next = resolve_key_event(&key(KeyCode::Char(']')), ctx);
+        assert_eq!(prev.action, Some(InputAction::NavigatePrev));
+        assert_eq!(next.action, Some(InputAction::NavigateNext));
+    }
+
+    #[test]
+    fn b_key_jumps_to_ballast() {
+        let ctx = InputContext::default();
+        let res = resolve_key_event(&key(KeyCode::Char('b')), ctx);
+        assert_eq!(res.action, Some(InputAction::JumpBallast));
+    }
+
+    #[test]
+    fn colon_opens_palette() {
+        let ctx = InputContext::default();
+        let res = resolve_key_event(&key(KeyCode::Char(':')), ctx);
+        assert_eq!(
+            res.action,
+            Some(InputAction::OpenOverlay(Overlay::CommandPalette))
+        );
+    }
+
+    #[test]
+    fn question_mark_opens_help() {
+        let ctx = InputContext::default();
+        let res = resolve_key_event(&key(KeyCode::Char('?')), ctx);
+        assert_eq!(res.action, Some(InputAction::OpenOverlay(Overlay::Help)));
+    }
+
+    #[test]
+    fn number_keys_navigate_to_all_screens() {
+        let ctx = InputContext::default();
+        for (n, screen) in [
+            ('1', Screen::Overview),
+            ('2', Screen::Timeline),
+            ('3', Screen::Explainability),
+            ('4', Screen::Candidates),
+            ('5', Screen::Ballast),
+            ('6', Screen::LogSearch),
+            ('7', Screen::Diagnostics),
+        ] {
+            let res = resolve_key_event(&key(KeyCode::Char(n)), ctx);
+            assert_eq!(res.action, Some(InputAction::Navigate(screen)));
+        }
+    }
+
+    #[test]
+    fn unknown_key_is_passthrough() {
+        let ctx = InputContext::default();
+        let res = resolve_key_event(&key(KeyCode::Char('z')), ctx);
+        assert!(!res.consumed);
+        assert!(res.action.is_none());
+    }
+
+    // ── Palette search stable ordering ──
+
+    #[test]
+    fn palette_search_results_are_deterministic() {
+        let first = search_palette_actions("nav", 15);
+        let second = search_palette_actions("nav", 15);
+        assert_eq!(
+            first.iter().map(|a| a.id).collect::<Vec<_>>(),
+            second.iter().map(|a| a.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn palette_search_with_no_match_returns_empty() {
+        let results = search_palette_actions("xyzzy123", 10);
+        assert!(results.is_empty());
     }
 }

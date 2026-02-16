@@ -31,10 +31,7 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
             // Request telemetry data when on a screen that needs it.
             if matches!(
                 model.screen,
-                Screen::Timeline
-                    | Screen::Explainability
-                    | Screen::Candidates
-                    | Screen::Ballast
+                Screen::Timeline | Screen::Explainability | Screen::Candidates | Screen::Ballast
             ) {
                 cmds.push(DashboardCmd::FetchTelemetry);
             }
@@ -445,10 +442,7 @@ fn handle_candidates_key(
 }
 
 /// Handle keys specific to the Ballast screen (S5).
-fn handle_ballast_key(
-    model: &mut DashboardModel,
-    key: ftui_core::event::KeyEvent,
-) -> DashboardCmd {
+fn handle_ballast_key(model: &mut DashboardModel, key: ftui_core::event::KeyEvent) -> DashboardCmd {
     match key.code {
         // Up/k: move cursor up in the volumes list.
         KeyCode::Up | KeyCode::Char('k') => {
@@ -1917,10 +1911,7 @@ mod tests {
         model.ballast_volumes = vec![sample_volume("/", 3, 5)];
         assert!(!model.ballast_detail);
 
-        update(
-            &mut model,
-            DashboardMsg::Key(make_key(KeyCode::Char(' '))),
-        );
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(' '))));
         assert!(model.ballast_detail);
     }
 
@@ -2072,10 +2063,7 @@ mod tests {
         update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('b'))));
         assert_eq!(model.palette_query, "ab");
 
-        update(
-            &mut model,
-            DashboardMsg::Key(make_key(KeyCode::Backspace)),
-        );
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Backspace)));
         assert_eq!(model.palette_query, "a");
     }
 
@@ -2085,10 +2073,7 @@ mod tests {
         model.active_overlay = Some(Overlay::CommandPalette);
         assert!(model.palette_query.is_empty());
 
-        update(
-            &mut model,
-            DashboardMsg::Key(make_key(KeyCode::Backspace)),
-        );
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Backspace)));
         assert!(model.palette_query.is_empty());
     }
 
@@ -2233,5 +2218,264 @@ mod tests {
         let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
         assert!(matches!(cmd, DashboardCmd::None));
         assert_eq!(model.active_overlay, Some(Overlay::CommandPalette));
+    }
+
+    // ── Tick on LogSearch screen ──
+
+    #[test]
+    fn tick_on_logsearch_does_not_request_telemetry() {
+        let mut model = test_model();
+        model.screen = Screen::LogSearch;
+
+        let cmd = update(&mut model, DashboardMsg::Tick);
+        if let DashboardCmd::Batch(cmds) = cmd {
+            let has_telemetry = cmds
+                .iter()
+                .any(|c| matches!(c, DashboardCmd::FetchTelemetry));
+            assert!(
+                !has_telemetry,
+                "Tick on S6 should not include FetchTelemetry"
+            );
+        }
+    }
+
+    // ── Multi-mount DataUpdate ──
+
+    #[test]
+    fn data_update_with_multiple_mounts() {
+        let mut model = test_model();
+        let mut state = sample_daemon_state();
+        state.pressure.mounts.push(MountPressure {
+            path: String::from("/data"),
+            free_pct: 25.0,
+            level: String::from("orange"),
+            rate_bps: Some(2048.0),
+        });
+
+        update(&mut model, DashboardMsg::DataUpdate(Some(Box::new(state))));
+        assert_eq!(model.rate_histories.len(), 2);
+        assert!(model.rate_histories.contains_key("/"));
+        assert!(model.rate_histories.contains_key("/data"));
+    }
+
+    #[test]
+    fn data_update_prunes_stale_mount_histories() {
+        let mut model = test_model();
+
+        // First update with two mounts.
+        let mut state1 = sample_daemon_state();
+        state1.pressure.mounts.push(MountPressure {
+            path: String::from("/data"),
+            free_pct: 25.0,
+            level: String::from("orange"),
+            rate_bps: Some(512.0),
+        });
+        update(&mut model, DashboardMsg::DataUpdate(Some(Box::new(state1))));
+        assert_eq!(model.rate_histories.len(), 2);
+
+        // Second update with only one mount — /data was unmounted.
+        let state2 = sample_daemon_state(); // only has "/"
+        update(&mut model, DashboardMsg::DataUpdate(Some(Box::new(state2))));
+        assert_eq!(model.rate_histories.len(), 1);
+        assert!(model.rate_histories.contains_key("/"));
+        assert!(!model.rate_histories.contains_key("/data"));
+    }
+
+    #[test]
+    fn data_update_some_clears_degraded() {
+        let mut model = test_model();
+        model.degraded = true;
+        update(
+            &mut model,
+            DashboardMsg::DataUpdate(Some(Box::new(sample_daemon_state()))),
+        );
+        assert!(!model.degraded);
+    }
+
+    // ── Tick wrapping ──
+
+    #[test]
+    fn tick_wraps_counter() {
+        let mut model = test_model();
+        model.tick = u64::MAX;
+        update(&mut model, DashboardMsg::Tick);
+        assert_eq!(model.tick, 0); // wrapping_add
+    }
+
+    // ── Tick always includes FetchData + ScheduleTick ──
+
+    #[test]
+    fn tick_always_includes_fetch_data_and_schedule_tick() {
+        let mut model = test_model();
+        let cmd = update(&mut model, DashboardMsg::Tick);
+        if let DashboardCmd::Batch(cmds) = cmd {
+            let has_fetch = cmds.iter().any(|c| matches!(c, DashboardCmd::FetchData));
+            let has_schedule = cmds
+                .iter()
+                .any(|c| matches!(c, DashboardCmd::ScheduleTick(_)));
+            assert!(has_fetch, "Tick must always include FetchData");
+            assert!(has_schedule, "Tick must always include ScheduleTick");
+        } else {
+            panic!("Expected Batch command from Tick");
+        }
+    }
+
+    // ── Error msg creates notification ──
+
+    #[test]
+    fn error_msg_creates_notification_and_schedules_expiry() {
+        let mut model = test_model();
+        let cmd = update(
+            &mut model,
+            DashboardMsg::Error(crate::tui::model::DashboardError {
+                message: "test error".to_string(),
+                source: "adapter".to_string(),
+            }),
+        );
+        assert_eq!(model.notifications.len(), 1);
+        assert_eq!(model.notifications[0].message, "test error");
+        assert!(matches!(
+            cmd,
+            DashboardCmd::ScheduleNotificationExpiry { .. }
+        ));
+    }
+
+    // ── ForceRefresh msg ──
+
+    #[test]
+    fn force_refresh_returns_fetch_data() {
+        let mut model = test_model();
+        let cmd = update(&mut model, DashboardMsg::ForceRefresh);
+        assert!(matches!(cmd, DashboardCmd::FetchData));
+    }
+
+    // ── ToggleOverlay/CloseOverlay msgs ──
+
+    #[test]
+    fn toggle_overlay_opens_and_closes() {
+        let mut model = test_model();
+        update(&mut model, DashboardMsg::ToggleOverlay(Overlay::Help));
+        assert_eq!(model.active_overlay, Some(Overlay::Help));
+
+        update(&mut model, DashboardMsg::ToggleOverlay(Overlay::Help));
+        assert!(model.active_overlay.is_none());
+    }
+
+    #[test]
+    fn close_overlay_clears_active() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::Voi);
+        update(&mut model, DashboardMsg::CloseOverlay);
+        assert!(model.active_overlay.is_none());
+    }
+
+    // ── TelemetryTimeline follow mode ──
+
+    #[test]
+    fn telemetry_timeline_follow_mode_jumps_to_latest() {
+        let mut model = test_model();
+        model.timeline_follow = true;
+        model.timeline_selected = 0;
+
+        let result = TelemetryResult {
+            data: vec![
+                sample_timeline_event("info", "a"),
+                sample_timeline_event("info", "b"),
+                sample_timeline_event("info", "c"),
+            ],
+            source: crate::tui::telemetry::DataSource::Sqlite,
+            partial: false,
+            diagnostics: String::new(),
+        };
+
+        update(&mut model, DashboardMsg::TelemetryTimeline(result));
+        assert_eq!(model.timeline_selected, 2); // last event
+    }
+
+    #[test]
+    fn telemetry_timeline_no_follow_clamps_cursor() {
+        let mut model = test_model();
+        model.timeline_follow = false;
+        model.timeline_selected = 5; // out of range
+
+        let result = TelemetryResult {
+            data: vec![
+                sample_timeline_event("info", "a"),
+                sample_timeline_event("info", "b"),
+            ],
+            source: crate::tui::telemetry::DataSource::Sqlite,
+            partial: false,
+            diagnostics: String::new(),
+        };
+
+        update(&mut model, DashboardMsg::TelemetryTimeline(result));
+        assert_eq!(model.timeline_selected, 1); // clamped to last
+    }
+
+    #[test]
+    fn esc_quits_when_history_empty() {
+        let mut model = test_model();
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Escape)));
+        assert!(matches!(cmd, DashboardCmd::Quit));
+        assert!(model.quit);
+    }
+
+    // ── Preference action commands ──
+
+    #[test]
+    fn preference_action_commands_returned() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+        // Type exact action ID for density compact
+        for c in "pref.density.compact".chars() {
+            update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(c))));
+        }
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+        assert!(matches!(
+            cmd,
+            DashboardCmd::ExecutePreferenceAction(PreferenceAction::SetDensity(
+                crate::tui::preferences::DensityMode::Compact
+            ))
+        ));
+    }
+
+    // ── DataUpdate with None rate_bps ──
+
+    #[test]
+    fn data_update_handles_none_rate_bps() {
+        let mut model = test_model();
+        let mut state = sample_daemon_state();
+        state.pressure.mounts[0].rate_bps = None;
+
+        update(
+            &mut model,
+            DashboardMsg::DataUpdate(Some(Box::new(state))),
+        );
+        assert_eq!(model.rate_histories.len(), 1);
+        let history = model.rate_histories.get("/").unwrap();
+        assert_eq!(history.latest(), Some(0.0)); // None → 0.0 fallback
+    }
+
+    // ── DataUpdate sets last_fetch ──
+
+    #[test]
+    fn data_update_sets_last_fetch() {
+        let mut model = test_model();
+        assert!(model.last_fetch.is_none());
+
+        update(
+            &mut model,
+            DashboardMsg::DataUpdate(Some(Box::new(sample_daemon_state()))),
+        );
+        assert!(model.last_fetch.is_some());
+    }
+
+    #[test]
+    fn data_update_none_also_sets_last_fetch() {
+        let mut model = test_model();
+        assert!(model.last_fetch.is_none());
+
+        update(&mut model, DashboardMsg::DataUpdate(None));
+        assert!(model.last_fetch.is_some());
     }
 }

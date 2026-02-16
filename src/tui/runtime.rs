@@ -652,9 +652,11 @@ mod tests {
         assert_eq!(detail["result"], "ok");
         assert_eq!(detail["profile_mode"], "session_override");
         assert_eq!(detail["schema_version"], 1);
-        assert!(detail["profile_hash"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty()));
+        assert!(
+            detail["profile_hash"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        );
         assert!(detail["error"].is_null());
     }
 }

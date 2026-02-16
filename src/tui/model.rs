@@ -1635,7 +1635,10 @@ mod tests {
         assert_eq!(model.preferred_start_screen, StartScreen::Overview);
         assert_eq!(model.density, DensityMode::Comfortable);
         assert_eq!(model.hint_verbosity, HintVerbosity::Full);
-        assert_eq!(model.preference_profile_mode, PreferenceProfileMode::Defaults);
+        assert_eq!(
+            model.preference_profile_mode,
+            PreferenceProfileMode::Defaults
+        );
     }
 
     #[test]
@@ -1820,5 +1823,294 @@ mod tests {
         model.adapter_errors = 3;
         assert_eq!(model.adapter_reads, 42);
         assert_eq!(model.adapter_errors, 3);
+    }
+
+    // ── RateHistory edge cases ──
+
+    #[test]
+    fn rate_history_stats_single_value() {
+        let mut h = RateHistory::new(10);
+        h.push(42.0);
+        let (latest, avg, min, max) = h.stats().unwrap();
+        assert!((latest - 42.0).abs() < f64::EPSILON);
+        assert!((avg - 42.0).abs() < f64::EPSILON);
+        assert!((min - 42.0).abs() < f64::EPSILON);
+        assert!((max - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rate_history_stats_with_negatives() {
+        let mut h = RateHistory::new(5);
+        h.push(-10.0);
+        h.push(20.0);
+        h.push(-30.0);
+        let (latest, avg, min, max) = h.stats().unwrap();
+        assert!((latest - (-30.0)).abs() < f64::EPSILON);
+        assert!((avg - (-20.0 / 3.0)).abs() < 0.01);
+        assert!((min - (-30.0)).abs() < f64::EPSILON);
+        assert!((max - 20.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rate_history_stats_empty_is_none() {
+        let h = RateHistory::new(5);
+        assert!(h.stats().is_none());
+    }
+
+    #[test]
+    fn rate_history_stats_after_wrapping() {
+        let mut h = RateHistory::new(3);
+        h.push(10.0);
+        h.push(20.0);
+        h.push(30.0);
+        h.push(40.0); // overwrites 10.0; buffer now [40, 20, 30] logically
+        let (latest, avg, min, max) = h.stats().unwrap();
+        assert!((latest - 40.0).abs() < f64::EPSILON);
+        assert!((avg - 30.0).abs() < 0.01); // (20+30+40)/3
+        assert!((min - 20.0).abs() < f64::EPSILON);
+        assert!((max - 40.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rate_history_normalized_ordering_after_wrap() {
+        let mut h = RateHistory::new(3);
+        h.push(1.0);
+        h.push(2.0);
+        h.push(3.0);
+        h.push(4.0); // now: physical [4, 2, 3], chronological [2, 3, 4]
+        let norm = h.normalized();
+        assert_eq!(norm.len(), 3);
+        // Chronological: 2, 3, 4 with max_abs=4
+        // normalized = midpoint(val/max_abs, 1.0) = (val/4 + 1)/2
+        let expected_first = f64::midpoint(2.0 / 4.0, 1.0); // 0.75
+        let expected_last = f64::midpoint(4.0 / 4.0, 1.0); // 1.0
+        assert!((norm[0] - expected_first).abs() < 0.01);
+        assert!((norm[2] - expected_last).abs() < 0.01);
+        // Values should be monotonically increasing
+        assert!(norm[0] <= norm[1]);
+        assert!(norm[1] <= norm[2]);
+    }
+
+    #[test]
+    fn rate_history_len_and_is_empty() {
+        let mut h = RateHistory::new(3);
+        assert!(h.is_empty());
+        assert_eq!(h.len(), 0);
+        h.push(1.0);
+        assert!(!h.is_empty());
+        assert_eq!(h.len(), 1);
+        h.push(2.0);
+        h.push(3.0);
+        h.push(4.0); // wraps, still len=3
+        assert_eq!(h.len(), 3);
+    }
+
+    // ── navigate_back deep history ──
+
+    #[test]
+    fn navigate_back_deep_history_chain() {
+        let mut model = test_model();
+        // Build a deep history: Overview → Timeline → Candidates → Ballast → LogSearch → Diagnostics
+        model.navigate_to(Screen::Timeline);
+        model.navigate_to(Screen::Candidates);
+        model.navigate_to(Screen::Ballast);
+        model.navigate_to(Screen::LogSearch);
+        model.navigate_to(Screen::Diagnostics);
+        assert_eq!(model.screen, Screen::Diagnostics);
+        assert_eq!(model.screen_history.len(), 5);
+
+        // Unwind completely
+        assert!(model.navigate_back());
+        assert_eq!(model.screen, Screen::LogSearch);
+        assert!(model.navigate_back());
+        assert_eq!(model.screen, Screen::Ballast);
+        assert!(model.navigate_back());
+        assert_eq!(model.screen, Screen::Candidates);
+        assert!(model.navigate_back());
+        assert_eq!(model.screen, Screen::Timeline);
+        assert!(model.navigate_back());
+        assert_eq!(model.screen, Screen::Overview);
+        assert!(!model.navigate_back()); // empty
+        assert_eq!(model.screen, Screen::Overview);
+    }
+
+    // ── palette_reset ──
+
+    #[test]
+    fn palette_reset_clears_query_and_cursor() {
+        let mut model = test_model();
+        model.palette_query = "some query".to_string();
+        model.palette_selected = 5;
+        model.palette_reset();
+        assert!(model.palette_query.is_empty());
+        assert_eq!(model.palette_selected, 0);
+    }
+
+    // ── Screen::from_number for LogSearch ──
+
+    #[test]
+    fn screen_from_number_covers_logsearch() {
+        let screen = Screen::from_number(6).unwrap();
+        assert_eq!(screen, Screen::LogSearch);
+        assert_eq!(screen.number(), 6);
+    }
+
+    #[test]
+    fn logsearch_next_is_diagnostics() {
+        assert_eq!(Screen::LogSearch.next(), Screen::Diagnostics);
+    }
+
+    #[test]
+    fn logsearch_prev_is_ballast() {
+        assert_eq!(Screen::LogSearch.prev(), Screen::Ballast);
+    }
+
+    // ── BallastVolume boundary conditions ──
+
+    #[test]
+    fn ballast_volume_exact_low_ok_boundary() {
+        // The condition is: files_available * 2 < files_total → LOW, otherwise OK
+        // At exact boundary: 5 * 2 = 10, not < 10, so "OK"
+        let exact_boundary = sample_volume("/test", 5, 10);
+        assert_eq!(exact_boundary.status_level(), "OK");
+
+        // Just below boundary: 4 * 2 = 8 < 10, so "LOW"
+        let below_boundary = sample_volume("/test", 4, 10);
+        assert_eq!(below_boundary.status_level(), "LOW");
+    }
+
+    #[test]
+    fn ballast_volume_single_file_critical_vs_ok() {
+        // 0 of 1 → CRITICAL
+        let critical = BallastVolume {
+            files_available: 0,
+            ..sample_volume("/x", 0, 1)
+        };
+        assert_eq!(critical.status_level(), "CRITICAL");
+
+        // 1 of 1 → files_available*2=2 >= files_total=1 → OK
+        let ok = sample_volume("/x", 1, 1);
+        assert_eq!(ok.status_level(), "OK");
+    }
+
+    #[test]
+    fn ballast_volume_skipped_takes_precedence() {
+        let vol = BallastVolume {
+            skipped: true,
+            skip_reason: Some("unsupported".to_string()),
+            files_available: 0,
+            files_total: 10,
+            ..sample_volume("/skip", 0, 10)
+        };
+        // Even though files_available=0 would be CRITICAL, skipped wins.
+        assert_eq!(vol.status_level(), "SKIPPED");
+    }
+
+    // ── CandidatesSortOrder coverage ──
+
+    #[test]
+    fn candidates_sort_order_full_cycle() {
+        let s = CandidatesSortOrder::Score;
+        let s = s.cycle();
+        assert_eq!(s, CandidatesSortOrder::Size);
+        assert_eq!(s.label(), "size");
+        let s = s.cycle();
+        assert_eq!(s, CandidatesSortOrder::Age);
+        assert_eq!(s.label(), "age");
+        let s = s.cycle();
+        assert_eq!(s, CandidatesSortOrder::Path);
+        assert_eq!(s.label(), "path");
+        let s = s.cycle();
+        assert_eq!(s, CandidatesSortOrder::Score);
+        assert_eq!(s.label(), "score");
+    }
+
+    // ── candidates_apply_sort ──
+
+    #[test]
+    fn candidates_apply_sort_orders_correctly() {
+        let mut model = test_model();
+        model.candidates_list = vec![
+            sample_candidate(1, 1.0, 300, 10),
+            sample_candidate(2, 3.0, 100, 30),
+            sample_candidate(3, 2.0, 200, 20),
+        ];
+
+        // Score sort: highest first
+        model.candidates_sort = CandidatesSortOrder::Score;
+        model.candidates_apply_sort();
+        assert_eq!(model.candidates_list[0].decision_id, 2);
+        assert_eq!(model.candidates_list[1].decision_id, 3);
+        assert_eq!(model.candidates_list[2].decision_id, 1);
+
+        // Size sort: largest first
+        model.candidates_sort = CandidatesSortOrder::Size;
+        model.candidates_apply_sort();
+        assert_eq!(model.candidates_list[0].decision_id, 1); // 300 bytes
+        assert_eq!(model.candidates_list[1].decision_id, 3); // 200 bytes
+        assert_eq!(model.candidates_list[2].decision_id, 2); // 100 bytes
+
+        // Age sort: oldest first
+        model.candidates_sort = CandidatesSortOrder::Age;
+        model.candidates_apply_sort();
+        assert_eq!(model.candidates_list[0].decision_id, 2); // 30 secs
+        assert_eq!(model.candidates_list[1].decision_id, 3); // 20 secs
+        assert_eq!(model.candidates_list[2].decision_id, 1); // 10 secs
+
+        // Path sort: alphabetical
+        model.candidates_sort = CandidatesSortOrder::Path;
+        model.candidates_apply_sort();
+        assert_eq!(model.candidates_list[0].path, "/test/1");
+        assert_eq!(model.candidates_list[1].path, "/test/2");
+        assert_eq!(model.candidates_list[2].path, "/test/3");
+    }
+
+    // ── timeline_cursor_down_disables_follow ──
+
+    #[test]
+    fn timeline_cursor_down_disables_follow() {
+        let mut model = test_model();
+        model.timeline_events = vec![make_event("info", "a"), make_event("info", "b")];
+        model.timeline_follow = true;
+        model.timeline_cursor_down();
+        assert!(!model.timeline_follow);
+    }
+
+    #[test]
+    fn timeline_cursor_up_disables_follow() {
+        let mut model = test_model();
+        model.timeline_events = vec![make_event("info", "a"), make_event("info", "b")];
+        model.timeline_follow = true;
+        model.timeline_selected = 1;
+        model.timeline_cursor_up();
+        assert!(!model.timeline_follow);
+    }
+
+    // ── notification level values ──
+
+    #[test]
+    fn notification_level_variants() {
+        let mut model = test_model();
+        let id_info = model.push_notification(NotificationLevel::Info, "info".into());
+        let id_warn = model.push_notification(NotificationLevel::Warning, "warn".into());
+        let id_err = model.push_notification(NotificationLevel::Error, "err".into());
+        assert_eq!(model.notifications[0].level, NotificationLevel::Info);
+        assert_eq!(model.notifications[1].level, NotificationLevel::Warning);
+        assert_eq!(model.notifications[2].level, NotificationLevel::Error);
+        assert!(id_info < id_warn);
+        assert!(id_warn < id_err);
+    }
+
+    // ── terminal_size preserved ──
+
+    #[test]
+    fn model_preserves_terminal_size() {
+        let model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 40),
+        );
+        assert_eq!(model.terminal_size, (120, 40));
     }
 }

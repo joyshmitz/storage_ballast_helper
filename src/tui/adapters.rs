@@ -876,6 +876,104 @@ mod tests {
         assert!(!w.has_drift());
     }
 
+    // ── fallback_pressure_level thresholds ──
+
+    #[test]
+    fn fallback_pressure_level_red_below_5() {
+        assert_eq!(super::fallback_pressure_level(0.0), "red");
+        assert_eq!(super::fallback_pressure_level(4.9), "red");
+    }
+
+    #[test]
+    fn fallback_pressure_level_orange_5_to_20() {
+        assert_eq!(super::fallback_pressure_level(5.0), "orange");
+        assert_eq!(super::fallback_pressure_level(19.9), "orange");
+    }
+
+    #[test]
+    fn fallback_pressure_level_yellow_20_to_35() {
+        assert_eq!(super::fallback_pressure_level(20.0), "yellow");
+        assert_eq!(super::fallback_pressure_level(34.9), "yellow");
+    }
+
+    #[test]
+    fn fallback_pressure_level_green_above_35() {
+        assert_eq!(super::fallback_pressure_level(35.0), "green");
+        assert_eq!(super::fallback_pressure_level(100.0), "green");
+    }
+
+    #[test]
+    fn fallback_pressure_level_exact_boundaries() {
+        // Exactly at each boundary
+        assert_eq!(super::fallback_pressure_level(5.0), "orange"); // >= 5 → not red
+        assert_eq!(super::fallback_pressure_level(20.0), "yellow"); // >= 20 → not orange
+        assert_eq!(super::fallback_pressure_level(35.0), "green"); // >= 35 → not yellow
+    }
+
+    // ── NullStateAdapter health ──
+
+    #[test]
+    fn null_adapter_health_is_unavailable() {
+        let adapter = NullStateAdapter;
+        let health = adapter.health();
+        assert!(!health.state_file_available);
+        assert!(!health.telemetry_available);
+    }
+
+    // ── DashboardStateAdapter health default ──
+
+    #[test]
+    fn dashboard_adapter_health_defaults_to_available() {
+        let adapter = DashboardStateAdapter::new(
+            mock_platform(),
+            Duration::from_secs(90),
+            Duration::from_secs(1),
+        );
+        let health = adapter.health();
+        // AdapterHealth::default() is optimistic (both true).
+        assert!(health.state_file_available);
+        assert!(health.telemetry_available);
+    }
+
+    // ── Empty monitor_paths with missing state ──
+
+    #[test]
+    fn missing_state_with_empty_monitor_paths_is_unavailable() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state_path = tmp.path().join("nonexistent.json");
+
+        let adapter = DashboardStateAdapter::new(
+            mock_platform(),
+            Duration::from_secs(90),
+            Duration::from_secs(1),
+        );
+        let snapshot = adapter.load_snapshot(&state_path, &[]);
+
+        assert_eq!(snapshot.freshness, StateFreshness::Missing);
+        // With no monitor_paths and missing state, source is Unavailable.
+        assert_eq!(snapshot.source, SnapshotSource::Unavailable);
+    }
+
+    // ── SchemaWarnings methods ──
+
+    #[test]
+    fn schema_warnings_has_drift_with_unknown_only() {
+        let w = SchemaWarnings {
+            unknown_fields: vec!["extra".to_string()],
+            missing_fields: vec![],
+        };
+        assert!(w.has_drift());
+    }
+
+    #[test]
+    fn schema_warnings_has_drift_with_missing_only() {
+        let w = SchemaWarnings {
+            unknown_fields: vec![],
+            missing_fields: vec!["version".to_string()],
+        };
+        assert!(w.has_drift());
+    }
+
     #[test]
     fn stale_state_still_reports_schema_warnings() {
         let tmp = TempDir::new().expect("tempdir");

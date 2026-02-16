@@ -618,12 +618,12 @@ impl Config {
 
         // dashboard
         if let Some(raw) = env_var("SBH_DASHBOARD_MODE") {
-            self.dashboard.mode = raw.parse::<DashboardMode>().map_err(|details| {
-                SbhError::ConfigParse {
-                    context: "env",
-                    details: format!("SBH_DASHBOARD_MODE={raw:?}: {details}"),
-                }
-            })?;
+            self.dashboard.mode =
+                raw.parse::<DashboardMode>()
+                    .map_err(|details| SbhError::ConfigParse {
+                        context: "env",
+                        details: format!("SBH_DASHBOARD_MODE={raw:?}: {details}"),
+                    })?;
         }
         set_env_bool("SBH_DASHBOARD_KILL_SWITCH", &mut self.dashboard.kill_switch)?;
 
@@ -1325,7 +1325,10 @@ mod tests {
     #[test]
     fn dashboard_mode_parse_roundtrip() {
         use super::DashboardMode;
-        for (input, expected) in [("legacy", DashboardMode::Legacy), ("new", DashboardMode::New)] {
+        for (input, expected) in [
+            ("legacy", DashboardMode::Legacy),
+            ("new", DashboardMode::New),
+        ] {
             let parsed: DashboardMode = input.parse().unwrap();
             assert_eq!(parsed, expected);
             assert_eq!(parsed.to_string(), input);

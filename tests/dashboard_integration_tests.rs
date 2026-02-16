@@ -11,8 +11,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use storage_ballast_helper::daemon::self_monitor::{
-    BallastState, Counters, DaemonState, LastScanState, MountPressure, PressureState,
-    SelfMonitor, DAEMON_STATE_STALE_THRESHOLD_SECS,
+    BallastState, Counters, DAEMON_STATE_STALE_THRESHOLD_SECS, DaemonState, LastScanState,
+    MountPressure, PressureState, SelfMonitor,
 };
 
 // ══════════════════════════════════════════════════════════════════
@@ -36,10 +36,7 @@ fn dashboard_help_prints_usage() {
 
 #[test]
 fn dashboard_json_flag_is_rejected() {
-    let result = common::run_cli_case(
-        "dashboard_json_flag_is_rejected",
-        &["dashboard", "--json"],
-    );
+    let result = common::run_cli_case("dashboard_json_flag_is_rejected", &["dashboard", "--json"]);
     assert!(
         !result.status.success(),
         "dashboard --json should fail; log: {}",
@@ -217,10 +214,7 @@ fn state_file_missing_returns_error() {
     let nonexistent = tmpdir.path().join("does-not-exist.json");
 
     let result = SelfMonitor::read_state(&nonexistent);
-    assert!(
-        result.is_err(),
-        "missing state file should return error"
-    );
+    assert!(result.is_err(), "missing state file should return error");
 }
 
 #[test]
@@ -334,10 +328,7 @@ fn state_file_with_wrong_typed_fields_returns_error() {
     fs::write(&state_path, json).expect("write mistyped state");
 
     let result = SelfMonitor::read_state(&state_path);
-    assert!(
-        result.is_err(),
-        "state with wrong-typed fields should fail"
-    );
+    assert!(result.is_err(), "state with wrong-typed fields should fail");
 }
 
 #[test]
@@ -347,10 +338,7 @@ fn state_file_empty_file_returns_error() {
     fs::write(&state_path, "").expect("write empty file");
 
     let result = SelfMonitor::read_state(&state_path);
-    assert!(
-        result.is_err(),
-        "empty file should return error"
-    );
+    assert!(result.is_err(), "empty file should return error");
 }
 
 #[test]
@@ -503,7 +491,9 @@ fn state_file_negative_rate_bps_preserved() {
     let state_path = write_state_json(tmpdir.path(), &state);
 
     let loaded = SelfMonitor::read_state(&state_path).expect("read negative rate");
-    let rate = loaded.pressure.mounts[0].rate_bps.expect("rate should be present");
+    let rate = loaded.pressure.mounts[0]
+        .rate_bps
+        .expect("rate should be present");
     assert!(rate < 0.0, "negative rate should be preserved: {rate}");
     assert!((rate - (-2_097_152.0)).abs() < 0.1);
 }
@@ -520,8 +510,7 @@ fn dashboard_json_flag_with_explicit_config_still_rejected() {
     // Even when a config file is explicitly passed, --json must be rejected.
     let tmpdir = tempfile::tempdir().expect("create temp dir");
     let config_path = tmpdir.path().join("sbh-test.toml");
-    fs::write(&config_path, "[pressure]\npoll_interval_ms = 1000\n")
-        .expect("write config");
+    fs::write(&config_path, "[pressure]\npoll_interval_ms = 1000\n").expect("write config");
 
     let config_str = config_path.to_string_lossy().to_string();
     let result = common::run_cli_case(
@@ -538,10 +527,7 @@ fn dashboard_json_flag_with_explicit_config_still_rejected() {
 #[test]
 fn dashboard_verbose_flag_accepted() {
     // Global --verbose should not cause dashboard to crash.
-    let result = common::run_cli_case(
-        "dashboard_verbose_flag_accepted",
-        &["dashboard", "--help"],
-    );
+    let result = common::run_cli_case("dashboard_verbose_flag_accepted", &["dashboard", "--help"]);
     assert!(
         result.status.success(),
         "dashboard help with verbose context should work; log: {}",
@@ -696,8 +682,5 @@ fn state_file_unicode_in_paths_roundtrips() {
     let state_path = write_state_json(tmpdir.path(), &state);
 
     let loaded = SelfMonitor::read_state(&state_path).expect("read unicode paths");
-    assert_eq!(
-        loaded.pressure.mounts[0].path,
-        "/data/\u{1F4BE}ドライブ"
-    );
+    assert_eq!(loaded.pressure.mounts[0].path, "/data/\u{1F4BE}ドライブ");
 }

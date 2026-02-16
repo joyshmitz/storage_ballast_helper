@@ -1035,10 +1035,7 @@ fn read_u64_field(object: &Map<String, Value>, keys: &[&str]) -> Option<u64> {
                     if float.is_sign_negative() || !float.is_finite() {
                         None
                     } else {
-                        #[allow(
-                            clippy::cast_possible_truncation,
-                            clippy::cast_sign_loss
-                        )]
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                         Some(float.round() as u64)
                     }
                 })

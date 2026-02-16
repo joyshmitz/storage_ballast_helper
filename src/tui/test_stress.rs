@@ -740,8 +740,8 @@ fn rapid_resize_under_data_load() {
 /// [`TestRunBundle`] suitable for trend tracking and regression comparison.
 #[test]
 fn performance_artifact_collection() {
-    let mut collector = ArtifactCollector::new("stress-perf")
-        .with_run_id("stress-perf-deterministic");
+    let mut collector =
+        ArtifactCollector::new("stress-perf").with_run_id("stress-perf-deterministic");
 
     // ── Scenario 1: sustained tick throughput ──
     {
@@ -762,8 +762,17 @@ fn performance_artifact_collection() {
             .start_case("sustained_tick_500")
             .section("throughput")
             .tags(["stress", "tui"])
-            .status(if pass { CaseStatus::Pass } else { CaseStatus::Fail })
-            .assertion("tick_budget_5s", pass, "<5000ms", Some(format!("{}ms", elapsed.as_millis())))
+            .status(if pass {
+                CaseStatus::Pass
+            } else {
+                CaseStatus::Fail
+            })
+            .assertion(
+                "tick_budget_5s",
+                pass,
+                "<5000ms",
+                Some(format!("{}ms", elapsed.as_millis())),
+            )
             .diagnostic(DiagnosticEntry::info(trace))
             .finish();
     }
@@ -794,8 +803,17 @@ fn performance_artifact_collection() {
             .start_case("render_cycle_all_screens_70")
             .section("render")
             .tags(["stress", "tui"])
-            .status(if pass { CaseStatus::Pass } else { CaseStatus::Fail })
-            .assertion("render_budget_10s", pass, "<10000ms", Some(format!("{}ms", elapsed.as_millis())))
+            .status(if pass {
+                CaseStatus::Pass
+            } else {
+                CaseStatus::Fail
+            })
+            .assertion(
+                "render_budget_10s",
+                pass,
+                "<10000ms",
+                Some(format!("{}ms", elapsed.as_millis())),
+            )
             .diagnostic(DiagnosticEntry::info(trace))
             .finish();
     }
@@ -832,8 +850,17 @@ fn performance_artifact_collection() {
             .start_case("bursty_mixed_workload_100")
             .section("integration")
             .tags(["stress", "tui"])
-            .status(if pass { CaseStatus::Pass } else { CaseStatus::Fail })
-            .assertion("mixed_budget_10s", pass, "<10000ms", Some(format!("{}ms", elapsed.as_millis())))
+            .status(if pass {
+                CaseStatus::Pass
+            } else {
+                CaseStatus::Fail
+            })
+            .assertion(
+                "mixed_budget_10s",
+                pass,
+                "<10000ms",
+                Some(format!("{}ms", elapsed.as_millis())),
+            )
             .diagnostic(DiagnosticEntry::info(trace))
             .finish();
     }
@@ -843,7 +870,8 @@ fn performance_artifact_collection() {
     assert_eq!(bundle.suite, "stress-perf");
     assert_eq!(bundle.summary.total, 3);
     assert_eq!(
-        bundle.summary.failed, 0,
+        bundle.summary.failed,
+        0,
         "Performance regressions detected:\n{}",
         bundle
             .cases

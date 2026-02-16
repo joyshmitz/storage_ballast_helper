@@ -465,8 +465,7 @@ fn write_artifact(trace: &DashboardTestTrace, dir: &Path) -> std::io::Result<Pat
         .collect();
     let filename = format!("{}_{slug}.json", trace.trace_id);
     let path = dir.join(filename);
-    let json = serde_json::to_string_pretty(trace)
-        .map_err(std::io::Error::other)?;
+    let json = serde_json::to_string_pretty(trace).map_err(std::io::Error::other)?;
     std::fs::write(&path, json)?;
     Ok(path)
 }
