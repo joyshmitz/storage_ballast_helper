@@ -106,7 +106,10 @@ impl DirectoryWalker {
         let parallelism = self.config.parallelism.max(1);
 
         // Channels: work items (bounded) and results (unbounded for throughput).
-        let (work_tx, work_rx) = channel::bounded::<WorkItem>(1024);
+        // Queue sized to hold children from multiple root paths without starvation.
+        // Per-directory child cap (MAX_CHILDREN_QUEUED) prevents any single huge
+        // directory (e.g. /data/tmp with 60K+ children) from monopolizing the queue.
+        let (work_tx, work_rx) = channel::bounded::<WorkItem>(4096);
         let (result_tx, result_rx) = channel::unbounded::<WalkEntry>();
 
         // Track in-flight work items so workers know when to stop.
@@ -268,6 +271,7 @@ fn process_directory(
     let mut signals = StructuralSignals::default();
     let mut object_count = 0u32;
     let mut total_count = 0u32;
+    let mut child_dirs_queued = 0usize;
 
     for entry_result in entries {
         let Ok(entry) = entry_result else {
@@ -336,11 +340,11 @@ fn process_directory(
         };
 
         // ─── Recursion Dispatch ───
-        // Only recurse if it's a directory and within depth limits.
-        // No per-child stat for device check: if THIS directory is on root_dev
-        // (checked above), children are too. Mount points inside are caught
-        // when the child directory is processed (device check at top of this fn).
-        if depth < config.max_depth && is_dir {
+        // Only recurse if it's a directory, within depth limits, and under
+        // the per-directory child cap. The cap prevents a single huge directory
+        // (e.g. /data/tmp with 60K+ child dirs) from monopolizing the work
+        // queue and starving other root paths of scan coverage.
+        if depth < config.max_depth && is_dir && child_dirs_queued < MAX_CHILDREN_QUEUED {
             // Don't re-enter excluded paths.
             if config.excluded_paths.contains(&child_path) {
                 continue;
@@ -348,13 +352,10 @@ fn process_directory(
 
             in_flight.fetch_add(1, Ordering::Release);
             // Use try_send to avoid blocking on a full work queue.
-            // Blocking (send or send_timeout) causes catastrophic slowdown
-            // when processing huge directories (e.g. /data/tmp with 60K+
-            // child dirs): the thread spends the entire scan budget waiting
-            // on timeouts instead of making progress. With try_send, excess
-            // children are skipped — the next scan pass rediscovers them.
             match work_tx.try_send((child_path.clone(), depth + 1, root_dev)) {
-                Ok(()) => {}
+                Ok(()) => {
+                    child_dirs_queued += 1;
+                }
                 Err(_) => {
                     // Queue full or disconnected — skip this subdirectory.
                     in_flight.fetch_sub(1, Ordering::Release);
@@ -530,6 +531,12 @@ fn collect_open_files_linux() -> HashSet<(u64, u64)> {
 
     open
 }
+
+/// Maximum child directories queued per parent directory.
+/// Prevents a single huge directory (e.g. /data/tmp with 60K+ children) from
+/// monopolizing the work queue and starving other scan roots. Children beyond
+/// this cap are skipped; the next scan pass will rediscover them.
+const MAX_CHILDREN_QUEUED: usize = 512;
 
 /// Maximum time to spend scanning /proc for open file ancestors.
 /// On agent swarms with many processes, /proc scanning can take minutes.

@@ -1723,6 +1723,12 @@ fn scanner_thread_main(
         #[allow(clippy::cast_possible_truncation)]
         let scan_duration_ms = scan_start.elapsed().as_millis() as u64;
 
+        eprintln!(
+            "[SBH-SCANNER] scan complete: {paths_scanned} entries, \
+             {candidates_found} candidates, {:.1}s",
+            scan_start.elapsed().as_secs_f64()
+        );
+
         // Log scan completion.
         logger.send(ActivityEvent::ScanCompleted {
             paths_scanned,
