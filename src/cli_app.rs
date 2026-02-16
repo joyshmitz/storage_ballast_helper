@@ -5578,6 +5578,8 @@ mod tests {
             monitor_paths: vec![PathBuf::from("/tmp")],
             selection: DashboardRuntimeSelection::New,
             _reason: DashboardSelectionReason::CliFlagNew,
+            sqlite_db: None,
+            jsonl_log: None,
         };
 
         let err_text = run_new_dashboard_runtime(&request)
