@@ -2066,13 +2066,25 @@ fn scanner_thread_main(
             }
         }
 
+        // Distribute total scan duration across roots so the VOI scheduler gets
+        // non-zero IO cost estimates.  The walker interleaves entries from all
+        // roots, so per-root wall time is not available; dividing evenly is an
+        // acceptable approximation that the EWMA smooths over time.
+        let total_scan_duration = scan_start.elapsed();
+        let num_roots = root_stats_map.len().max(1);
+        let per_root_divisor = u32::try_from(num_roots).unwrap_or(u32::MAX);
+        let per_root_duration = total_scan_duration / per_root_divisor;
+        for stat in root_stats_map.values_mut() {
+            stat.duration = per_root_duration;
+        }
+
         #[allow(clippy::cast_possible_truncation)]
-        let scan_duration_ms = scan_start.elapsed().as_millis() as u64;
+        let scan_duration_ms = total_scan_duration.as_millis() as u64;
 
         eprintln!(
             "[SBH-SCANNER] scan complete: {paths_scanned} entries, \
              {candidates_found} candidates, {:.1}s",
-            scan_start.elapsed().as_secs_f64()
+            total_scan_duration.as_secs_f64()
         );
 
         // Log scan completion.
@@ -2085,7 +2097,7 @@ fn scanner_thread_main(
         // Report scan stats back to main loop for SelfMonitor counters.
         let _ = report_tx.try_send(WorkerReport::ScanCompleted {
             candidates: candidates_found,
-            duration: scan_start.elapsed(),
+            duration: total_scan_duration,
             root_stats: root_stats_map.into_values().collect(),
         });
 
