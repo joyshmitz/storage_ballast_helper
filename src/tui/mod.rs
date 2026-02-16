@@ -11,6 +11,7 @@ pub mod e2e_artifact;
 pub mod input;
 pub mod layout;
 pub mod model;
+pub mod preferences;
 pub mod render;
 pub mod runtime;
 pub mod telemetry;
