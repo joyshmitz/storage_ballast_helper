@@ -384,7 +384,7 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
             .presenter()
             .present_ui(&frame.buffer, Some(&diff), full_repaint)?;
         first_frame = false;
-        prev_buffer = frame.buffer.clone();
+        prev_buffer = std::mem::replace(&mut frame.buffer, Buffer::new(0, 0));
 
         // Check for expired notification timers.
         let now = Instant::now();

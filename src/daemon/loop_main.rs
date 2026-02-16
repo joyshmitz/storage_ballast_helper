@@ -86,14 +86,24 @@ struct SharedExecutorConfig {
     max_batch_size: AtomicUsize,
     /// f64 stored as u64 bits (to_bits/from_bits).
     min_score_bits: AtomicU64,
+    repeat_base_cooldown_secs: AtomicU64,
+    repeat_max_cooldown_secs: AtomicU64,
 }
 
 impl SharedExecutorConfig {
-    fn new(dry_run: bool, max_batch_size: usize, min_score: f64) -> Self {
+    fn new(
+        dry_run: bool,
+        max_batch_size: usize,
+        min_score: f64,
+        repeat_base_cooldown: u64,
+        repeat_max_cooldown: u64,
+    ) -> Self {
         Self {
             dry_run: AtomicBool::new(dry_run),
             max_batch_size: AtomicUsize::new(max_batch_size),
             min_score_bits: AtomicU64::new(min_score.to_bits()),
+            repeat_base_cooldown_secs: AtomicU64::new(repeat_base_cooldown),
+            repeat_max_cooldown_secs: AtomicU64::new(repeat_max_cooldown),
         }
     }
 
@@ -103,6 +113,14 @@ impl SharedExecutorConfig {
 
     fn set_min_score(&self, val: f64) {
         self.min_score_bits.store(val.to_bits(), Ordering::Relaxed);
+    }
+
+    fn repeat_base_cooldown_secs(&self) -> u64 {
+        self.repeat_base_cooldown_secs.load(Ordering::Relaxed)
+    }
+
+    fn repeat_max_cooldown_secs(&self) -> u64 {
+        self.repeat_max_cooldown_secs.load(Ordering::Relaxed)
     }
 }
 
@@ -349,8 +367,14 @@ fn should_fast_track_temp_age(
     if classification.category == ArtifactCategory::Unknown || !is_tmp_like_path(path) {
         return false;
     }
-    if classification.name_confidence >= 0.85 {
-        return true;
+
+    // Never fast-track broad ecosystem caches by category alone.
+    // These are common in /tmp but can also include active dependency trees.
+    if matches!(
+        classification.category,
+        ArtifactCategory::NodeModules | ArtifactCategory::PythonCache
+    ) {
+        return false;
     }
 
     matches!(
@@ -521,6 +545,8 @@ impl MonitoringDaemon {
             config.scanner.dry_run,
             config.scanner.max_delete_batch,
             config.scoring.min_score,
+            config.scanner.repeat_deletion_base_cooldown_secs,
+            config.scanner.repeat_deletion_max_cooldown_secs,
         ));
 
         let shared_scoring_config = Arc::new(RwLock::new(config.scoring.clone()));
@@ -1484,6 +1510,18 @@ impl MonitoringDaemon {
                         .store(new_config.scanner.max_delete_batch, Ordering::Relaxed);
                     self.shared_executor_config
                         .set_min_score(new_config.scoring.min_score);
+                    self.shared_executor_config
+                        .repeat_base_cooldown_secs
+                        .store(
+                            new_config.scanner.repeat_deletion_base_cooldown_secs,
+                            Ordering::Relaxed,
+                        );
+                    self.shared_executor_config
+                        .repeat_max_cooldown_secs
+                        .store(
+                            new_config.scanner.repeat_deletion_max_cooldown_secs,
+                            Ordering::Relaxed,
+                        );
 
                     // Update FS collector TTL.
                     self.fs_collector
@@ -1499,6 +1537,11 @@ impl MonitoringDaemon {
                     // Update shared configs for scanner thread.
                     *self.shared_scoring_config.write() = new_config.scoring.clone();
                     *self.shared_scanner_config.write() = new_config.scanner.clone();
+
+                    // Propagate policy config (kill_switch, budgets, loss values).
+                    self.policy_engine
+                        .lock()
+                        .update_config(new_config.policy.clone());
 
                     self.logger_handle.send(ActivityEvent::ConfigReloaded {
                         details: format!("config hash: {old_hash} -> {new_hash}"),
@@ -1942,6 +1985,103 @@ fn scanner_thread_main(
     }
 }
 
+// ──────────────────── repeat deletion dampening ────────────────────
+
+/// Tracks a single path's deletion history for repeat-deletion dampening.
+struct DeletionRecord {
+    last_deleted: Instant,
+    cycle_count: u32,
+}
+
+/// Exponential-backoff tracker that dampens re-deletion of paths that keep reappearing.
+///
+/// When an agent builds to a default target dir without `CARGO_TARGET_DIR`, sbh deletes
+/// it, the agent rebuilds, sbh deletes again — creating a cleanup loop. This tracker
+/// applies increasing cooldowns to break the cycle while still allowing deletion after
+/// enough time passes.
+///
+/// Red/Critical pressure bypasses all dampening (disk safety always wins).
+struct RepeatDeletionTracker {
+    history: HashMap<PathBuf, DeletionRecord>,
+    base_cooldown: Duration,
+    max_cooldown: Duration,
+}
+
+impl RepeatDeletionTracker {
+    fn new(base_cooldown: Duration, max_cooldown: Duration) -> Self {
+        Self {
+            history: HashMap::new(),
+            base_cooldown,
+            max_cooldown,
+        }
+    }
+
+    /// Remaining cooldown for a path, or `None` if no cooldown applies.
+    ///
+    /// Formula: `base_cooldown * 2^(cycle_count - 1)`, capped at `max_cooldown`.
+    /// First deletion (cycle_count == 0 or no record) has no cooldown.
+    fn cooldown_for(&self, path: &Path) -> Option<Duration> {
+        let record = self.history.get(path)?;
+        if record.cycle_count == 0 {
+            return None;
+        }
+        let multiplier =
+            1u64.checked_shl(record.cycle_count.saturating_sub(1))
+                .unwrap_or(u64::MAX);
+        let cooldown = self
+            .base_cooldown
+            .saturating_mul(multiplier.try_into().unwrap_or(u32::MAX));
+        let cooldown = cooldown.min(self.max_cooldown);
+        let elapsed = record.last_deleted.elapsed();
+        if elapsed >= cooldown {
+            None
+        } else {
+            Some(cooldown - elapsed)
+        }
+    }
+
+    /// Record that the given paths were just deleted. Increments cycle_count for repeats.
+    fn record_deletions(&mut self, paths: &[PathBuf]) {
+        let now = Instant::now();
+        for path in paths {
+            let entry = self.history.entry(path.clone()).or_insert(DeletionRecord {
+                last_deleted: now,
+                cycle_count: 0,
+            });
+            entry.last_deleted = now;
+            entry.cycle_count = entry.cycle_count.saturating_add(1);
+        }
+    }
+
+    /// Split candidates into (approved, dampened).
+    /// Red/Critical pressure bypasses all dampening.
+    fn filter_candidates(
+        &self,
+        candidates: Vec<CandidacyScore>,
+        pressure: PressureLevel,
+    ) -> (Vec<CandidacyScore>, Vec<CandidacyScore>) {
+        if pressure >= PressureLevel::Red {
+            return (candidates, Vec::new());
+        }
+        let mut approved = Vec::with_capacity(candidates.len());
+        let mut dampened = Vec::new();
+        for candidate in candidates {
+            if self.cooldown_for(&candidate.path).is_some() {
+                dampened.push(candidate);
+            } else {
+                approved.push(candidate);
+            }
+        }
+        (approved, dampened)
+    }
+
+    /// Remove entries whose last deletion is older than max_cooldown.
+    fn prune_expired(&mut self) {
+        self.history
+            .retain(|_, record| record.last_deleted.elapsed() < self.max_cooldown);
+    }
+}
+
 // ──────────────────── executor thread ────────────────────
 
 /// Executor thread: receives deletion batches and safely removes artifacts.
@@ -1960,8 +2100,15 @@ fn executor_thread_main(
     report_tx: &Sender<WorkerReport>,
     policy_engine: &Arc<Mutex<PolicyEngine>>,
 ) {
+    let mut tracker = RepeatDeletionTracker::new(
+        Duration::from_secs(shared_config.repeat_base_cooldown_secs()),
+        Duration::from_secs(shared_config.repeat_max_cooldown_secs()),
+    );
+    let mut batch_count: u64 = 0;
+
     while let Ok(batch) = del_rx.recv() {
         heartbeat.beat();
+        batch_count += 1;
 
         // Gate candidates through the policy engine. The lock is held only for
         // the duration of evaluate() (pure computation, no I/O).
@@ -1976,6 +2123,22 @@ fn executor_thread_main(
                 approved_candidates.len(),
                 batch.candidates.len(),
                 policy_mode,
+            );
+        }
+
+        if approved_candidates.is_empty() {
+            continue;
+        }
+
+        // Apply repeat-deletion dampening (Red/Critical bypasses).
+        let (approved_candidates, dampened) =
+            tracker.filter_candidates(approved_candidates, batch.pressure_level);
+
+        if !dampened.is_empty() {
+            eprintln!(
+                "[SBH-EXECUTOR] dampened {}/{} repeat-deletion candidates",
+                dampened.len(),
+                dampened.len() + approved_candidates.len(),
             );
         }
 
@@ -2007,6 +2170,9 @@ fn executor_thread_main(
 
         let report = executor.execute(&plan, None);
 
+        // Record deletions for repeat-deletion dampening.
+        tracker.record_deletions(&report.deleted_paths);
+
         if report.items_deleted > 0 || report.items_failed > 0 {
             eprintln!(
                 "[SBH-EXECUTOR] deleted={} failed={} skipped={} freed={}B ({:?})",
@@ -2030,6 +2196,11 @@ fn executor_thread_main(
                 code: "SBH-2003".to_string(),
                 message: "executor circuit breaker tripped".to_string(),
             });
+        }
+
+        // Periodic pruning of expired dampening entries.
+        if batch_count % 10 == 0 {
+            tracker.prune_expired();
         }
     }
 }
@@ -2428,6 +2599,43 @@ mod tests {
             &classification,
         );
         assert_eq!(adjusted, fresh_age);
+    }
+
+    #[test]
+    fn temp_artifact_age_fast_track_skips_node_modules_and_pycache() {
+        let node_modules = ArtifactClassification {
+            pattern_name: "node-modules".into(),
+            category: ArtifactCategory::NodeModules,
+            name_confidence: 0.97,
+            structural_confidence: 0.80,
+            combined_confidence: 0.92,
+        };
+        let pycache = ArtifactClassification {
+            pattern_name: "python-pycache".into(),
+            category: ArtifactCategory::PythonCache,
+            name_confidence: 0.96,
+            structural_confidence: 0.75,
+            combined_confidence: 0.89,
+        };
+        let age = Duration::from_secs(5 * 60);
+
+        let adjusted_node = adjusted_candidate_age(
+            age,
+            30,
+            PressureLevel::Red,
+            Path::new("/tmp/node_modules"),
+            &node_modules,
+        );
+        assert_eq!(adjusted_node, age);
+
+        let adjusted_pycache = adjusted_candidate_age(
+            age,
+            30,
+            PressureLevel::Red,
+            Path::new("/tmp/__pycache__"),
+            &pycache,
+        );
+        assert_eq!(adjusted_pycache, age);
     }
 
     #[test]

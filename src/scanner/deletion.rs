@@ -78,6 +78,7 @@ pub struct DeletionReport {
     pub errors: Vec<DeletionError>,
     pub dry_run: bool,
     pub circuit_breaker_tripped: bool,
+    pub deleted_paths: Vec<PathBuf>,
 }
 
 /// A single deletion failure record.
@@ -163,6 +164,7 @@ impl DeletionExecutor {
             errors: Vec::new(),
             dry_run: self.config.dry_run,
             circuit_breaker_tripped: false,
+            deleted_paths: Vec::new(),
         };
 
         let mut consecutive_failures: u32 = 0;
@@ -234,6 +236,7 @@ impl DeletionExecutor {
                     let duration_ms = del_start.elapsed().as_millis() as u64;
                     report.items_deleted += 1;
                     report.bytes_freed += candidate.size_bytes;
+                    report.deleted_paths.push(candidate.path.clone());
                     consecutive_failures = 0;
 
                     self.log_deletion_success(candidate, duration_ms);

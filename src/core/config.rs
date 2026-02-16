@@ -78,6 +78,8 @@ pub struct ScannerConfig {
     pub cross_devices: bool,
     pub dry_run: bool,
     pub max_delete_batch: usize,
+    pub repeat_deletion_base_cooldown_secs: u64,
+    pub repeat_deletion_max_cooldown_secs: u64,
 }
 
 /// Multi-factor score weights and decision-theoretic losses.
@@ -358,6 +360,8 @@ impl Default for ScannerConfig {
             cross_devices: false,
             dry_run: false,
             max_delete_batch: 20,
+            repeat_deletion_base_cooldown_secs: 300,
+            repeat_deletion_max_cooldown_secs: 3600,
         }
     }
 }
@@ -611,6 +615,14 @@ impl Config {
         set_env_usize(
             "SBH_SCANNER_MAX_DELETE_BATCH",
             &mut self.scanner.max_delete_batch,
+        )?;
+        set_env_u64(
+            "SBH_SCANNER_REPEAT_DELETION_BASE_COOLDOWN_SECS",
+            &mut self.scanner.repeat_deletion_base_cooldown_secs,
+        )?;
+        set_env_u64(
+            "SBH_SCANNER_REPEAT_DELETION_MAX_COOLDOWN_SECS",
+            &mut self.scanner.repeat_deletion_max_cooldown_secs,
         )?;
 
         // scoring

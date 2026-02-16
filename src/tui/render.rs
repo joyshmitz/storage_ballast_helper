@@ -480,7 +480,7 @@ fn frame_render_counters_panel(
 
 /// Generic list-screen renderer for Timeline, Explainability, Candidates, Ballast.
 ///
-/// Uses the legacy `render_to_string()` content inside a bordered Block.
+/// Renders the screen-specific legacy text content directly inside a bordered Block.
 /// Full per-screen widget breakdowns will follow in subsequent iterations.
 #[cfg(feature = "tui")]
 fn frame_render_list_screen(
@@ -498,12 +498,18 @@ fn frame_render_list_screen(
     let inner = block.inner(area);
     block.render(area, frame);
 
-    // Render the legacy text content of this screen into the block.
-    let legacy = render_to_string(model);
-    // Extract just the screen-specific content (skip the header lines).
-    let content_lines: Vec<&str> = legacy.lines().skip(3).collect();
-    let text = content_lines.join("\n");
-    Paragraph::new(text)
+    // Render only the screen-specific content (not the full dashboard).
+    let accessibility = AccessibilityProfile::from_environment();
+    let legacy_theme = Theme::for_terminal(model.terminal_size.0, accessibility);
+    let mut content = String::new();
+    match model.screen {
+        Screen::Timeline => render_timeline(model, &legacy_theme, &mut content),
+        Screen::Explainability => render_explainability(model, &legacy_theme, &mut content),
+        Screen::Candidates => render_candidates(model, &legacy_theme, &mut content),
+        Screen::Ballast => render_ballast(model, &legacy_theme, &mut content),
+        _ => {}
+    }
+    Paragraph::new(content)
         .style(Style::default().fg(theme.palette.text_primary()))
         .render(inner, frame);
 }
@@ -646,9 +652,9 @@ fn frame_render_overlay(
     body_area: Rect,
     frame: &mut Frame,
 ) {
-    // Center a panel in the body area.
-    let overlay_w = body_area.width.clamp(30, 60);
-    let overlay_h = body_area.height.clamp(8, 20);
+    // Center a panel in the body area, but never exceed available space.
+    let overlay_w = body_area.width.min(60);
+    let overlay_h = body_area.height.min(20);
     let x = body_area.x + (body_area.width.saturating_sub(overlay_w)) / 2;
     let y = body_area.y + (body_area.height.saturating_sub(overlay_h)) / 2;
     let overlay_area = Rect::new(x, y, overlay_w, overlay_h);
