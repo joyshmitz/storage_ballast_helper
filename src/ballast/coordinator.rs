@@ -794,7 +794,30 @@ mod tests {
         assert_eq!(inv.len(), 2);
         for item in &inv {
             assert_eq!(item.files_available, 3);
+            assert_eq!(item.files_total, 3);
             assert!(!item.skipped);
+        }
+    }
+
+    #[test]
+    fn inventory_reports_configured_total_before_provision() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let platform = mock_platform_two_volumes(dir_a.path(), dir_b.path());
+
+        let watched = vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()];
+        let config = tiny_ballast_config();
+
+        // Discover but do NOT provision.
+        let coordinator =
+            BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+
+        let inv = coordinator.inventory();
+        assert_eq!(inv.len(), 2);
+        for item in &inv {
+            // files_total must reflect configured count, not on-disk files.
+            assert_eq!(item.files_total, 3);
+            assert_eq!(item.files_available, 0);
         }
     }
 
