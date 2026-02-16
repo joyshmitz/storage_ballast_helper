@@ -116,6 +116,47 @@ pub fn resolve_palette_action(id: &str) -> Option<InputAction> {
         .map(|entry| entry.action)
 }
 
+/// Search command-palette actions using deterministic ranking.
+///
+/// Ranking precedence:
+/// 1. exact ID match
+/// 2. exact title match
+/// 3. exact shortcut match
+/// 4. ID prefix
+/// 5. title prefix
+/// 6. ID substring
+/// 7. title substring
+///
+/// Ties are resolved lexicographically by action ID to keep output stable.
+#[must_use]
+pub fn search_palette_actions(query: &str, limit: usize) -> Vec<&'static PaletteAction> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let query = normalize(query);
+    if query.is_empty() {
+        return PALETTE_ACTIONS.iter().take(limit).collect();
+    }
+
+    let mut matches: Vec<(u8, &PaletteAction)> = PALETTE_ACTIONS
+        .iter()
+        .filter_map(|action| match_score(action, &query).map(|score| (score, action)))
+        .collect();
+
+    matches.sort_unstable_by(|(left_score, left_action), (right_score, right_action)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_action.id.cmp(right_action.id))
+    });
+
+    matches
+        .into_iter()
+        .map(|(_, action)| action)
+        .take(limit)
+        .collect()
+}
+
 /// Build contextual help entries for the current screen/overlay state.
 #[must_use]
 pub fn contextual_help(context: InputContext) -> ContextualHelp {
@@ -165,6 +206,40 @@ fn resolve_global_key(key: &KeyEvent) -> InputResolution {
         KeyCode::Char('r') => InputResolution::action(InputAction::ForceRefresh),
         _ => InputResolution::passthrough(),
     }
+}
+
+fn match_score(action: &PaletteAction, query: &str) -> Option<u8> {
+    let id = normalize(action.id);
+    let title = normalize(action.title);
+    let shortcut = normalize(action.shortcut);
+
+    if id == query {
+        return Some(70);
+    }
+    if title == query {
+        return Some(60);
+    }
+    if shortcut == query {
+        return Some(50);
+    }
+    if id.starts_with(query) {
+        return Some(40);
+    }
+    if title.starts_with(query) {
+        return Some(30);
+    }
+    if id.contains(query) {
+        return Some(20);
+    }
+    if title.contains(query) {
+        return Some(10);
+    }
+
+    None
+}
+
+fn normalize(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
 }
 
 fn overlay_help(overlay: Overlay) -> ContextualHelp {
@@ -482,6 +557,46 @@ mod tests {
             assert!(ids.insert(action.id), "duplicate action id: {}", action.id);
             assert!(resolve_palette_action(action.id).is_some());
         }
+    }
+
+    #[test]
+    fn command_palette_search_empty_query_returns_catalog_prefix() {
+        let top = search_palette_actions("", 4);
+        assert_eq!(top.len(), 4);
+        assert_eq!(top[0].id, "nav.overview");
+        assert_eq!(top[1].id, "nav.timeline");
+        assert_eq!(top[2].id, "nav.explainability");
+        assert_eq!(top[3].id, "nav.candidates");
+    }
+
+    #[test]
+    fn command_palette_search_prefers_exact_id_then_prefix() {
+        let exact = search_palette_actions("nav.ballast", 3);
+        assert_eq!(exact[0].id, "nav.ballast");
+
+        let prefix = search_palette_actions("nav.", 3);
+        assert_eq!(prefix[0].id, "nav.ballast");
+        assert_eq!(prefix[1].id, "nav.candidates");
+        assert_eq!(prefix[2].id, "nav.diagnostics");
+    }
+
+    #[test]
+    fn command_palette_search_is_case_insensitive_and_stable() {
+        let upper = search_palette_actions("OVERVIEW", 2);
+        let mixed = search_palette_actions("OvErViEw", 2);
+
+        assert!(!upper.is_empty());
+        assert_eq!(upper[0].id, "nav.overview");
+        assert_eq!(upper, mixed);
+    }
+
+    #[test]
+    fn command_palette_search_respects_limit_and_zero_limit_is_empty() {
+        let limited = search_palette_actions("nav", 2);
+        assert_eq!(limited.len(), 2);
+
+        let none = search_palette_actions("nav", 0);
+        assert!(none.is_empty());
     }
 
     #[test]

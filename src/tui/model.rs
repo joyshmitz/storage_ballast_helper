@@ -130,6 +130,48 @@ pub enum ConfirmAction {
     BallastReleaseAll,
 }
 
+// ──────────────────── candidates sort ────────────────────
+
+/// Sort order for the candidates screen (S4).
+///
+/// Cycles through `Score → Size → Age → Path → Score` via the `s` key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CandidatesSortOrder {
+    /// Highest total score first (most likely safe to delete).
+    #[default]
+    Score,
+    /// Largest file size first (highest reclaim impact).
+    Size,
+    /// Oldest modification time first.
+    Age,
+    /// Alphabetical by path.
+    Path,
+}
+
+impl CandidatesSortOrder {
+    /// Advance to the next sort order in the cycle.
+    #[must_use]
+    pub const fn cycle(self) -> Self {
+        match self {
+            Self::Score => Self::Size,
+            Self::Size => Self::Age,
+            Self::Age => Self::Path,
+            Self::Path => Self::Score,
+        }
+    }
+
+    /// Human-readable label for status display.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Score => "score",
+            Self::Size => "size",
+            Self::Age => "age",
+            Self::Path => "path",
+        }
+    }
+}
+
 // ──────────────────── timeline filter ────────────────────
 
 /// Severity-level filter for the timeline screen (S2).
@@ -384,6 +426,22 @@ pub struct DashboardModel {
     pub explainability_partial: bool,
     /// Diagnostic message from the telemetry adapter.
     pub explainability_diagnostics: String,
+
+    // ── Candidates screen (S4) state ──
+    /// Cached candidate ranking for the candidates screen.
+    pub candidates_list: Vec<DecisionEvidence>,
+    /// Cursor position in the candidates list.
+    pub candidates_selected: usize,
+    /// Whether the detail pane is expanded for the selected candidate.
+    pub candidates_detail: bool,
+    /// Backend that sourced the current candidate data.
+    pub candidates_source: DataSource,
+    /// Whether the candidate data is known to be incomplete.
+    pub candidates_partial: bool,
+    /// Diagnostic message from the telemetry adapter.
+    pub candidates_diagnostics: String,
+    /// Sort order for the candidates list.
+    pub candidates_sort: CandidatesSortOrder,
 }
 
 impl DashboardModel {
@@ -424,6 +482,13 @@ impl DashboardModel {
             explainability_source: DataSource::None,
             explainability_partial: false,
             explainability_diagnostics: String::new(),
+            candidates_list: Vec::new(),
+            candidates_selected: 0,
+            candidates_detail: false,
+            candidates_source: DataSource::None,
+            candidates_partial: false,
+            candidates_diagnostics: String::new(),
+            candidates_sort: CandidatesSortOrder::default(),
         }
     }
 
@@ -543,6 +608,71 @@ impl DashboardModel {
             .get(self.explainability_selected)
     }
 
+    // ── Candidates (S4) methods ──
+
+    /// Move the candidates cursor up. Returns `true` if the cursor moved.
+    pub fn candidates_cursor_up(&mut self) -> bool {
+        if self.candidates_selected > 0 {
+            self.candidates_selected -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move the candidates cursor down. Returns `true` if the cursor moved.
+    pub fn candidates_cursor_down(&mut self) -> bool {
+        if !self.candidates_list.is_empty()
+            && self.candidates_selected < self.candidates_list.len() - 1
+        {
+            self.candidates_selected += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Toggle the detail pane for the selected candidate.
+    pub fn candidates_toggle_detail(&mut self) {
+        self.candidates_detail = !self.candidates_detail;
+    }
+
+    /// Cycle to the next sort order and re-sort the candidates list.
+    pub fn candidates_cycle_sort(&mut self) {
+        self.candidates_sort = self.candidates_sort.cycle();
+        self.candidates_apply_sort();
+    }
+
+    /// Apply the current sort order to the candidates list.
+    pub fn candidates_apply_sort(&mut self) {
+        match self.candidates_sort {
+            CandidatesSortOrder::Score => {
+                self.candidates_list.sort_by(|a, b| {
+                    b.total_score
+                        .partial_cmp(&a.total_score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+            CandidatesSortOrder::Size => {
+                self.candidates_list
+                    .sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+            }
+            CandidatesSortOrder::Age => {
+                self.candidates_list
+                    .sort_by(|a, b| b.age_secs.cmp(&a.age_secs));
+            }
+            CandidatesSortOrder::Path => {
+                self.candidates_list.sort_by(|a, b| a.path.cmp(&b.path));
+            }
+        }
+    }
+
+    /// Get the currently selected candidate, if any.
+    #[must_use]
+    pub fn candidates_selected_item(&self) -> Option<&DecisionEvidence> {
+        self.candidates_list.get(self.candidates_selected)
+    }
+
     /// Go back to the previous screen. Returns `true` if history was non-empty.
     pub fn navigate_back(&mut self) -> bool {
         if let Some(prev) = self.screen_history.pop() {
@@ -585,6 +715,8 @@ pub enum DashboardMsg {
     TelemetryTimeline(TelemetryResult<Vec<TimelineEvent>>),
     /// Decision evidence arrived from the telemetry adapter.
     TelemetryDecisions(TelemetryResult<Vec<DecisionEvidence>>),
+    /// Candidate ranking data arrived from the telemetry adapter.
+    TelemetryCandidates(TelemetryResult<Vec<DecisionEvidence>>),
 }
 
 // ──────────────────── commands ────────────────────

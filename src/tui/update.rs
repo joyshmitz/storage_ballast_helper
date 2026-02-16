@@ -28,7 +28,7 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
                 DashboardCmd::ScheduleTick(model.refresh),
             ];
             // Request telemetry data when on a screen that needs it.
-            if matches!(model.screen, Screen::Explainability) {
+            if matches!(model.screen, Screen::Explainability | Screen::Candidates) {
                 cmds.push(DashboardCmd::FetchTelemetry);
             }
             DashboardCmd::Batch(cmds)
@@ -117,6 +117,25 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
             }
         }
 
+        DashboardMsg::TelemetryTimeline(result) => {
+            model.timeline_source = result.source;
+            model.timeline_partial = result.partial;
+            model.timeline_diagnostics = result.diagnostics;
+            model.timeline_events = result.data;
+            // Clamp cursor to valid range after data refresh.
+            let filtered_len = model.timeline_filtered_events().len();
+            if filtered_len == 0 {
+                model.timeline_selected = 0;
+            } else if model.timeline_selected >= filtered_len {
+                model.timeline_selected = filtered_len - 1;
+            }
+            // Auto-follow: jump to latest event.
+            if model.timeline_follow && filtered_len > 0 {
+                model.timeline_selected = filtered_len - 1;
+            }
+            DashboardCmd::None
+        }
+
         DashboardMsg::TelemetryDecisions(result) => {
             model.explainability_source = result.source;
             model.explainability_partial = result.partial;
@@ -128,6 +147,23 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
                 model.explainability_detail = false;
             } else if model.explainability_selected >= model.explainability_decisions.len() {
                 model.explainability_selected = model.explainability_decisions.len() - 1;
+            }
+            DashboardCmd::None
+        }
+
+        DashboardMsg::TelemetryCandidates(result) => {
+            model.candidates_source = result.source;
+            model.candidates_partial = result.partial;
+            model.candidates_diagnostics = result.diagnostics;
+            model.candidates_list = result.data;
+            // Apply current sort order to incoming data.
+            model.candidates_apply_sort();
+            // Clamp cursor to valid range after data refresh.
+            if model.candidates_list.is_empty() {
+                model.candidates_selected = 0;
+                model.candidates_detail = false;
+            } else if model.candidates_selected >= model.candidates_list.len() {
+                model.candidates_selected = model.candidates_list.len() - 1;
             }
             DashboardCmd::None
         }
@@ -252,6 +288,7 @@ fn handle_global_key(model: &mut DashboardModel, key: ftui_core::event::KeyEvent
 fn handle_screen_key(model: &mut DashboardModel, key: ftui_core::event::KeyEvent) -> DashboardCmd {
     match model.screen {
         Screen::Explainability => handle_explainability_key(model, key),
+        Screen::Candidates => handle_candidates_key(model, key),
         _ => DashboardCmd::None,
     }
 }
@@ -282,6 +319,43 @@ fn handle_explainability_key(
             if model.explainability_detail {
                 model.explainability_detail = false;
             }
+            DashboardCmd::None
+        }
+        _ => DashboardCmd::None,
+    }
+}
+
+/// Handle keys specific to the Candidates screen (S4).
+fn handle_candidates_key(
+    model: &mut DashboardModel,
+    key: ftui_core::event::KeyEvent,
+) -> DashboardCmd {
+    match key.code {
+        // Up/k: move cursor up in the candidates list.
+        KeyCode::Up | KeyCode::Char('k') => {
+            model.candidates_cursor_up();
+            DashboardCmd::None
+        }
+        // Down/j: move cursor down in the candidates list.
+        KeyCode::Down | KeyCode::Char('j') => {
+            model.candidates_cursor_down();
+            DashboardCmd::None
+        }
+        // Enter/Space: toggle detail pane for selected candidate.
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            model.candidates_toggle_detail();
+            DashboardCmd::None
+        }
+        // d: close detail pane (if open).
+        KeyCode::Char('d') => {
+            if model.candidates_detail {
+                model.candidates_detail = false;
+            }
+            DashboardCmd::None
+        }
+        // s: cycle sort order.
+        KeyCode::Char('s') => {
+            model.candidates_cycle_sort();
             DashboardCmd::None
         }
         _ => DashboardCmd::None,

@@ -5,7 +5,7 @@
 use super::layout::{
     OverviewPane, PanePriority, TimelinePane, build_overview_layout, build_timeline_layout,
 };
-use super::model::{DashboardModel, NotificationLevel, Screen, SeverityFilter};
+use super::model::{CandidatesSortOrder, DashboardModel, NotificationLevel, Screen, SeverityFilter};
 use super::theme::{AccessibilityProfile, Theme, ThemePalette};
 use super::widgets::{
     extract_time, gauge, human_bytes, human_duration, human_rate, section_header, sparkline,
@@ -49,6 +49,7 @@ pub fn render(model: &DashboardModel) -> String {
         Screen::Overview => render_overview(model, theme, &mut out),
         Screen::Timeline => render_timeline(model, theme, &mut out),
         Screen::Explainability => render_explainability(model, theme, &mut out),
+        Screen::Candidates => render_candidates(model, theme, &mut out),
         screen => render_screen_stub(screen_label(screen), theme, &mut out),
     }
 
@@ -607,8 +608,8 @@ fn render_decision_detail(
     let _ = writeln!(out, "  age:         {}", human_duration(decision.age_secs));
 
     // ── Action & Policy ──
-    let action_badge = action_badge(&decision.action, theme);
-    let _ = writeln!(out, "  action:      {action_badge}");
+    let act_badge = action_badge(&decision.action, theme);
+    let _ = writeln!(out, "  action:      {act_badge}");
     if let Some(ref effective) = decision.effective_action {
         let eff_badge = action_badge(effective, theme);
         let _ = writeln!(out, "  effective:   {eff_badge}");
@@ -741,6 +742,267 @@ fn truncate_path(path: &str, max_len: usize) -> &str {
     }
 }
 
+// ──────────────────── S4: Candidates ────────────────────
+
+fn render_candidates(model: &DashboardModel, theme: Theme, out: &mut String) {
+    use std::fmt::Write as _;
+    let width = usize::from(model.terminal_size.0).max(40);
+
+    // ── Data-source header ──
+    let source_label = match model.candidates_source {
+        DataSource::Sqlite => "SQLite",
+        DataSource::Jsonl => "JSONL",
+        DataSource::None => "none",
+    };
+    let health_badge = if model.candidates_source == DataSource::None {
+        status_badge("NO DATA", theme.palette.muted, theme.accessibility)
+    } else if model.candidates_partial {
+        status_badge("PARTIAL", theme.palette.warning, theme.accessibility)
+    } else {
+        status_badge("OK", theme.palette.success, theme.accessibility)
+    };
+
+    let _ = writeln!(
+        out,
+        "data-source={source_label} {health_badge} candidates={}",
+        model.candidates_list.len(),
+    );
+
+    if !model.candidates_diagnostics.is_empty() {
+        let _ = writeln!(out, "  diag: {}", model.candidates_diagnostics);
+    }
+
+    // ── Sort indicator ──
+    let _ = writeln!(out, "sort={}", model.candidates_sort.label());
+
+    // ── Policy context ──
+    if let Some(ref state) = model.daemon_state {
+        let pressure_badge = status_badge(
+            &state.pressure.overall.to_ascii_uppercase(),
+            theme.palette.for_pressure_level(&state.pressure.overall),
+            theme.accessibility,
+        );
+        let _ = writeln!(
+            out,
+            "pressure={pressure_badge} scans={} deletions={} errors={}",
+            state.counters.scans, state.counters.deletions, state.counters.errors,
+        );
+    }
+
+    // ── Empty state ──
+    if model.candidates_list.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "No scan candidates available. The daemon must be running with"
+        );
+        let _ = writeln!(out, "telemetry enabled to populate this screen.");
+        let _ = writeln!(
+            out,
+            "Press r to force refresh, or check daemon status with key 1."
+        );
+        return;
+    }
+
+    // ── Candidate ranking list ──
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", section_header("Scan Candidates", width));
+
+    // Column headers.
+    let _ = writeln!(
+        out,
+        "  {:<4} {:<8} {:<6} {:<10} {:<8} {:<6} {}",
+        "#", "ACTION", "SCORE", "SIZE", "AGE", "VETO", "PATH"
+    );
+
+    for (i, candidate) in model.candidates_list.iter().enumerate() {
+        let cursor = if i == model.candidates_selected {
+            ">"
+        } else {
+            " "
+        };
+        let action_badge = action_badge(&candidate.action, theme);
+        let veto_col = if candidate.vetoed { "YES" } else { "-" };
+        let age_str = human_duration(candidate.age_secs);
+        let size_str = human_bytes(candidate.size_bytes);
+        let path_short = truncate_path(&candidate.path, 40);
+        let _ = writeln!(
+            out,
+            "{cursor} {:<4} {action_badge} {:.2}  {:<10} {:<8} {:<6} {}",
+            candidate.decision_id,
+            candidate.total_score,
+            size_str,
+            age_str,
+            veto_col,
+            path_short,
+        );
+    }
+
+    // ── Vetoed summary ──
+    let vetoed_count = model.candidates_list.iter().filter(|c| c.vetoed).count();
+    if vetoed_count > 0 {
+        let _ = writeln!(out);
+        let veto_badge = status_badge("VETOED", theme.palette.danger, theme.accessibility);
+        let _ = writeln!(
+            out,
+            "{vetoed_count} candidate(s) {veto_badge} — protected from deletion"
+        );
+    }
+
+    // ── Reclaim estimate ──
+    let total_reclaimable: u64 = model
+        .candidates_list
+        .iter()
+        .filter(|c| !c.vetoed && c.action == "delete")
+        .map(|c| c.size_bytes)
+        .sum();
+    if total_reclaimable > 0 {
+        let _ = writeln!(
+            out,
+            "estimated reclaimable: {}",
+            human_bytes(total_reclaimable)
+        );
+    }
+
+    // ── Detail pane (expanded for selected candidate) ──
+    if model.candidates_detail {
+        if let Some(candidate) = model.candidates_selected_item() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "{}", section_header("Candidate Detail", width));
+            render_candidate_detail(candidate, theme, width, out);
+        }
+    } else {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Press Enter to expand detail for selected candidate");
+    }
+
+    // ── Navigation hint ──
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close  s sort  r refresh"
+    );
+}
+
+fn render_candidate_detail(
+    candidate: &DecisionEvidence,
+    theme: Theme,
+    width: usize,
+    out: &mut String,
+) {
+    use std::fmt::Write as _;
+
+    // ── Identity ──
+    let _ = writeln!(out, "  decision-id: #{}", candidate.decision_id);
+    let _ = writeln!(out, "  timestamp:   {}", candidate.timestamp);
+    let _ = writeln!(out, "  path:        {}", candidate.path);
+    let _ = writeln!(
+        out,
+        "  size:        {} ({} bytes)",
+        human_bytes(candidate.size_bytes),
+        candidate.size_bytes
+    );
+    let _ = writeln!(out, "  age:         {}", human_duration(candidate.age_secs));
+
+    // ── Action & Policy ──
+    let ab = action_badge(&candidate.action, theme);
+    let _ = writeln!(out, "  action:      {ab}");
+    if let Some(ref effective) = candidate.effective_action {
+        let eff_badge = action_badge(effective, theme);
+        let _ = writeln!(out, "  effective:   {eff_badge}");
+    }
+    let _ = writeln!(out, "  policy-mode: {}", candidate.policy_mode);
+
+    // ── Safety / Veto ──
+    if candidate.vetoed {
+        let veto_badge = status_badge("VETOED", theme.palette.danger, theme.accessibility);
+        let _ = writeln!(out, "  veto:        {veto_badge}");
+        if let Some(ref reason) = candidate.veto_reason {
+            let _ = writeln!(out, "  veto-reason: {reason}");
+        }
+    } else {
+        let safe_badge = status_badge("CLEAR", theme.palette.success, theme.accessibility);
+        let _ = writeln!(out, "  safety:      {safe_badge}");
+    }
+
+    // ── Guard status ──
+    if let Some(ref guard) = candidate.guard_status {
+        let _ = writeln!(out, "  guard:       {guard}");
+    }
+
+    // ── Score breakdown ──
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", section_header("Score Breakdown", width));
+    let bar_width = (width / 3).clamp(10, 30);
+    render_factor_bar(
+        out,
+        "location ",
+        candidate.factors.location,
+        bar_width,
+        theme,
+    );
+    render_factor_bar(out, "name     ", candidate.factors.name, bar_width, theme);
+    render_factor_bar(out, "age      ", candidate.factors.age, bar_width, theme);
+    render_factor_bar(out, "size     ", candidate.factors.size, bar_width, theme);
+    render_factor_bar(
+        out,
+        "structure",
+        candidate.factors.structure,
+        bar_width,
+        theme,
+    );
+    let _ = writeln!(
+        out,
+        "  pressure-multiplier: {:.2}x",
+        candidate.factors.pressure_multiplier
+    );
+    let _ = writeln!(out, "  total-score: {:.4}", candidate.total_score);
+
+    // ── Decision statistics ──
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", section_header("Decision Statistics", width));
+    let _ = writeln!(
+        out,
+        "  P(abandoned):     {:.4}",
+        candidate.posterior_abandoned
+    );
+    let _ = writeln!(
+        out,
+        "  E[loss|keep]:     {:.2}",
+        candidate.expected_loss_keep
+    );
+    let _ = writeln!(
+        out,
+        "  E[loss|delete]:   {:.2}",
+        candidate.expected_loss_delete
+    );
+    let _ = writeln!(out, "  calibration:      {:.4}", candidate.calibration_score);
+
+    // ── Confidence badge ──
+    let confidence_level = if candidate.calibration_score >= 0.85 {
+        "HIGH"
+    } else if candidate.calibration_score >= 0.60 {
+        "MODERATE"
+    } else {
+        "LOW"
+    };
+    let confidence_palette = if candidate.calibration_score >= 0.85 {
+        theme.palette.success
+    } else if candidate.calibration_score >= 0.60 {
+        theme.palette.warning
+    } else {
+        theme.palette.danger
+    };
+    let confidence_badge = status_badge(confidence_level, confidence_palette, theme.accessibility);
+    let _ = writeln!(out, "  confidence:       {confidence_badge}");
+
+    // ── Summary ──
+    if !candidate.summary.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "  summary: {}", candidate.summary);
+    }
+}
+
 fn render_screen_stub(name: &str, theme: Theme, out: &mut String) {
     use std::fmt::Write as _;
     let pending = status_badge("PENDING", theme.palette.muted, theme.accessibility);
@@ -837,9 +1099,9 @@ mod tests {
             Duration::from_secs(1),
             (80, 24),
         );
-        model.screen = Screen::Candidates;
+        model.screen = Screen::Ballast;
         let frame = render(&model);
-        assert!(frame.contains("[S4 Candidates]"));
+        assert!(frame.contains("[S5 Ballast]"));
         assert!(frame.contains("pending"));
     }
 

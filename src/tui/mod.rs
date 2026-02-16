@@ -21,6 +21,8 @@ pub mod update;
 pub mod widgets;
 
 #[cfg(test)]
+mod parity_harness;
+#[cfg(test)]
 mod test_artifact;
 #[cfg(test)]
 mod test_fault_injection;
