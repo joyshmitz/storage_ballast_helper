@@ -471,7 +471,7 @@ fn render_timeline(model: &DashboardModel, theme: &Theme, out: &mut String) {
         write_navigation_hint(
             model,
             out,
-            "j/k or \u{2191}/\u{2193} navigate  f filter  F follow  r refresh  ? help",
+            "j/k or \u{2191}/\u{2193} navigate  f filter  F follow  r refresh  ? help  : palette",
             "j/k navigate  f filter  F follow  r refresh",
         );
     }
@@ -605,6 +605,12 @@ fn render_explainability(model: &DashboardModel, theme: &Theme, out: &mut String
             out,
             "Press r to force refresh, or check daemon status with key 1."
         );
+        write_navigation_hint(
+            model,
+            out,
+            "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close detail  r refresh  ? help  : palette",
+            "j/k navigate  Enter detail  d close  r refresh",
+        );
         return;
     }
 
@@ -648,7 +654,7 @@ fn render_explainability(model: &DashboardModel, theme: &Theme, out: &mut String
     write_navigation_hint(
         model,
         out,
-        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close detail  r refresh",
+        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close detail  r refresh  ? help  : palette",
         "j/k navigate  Enter detail  d close  r refresh",
     );
 }
@@ -872,6 +878,12 @@ fn render_candidates(model: &DashboardModel, theme: &Theme, out: &mut String) {
             out,
             "Press r to force refresh, or check daemon status with key 1."
         );
+        write_navigation_hint(
+            model,
+            out,
+            "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close  s sort  r refresh  ? help  : palette",
+            "j/k navigate  Enter detail  s sort  r refresh",
+        );
         return;
     }
 
@@ -945,7 +957,7 @@ fn render_candidates(model: &DashboardModel, theme: &Theme, out: &mut String) {
     write_navigation_hint(
         model,
         out,
-        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close  s sort  r refresh",
+        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close  s sort  r refresh  ? help  : palette",
         "j/k navigate  Enter detail  s sort  r refresh",
     );
 }
@@ -1274,7 +1286,7 @@ fn render_diagnostics(model: &DashboardModel, theme: &Theme, out: &mut String) {
     write_navigation_hint(
         model,
         out,
-        &format!("V verbose ({verbose_label})  r refresh  ? help  q quit"),
+        &format!("V verbose ({verbose_label})  r refresh  ? help  : palette  q quit"),
         "V verbose  r refresh  q quit",
     );
 }
@@ -1340,6 +1352,12 @@ fn render_ballast(model: &DashboardModel, theme: &Theme, out: &mut String) {
         let _ = writeln!(
             out,
             "Press r to force refresh, or check daemon status with key 1."
+        );
+        write_navigation_hint(
+            model,
+            out,
+            "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close  r refresh  ? help  : palette",
+            "j/k navigate  Enter detail  d close  r refresh",
         );
         return;
     }
@@ -1477,7 +1495,7 @@ fn render_screen_stub(model: &DashboardModel, name: &str, theme: &Theme, out: &m
     write_navigation_hint(
         model,
         out,
-        "Press 1-7 to navigate, ? for help, q to quit",
+        "Press 1-7 to navigate, ? for help, : palette, q to quit",
         "Press 1-7 to navigate, q to quit",
     );
 }
