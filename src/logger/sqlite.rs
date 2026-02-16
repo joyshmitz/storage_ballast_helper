@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::functions::FunctionFlags;
 
 use crate::core::errors::{Result, SbhError};
 
@@ -33,6 +34,17 @@ impl SqliteLogger {
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+
+        // Register custom functions.
+        conn.create_scalar_function(
+            "extract_pattern",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            move |ctx| {
+                let path: String = ctx.get(0)?;
+                Ok(crate::scanner::patterns::extract_pattern_label(&path))
+            },
         )?;
 
         apply_pragmas(&conn)?;

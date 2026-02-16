@@ -197,34 +197,28 @@ impl<'a> StatsEngine<'a> {
         let since = since_timestamp(window);
         let conn = self.db.connection();
         let mut stmt = conn.prepare(
-            "SELECT path, size_bytes FROM activity_log
+            "SELECT
+                extract_pattern(path) AS pattern,
+                COUNT(*) as count,
+                SUM(COALESCE(size_bytes, 0)) as total_bytes
+             FROM activity_log
              WHERE event_type = 'artifact_delete' AND success = 1
-               AND timestamp >= ?1 AND path IS NOT NULL",
+               AND timestamp >= ?1 AND path IS NOT NULL
+             GROUP BY pattern
+             ORDER BY count DESC
+             LIMIT ?2",
         )?;
 
-        let mut pattern_counts: HashMap<String, (u64, u64)> = HashMap::new();
-        let rows = stmt.query_map(params![since], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
-        })?;
+        let patterns = stmt
+            .query_map(params![since, n as i64], |row| {
+                Ok(PatternStat {
+                    pattern: row.get(0)?,
+                    count: row.get(1)?,
+                    total_bytes: row.get::<_, i64>(2).unwrap_or(0) as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        for row in rows {
-            let (path, size) = row?;
-            let pattern = extract_pattern(&path);
-            let entry = pattern_counts.entry(pattern).or_insert((0, 0));
-            entry.0 += 1;
-            entry.1 += size.unwrap_or(0) as u64;
-        }
-
-        let mut patterns: Vec<PatternStat> = pattern_counts
-            .into_iter()
-            .map(|(pattern, (count, total_bytes))| PatternStat {
-                pattern,
-                count,
-                total_bytes,
-            })
-            .collect();
-        patterns.sort_by(|a, b| b.count.cmp(&a.count));
-        patterns.truncate(n);
         Ok(patterns)
     }
 
@@ -378,21 +372,21 @@ impl<'a> StatsEngine<'a> {
 
     fn most_common_deleted_pattern(&self, since: &str) -> Result<Option<String>> {
         let conn = self.db.connection();
-        let mut stmt = conn.prepare(
-            "SELECT path FROM activity_log
+        match conn.query_row(
+            "SELECT extract_pattern(path) AS pattern, COUNT(*) AS count
+             FROM activity_log
              WHERE event_type = 'artifact_delete' AND success = 1
-               AND timestamp >= ?1 AND path IS NOT NULL",
-        )?;
-
-        let mut counts: HashMap<String, u64> = HashMap::new();
-        let rows = stmt.query_map(params![since], |row| row.get::<_, String>(0))?;
-        for row in rows {
-            let path = row?;
-            let pattern = extract_pattern(&path);
-            *counts.entry(pattern).or_insert(0) += 1;
+               AND timestamp >= ?1 AND path IS NOT NULL
+             GROUP BY pattern
+             ORDER BY count DESC
+             LIMIT 1",
+            params![since],
+            |row| row.get(0),
+        ) {
+            Ok(pattern) => Ok(Some(pattern)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(crate::core::errors::SbhError::from(e)),
         }
-
-        Ok(counts.into_iter().max_by_key(|&(_, c)| c).map(|(p, _)| p))
     }
 
     #[allow(clippy::cast_sign_loss)]
@@ -543,48 +537,6 @@ fn timestamp_delta_secs(a: &str, b: &str) -> f64 {
     }
 }
 
-/// Extract a recognizable pattern from a deleted path.
-///
-/// Looks at the last path component and maps known artifact patterns to
-/// category names. Falls back to the directory name itself.
-fn extract_pattern(path: &str) -> String {
-    let p = PathBuf::from(path);
-    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
-
-    // Match known artifact patterns.
-    let lower = name.to_ascii_lowercase();
-    if lower == "target" || lower.starts_with("target-") {
-        return "target/".to_string();
-    }
-    if lower.starts_with(".target") || lower.starts_with("_target_") {
-        return ".target*".to_string();
-    }
-    if lower.starts_with("cargo-target") || lower.starts_with("cargo_target") {
-        return "cargo-target-*".to_string();
-    }
-    if lower.starts_with("pi_agent")
-        || lower.starts_with("pi_target")
-        || lower.starts_with("pi_opus")
-    {
-        return "pi_*".to_string();
-    }
-    if lower.starts_with("cass-target") {
-        return "cass-target*".to_string();
-    }
-    if lower.starts_with("br-build") {
-        return "br-build*".to_string();
-    }
-    if lower.starts_with(".tmp_target") {
-        return ".tmp_target*".to_string();
-    }
-    if lower == "node_modules" {
-        return "node_modules/".to_string();
-    }
-
-    // Fallback: use the directory name.
-    name.to_string()
-}
-
 /// Human-readable label for a duration.
 pub fn window_label(d: Duration) -> String {
     let secs = d.as_secs();
@@ -613,6 +565,7 @@ pub fn window_label(d: Duration) -> String {
 mod tests {
     use super::*;
     use crate::logger::sqlite::{ActivityRow, BallastRow, PressureRow, SqliteLogger};
+    use crate::scanner::patterns::extract_pattern_label as extract_pattern;
 
     fn temp_db() -> (tempfile::TempDir, SqliteLogger) {
         let dir = tempfile::tempdir().unwrap();
