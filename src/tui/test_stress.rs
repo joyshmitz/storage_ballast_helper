@@ -10,6 +10,14 @@
 //!
 //! **Bead:** bd-xzt.4.5
 
+#![allow(
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::cast_lossless,
+    clippy::suboptimal_flops,
+    clippy::too_many_lines
+)]
+
 use std::time::Instant;
 
 use super::e2e_artifact::{ArtifactCollector, CaseStatus, DiagnosticEntry};
