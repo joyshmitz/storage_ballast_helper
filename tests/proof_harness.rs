@@ -306,7 +306,10 @@ struct ReplayMismatch {
 /// Execute a trace and collect outcomes.
 #[allow(clippy::too_many_lines)]
 fn execute_trace(trace: &[TraceOp]) -> Vec<TraceOutcome> {
-    let mut engine = PolicyEngine::new(PolicyConfig::default());
+    let mut engine = PolicyEngine::new(PolicyConfig {
+        initial_mode: ActiveMode::Observe,
+        ..PolicyConfig::default()
+    });
     let scoring = default_engine();
     let mut guard = AdaptiveGuard::new(GuardrailConfig {
         min_observations: 5,
@@ -709,7 +712,10 @@ fn replay_mixed_operations_seeded() {
 fn fault_serialization_failure_triggers_conservative_action() {
     // When evidence serialization fails, the engine should produce
     // fallback-safe decisions (no deletions approved).
-    let mut engine = PolicyEngine::new(PolicyConfig::default());
+    let mut engine = PolicyEngine::new(PolicyConfig {
+        initial_mode: ActiveMode::Observe,
+        ..PolicyConfig::default()
+    });
     engine.promote();
     engine.promote(); // enforce
 
@@ -737,7 +743,10 @@ fn fault_serialization_failure_triggers_conservative_action() {
 
 #[test]
 fn fault_stale_guard_unknown_blocks_adaptive() {
-    let mut engine = PolicyEngine::new(PolicyConfig::default());
+    let mut engine = PolicyEngine::new(PolicyConfig {
+        initial_mode: ActiveMode::Observe,
+        ..PolicyConfig::default()
+    });
     engine.promote();
     engine.promote(); // enforce
 
@@ -766,7 +775,10 @@ fn fault_stale_guard_unknown_blocks_adaptive() {
 
 #[test]
 fn fault_eprocess_drift_forces_fallback() {
-    let mut engine = PolicyEngine::new(PolicyConfig::default());
+    let mut engine = PolicyEngine::new(PolicyConfig {
+        initial_mode: ActiveMode::Observe,
+        ..PolicyConfig::default()
+    });
     engine.promote(); // canary
 
     let drift_guard = failing_guard();
@@ -787,6 +799,7 @@ fn fault_eprocess_drift_forces_fallback() {
 fn fault_canary_budget_exhaustion() {
     let config = PolicyConfig {
         max_canary_deletes_per_hour: 2,
+        initial_mode: ActiveMode::Observe,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(config);
@@ -837,6 +850,7 @@ fn fault_kill_switch_blocks_everything() {
 fn fault_calibration_breach_cascade() {
     let config = PolicyConfig {
         calibration_breach_windows: 3,
+        initial_mode: ActiveMode::Observe,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(config);
@@ -877,6 +891,7 @@ fn fault_calibration_breach_cascade() {
 fn fault_recovery_after_drift() {
     let config = PolicyConfig {
         recovery_clean_windows: 2,
+        initial_mode: ActiveMode::Observe,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(config);
@@ -980,7 +995,10 @@ fn fault_matrix_all_types_produce_expected_fallback() {
     ];
 
     for case in &cases {
-        let mut engine = PolicyEngine::new(PolicyConfig::default());
+        let mut engine = PolicyEngine::new(PolicyConfig {
+            initial_mode: ActiveMode::Observe,
+            ..PolicyConfig::default()
+        });
         engine.promote();
         engine.promote(); // enforce
 
@@ -1387,7 +1405,10 @@ fn benchmark_policy_evaluation() {
     let guard = good_guard();
 
     let report = benchmark_operation("policy_eval_3", iterations, || {
-        let mut engine = PolicyEngine::new(PolicyConfig::default());
+        let mut engine = PolicyEngine::new(PolicyConfig {
+            initial_mode: ActiveMode::Observe,
+            ..PolicyConfig::default()
+        });
         engine.promote();
         engine.promote();
         let _ = engine.evaluate(&candidates, Some(&guard));
@@ -1527,7 +1548,10 @@ fn invariant_fallback_always_dominates() {
         ];
 
         for fault in &faults {
-            let mut engine = PolicyEngine::new(PolicyConfig::default());
+            let mut engine = PolicyEngine::new(PolicyConfig {
+                initial_mode: ActiveMode::Observe,
+                ..PolicyConfig::default()
+            });
             // Randomly promote before fallback.
             let promotions = rng.next_range(0, 2);
             for _ in 0..promotions {
@@ -1553,7 +1577,10 @@ fn invariant_fallback_always_dominates() {
 
 #[test]
 fn invariant_decision_ids_are_globally_monotonic() {
-    let mut engine = PolicyEngine::new(PolicyConfig::default());
+    let mut engine = PolicyEngine::new(PolicyConfig {
+        initial_mode: ActiveMode::Observe,
+        ..PolicyConfig::default()
+    });
     let candidates = vec![
         make_scored(DecisionAction::Delete, 2.5),
         make_scored(DecisionAction::Keep, 0.5),
@@ -1635,7 +1662,10 @@ fn invariant_all_records_serialize_and_roundtrip() {
 
 #[test]
 fn invariant_transition_log_is_append_only() {
-    let mut engine = PolicyEngine::new(PolicyConfig::default());
+    let mut engine = PolicyEngine::new(PolicyConfig {
+        initial_mode: ActiveMode::Observe,
+        ..PolicyConfig::default()
+    });
 
     let ops = [
         |e: &mut PolicyEngine| {

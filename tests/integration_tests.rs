@@ -1411,7 +1411,10 @@ fn failing_guard_diag() -> GuardDiagnostics {
 fn e2e_scenario_1_burst_growth_shadow_safe() {
     // Setup: scoring engine + policy in observe mode + guard.
     let scoring = e2e_scoring_engine();
-    let mut policy = PolicyEngine::new(PolicyConfig::default());
+    let mut policy = PolicyEngine::new(PolicyConfig {
+        initial_mode: ActiveMode::Observe,
+        ..PolicyConfig::default()
+    });
     let mut guard = AdaptiveGuard::with_defaults();
 
     // Phase 1: Feed good calibration data.
@@ -1472,6 +1475,7 @@ fn e2e_scenario_2_canary_bounded_impact() {
     let scoring = e2e_scoring_engine();
     let config = PolicyConfig {
         max_canary_deletes_per_hour: 3,
+        initial_mode: ActiveMode::Observe,
         ..PolicyConfig::default()
     };
     let mut policy = PolicyEngine::new(config);
@@ -1521,6 +1525,7 @@ fn e2e_scenario_3_calibration_drift_fallback() {
     let scoring = e2e_scoring_engine();
     let config = PolicyConfig {
         calibration_breach_windows: 3,
+        initial_mode: ActiveMode::Observe,
         ..PolicyConfig::default()
     };
     let mut policy = PolicyEngine::new(config);
@@ -1575,7 +1580,10 @@ fn e2e_scenario_4_index_corruption_full_scan() {
     // or unavailable, the system falls back to a full scan and still
     // produces valid scoring results.
     let scoring = e2e_scoring_engine();
-    let _policy = PolicyEngine::new(PolicyConfig::default());
+    let _policy = PolicyEngine::new(PolicyConfig {
+        initial_mode: ActiveMode::Observe,
+        ..PolicyConfig::default()
+    });
 
     // Simulate a full scan by scoring candidates directly (no incremental index).
     let candidates: Vec<CandidateInput> = vec![
@@ -1618,7 +1626,10 @@ fn e2e_scenario_4_index_corruption_full_scan() {
 #[test]
 fn e2e_scenario_5_fault_injection_safe_degradation() {
     let scoring = e2e_scoring_engine();
-    let mut policy = PolicyEngine::new(PolicyConfig::default());
+    let mut policy = PolicyEngine::new(PolicyConfig {
+        initial_mode: ActiveMode::Observe,
+        ..PolicyConfig::default()
+    });
     let mut guard = AdaptiveGuard::with_defaults();
 
     // Warmup to enforce mode.
@@ -1652,7 +1663,10 @@ fn e2e_scenario_5_fault_injection_safe_degradation() {
     );
 
     // Simulate serializer fault — enter fallback again.
-    let mut policy2 = PolicyEngine::new(PolicyConfig::default());
+    let mut policy2 = PolicyEngine::new(PolicyConfig {
+        initial_mode: ActiveMode::Observe,
+        ..PolicyConfig::default()
+    });
     policy2.enter_fallback(FallbackReason::SerializationFailure);
     let decision2 = policy2.evaluate(&scored, Some(&diag));
     assert!(
@@ -1668,6 +1682,7 @@ fn e2e_scenario_6_progressive_recovery() {
     let scoring = e2e_scoring_engine();
     let config = PolicyConfig {
         recovery_clean_windows: 3,
+        initial_mode: ActiveMode::Observe,
         ..PolicyConfig::default()
     };
     let mut policy = PolicyEngine::new(config);
