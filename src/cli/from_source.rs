@@ -9,6 +9,7 @@ use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use rand::random;
 use serde::Serialize;
 
 use super::RELEASE_REPOSITORY;
@@ -377,16 +378,28 @@ impl Drop for BuildDirGuard {
 }
 
 fn create_build_dir() -> std::io::Result<PathBuf> {
-    let base = std::env::temp_dir().join("sbh-from-source");
-    std::fs::create_dir_all(&base)?;
-    // Use a timestamp-based subdirectory to avoid collisions.
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let dir = base.join(format!("build-{ts}"));
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+
+    for _attempt in 0..32 {
+        let nonce = random::<u128>();
+        let dir = base.join(format!("sbh-from-source-{pid}-{nonce:032x}"));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(std::io::Error::new(
+                    err.kind(),
+                    format!("failed to create build dir {}: {err}", dir.display()),
+                ));
+            }
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "failed to allocate unique build directory after 32 attempts",
+    ))
 }
 
 fn run_git_clone(url: &str, dest: &Path, checkout: &SourceCheckout) -> Result<(), String> {

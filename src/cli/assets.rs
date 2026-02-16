@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read as _};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -840,17 +841,26 @@ fn download_and_verify(entry: &AssetEntry, cache: &AssetCache) -> io::Result<u64
     }
 
     // Write asset data to partial file.
-    // In a real implementation this would use HTTP with resume support.
-    // For now, we create the file structure to support the pipeline.
-    //
-    // The actual download is delegated to the caller or a platform-specific
-    // HTTP client. This function expects the file to be placed at the partial
-    // path before verification.
+    // Use curl for robust downloading.
+    let status = Command::new("curl")
+        .args(["-fsSL", "-o"])
+        .arg(&partial)
+        .arg(&entry.url)
+        .status()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to execute curl: {e}")))?;
+
+    if !status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("download failed (status {status})"),
+        ));
+    }
+
     if !partial.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "download not implemented in library; place file at {} then call verify",
+                "download failed; file missing at {}",
                 partial.display()
             ),
         ));
