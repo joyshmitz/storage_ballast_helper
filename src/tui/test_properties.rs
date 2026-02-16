@@ -123,8 +123,8 @@ fn arb_timeline_event() -> impl Strategy<Value = TimelineEvent> {
 }
 
 fn arb_decision() -> impl Strategy<Value = DecisionEvidence> {
-    (0u64..1000, 0.0f64..10.0, 0u64..100_000, 0u64..86400).prop_map(
-        |(id, score, size, age)| DecisionEvidence {
+    (0u64..1000, 0.0f64..10.0, 0u64..100_000, 0u64..86400).prop_map(|(id, score, size, age)| {
+        DecisionEvidence {
             decision_id: id,
             timestamp: String::new(),
             path: format!("/test/{id}"),
@@ -151,8 +151,8 @@ fn arb_decision() -> impl Strategy<Value = DecisionEvidence> {
             guard_status: None,
             summary: String::new(),
             raw_json: None,
-        },
-    )
+        }
+    })
 }
 
 fn arb_ballast_volume() -> impl Strategy<Value = BallastVolume> {
@@ -202,8 +202,7 @@ fn arb_msg() -> impl Strategy<Value = DashboardMsg> {
         // Notification expiry (arbitrary ID)
         (0u64..100).prop_map(DashboardMsg::NotificationExpired),
         // Frame metrics
-        (0.1f64..100.0)
-            .prop_map(|d| DashboardMsg::FrameMetrics { duration_ms: d }),
+        (0.1f64..100.0).prop_map(|d| DashboardMsg::FrameMetrics { duration_ms: d }),
         // Timeline telemetry (0-10 events)
         prop::collection::vec(arb_timeline_event(), 0..10).prop_map(|events| {
             DashboardMsg::TelemetryTimeline(TelemetryResult {

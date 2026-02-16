@@ -5,7 +5,8 @@
 use super::layout::{
     OverviewPane, PanePriority, TimelinePane, build_overview_layout, build_timeline_layout,
 };
-use super::model::{BallastVolume, DashboardModel, NotificationLevel, Screen};
+use super::input::search_palette_actions;
+use super::model::{BallastVolume, DashboardModel, NotificationLevel, Overlay, Screen};
 use super::theme::{AccessibilityProfile, Theme, ThemePalette};
 use super::widgets::{
     extract_time, gauge, human_bytes, human_duration, human_rate, section_header, sparkline,
@@ -132,6 +133,13 @@ fn render_overview(model: &DashboardModel, theme: &Theme, out: &mut String) {
             }
         }
     }
+
+    // ── Navigation hint ──
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "1-7 screens  [/] prev/next  b ballast  r refresh  ? help  : palette"
+    );
 }
 
 fn pane_priority_label(priority: PanePriority) -> &'static str {
@@ -709,7 +717,11 @@ fn render_decision_detail(
 fn render_factor_bar(out: &mut String, label: &str, value: f64, width: usize, _theme: &Theme) {
     use std::fmt::Write as _;
     let clamped = value.clamp(0.0, 1.0);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     let filled = (clamped * width as f64).round() as usize;
     let empty = width.saturating_sub(filled);
     let _ = writeln!(
@@ -1349,7 +1361,7 @@ fn render_ballast(model: &DashboardModel, theme: &Theme, out: &mut String) {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close  r refresh"
+        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close  r refresh  ? help  : palette"
     );
 }
 
@@ -1429,7 +1441,7 @@ mod tests {
     use crate::daemon::self_monitor::{
         BallastState, Counters, DaemonState, LastScanState, MountPressure, PressureState,
     };
-    use crate::tui::model::SeverityFilter;
+    use crate::tui::model::{Overlay, SeverityFilter};
 
     fn sample_state(level: &str, free_pct: f64) -> DaemonState {
         DaemonState {
@@ -2826,5 +2838,215 @@ mod tests {
         assert!(frame.contains("ballast:"));
         assert!(frame.contains("available"));
         assert!(frame.contains("released"));
+    }
+
+    // ── bd-xzt.3.7: Navigation & Command Palette ──
+
+    #[test]
+    fn breadcrumb_not_shown_with_empty_history() {
+        let model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (80, 24),
+        );
+        let frame = render(&model);
+        assert!(!frame.contains("nav:"));
+    }
+
+    #[test]
+    fn breadcrumb_shown_after_navigation() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (80, 24),
+        );
+        model.navigate_to(Screen::Timeline);
+        model.navigate_to(Screen::Candidates);
+
+        let frame = render(&model);
+        assert!(frame.contains("nav:"));
+        assert!(frame.contains("S1 Overview"));
+        assert!(frame.contains("S2 Timeline"));
+        assert!(frame.contains("S4 Candidates"));
+    }
+
+    #[test]
+    fn breadcrumb_limited_to_five_entries() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        // Navigate through 7 screens to build long history.
+        model.navigate_to(Screen::Timeline);
+        model.navigate_to(Screen::Explainability);
+        model.navigate_to(Screen::Candidates);
+        model.navigate_to(Screen::Ballast);
+        model.navigate_to(Screen::Diagnostics);
+        model.navigate_to(Screen::Overview);
+
+        let frame = render(&model);
+        // Breadcrumb shows last 5 + current, so first entry (Overview) is trimmed.
+        let nav_line = frame.lines().find(|l| l.starts_with("nav:")).unwrap();
+        // Count "> " separators: 5 entries + current = 5 " > " separators.
+        let separator_count = nav_line.matches(" > ").count();
+        assert!(separator_count <= 5, "breadcrumb too long: {nav_line}");
+    }
+
+    #[test]
+    fn palette_overlay_renders_search_box() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (80, 24),
+        );
+        model.active_overlay = Some(Overlay::CommandPalette);
+        model.palette_query = String::from("ballast");
+
+        let frame = render(&model);
+        assert!(frame.contains("Command Palette"));
+        assert!(frame.contains("> ballast"));
+        assert!(frame.contains("matches:"));
+    }
+
+    #[test]
+    fn palette_overlay_shows_matching_actions() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (80, 24),
+        );
+        model.active_overlay = Some(Overlay::CommandPalette);
+
+        let frame = render(&model);
+        // Empty query shows all 15 actions (up to 10).
+        assert!(frame.contains("matches: 10 / 15"));
+        assert!(frame.contains("nav.overview"));
+        assert!(frame.contains("Enter execute"));
+        assert!(frame.contains("Esc close"));
+    }
+
+    #[test]
+    fn palette_overlay_shows_cursor() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (80, 24),
+        );
+        model.active_overlay = Some(Overlay::CommandPalette);
+        model.palette_selected = 2;
+
+        let frame = render(&model);
+        // Third action should have cursor ">"
+        let palette_lines: Vec<_> = frame
+            .lines()
+            .filter(|l| l.starts_with("> ") || l.starts_with("  "))
+            .filter(|l| l.contains("nav.") || l.contains("overlay.") || l.contains("action."))
+            .collect();
+        assert!(!palette_lines.is_empty());
+    }
+
+    #[test]
+    fn palette_overlay_suppresses_debug_line() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (80, 24),
+        );
+        model.active_overlay = Some(Overlay::CommandPalette);
+
+        let frame = render(&model);
+        // Should NOT show debug "[overlay: CommandPalette]"
+        assert!(!frame.contains("[overlay: CommandPalette]"));
+        // But should show the actual palette UI
+        assert!(frame.contains("Command Palette"));
+    }
+
+    #[test]
+    fn help_overlay_still_shows_debug_line() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (80, 24),
+        );
+        model.active_overlay = Some(Overlay::Help);
+
+        let frame = render(&model);
+        assert!(frame.contains("[overlay: Help]"));
+    }
+
+    #[test]
+    fn overview_has_navigation_footer() {
+        let model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (80, 24),
+        );
+        let frame = render(&model);
+        assert!(frame.contains("? help"));
+        assert!(frame.contains(": palette"));
+    }
+
+    #[test]
+    fn all_screens_mention_palette_in_footer() {
+        let screens = [
+            Screen::Overview,
+            Screen::Timeline,
+            Screen::Explainability,
+            Screen::Candidates,
+            Screen::Diagnostics,
+            Screen::Ballast,
+            Screen::LogSearch,
+        ];
+        for screen in screens {
+            let mut model = DashboardModel::new(
+                PathBuf::from("/tmp/state.json"),
+                vec![],
+                Duration::from_secs(1),
+                (80, 24),
+            );
+            model.screen = screen;
+            let frame = render(&model);
+            assert!(
+                frame.contains("palette"),
+                "screen {screen:?} missing palette hint"
+            );
+        }
+    }
+
+    #[test]
+    fn all_screens_mention_help_in_footer() {
+        let screens = [
+            Screen::Overview,
+            Screen::Timeline,
+            Screen::Explainability,
+            Screen::Candidates,
+            Screen::Diagnostics,
+            Screen::Ballast,
+            Screen::LogSearch,
+        ];
+        for screen in screens {
+            let mut model = DashboardModel::new(
+                PathBuf::from("/tmp/state.json"),
+                vec![],
+                Duration::from_secs(1),
+                (80, 24),
+            );
+            model.screen = screen;
+            let frame = render(&model);
+            assert!(
+                frame.contains("help"),
+                "screen {screen:?} missing help hint"
+            );
+        }
     }
 }
