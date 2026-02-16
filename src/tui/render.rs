@@ -163,7 +163,7 @@ pub fn render_frame(model: &DashboardModel, frame: &mut Frame) {
     }
 
     // Split: header (3 rows) | body (fill) | footer (1 row) | notifications.
-    let notif_rows = model.notifications.len().min(3) as u16;
+    let notif_rows = u16::try_from(model.notifications.len().min(3)).unwrap_or(3);
     let chunks = Flex::vertical()
         .constraints([
             Constraint::Fixed(3),
@@ -182,12 +182,9 @@ pub fn render_frame(model: &DashboardModel, frame: &mut Frame) {
     frame_render_header(model, &theme, header_area, frame);
 
     // ── Body (screen-specific content) ──
-    if let Some(ref overlay) = model.active_overlay {
-        // Render screen content first, then overlay on top.
-        frame_render_screen(model, &theme, body_area, frame);
+    frame_render_screen(model, &theme, body_area, frame);
+    if let Some(overlay) = model.active_overlay {
         frame_render_overlay(model, overlay, &theme, body_area, frame);
-    } else {
-        frame_render_screen(model, &theme, body_area, frame);
     }
 
     // ── Footer keybindings ──
@@ -393,16 +390,17 @@ fn frame_render_actions_panel(
     let inner = block.inner(area);
     block.render(area, frame);
 
-    let content = if let Some(ref state) = model.daemon_state {
-        format!(
-            "  Scans: {}  Deleted: {}  Freed: {}",
-            state.counters.scans,
-            state.counters.deletions,
-            human_bytes(state.counters.bytes_freed),
-        )
-    } else {
-        String::from("  Awaiting daemon connection")
-    };
+    let content = model.daemon_state.as_ref().map_or_else(
+        || String::from("  Awaiting daemon connection"),
+        |state| {
+            format!(
+                "  Scans: {}  Deleted: {}  Freed: {}",
+                state.counters.scans,
+                state.counters.deletions,
+                human_bytes(state.counters.bytes_freed),
+            )
+        },
+    );
     Paragraph::new(content)
         .style(Style::default().fg(theme.palette.text_secondary()))
         .render(inner, frame);
@@ -462,18 +460,19 @@ fn frame_render_counters_panel(
     let inner = block.inner(area);
     block.render(area, frame);
 
-    let content = if let Some(ref state) = model.daemon_state {
-        format!(
-            "  errors={}  dropped={}  rss={}  pid={}  uptime={}",
-            state.counters.errors,
-            state.counters.dropped_log_events,
-            human_bytes(state.memory_rss_bytes),
-            state.pid,
-            human_duration(state.uptime_seconds),
-        )
-    } else {
-        String::from("  Counters unavailable")
-    };
+    let content = model.daemon_state.as_ref().map_or_else(
+        || String::from("  Counters unavailable"),
+        |state| {
+            format!(
+                "  errors={}  dropped={}  rss={}  pid={}  uptime={}",
+                state.counters.errors,
+                state.counters.dropped_log_events,
+                human_bytes(state.memory_rss_bytes),
+                state.pid,
+                human_duration(state.uptime_seconds),
+            )
+        },
+    );
     Paragraph::new(content)
         .style(Style::default().fg(theme.palette.text_secondary()))
         .render(inner, frame);
@@ -591,11 +590,10 @@ fn frame_render_footer(model: &DashboardModel, theme: &Theme, area: Rect, frame:
             "1-7 screens  [/] prev/next  b ballast  r refresh  ? help  : palette  q quit"
         }
         Screen::Timeline => "j/k navigate  f filter  F follow  r refresh  ? help  : palette",
-        Screen::Explainability => {
+        Screen::Explainability | Screen::Ballast => {
             "j/k navigate  Enter expand  d close  r refresh  ? help  : palette"
         }
         Screen::Candidates => "j/k navigate  Enter expand  s sort  r refresh  ? help  : palette",
-        Screen::Ballast => "j/k navigate  Enter expand  d close  r refresh  ? help  : palette",
         Screen::LogSearch => "1-7 screens  ? help  : palette  q quit",
         Screen::Diagnostics => "V verbose  r refresh  ? help  : palette  q quit",
     };
@@ -643,14 +641,14 @@ fn frame_render_notifications(
 #[cfg(feature = "tui")]
 fn frame_render_overlay(
     model: &DashboardModel,
-    overlay: &super::model::Overlay,
+    overlay: super::model::Overlay,
     theme: &Theme,
     body_area: Rect,
     frame: &mut Frame,
 ) {
     // Center a panel in the body area.
-    let overlay_w = body_area.width.min(60).max(30);
-    let overlay_h = body_area.height.min(20).max(8);
+    let overlay_w = body_area.width.clamp(30, 60);
+    let overlay_h = body_area.height.clamp(8, 20);
     let x = body_area.x + (body_area.width.saturating_sub(overlay_w)) / 2;
     let y = body_area.y + (body_area.height.saturating_sub(overlay_h)) / 2;
     let overlay_area = Rect::new(x, y, overlay_w, overlay_h);
@@ -659,7 +657,7 @@ fn frame_render_overlay(
         super::model::Overlay::CommandPalette => "Command Palette",
         super::model::Overlay::Help => "Help",
         super::model::Overlay::Voi => "VOI Scheduler",
-        super::model::Overlay::Confirmation { .. } => "Confirm",
+        super::model::Overlay::Confirmation(..) => "Confirm",
         super::model::Overlay::IncidentPlaybook => "Incident Playbook",
     };
 
