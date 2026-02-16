@@ -445,6 +445,30 @@ impl PolicyEngine {
         }
     }
 
+    /// Update the policy configuration at runtime (e.g. on SIGHUP config reload).
+    ///
+    /// Propagates tunable parameters (budgets, loss values, window thresholds) and
+    /// handles kill_switch transitions without resetting the mode state machine.
+    pub fn update_config(&mut self, new_config: PolicyConfig) {
+        let old_kill = self.config.kill_switch;
+        let new_kill = new_config.kill_switch;
+
+        self.config = new_config;
+
+        // Kill-switch engaged: force fallback_safe.
+        if !old_kill && new_kill && self.mode != ActiveMode::FallbackSafe {
+            self.enter_fallback(FallbackReason::KillSwitch);
+        }
+        // Kill-switch disengaged: recover if we were in fallback *due to* kill-switch.
+        if old_kill
+            && !new_kill
+            && self.mode == ActiveMode::FallbackSafe
+            && self.fallback_reason == Some(FallbackReason::KillSwitch)
+        {
+            self.recover_from_fallback();
+        }
+    }
+
     /// Generate a diagnostic snapshot of the policy engine state.
     #[must_use]
     pub fn diagnostics(&self) -> PolicyDiagnostics {
@@ -1088,5 +1112,63 @@ mod tests {
         engine.observe_window(&bad);
         assert_eq!(engine.consecutive_clean_windows, 0);
         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+    }
+
+    #[test]
+    fn update_config_engages_kill_switch() {
+        let mut engine = PolicyEngine::new(default_config());
+        assert_eq!(engine.mode(), ActiveMode::Observe);
+
+        let mut new = default_config();
+        new.kill_switch = true;
+        engine.update_config(new);
+
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+        assert_eq!(
+            engine.fallback_reason(),
+            Some(&FallbackReason::KillSwitch)
+        );
+    }
+
+    #[test]
+    fn update_config_disengages_kill_switch_recovers() {
+        let mut config = default_config();
+        config.kill_switch = true;
+        let mut engine = PolicyEngine::new(config);
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+
+        let mut new = default_config();
+        new.kill_switch = false;
+        engine.update_config(new);
+
+        // Should recover from fallback (kill-switch was the reason).
+        assert_ne!(engine.mode(), ActiveMode::FallbackSafe);
+        assert!(engine.fallback_reason().is_none());
+    }
+
+    #[test]
+    fn update_config_preserves_non_killswitch_fallback() {
+        let mut engine = PolicyEngine::new(default_config());
+        engine.enter_fallback(FallbackReason::GuardrailDrift);
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+
+        // Toggling kill_switch off should NOT recover from a drift-caused fallback.
+        let mut new = default_config();
+        new.kill_switch = false;
+        engine.update_config(new);
+
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+    }
+
+    #[test]
+    fn update_config_propagates_budget_changes() {
+        let mut engine = PolicyEngine::new(default_config());
+        assert_eq!(engine.config.max_canary_deletes_per_hour, 10);
+
+        let mut new = default_config();
+        new.max_canary_deletes_per_hour = 50;
+        engine.update_config(new);
+
+        assert_eq!(engine.config.max_canary_deletes_per_hour, 50);
     }
 }

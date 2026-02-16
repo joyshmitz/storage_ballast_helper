@@ -1510,18 +1510,14 @@ impl MonitoringDaemon {
                         .store(new_config.scanner.max_delete_batch, Ordering::Relaxed);
                     self.shared_executor_config
                         .set_min_score(new_config.scoring.min_score);
-                    self.shared_executor_config
-                        .repeat_base_cooldown_secs
-                        .store(
-                            new_config.scanner.repeat_deletion_base_cooldown_secs,
-                            Ordering::Relaxed,
-                        );
-                    self.shared_executor_config
-                        .repeat_max_cooldown_secs
-                        .store(
-                            new_config.scanner.repeat_deletion_max_cooldown_secs,
-                            Ordering::Relaxed,
-                        );
+                    self.shared_executor_config.repeat_base_cooldown_secs.store(
+                        new_config.scanner.repeat_deletion_base_cooldown_secs,
+                        Ordering::Relaxed,
+                    );
+                    self.shared_executor_config.repeat_max_cooldown_secs.store(
+                        new_config.scanner.repeat_deletion_max_cooldown_secs,
+                        Ordering::Relaxed,
+                    );
 
                     // Update FS collector TTL.
                     self.fs_collector
@@ -2025,9 +2021,9 @@ impl RepeatDeletionTracker {
         if record.cycle_count == 0 {
             return None;
         }
-        let multiplier =
-            1u64.checked_shl(record.cycle_count.saturating_sub(1))
-                .unwrap_or(u64::MAX);
+        let multiplier = 1u64
+            .checked_shl(record.cycle_count.saturating_sub(1))
+            .unwrap_or(u64::MAX);
         let cooldown = self
             .base_cooldown
             .saturating_mul(multiplier.try_into().unwrap_or(u32::MAX));
