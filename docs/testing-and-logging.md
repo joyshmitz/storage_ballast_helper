@@ -80,14 +80,28 @@ Installer/update flows should emit phase-level records that include:
 
 ## Verification Commands
 
+**Authoritative runbook:** `scripts/quality-gate.sh` (bd-xzt.4.6)
+
+Quick validation (manual):
 ```bash
 cargo fmt --check
-rch exec "cargo check --all-targets"
-rch exec "cargo clippy --all-targets -- -D warnings"
-rch exec "cargo test --lib"
+rch exec "cargo clippy --all-targets --features tui -- -D warnings"
+rch exec "cargo test --lib --features tui"
 rch exec "cargo test --test integration_tests"
-./scripts/e2e_test.sh
 ```
+
+Full gate sequence:
+```bash
+./scripts/quality-gate.sh              # Remote compilation via rch (default)
+./scripts/quality-gate.sh --local      # Local compilation
+./scripts/quality-gate.sh --ci         # CI mode (abort on first HARD failure)
+./scripts/quality-gate.sh --stage NAME # Run single named stage
+./scripts/quality-gate.sh --verbose    # Full command output
+```
+
+The runbook runs 20 stages (HARD/SOFT gated), emits per-stage logs and a
+machine-readable `summary.json`. See `docs/tui-acceptance-gates-and-budgets.md`
+for gate definitions and thresholds.
 
 ## FrankentUI Code Reuse Compliance (bd-xzt.1.6)
 

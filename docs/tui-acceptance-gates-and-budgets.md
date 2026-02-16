@@ -115,29 +115,71 @@ Workflow criteria:
 
 ## 6. Required Verification Command Sequence
 
-CPU-intensive checks must use `rch` per project policy.
+**Authoritative runbook script:** `scripts/quality-gate.sh`
 
+Run the full gate sequence with remote compilation:
+```bash
+./scripts/quality-gate.sh              # Uses rch exec (default)
+./scripts/quality-gate.sh --local      # Local compilation (no rch)
+./scripts/quality-gate.sh --ci         # CI mode (local, abort on first HARD failure)
+./scripts/quality-gate.sh --stage tui-replay  # Run single stage
+```
+
+The runbook executes 20 stages across 6 categories:
+
+| Stage | Gate | Quality Dimension |
+| --- | --- | --- |
+| `fmt` | HARD | Code style |
+| `clippy` | HARD | Correctness warnings |
+| `unit-lib` | HARD | Core logic |
+| `unit-bin` | HARD | CLI routing |
+| `integration` | HARD | Pipeline correctness |
+| `decision-plane` | HARD | Policy correctness |
+| `fallback` | HARD | Fallback safety |
+| `tui-unit` | HARD | Dashboard correctness |
+| `tui-replay` | HARD | Deterministic replay |
+| `tui-scenarios` | HARD | Operator workflows |
+| `tui-properties` | HARD | Invariant safety |
+| `tui-fault-injection` | HARD | Degraded recovery |
+| `tui-snapshots` | SOFT | Visual contract |
+| `tui-parity` | HARD | Legacy parity |
+| `tui-benchmarks` | SOFT | Operator efficiency |
+| `dashboard-integration` | HARD | Dashboard E2E |
+| `stress` | HARD | Daemon stability |
+| `stress-harness` | SOFT | Concurrency safety |
+| `tui-stress` | SOFT | Dashboard endurance |
+| `installer` | HARD | Install safety |
+| `e2e` | HARD | User experience |
+
+Output artifacts are written to `$SBH_QG_LOG_DIR` (default `/tmp/sbh-qg-TIMESTAMP/`)
+with per-stage logs in `stages/` and a machine-readable `summary.json`.
+
+Manual equivalent for CPU-intensive checks:
 ```bash
 # Formatting (allowed local)
 cargo fmt --check
 
 # Build/lint/test gates
-rch exec "cargo check --all-targets"
-rch exec "cargo clippy --all-targets -- -D warnings"
-rch exec "cargo test --lib"
+rch exec "cargo clippy --all-targets --features tui -- -D warnings"
+rch exec "cargo test --lib --features tui"
 rch exec "cargo test --bin sbh"
 rch exec "cargo test --test integration_tests"
+rch exec "cargo test --test proof_harness"
+rch exec "cargo test --test decision_plane_e2e"
+rch exec "cargo test --test fallback_verification"
+
+# Dashboard-specific suites
+rch exec "cargo test --lib --features tui tui::test_replay"
+rch exec "cargo test --lib --features tui tui::test_scenario_drills"
+rch exec "cargo test --lib --features tui tui::test_properties"
+rch exec "cargo test --lib --features tui tui::test_fault_injection"
+rch exec "cargo test --lib --features tui tui::parity_harness"
+rch exec "cargo test --test dashboard_integration_tests --features tui"
 
 # E2E + stress/perf
 ./scripts/e2e_test.sh
 rch exec "cargo test --test stress_tests -- --nocapture"
 ```
-
-Additional dashboard-overhaul suites (once added in `bd-xzt.4*`) become mandatory:
-- PTY keyflow suite (`bd-xzt.4.9`)
-- deterministic replay suite (`bd-xzt.4.10`)
-- property-based invariants (`bd-xzt.4.11`)
-- failure-injection suite (`bd-xzt.4.14`)
 
 ## 7. Gate Artifacts and Logging Requirements
 
