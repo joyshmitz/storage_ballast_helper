@@ -337,16 +337,11 @@ fn factor_age(age: Duration) -> f64 {
         0.20
     } else if hours < 4.0 {
         0.70
-    } else if hours < 10.0 {
-        1.0
-    } else if hours < 24.0 {
-        0.85
-    } else if hours < 24.0 * 7.0 {
-        0.60
-    } else if hours < 24.0 * 30.0 {
-        0.40
     } else {
-        0.25
+        // Monotonically caps at 1.0 — older artifacts are always at least as
+        // likely to be abandoned as younger ones. The previous curve dropped
+        // back to 0.25 for 30+ day artifacts, which is backwards.
+        1.0
     }
 }
 

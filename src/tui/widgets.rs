@@ -180,6 +180,16 @@ pub fn key_hint<'a>(key: &str, label: &str, accent: PackedRgba) -> Vec<Span<'a>>
     ]
 }
 
+/// Render a styled status strip from key hint pairs, returning a `Line`.
+#[must_use]
+pub fn styled_status_strip(hints: &[(&str, &str)], accent: PackedRgba) -> Line {
+    let mut spans: Vec<Span<'_>> = Vec::new();
+    for (key, label) in hints {
+        spans.extend(key_hint(key, label, accent));
+    }
+    Line::from_spans(spans)
+}
+
 /// Styled horizontal separator line using box-drawing characters.
 #[must_use]
 pub fn separator_line(width: usize, color: PackedRgba) -> Line {

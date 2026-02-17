@@ -22,8 +22,8 @@ use super::preferences::{DensityMode, HintVerbosity, StartScreen};
 use super::theme::{AccessibilityProfile, PaletteEntry, SpacingScale, Theme, ThemePalette};
 use super::widgets::{
     colored_sparkline, extract_time, gauge, human_bytes, human_duration, human_rate, key_hint,
-    mini_bar_chart, section_header, segmented_gauge, separator_line, sparkline, status_badge,
-    styled_badge, trend_label,
+    mini_bar_chart, progress_indicator, section_header, segmented_gauge, separator_line, sparkline,
+    status_badge, styled_badge, styled_status_strip, trend_label,
 };
 use crate::tui::telemetry::{DataSource, DecisionEvidence, TimelineEvent};
 
@@ -279,6 +279,12 @@ fn frame_render_header(model: &DashboardModel, theme: &Theme, area: Rect, frame:
     }
     lines.push(Line::from_spans(title_spans));
 
+    // ── Row 1.5: Subtle separator between title and tabs ──
+    lines.push(separator_line(
+        usize::from(area.width),
+        theme.palette.border_color(),
+    ));
+
     // ── Row 2: Tab strip with per-screen accent on active tab ──
     let screens = [
         Screen::Overview,
@@ -293,18 +299,44 @@ fn frame_render_header(model: &DashboardModel, theme: &Theme, area: Rect, frame:
     nav_spans.push(Span::raw(" "));
     for (idx, screen) in screens.iter().enumerate() {
         let active = *screen == model.screen;
-        let label = format!(" {}:{} ", screen.number(), screen_tab_label(*screen));
-        let style = if active {
-            Style::default()
-                .fg(PackedRgba::rgb(20, 20, 30))
-                .bg(theme.palette.tab_active_bg(screen.number()))
-                .bold()
+        let tab_accent = theme.palette.tab_active_bg(screen.number());
+        if active {
+            // Active tab: key portion dim on accent bg, name bold on accent bg.
+            nav_spans.push(Span::styled(
+                format!(" {}:", screen.number()),
+                Style::default()
+                    .fg(PackedRgba::rgb(20, 20, 30))
+                    .bg(tab_accent),
+            ));
+            nav_spans.push(Span::styled(
+                format!("{} ", screen_tab_label(*screen)),
+                Style::default()
+                    .fg(PackedRgba::rgb(20, 20, 30))
+                    .bg(tab_accent)
+                    .bold(),
+            ));
         } else {
-            Style::default().fg(theme.palette.text_secondary())
-        };
-        nav_spans.push(Span::styled(label, style));
+            // Inactive tab: key portion in muted, name in secondary.
+            nav_spans.push(Span::styled(
+                format!(" {}:", screen.number()),
+                Style::default().fg(theme.palette.muted_color()),
+            ));
+            nav_spans.push(Span::styled(
+                format!("{} ", screen_tab_label(*screen)),
+                Style::default().fg(theme.palette.text_secondary()),
+            ));
+        }
+        // Dim separator between inactive tabs (skip before/after active).
         if idx + 1 < screens.len() {
-            nav_spans.push(Span::raw(" "));
+            let next_active = screens[idx + 1] == model.screen;
+            if !active && !next_active {
+                nav_spans.push(Span::styled(
+                    "\u{2502}",
+                    Style::default().fg(theme.palette.border_color()),
+                ));
+            } else {
+                nav_spans.push(Span::raw(" "));
+            }
         }
     }
     lines.push(Line::from_spans(nav_spans));
@@ -445,6 +477,7 @@ fn overview_pane_title(pane: OverviewPane) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn overview_pane_text(
     model: &DashboardModel,
     theme: &Theme,
@@ -488,11 +521,9 @@ fn overview_pane_styled(
         OverviewPane::DecisionPulse => styled_decision_pulse(model, theme),
         OverviewPane::CandidateHotlist => styled_candidate_hotlist(model, theme, pane_width),
         OverviewPane::BallastQuick => styled_ballast_quick(model, theme),
-        _ => {
-            // Fallback: use plain text rendering for remaining panes.
-            let plain = overview_pane_text(model, theme, pane, pane_width, false);
-            plain.lines().map(|l| Line::from(l.to_string())).collect()
-        }
+        OverviewPane::ActionLane => styled_action_lane(model, theme),
+        OverviewPane::SpecialLocations => styled_special_locations(model, theme),
+        OverviewPane::ExtendedCounters => styled_extended_counters(model, theme),
     };
     if show_target_hint {
         lines.push(Line::from_spans([
@@ -530,6 +561,10 @@ fn styled_pressure_summary(model: &DashboardModel, theme: &Theme, pane_width: u1
                 &state.policy_mode.to_ascii_uppercase(),
                 policy_color,
             ));
+        }
+        if state.pressure.overall != "green" {
+            header.push(Span::raw(" "));
+            header.push(progress_indicator(model.tick, level_color));
         }
         lines.push(Line::from_spans(header));
 
@@ -870,6 +905,154 @@ fn styled_ballast_quick(model: &DashboardModel, theme: &Theme) -> Vec<Line> {
     }
 }
 
+#[allow(clippy::option_if_let_else)]
+fn styled_action_lane(model: &DashboardModel, theme: &Theme) -> Vec<Line> {
+    if let Some(ref state) = model.daemon_state {
+        let at_str = state.last_scan.at.as_deref().map_or("never", extract_time);
+        vec![
+            Line::from_spans([
+                Span::styled(
+                    "actions ",
+                    Style::default().fg(theme.palette.text_secondary()),
+                ),
+                Span::styled(
+                    format!(
+                        "scans={} deleted={} freed={}",
+                        state.counters.scans,
+                        state.counters.deletions,
+                        human_bytes(state.counters.bytes_freed)
+                    ),
+                    Style::default().fg(theme.palette.text_secondary()),
+                ),
+            ]),
+            Line::from_spans([
+                Span::styled(
+                    "  last-scan ",
+                    Style::default().fg(theme.palette.muted_color()),
+                ),
+                Span::styled(at_str, Style::default().fg(theme.palette.text_primary())),
+                Span::styled(
+                    format!(
+                        "  candidates={} deleted={}",
+                        state.last_scan.candidates, state.last_scan.deleted
+                    ),
+                    Style::default().fg(theme.palette.text_secondary()),
+                ),
+            ]),
+        ]
+    } else {
+        vec![Line::from(Span::styled(
+            "actions awaiting daemon connection",
+            Style::default().fg(theme.palette.muted_color()),
+        ))]
+    }
+}
+
+fn styled_special_locations(model: &DashboardModel, theme: &Theme) -> Vec<Line> {
+    if model.timeline_events.is_empty() {
+        return vec![Line::from(Span::styled(
+            "special-locations no timeline data yet",
+            Style::default().fg(theme.palette.muted_color()),
+        ))];
+    }
+    let mut tmp_hits = 0usize;
+    let mut data_tmp_hits = 0usize;
+    let mut critical = 0usize;
+    for event in &model.timeline_events {
+        if let Some(path) = event.path.as_deref() {
+            if path.contains("/tmp") {
+                tmp_hits += 1;
+            }
+            if path.contains("/data/tmp") {
+                data_tmp_hits += 1;
+            }
+        }
+        if event.severity == "critical" {
+            critical += 1;
+        }
+    }
+    let (badge_label, badge_color) = if critical > 0 {
+        ("WATCH", theme.palette.warning_color())
+    } else {
+        ("STABLE", theme.palette.success_color())
+    };
+    vec![
+        Line::from_spans([
+            Span::styled(
+                "special-locations ",
+                Style::default().fg(theme.palette.text_secondary()),
+            ),
+            styled_badge(badge_label, badge_color),
+        ]),
+        Line::from_spans([Span::styled(
+            format!("  /tmp={tmp_hits}  /data/tmp={data_tmp_hits}  critical={critical}"),
+            Style::default().fg(theme.palette.text_secondary()),
+        )]),
+    ]
+}
+
+#[allow(clippy::option_if_let_else)]
+fn styled_extended_counters(model: &DashboardModel, theme: &Theme) -> Vec<Line> {
+    if let Some(ref state) = model.daemon_state {
+        let policy = if state.policy_mode.is_empty() {
+            "unknown"
+        } else {
+            &state.policy_mode
+        };
+        let mut lines = Vec::new();
+        let mut row1 = vec![Span::styled(
+            "runtime ",
+            Style::default().fg(theme.palette.text_secondary()),
+        )];
+        if state.counters.dropped_log_events > 0 {
+            row1.push(styled_badge("DROPPED", theme.palette.warning_color()));
+            row1.push(Span::styled(
+                format!("={} ", state.counters.dropped_log_events),
+                Style::default().fg(theme.palette.warning_color()),
+            ));
+        }
+        row1.push(Span::styled(
+            format!(
+                "scans={} del={} err={}",
+                state.counters.scans, state.counters.deletions, state.counters.errors,
+            ),
+            Style::default().fg(theme.palette.text_secondary()),
+        ));
+        lines.push(Line::from_spans(row1));
+        lines.push(Line::from_spans([Span::styled(
+            format!(
+                "  freed={} rss={} up={}",
+                human_bytes(state.counters.bytes_freed),
+                human_bytes(state.memory_rss_bytes),
+                human_duration(state.uptime_seconds),
+            ),
+            Style::default().fg(theme.palette.muted_color()),
+        )]));
+        lines.push(Line::from_spans([Span::styled(
+            format!(
+                "  pid={} policy={policy} adapter(r/e)={}/{}",
+                state.pid, model.adapter_reads, model.adapter_errors
+            ),
+            Style::default().fg(theme.palette.muted_color()),
+        )]));
+        lines
+    } else {
+        vec![
+            Line::from(Span::styled(
+                "counters unavailable",
+                Style::default().fg(theme.palette.muted_color()),
+            )),
+            Line::from_spans([Span::styled(
+                format!(
+                    "  adapters(r/e)={}/{}",
+                    model.adapter_reads, model.adapter_errors
+                ),
+                Style::default().fg(theme.palette.muted_color()),
+            )]),
+        ]
+    }
+}
+
 fn overview_pane_target_label(pane: OverviewPane) -> &'static str {
     match pane {
         OverviewPane::ActionLane | OverviewPane::DecisionPulse => "Explainability",
@@ -883,6 +1066,7 @@ fn overview_pane_target_label(pane: OverviewPane) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn frame_render_text_pane(
     theme: &Theme,
     area: Rect,
@@ -923,7 +1107,7 @@ fn frame_render_styled_pane(
     area: Rect,
     title: &str,
     content: Text,
-    emphasis: bool,
+    accent: Option<PackedRgba>,
     frame: &mut Frame,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -936,11 +1120,7 @@ fn frame_render_styled_pane(
         return;
     }
 
-    let border_color = if emphasis {
-        theme.palette.accent_color()
-    } else {
-        theme.palette.border_color()
-    };
+    let border_color = accent.unwrap_or_else(|| theme.palette.border_color());
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .title(title)
@@ -953,11 +1133,31 @@ fn frame_render_styled_pane(
         .render(inner, frame);
 }
 
+#[allow(dead_code)]
 fn frame_render_status_strip(theme: &Theme, area: Rect, content: String, frame: &mut Frame) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     Paragraph::new(content)
+        .style(
+            Style::default()
+                .fg(theme.palette.muted_color())
+                .bg(theme.palette.panel_bg()),
+        )
+        .render(area, frame);
+}
+
+fn frame_render_styled_status_strip(
+    theme: &Theme,
+    area: Rect,
+    hints: &[(&str, &str)],
+    accent: PackedRgba,
+    frame: &mut Frame,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    Paragraph::new(styled_status_strip(hints, accent))
         .style(
             Style::default()
                 .fg(theme.palette.muted_color())
@@ -992,48 +1192,55 @@ const fn data_source_label(source: DataSource) -> &'static str {
 
 fn frame_render_timeline(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
     let layout = build_timeline_layout(area.width, area.height);
+    let accent = theme.palette.tab_active_bg(Screen::Timeline.number());
     for placement in layout.placements.iter().filter(|p| p.visible) {
         let pane_area = rect_in_body(area, placement.rect);
         if pane_area.width == 0 || pane_area.height == 0 {
             continue;
         }
         match placement.pane {
-            TimelinePane::FilterBar => frame_render_text_pane(
+            TimelinePane::FilterBar => frame_render_styled_pane(
                 theme,
                 pane_area,
-                "S2 Filters",
-                frame_timeline_filter_text(model),
-                false,
+                "Filters",
+                frame_timeline_filter_styled(model, theme),
+                None,
                 frame,
             ),
-            TimelinePane::EventList => frame_render_text_pane(
+            TimelinePane::EventList => frame_render_styled_pane(
                 theme,
                 pane_area,
-                "S2 Timeline Events",
-                frame_timeline_list_text(model, theme, pane_body_rows(pane_area)),
-                true,
+                "Events",
+                frame_timeline_list_styled(model, theme, pane_body_rows(pane_area)),
+                Some(accent),
                 frame,
             ),
-            TimelinePane::EventDetail => frame_render_text_pane(
+            TimelinePane::EventDetail => frame_render_styled_pane(
                 theme,
                 pane_area,
-                "S2 Event Detail",
-                frame_timeline_detail_text(model, theme),
-                true,
+                "Detail",
+                frame_timeline_detail_styled(model, theme),
+                Some(accent),
                 frame,
             ),
-            TimelinePane::StatusFooter => frame_render_status_strip(
+            TimelinePane::StatusFooter => frame_render_styled_status_strip(
                 theme,
                 pane_area,
-                String::from(
-                    "j/k or wheel scroll  f filter  F follow  r refresh  Esc overlay->detail->back->quit",
-                ),
+                &[
+                    ("j/k", "scroll"),
+                    ("f", "filter"),
+                    ("F", "follow"),
+                    ("r", "refresh"),
+                    ("Esc", "back"),
+                ],
+                accent,
                 frame,
             ),
         }
     }
 }
 
+#[allow(dead_code)]
 fn frame_timeline_filter_text(model: &DashboardModel) -> String {
     let follow = if model.timeline_follow { "on" } else { "off" };
     format!(
@@ -1045,6 +1252,49 @@ fn frame_timeline_filter_text(model: &DashboardModel) -> String {
     )
 }
 
+fn frame_timeline_filter_styled(model: &DashboardModel, theme: &Theme) -> Text {
+    let sev_label = model.timeline_filter.label();
+    let sev_color = match sev_label {
+        "critical" => theme.palette.critical_color(),
+        "warning+" => theme.palette.warning_color(),
+        _ => theme.palette.accent_color(),
+    };
+    let follow_color = if model.timeline_follow {
+        theme.palette.success_color()
+    } else {
+        theme.palette.muted_color()
+    };
+    let follow_label = if model.timeline_follow { "ON" } else { "OFF" };
+    let mut spans = vec![
+        Span::styled(
+            "severity ",
+            Style::default().fg(theme.palette.text_secondary()),
+        ),
+        styled_badge(sev_label, sev_color),
+        Span::raw("  "),
+        Span::styled(
+            "follow ",
+            Style::default().fg(theme.palette.text_secondary()),
+        ),
+        styled_badge(follow_label, follow_color),
+        Span::raw("  "),
+        Span::styled(
+            "source ",
+            Style::default().fg(theme.palette.text_secondary()),
+        ),
+        styled_badge(
+            data_source_label(model.timeline_source),
+            theme.palette.accent_color(),
+        ),
+    ];
+    if model.timeline_partial {
+        spans.push(Span::raw(" "));
+        spans.push(styled_badge("PARTIAL", theme.palette.warning_color()));
+    }
+    Text::from_lines(vec![Line::from_spans(spans)])
+}
+
+#[allow(dead_code)]
 fn frame_timeline_list_text(model: &DashboardModel, theme: &Theme, rows: usize) -> String {
     use std::fmt::Write as _;
     let filtered = model.timeline_filtered_events();
@@ -1078,6 +1328,76 @@ fn frame_timeline_list_text(model: &DashboardModel, theme: &Theme, rows: usize) 
     out
 }
 
+fn frame_timeline_list_styled(model: &DashboardModel, theme: &Theme, rows: usize) -> Text {
+    let accent = theme.palette.tab_active_bg(Screen::Timeline.number());
+    let filtered = model.timeline_filtered_events();
+    let total = model.timeline_events.len();
+    if filtered.is_empty() {
+        return Text::from_lines(vec![Line::from(Span::styled(
+            format!(
+                "No events available for filter={}. Press f to cycle.",
+                model.timeline_filter.label()
+            ),
+            Style::default().fg(theme.palette.muted_color()),
+        ))]);
+    }
+
+    let mut lines = Vec::new();
+    let (start, end) = centered_window(model.timeline_selected, filtered.len(), rows);
+    lines.push(Line::from_spans([
+        Span::styled(
+            format!("events={} of {} ", filtered.len(), total),
+            Style::default().fg(theme.palette.text_secondary()),
+        ),
+        Span::styled(
+            format!("(rows {}..{})", start + 1, end),
+            Style::default().fg(theme.palette.muted_color()),
+        ),
+    ]));
+    for (offset, event) in filtered[start..end].iter().enumerate() {
+        let idx = start + offset;
+        let selected = idx == model.timeline_selected;
+        let bg = if selected {
+            theme.palette.highlight_bg()
+        } else {
+            theme.palette.panel_bg()
+        };
+        let cursor_span = if selected {
+            Span::styled("\u{25B8} ", Style::default().fg(accent).bg(bg).bold())
+        } else {
+            Span::styled("  ", Style::default().bg(bg))
+        };
+        let time = extract_time(&event.timestamp);
+        let sev_color = severity_styled_color(&event.severity, theme);
+        let path_str = event.path.as_deref().map_or("-", |p| truncate_path(p, 24));
+        let mut row = vec![
+            cursor_span,
+            Span::styled(
+                format!("{time} "),
+                Style::default().fg(theme.palette.muted_color()).bg(bg),
+            ),
+            styled_badge_with_bg(&event.severity.to_ascii_uppercase(), sev_color, bg),
+            Span::styled(
+                format!(" {:<18} ", event.event_type),
+                Style::default().fg(theme.palette.text_primary()).bg(bg),
+            ),
+            Span::styled(
+                path_str.to_string(),
+                Style::default().fg(theme.palette.muted_color()).bg(bg),
+            ),
+        ];
+        if let Some(size) = event.size_bytes {
+            row.push(Span::styled(
+                format!(" {}", human_bytes(size)),
+                Style::default().fg(theme.palette.text_secondary()).bg(bg),
+            ));
+        }
+        lines.push(Line::from_spans(row));
+    }
+    Text::from_lines(lines)
+}
+
+#[allow(dead_code)]
 fn frame_timeline_detail_text(model: &DashboardModel, theme: &Theme) -> String {
     let mut out = String::new();
     if let Some(event) = model.timeline_selected_event() {
@@ -1088,6 +1408,155 @@ fn frame_timeline_detail_text(model: &DashboardModel, theme: &Theme) -> String {
     out
 }
 
+#[allow(clippy::option_if_let_else)]
+fn frame_timeline_detail_styled(model: &DashboardModel, theme: &Theme) -> Text {
+    if let Some(event) = model.timeline_selected_event() {
+        styled_event_detail(event, theme)
+    } else {
+        Text::from_lines(vec![Line::from(Span::styled(
+            "No selected event.",
+            Style::default().fg(theme.palette.muted_color()),
+        ))])
+    }
+}
+
+fn styled_event_detail(event: &TimelineEvent, theme: &Theme) -> Text {
+    let sev_color = severity_styled_color(&event.severity, theme);
+    let muted = theme.palette.muted_color();
+    let primary = theme.palette.text_primary();
+    let secondary = theme.palette.text_secondary();
+    let mut lines = vec![
+        Line::from_spans([
+            Span::styled("  timestamp  ", Style::default().fg(muted)),
+            Span::styled(&*event.timestamp, Style::default().fg(primary)),
+        ]),
+        Line::from_spans([
+            Span::styled("  event      ", Style::default().fg(muted)),
+            Span::styled(&*event.event_type, Style::default().fg(primary)),
+        ]),
+        Line::from_spans([
+            Span::styled("  severity   ", Style::default().fg(muted)),
+            styled_badge(&event.severity.to_ascii_uppercase(), sev_color),
+        ]),
+    ];
+    if let Some(ref path) = event.path {
+        let (dir, file) = split_path_dir_file(path);
+        lines.push(Line::from_spans([
+            Span::styled("  path       ", Style::default().fg(muted)),
+            Span::styled(dir, Style::default().fg(muted)),
+            Span::styled(file, Style::default().fg(theme.palette.accent_color())),
+        ]));
+    }
+    if let Some(size) = event.size_bytes {
+        lines.push(Line::from_spans([
+            Span::styled("  size       ", Style::default().fg(muted)),
+            Span::styled(
+                format!("{} ({size} bytes)", human_bytes(size)),
+                Style::default().fg(primary),
+            ),
+        ]));
+    }
+    if let Some(score) = event.score {
+        let score_color = theme.palette.gauge_gradient(score);
+        lines.push(Line::from_spans([
+            Span::styled("  score      ", Style::default().fg(muted)),
+            Span::styled(format!("{score:.4}"), Style::default().fg(score_color)),
+        ]));
+    }
+    if let Some(ref level) = event.pressure_level {
+        let level_color = theme.palette.pressure_color(level);
+        lines.push(Line::from_spans([
+            Span::styled("  pressure   ", Style::default().fg(muted)),
+            styled_badge(&level.to_ascii_uppercase(), level_color),
+        ]));
+    }
+    if let Some(pct) = event.free_pct {
+        lines.push(Line::from_spans([
+            Span::styled("  free       ", Style::default().fg(muted)),
+            Span::styled(format!("{pct:.1}%"), Style::default().fg(secondary)),
+        ]));
+    }
+    if let Some(success) = event.success {
+        let (label, color) = if success {
+            ("yes", theme.palette.success_color())
+        } else {
+            ("no", theme.palette.danger_color())
+        };
+        lines.push(Line::from_spans([
+            Span::styled("  success    ", Style::default().fg(muted)),
+            Span::styled(label, Style::default().fg(color)),
+        ]));
+    }
+    if let Some(ref code) = event.error_code {
+        lines.push(Line::from_spans([
+            Span::styled("  error-code ", Style::default().fg(muted)),
+            Span::styled(&**code, Style::default().fg(theme.palette.danger_color())),
+        ]));
+    }
+    if let Some(ref msg) = event.error_message {
+        lines.push(Line::from_spans([
+            Span::styled("  error      ", Style::default().fg(muted)),
+            Span::styled(&**msg, Style::default().fg(theme.palette.danger_color())),
+        ]));
+    }
+    if let Some(ms) = event.duration_ms {
+        lines.push(Line::from_spans([
+            Span::styled("  duration   ", Style::default().fg(muted)),
+            Span::styled(format!("{ms}ms"), Style::default().fg(secondary)),
+        ]));
+    }
+    if let Some(ref details) = event.details {
+        lines.push(Line::from_spans([
+            Span::styled("  details    ", Style::default().fg(muted)),
+            Span::styled(&**details, Style::default().fg(secondary)),
+        ]));
+    }
+    Text::from_lines(lines)
+}
+
+/// Helper: get severity color for styled badge.
+fn severity_styled_color(severity: &str, theme: &Theme) -> PackedRgba {
+    match severity {
+        "critical" => theme.palette.critical_color(),
+        "warning" => theme.palette.warning_color(),
+        "info" => theme.palette.accent_color(),
+        _ => theme.palette.muted_color(),
+    }
+}
+
+/// Helper: styled badge that respects a pre-set background (for selected rows).
+fn styled_badge_with_bg<'a>(label: &str, bg_color: PackedRgba, _row_bg: PackedRgba) -> Span<'a> {
+    Span::styled(
+        format!(" {label} "),
+        Style::default()
+            .fg(PackedRgba::rgb(20, 20, 30))
+            .bg(bg_color)
+            .bold(),
+    )
+}
+
+/// Helper: styled action badge returning a Span.
+fn action_styled_badge<'a>(action: &str, theme: &Theme) -> Span<'a> {
+    let (label, color) = match action {
+        "delete" => ("DELETE", theme.palette.danger_color()),
+        "keep" => ("KEEP", theme.palette.success_color()),
+        "review" => ("REVIEW", theme.palette.warning_color()),
+        "skip" => ("SKIP", theme.palette.muted_color()),
+        _ => (action, theme.palette.muted_color()),
+    };
+    styled_badge(label, color)
+}
+
+/// Split a path into (directory_part, file_part) for color-split rendering.
+#[allow(clippy::option_if_let_else)]
+fn split_path_dir_file(path: &str) -> (String, String) {
+    if let Some(idx) = path.rfind('/') {
+        (path[..=idx].to_string(), path[idx + 1..].to_string())
+    } else {
+        (String::new(), path.to_string())
+    }
+}
+
 fn frame_render_explainability(
     model: &DashboardModel,
     theme: &Theme,
@@ -1095,48 +1564,55 @@ fn frame_render_explainability(
     frame: &mut Frame,
 ) {
     let layout = build_explainability_layout(area.width, area.height);
+    let accent = theme.palette.tab_active_bg(Screen::Explainability.number());
     for placement in layout.placements.iter().filter(|p| p.visible) {
         let pane_area = rect_in_body(area, placement.rect);
         if pane_area.width == 0 || pane_area.height == 0 {
             continue;
         }
         match placement.pane {
-            ExplainabilityPane::DecisionHeader => frame_render_text_pane(
+            ExplainabilityPane::DecisionHeader => frame_render_styled_pane(
                 theme,
                 pane_area,
-                "S3 Decision Header",
-                frame_explainability_header_text(model),
-                false,
+                "Overview",
+                frame_explainability_header_styled(model, theme),
+                None,
                 frame,
             ),
-            ExplainabilityPane::FactorBreakdown => frame_render_text_pane(
+            ExplainabilityPane::FactorBreakdown => frame_render_styled_pane(
                 theme,
                 pane_area,
-                "S3 Decisions",
-                frame_explainability_list_text(model, theme, pane_body_rows(pane_area)),
-                true,
+                "Decisions",
+                frame_explainability_list_styled(model, theme, pane_body_rows(pane_area)),
+                Some(accent),
                 frame,
             ),
-            ExplainabilityPane::VetoDetail => frame_render_text_pane(
+            ExplainabilityPane::VetoDetail => frame_render_styled_pane(
                 theme,
                 pane_area,
-                "S3 Detail / Veto",
-                frame_explainability_detail_text(model, theme, pane_area.width),
-                true,
+                "Evidence",
+                frame_explainability_detail_styled(model, theme, pane_area.width),
+                Some(accent),
                 frame,
             ),
-            ExplainabilityPane::StatusFooter => frame_render_status_strip(
+            ExplainabilityPane::StatusFooter => frame_render_styled_status_strip(
                 theme,
                 pane_area,
-                String::from(
-                    "j/k or wheel scroll  click row opens detail  Enter/Space toggle detail  d close  Esc overlay->detail->back->quit",
-                ),
+                &[
+                    ("j/k", "scroll"),
+                    ("\u{23CE}", "detail"),
+                    ("d", "close"),
+                    ("r", "refresh"),
+                    ("Esc", "back"),
+                ],
+                accent,
                 frame,
             ),
         }
     }
 }
 
+#[allow(dead_code)]
 fn frame_explainability_header_text(model: &DashboardModel) -> String {
     use std::fmt::Write as _;
     let mut out = format!(
@@ -1162,6 +1638,7 @@ fn frame_explainability_header_text(model: &DashboardModel) -> String {
     out
 }
 
+#[allow(dead_code)]
 fn frame_explainability_list_text(model: &DashboardModel, theme: &Theme, rows: usize) -> String {
     use std::fmt::Write as _;
     if model.explainability_decisions.is_empty() {
@@ -1192,6 +1669,7 @@ fn frame_explainability_list_text(model: &DashboardModel, theme: &Theme, rows: u
     out
 }
 
+#[allow(dead_code)]
 fn frame_explainability_detail_text(
     model: &DashboardModel,
     theme: &Theme,
@@ -1221,50 +1699,412 @@ fn frame_explainability_detail_text(
     out
 }
 
+fn frame_explainability_header_styled(model: &DashboardModel, theme: &Theme) -> Text {
+    let mut lines = Vec::new();
+    let mut row1 = vec![
+        Span::styled(
+            "source ",
+            Style::default().fg(theme.palette.text_secondary()),
+        ),
+        styled_badge(
+            data_source_label(model.explainability_source),
+            theme.palette.accent_color(),
+        ),
+        Span::raw("  "),
+    ];
+    if model.explainability_partial {
+        row1.push(styled_badge("PARTIAL", theme.palette.warning_color()));
+        row1.push(Span::raw("  "));
+    }
+    row1.push(Span::styled(
+        format!("decisions={} ", model.explainability_decisions.len()),
+        Style::default().fg(theme.palette.text_secondary()),
+    ));
+    lines.push(Line::from_spans(row1));
+
+    if let Some(state) = &model.daemon_state {
+        let level_color = theme.palette.pressure_color(&state.pressure.overall);
+        let policy_color = policy_mode_color(&state.policy_mode, &theme.palette);
+        lines.push(Line::from_spans([
+            Span::styled(
+                "pressure ",
+                Style::default().fg(theme.palette.text_secondary()),
+            ),
+            styled_badge(&state.pressure.overall.to_ascii_uppercase(), level_color),
+            Span::raw("  "),
+            Span::styled(
+                "policy ",
+                Style::default().fg(theme.palette.text_secondary()),
+            ),
+            styled_badge(&state.policy_mode.to_ascii_uppercase(), policy_color),
+            Span::styled(
+                format!(
+                    "  scans={} deletions={}",
+                    state.counters.scans, state.counters.deletions
+                ),
+                Style::default().fg(theme.palette.text_secondary()),
+            ),
+        ]));
+    }
+    Text::from_lines(lines)
+}
+
+fn frame_explainability_list_styled(model: &DashboardModel, theme: &Theme, rows: usize) -> Text {
+    let accent = theme.palette.tab_active_bg(Screen::Explainability.number());
+    if model.explainability_decisions.is_empty() {
+        return Text::from_lines(vec![Line::from(Span::styled(
+            "No decision evidence loaded.",
+            Style::default().fg(theme.palette.muted_color()),
+        ))]);
+    }
+    let mut lines = Vec::new();
+    let total = model.explainability_decisions.len();
+    let (start, end) = centered_window(model.explainability_selected, total, rows);
+    for idx in start..end {
+        let decision = &model.explainability_decisions[idx];
+        let selected = idx == model.explainability_selected;
+        let bg = if selected {
+            theme.palette.highlight_bg()
+        } else {
+            theme.palette.panel_bg()
+        };
+        let cursor_span = if selected {
+            Span::styled("\u{25B8} ", Style::default().fg(accent).bg(bg).bold())
+        } else {
+            Span::styled("  ", Style::default().bg(bg))
+        };
+        let score_color = theme.palette.gauge_gradient(decision.total_score);
+        let post_color = theme.palette.gauge_gradient(decision.posterior_abandoned);
+        let mut row = vec![
+            cursor_span,
+            Span::styled(
+                format!("#{:<4} ", decision.decision_id),
+                Style::default().fg(theme.palette.muted_color()).bg(bg),
+            ),
+            Span::styled(
+                format!("{} ", extract_time(&decision.timestamp)),
+                Style::default().fg(theme.palette.muted_color()).bg(bg),
+            ),
+            action_styled_badge(&decision.action, theme),
+            Span::styled(
+                format!(" {:.2}", decision.total_score),
+                Style::default().fg(score_color).bg(bg),
+            ),
+            Span::styled(
+                format!(" P={:.2}", decision.posterior_abandoned),
+                Style::default().fg(post_color).bg(bg),
+            ),
+        ];
+        if decision.vetoed {
+            row.push(Span::raw(" "));
+            row.push(styled_badge("VETO", theme.palette.danger_color()));
+        }
+        lines.push(Line::from_spans(row));
+    }
+    Text::from_lines(lines)
+}
+
+#[allow(clippy::too_many_lines, clippy::option_if_let_else)]
+fn frame_explainability_detail_styled(
+    model: &DashboardModel,
+    theme: &Theme,
+    pane_width: u16,
+) -> Text {
+    let muted = theme.palette.muted_color();
+    let secondary = theme.palette.text_secondary();
+    if let Some(decision) = model.explainability_selected_decision() {
+        if model.explainability_detail {
+            styled_decision_detail(decision, theme, usize::from(pane_width).max(40))
+        } else {
+            let (dir, file) = split_path_dir_file(&decision.path);
+            let score_color = theme.palette.gauge_gradient(decision.total_score);
+            let mut lines = vec![
+                Line::from_spans([
+                    Span::styled("  path       ", Style::default().fg(muted)),
+                    Span::styled(dir, Style::default().fg(muted)),
+                    Span::styled(file, Style::default().fg(theme.palette.accent_color())),
+                ]),
+                Line::from_spans([
+                    Span::styled("  action     ", Style::default().fg(muted)),
+                    action_styled_badge(&decision.action, theme),
+                ]),
+                Line::from_spans([
+                    Span::styled("  score      ", Style::default().fg(muted)),
+                    Span::styled(
+                        format!("{:.3}", decision.total_score),
+                        Style::default().fg(score_color),
+                    ),
+                ]),
+                Line::from_spans([
+                    Span::styled("  posterior  ", Style::default().fg(muted)),
+                    Span::styled(
+                        format!("{:.3}", decision.posterior_abandoned),
+                        Style::default()
+                            .fg(theme.palette.gauge_gradient(decision.posterior_abandoned)),
+                    ),
+                ]),
+                Line::from_spans([
+                    Span::styled("  calibrate  ", Style::default().fg(muted)),
+                    Span::styled(
+                        format!("{:.3}", decision.calibration_score),
+                        Style::default().fg(secondary),
+                    ),
+                ]),
+            ];
+            if decision.vetoed
+                && let Some(reason) = &decision.veto_reason
+            {
+                lines.push(Line::from_spans([
+                    Span::styled("  veto       ", Style::default().fg(muted)),
+                    styled_badge("VETO", theme.palette.danger_color()),
+                    Span::styled(
+                        format!(" {reason}"),
+                        Style::default().fg(theme.palette.danger_color()),
+                    ),
+                ]));
+            }
+            lines.push(Line::from(Span::styled(
+                "  Enter/Space for full detail",
+                Style::default().fg(muted),
+            )));
+            Text::from_lines(lines)
+        }
+    } else {
+        Text::from_lines(vec![Line::from(Span::styled(
+            "No selected decision.",
+            Style::default().fg(muted),
+        ))])
+    }
+}
+
+fn styled_decision_detail(decision: &DecisionEvidence, theme: &Theme, width: usize) -> Text {
+    let muted = theme.palette.muted_color();
+    let primary = theme.palette.text_primary();
+    let secondary = theme.palette.text_secondary();
+    let (dir, file) = split_path_dir_file(&decision.path);
+    let mut lines = vec![
+        Line::from_spans([
+            Span::styled("  decision-id ", Style::default().fg(muted)),
+            Span::styled(
+                format!("#{}", decision.decision_id),
+                Style::default().fg(primary),
+            ),
+        ]),
+        Line::from_spans([
+            Span::styled("  timestamp   ", Style::default().fg(muted)),
+            Span::styled(&*decision.timestamp, Style::default().fg(primary)),
+        ]),
+        Line::from_spans([
+            Span::styled("  path        ", Style::default().fg(muted)),
+            Span::styled(dir, Style::default().fg(muted)),
+            Span::styled(file, Style::default().fg(theme.palette.accent_color())),
+        ]),
+        Line::from_spans([
+            Span::styled("  size        ", Style::default().fg(muted)),
+            Span::styled(
+                format!(
+                    "{} ({} bytes)",
+                    human_bytes(decision.size_bytes),
+                    decision.size_bytes
+                ),
+                Style::default().fg(primary),
+            ),
+        ]),
+        Line::from_spans([
+            Span::styled("  age         ", Style::default().fg(muted)),
+            Span::styled(
+                human_duration(decision.age_secs),
+                Style::default().fg(secondary),
+            ),
+        ]),
+        Line::from_spans([
+            Span::styled("  action      ", Style::default().fg(muted)),
+            action_styled_badge(&decision.action, theme),
+        ]),
+    ];
+    if let Some(ref effective) = decision.effective_action {
+        lines.push(Line::from_spans([
+            Span::styled("  effective   ", Style::default().fg(muted)),
+            action_styled_badge(effective, theme),
+        ]));
+    }
+    lines.push(Line::from_spans([
+        Span::styled("  policy      ", Style::default().fg(muted)),
+        Span::styled(&*decision.policy_mode, Style::default().fg(secondary)),
+    ]));
+    if decision.vetoed {
+        lines.push(Line::from_spans([
+            Span::styled("  veto        ", Style::default().fg(muted)),
+            styled_badge("VETOED", theme.palette.danger_color()),
+        ]));
+        if let Some(ref reason) = decision.veto_reason {
+            lines.push(Line::from_spans([
+                Span::styled("  veto-reason ", Style::default().fg(muted)),
+                Span::styled(&**reason, Style::default().fg(theme.palette.danger_color())),
+            ]));
+        }
+    }
+    if let Some(ref guard) = decision.guard_status {
+        lines.push(Line::from_spans([
+            Span::styled("  guard       ", Style::default().fg(muted)),
+            Span::styled(&**guard, Style::default().fg(secondary)),
+        ]));
+    }
+
+    // Factor breakdown with mini bar charts.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Factor Breakdown",
+        Style::default().fg(primary).bold(),
+    )));
+    let factors = [
+        ("location ", decision.factors.location),
+        ("name     ", decision.factors.name),
+        ("age      ", decision.factors.age),
+        ("size     ", decision.factors.size),
+        ("structure", decision.factors.structure),
+    ];
+    for (label, value) in &factors {
+        let color = theme.palette.gauge_gradient(*value);
+        let bar_w = (width / 3).clamp(10, 30);
+        let mut row = vec![
+            Span::styled(format!("  {label} "), Style::default().fg(muted)),
+            mini_bar_chart(*value, color),
+            Span::raw(" "),
+        ];
+        row.extend(segmented_gauge(*value * 100.0, bar_w, &theme.palette));
+        row.push(Span::styled(
+            format!(" {value:.2}"),
+            Style::default().fg(color),
+        ));
+        lines.push(Line::from_spans(row));
+    }
+    lines.push(Line::from_spans([
+        Span::styled("  pressure-x  ", Style::default().fg(muted)),
+        Span::styled(
+            format!("{:.2}x", decision.factors.pressure_multiplier),
+            Style::default().fg(secondary),
+        ),
+    ]));
+    let total_color = theme.palette.gauge_gradient(decision.total_score);
+    lines.push(Line::from_spans([
+        Span::styled("  total-score ", Style::default().fg(muted)),
+        Span::styled(
+            format!("{:.4}", decision.total_score),
+            Style::default().fg(total_color).bold(),
+        ),
+    ]));
+
+    // Bayesian stats.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Bayesian Decision",
+        Style::default().fg(primary).bold(),
+    )));
+    let post_color = theme.palette.gauge_gradient(decision.posterior_abandoned);
+    lines.push(Line::from_spans([
+        Span::styled("  P(abandoned)  ", Style::default().fg(muted)),
+        Span::styled(
+            format!("{:.4}", decision.posterior_abandoned),
+            Style::default().fg(post_color),
+        ),
+    ]));
+    lines.push(Line::from_spans([
+        Span::styled("  E[loss|keep]  ", Style::default().fg(muted)),
+        Span::styled(
+            format!("{:.2}", decision.expected_loss_keep),
+            Style::default().fg(secondary),
+        ),
+    ]));
+    lines.push(Line::from_spans([
+        Span::styled("  E[loss|del]   ", Style::default().fg(muted)),
+        Span::styled(
+            format!("{:.2}", decision.expected_loss_delete),
+            Style::default().fg(secondary),
+        ),
+    ]));
+    lines.push(Line::from_spans([
+        Span::styled("  calibration   ", Style::default().fg(muted)),
+        Span::styled(
+            format!("{:.4}", decision.calibration_score),
+            Style::default().fg(secondary),
+        ),
+    ]));
+
+    // Confidence.
+    let (conf_label, conf_color) = if decision.calibration_score >= 0.85 {
+        ("HIGH", theme.palette.success_color())
+    } else if decision.calibration_score >= 0.60 {
+        ("MODERATE", theme.palette.warning_color())
+    } else {
+        ("LOW", theme.palette.danger_color())
+    };
+    lines.push(Line::from_spans([
+        Span::styled("  confidence    ", Style::default().fg(muted)),
+        styled_badge(conf_label, conf_color),
+    ]));
+
+    if !decision.summary.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from_spans([
+            Span::styled("  summary ", Style::default().fg(muted)),
+            Span::styled(&*decision.summary, Style::default().fg(primary)),
+        ]));
+    }
+    Text::from_lines(lines)
+}
+
 fn frame_render_candidates(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
     let layout = build_candidates_layout(area.width, area.height);
+    let accent = theme.palette.tab_active_bg(Screen::Candidates.number());
     for placement in layout.placements.iter().filter(|p| p.visible) {
         let pane_area = rect_in_body(area, placement.rect);
         if pane_area.width == 0 || pane_area.height == 0 {
             continue;
         }
         match placement.pane {
-            CandidatesPane::SummaryBar => frame_render_text_pane(
+            CandidatesPane::SummaryBar => frame_render_styled_pane(
                 theme,
                 pane_area,
-                "S4 Summary",
-                frame_candidates_summary_text(model),
-                false,
+                "Summary",
+                frame_candidates_summary_styled(model, theme),
+                None,
                 frame,
             ),
-            CandidatesPane::CandidateList => frame_render_text_pane(
+            CandidatesPane::CandidateList => frame_render_styled_pane(
                 theme,
                 pane_area,
-                "S4 Candidate Ranking",
-                frame_candidates_list_text(model, theme, pane_body_rows(pane_area)),
-                true,
+                "Candidates",
+                frame_candidates_list_styled(model, theme, pane_body_rows(pane_area)),
+                Some(accent),
                 frame,
             ),
-            CandidatesPane::ScoreDetail => frame_render_text_pane(
+            CandidatesPane::ScoreDetail => frame_render_styled_pane(
                 theme,
                 pane_area,
-                "S4 Score Detail",
-                frame_candidates_detail_text(model, theme, pane_area.width),
-                true,
+                "Score Breakdown",
+                frame_candidates_detail_styled(model, theme, pane_area.width),
+                Some(accent),
                 frame,
             ),
-            CandidatesPane::StatusFooter => frame_render_status_strip(
+            CandidatesPane::StatusFooter => frame_render_styled_status_strip(
                 theme,
                 pane_area,
-                String::from(
-                    "j/k or wheel scroll  click row opens detail  Enter/Space toggle detail  s sort  d close  Esc overlay->detail->back->quit",
-                ),
+                &[
+                    ("j/k", "scroll"),
+                    ("\u{23CE}", "detail"),
+                    ("s", "sort"),
+                    ("d", "close"),
+                    ("Esc", "back"),
+                ],
+                accent,
                 frame,
             ),
         }
     }
 }
 
+#[allow(dead_code)]
 fn frame_candidates_summary_text(model: &DashboardModel) -> String {
     use std::fmt::Write as _;
     let mut out = format!(
@@ -1287,6 +2127,7 @@ fn frame_candidates_summary_text(model: &DashboardModel) -> String {
     out
 }
 
+#[allow(dead_code)]
 fn frame_candidates_list_text(model: &DashboardModel, theme: &Theme, rows: usize) -> String {
     use std::fmt::Write as _;
     if model.candidates_list.is_empty() {
@@ -1317,6 +2158,7 @@ fn frame_candidates_list_text(model: &DashboardModel, theme: &Theme, rows: usize
     out
 }
 
+#[allow(dead_code)]
 fn frame_candidates_detail_text(model: &DashboardModel, theme: &Theme, pane_width: u16) -> String {
     let mut out = String::new();
     if let Some(candidate) = model.candidates_selected_item() {
@@ -1338,42 +2180,207 @@ fn frame_candidates_detail_text(model: &DashboardModel, theme: &Theme, pane_widt
     out
 }
 
+fn frame_candidates_summary_styled(model: &DashboardModel, theme: &Theme) -> Text {
+    let reclaimable: u64 = model
+        .candidates_list
+        .iter()
+        .filter(|c| !c.vetoed && c.action == "delete")
+        .map(|c| c.size_bytes)
+        .sum();
+    let mut row = vec![
+        Span::styled(
+            "source ",
+            Style::default().fg(theme.palette.text_secondary()),
+        ),
+        styled_badge(
+            data_source_label(model.candidates_source),
+            theme.palette.accent_color(),
+        ),
+        Span::raw("  "),
+    ];
+    if model.candidates_partial {
+        row.push(styled_badge("PARTIAL", theme.palette.warning_color()));
+        row.push(Span::raw("  "));
+    }
+    row.push(Span::styled(
+        format!("candidates={} ", model.candidates_list.len()),
+        Style::default().fg(theme.palette.text_secondary()),
+    ));
+    row.push(Span::styled(
+        "sort ",
+        Style::default().fg(theme.palette.text_secondary()),
+    ));
+    row.push(styled_badge(
+        model.candidates_sort.label(),
+        theme.palette.accent_color(),
+    ));
+    row.push(Span::raw("  "));
+    row.push(Span::styled(
+        "reclaimable ",
+        Style::default().fg(theme.palette.text_secondary()),
+    ));
+    row.push(Span::styled(
+        human_bytes(reclaimable),
+        Style::default().fg(theme.palette.accent_color()).bold(),
+    ));
+    Text::from_lines(vec![Line::from_spans(row)])
+}
+
+fn frame_candidates_list_styled(model: &DashboardModel, theme: &Theme, rows: usize) -> Text {
+    let accent = theme.palette.tab_active_bg(Screen::Candidates.number());
+    if model.candidates_list.is_empty() {
+        return Text::from_lines(vec![Line::from(Span::styled(
+            "No candidates loaded.",
+            Style::default().fg(theme.palette.muted_color()),
+        ))]);
+    }
+    let mut lines = Vec::new();
+    let total = model.candidates_list.len();
+    let (start, end) = centered_window(model.candidates_selected, total, rows);
+    for idx in start..end {
+        let candidate = &model.candidates_list[idx];
+        let selected = idx == model.candidates_selected;
+        let bg = if selected {
+            theme.palette.highlight_bg()
+        } else {
+            theme.palette.panel_bg()
+        };
+        let cursor_span = if selected {
+            Span::styled("\u{25B8} ", Style::default().fg(accent).bg(bg).bold())
+        } else {
+            Span::styled("  ", Style::default().bg(bg))
+        };
+        let score_color = theme.palette.gauge_gradient(candidate.total_score);
+        let mut row = vec![
+            cursor_span,
+            Span::styled(
+                format!("#{:<4} ", candidate.decision_id),
+                Style::default().fg(theme.palette.muted_color()).bg(bg),
+            ),
+            action_styled_badge(&candidate.action, theme),
+            Span::styled(
+                format!(" {:.2}", candidate.total_score),
+                Style::default().fg(score_color).bg(bg),
+            ),
+            Span::styled(
+                format!(" {:>8}", human_bytes(candidate.size_bytes)),
+                Style::default().fg(theme.palette.text_primary()).bg(bg),
+            ),
+            Span::styled(
+                format!(" {:>6}", human_duration(candidate.age_secs)),
+                Style::default().fg(theme.palette.muted_color()).bg(bg),
+            ),
+        ];
+        if candidate.vetoed {
+            row.push(Span::raw(" "));
+            row.push(styled_badge("VETO", theme.palette.danger_color()));
+        }
+        lines.push(Line::from_spans(row));
+    }
+    Text::from_lines(lines)
+}
+
+#[allow(clippy::too_many_lines, clippy::option_if_let_else)]
+fn frame_candidates_detail_styled(model: &DashboardModel, theme: &Theme, pane_width: u16) -> Text {
+    let muted = theme.palette.muted_color();
+    let primary = theme.palette.text_primary();
+    let secondary = theme.palette.text_secondary();
+    if let Some(candidate) = model.candidates_selected_item() {
+        if model.candidates_detail {
+            // Full detail reuses the decision detail renderer.
+            styled_decision_detail(candidate, theme, usize::from(pane_width).max(40))
+        } else {
+            let (dir, file) = split_path_dir_file(&candidate.path);
+            let score_color = theme.palette.gauge_gradient(candidate.total_score);
+            let lines = vec![
+                Line::from_spans([
+                    Span::styled("  path    ", Style::default().fg(muted)),
+                    Span::styled(dir, Style::default().fg(muted)),
+                    Span::styled(file, Style::default().fg(theme.palette.accent_color())),
+                ]),
+                Line::from_spans([
+                    Span::styled("  action  ", Style::default().fg(muted)),
+                    action_styled_badge(&candidate.action, theme),
+                ]),
+                Line::from_spans([
+                    Span::styled("  score   ", Style::default().fg(muted)),
+                    Span::styled(
+                        format!("{:.3}", candidate.total_score),
+                        Style::default().fg(score_color),
+                    ),
+                ]),
+                Line::from_spans([
+                    Span::styled("  size    ", Style::default().fg(muted)),
+                    Span::styled(
+                        human_bytes(candidate.size_bytes),
+                        Style::default().fg(primary),
+                    ),
+                ]),
+                Line::from_spans([
+                    Span::styled("  age     ", Style::default().fg(muted)),
+                    Span::styled(
+                        human_duration(candidate.age_secs),
+                        Style::default().fg(secondary),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    "  Enter/Space for full detail",
+                    Style::default().fg(muted),
+                )),
+            ];
+            Text::from_lines(lines)
+        }
+    } else {
+        Text::from_lines(vec![Line::from(Span::styled(
+            "No selected candidate.",
+            Style::default().fg(muted),
+        ))])
+    }
+}
+
 fn frame_render_ballast(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
     let layout = build_ballast_layout(area.width, area.height);
+    let accent = theme.palette.tab_active_bg(Screen::Ballast.number());
     for placement in layout.placements.iter().filter(|p| p.visible) {
         let pane_area = rect_in_body(area, placement.rect);
         if pane_area.width == 0 || pane_area.height == 0 {
             continue;
         }
         match placement.pane {
-            BallastPane::VolumeList => frame_render_text_pane(
+            BallastPane::VolumeList => frame_render_styled_pane(
                 theme,
                 pane_area,
-                "S5 Volume Inventory",
-                frame_ballast_list_text(model, theme, pane_body_rows(pane_area)),
-                true,
+                "Volumes",
+                frame_ballast_list_styled(model, theme, pane_body_rows(pane_area)),
+                Some(accent),
                 frame,
             ),
-            BallastPane::VolumeDetail => frame_render_text_pane(
+            BallastPane::VolumeDetail => frame_render_styled_pane(
                 theme,
                 pane_area,
-                "S5 Volume Detail",
-                frame_ballast_detail_text(model, theme),
-                true,
+                "Volume Detail",
+                frame_ballast_detail_styled(model, theme),
+                Some(accent),
                 frame,
             ),
-            BallastPane::StatusFooter => frame_render_status_strip(
+            BallastPane::StatusFooter => frame_render_styled_status_strip(
                 theme,
                 pane_area,
-                String::from(
-                    "j/k or wheel scroll  click row opens detail  Enter/Space toggle detail  d close  Esc overlay->detail->back->quit",
-                ),
+                &[
+                    ("j/k", "scroll"),
+                    ("\u{23CE}", "detail"),
+                    ("d", "close"),
+                    ("r", "refresh"),
+                    ("Esc", "back"),
+                ],
+                accent,
                 frame,
             ),
         }
     }
 }
 
+#[allow(dead_code)]
 fn frame_ballast_list_text(model: &DashboardModel, theme: &Theme, rows: usize) -> String {
     use std::fmt::Write as _;
     if model.ballast_volumes.is_empty() {
@@ -1409,6 +2416,7 @@ fn frame_ballast_list_text(model: &DashboardModel, theme: &Theme, rows: usize) -
     out
 }
 
+#[allow(dead_code)]
 fn frame_ballast_detail_text(model: &DashboardModel, theme: &Theme) -> String {
     let mut out = String::new();
     if let Some(vol) = model.ballast_selected_volume() {
@@ -1430,50 +2438,241 @@ fn frame_ballast_detail_text(model: &DashboardModel, theme: &Theme) -> String {
     out
 }
 
+fn frame_ballast_list_styled(model: &DashboardModel, theme: &Theme, rows: usize) -> Text {
+    let accent = theme.palette.tab_active_bg(Screen::Ballast.number());
+    if model.ballast_volumes.is_empty() {
+        return Text::from_lines(vec![Line::from(Span::styled(
+            "No ballast inventory loaded.",
+            Style::default().fg(theme.palette.muted_color()),
+        ))]);
+    }
+    let mut lines = Vec::new();
+    let total = model.ballast_volumes.len();
+    let (start, end) = centered_window(model.ballast_selected, total, rows);
+    for idx in start..end {
+        let vol = &model.ballast_volumes[idx];
+        let selected = idx == model.ballast_selected;
+        let bg = if selected {
+            theme.palette.highlight_bg()
+        } else {
+            theme.palette.panel_bg()
+        };
+        let cursor_span = if selected {
+            Span::styled("\u{25B8} ", Style::default().fg(accent).bg(bg).bold())
+        } else {
+            Span::styled("  ", Style::default().bg(bg))
+        };
+        let status = vol.status_level();
+        let status_color = match status {
+            "OK" => theme.palette.success_color(),
+            "LOW" => theme.palette.warning_color(),
+            "CRITICAL" => theme.palette.critical_color(),
+            _ => theme.palette.muted_color(),
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let file_color = if vol.files_total == 0 {
+            theme.palette.muted_color()
+        } else if vol.files_available == 0 {
+            theme.palette.danger_color()
+        } else if (vol.files_available as f64 / vol.files_total as f64) < 0.5 {
+            theme.palette.warning_color()
+        } else {
+            theme.palette.success_color()
+        };
+        let row = vec![
+            cursor_span,
+            styled_badge(status, status_color),
+            Span::styled(
+                format!(" {:<18}", truncate_path(&vol.mount_point, 18)),
+                Style::default().fg(theme.palette.text_secondary()).bg(bg),
+            ),
+            Span::styled(
+                format!(" {}/{}", vol.files_available, vol.files_total),
+                Style::default().fg(file_color).bg(bg),
+            ),
+            Span::styled(
+                format!(" {}", human_bytes(vol.releasable_bytes)),
+                Style::default().fg(accent).bg(bg),
+            ),
+        ];
+        lines.push(Line::from_spans(row));
+    }
+    Text::from_lines(lines)
+}
+
+#[allow(clippy::option_if_let_else)]
+fn frame_ballast_detail_styled(model: &DashboardModel, theme: &Theme) -> Text {
+    let muted = theme.palette.muted_color();
+    let primary = theme.palette.text_primary();
+    let secondary = theme.palette.text_secondary();
+    if let Some(vol) = model.ballast_selected_volume() {
+        if model.ballast_detail {
+            styled_volume_detail(vol, theme)
+        } else {
+            let status = vol.status_level();
+            let status_color = match status {
+                "OK" => theme.palette.success_color(),
+                "LOW" => theme.palette.warning_color(),
+                "CRITICAL" => theme.palette.critical_color(),
+                _ => muted,
+            };
+            let lines = vec![
+                Line::from_spans([
+                    Span::styled("  mount       ", Style::default().fg(muted)),
+                    Span::styled(&*vol.mount_point, Style::default().fg(primary)),
+                ]),
+                Line::from_spans([
+                    Span::styled("  status      ", Style::default().fg(muted)),
+                    styled_badge(status, status_color),
+                ]),
+                Line::from_spans([
+                    Span::styled("  files       ", Style::default().fg(muted)),
+                    Span::styled(
+                        format!("{}/{}", vol.files_available, vol.files_total),
+                        Style::default().fg(secondary),
+                    ),
+                ]),
+                Line::from_spans([
+                    Span::styled("  releasable  ", Style::default().fg(muted)),
+                    Span::styled(
+                        human_bytes(vol.releasable_bytes),
+                        Style::default().fg(theme.palette.accent_color()),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    "  Enter/Space for full detail",
+                    Style::default().fg(muted),
+                )),
+            ];
+            Text::from_lines(lines)
+        }
+    } else {
+        Text::from_lines(vec![Line::from(Span::styled(
+            "No selected volume.",
+            Style::default().fg(muted),
+        ))])
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn styled_volume_detail(vol: &BallastVolume, theme: &Theme) -> Text {
+    let muted = theme.palette.muted_color();
+    let primary = theme.palette.text_primary();
+    let secondary = theme.palette.text_secondary();
+    let status = vol.status_level();
+    let status_color = match status {
+        "OK" => theme.palette.success_color(),
+        "LOW" => theme.palette.warning_color(),
+        "CRITICAL" => theme.palette.critical_color(),
+        _ => muted,
+    };
+
+    let mut lines = vec![
+        Line::from_spans([
+            Span::styled("  mount       ", Style::default().fg(muted)),
+            Span::styled(&*vol.mount_point, Style::default().fg(primary)),
+        ]),
+        Line::from_spans([
+            Span::styled("  ballast     ", Style::default().fg(muted)),
+            Span::styled(&*vol.ballast_dir, Style::default().fg(primary)),
+        ]),
+        Line::from_spans([
+            Span::styled("  fs-type     ", Style::default().fg(muted)),
+            Span::styled(&*vol.fs_type, Style::default().fg(secondary)),
+        ]),
+        Line::from_spans([
+            Span::styled("  strategy    ", Style::default().fg(muted)),
+            Span::styled(&*vol.strategy, Style::default().fg(secondary)),
+        ]),
+        Line::from_spans([
+            Span::styled("  files       ", Style::default().fg(muted)),
+            Span::styled(
+                format!("{}/{}", vol.files_available, vol.files_total),
+                Style::default().fg(secondary),
+            ),
+        ]),
+        Line::from_spans([
+            Span::styled("  releasable  ", Style::default().fg(muted)),
+            Span::styled(
+                format!(
+                    "{} ({} bytes)",
+                    human_bytes(vol.releasable_bytes),
+                    vol.releasable_bytes
+                ),
+                Style::default().fg(theme.palette.accent_color()),
+            ),
+        ]),
+        Line::from_spans([
+            Span::styled("  status      ", Style::default().fg(muted)),
+            styled_badge(status, status_color),
+        ]),
+    ];
+    if vol.skipped
+        && let Some(ref reason) = vol.skip_reason
+    {
+        lines.push(Line::from_spans([
+            Span::styled("  skip-reason ", Style::default().fg(muted)),
+            Span::styled(
+                &**reason,
+                Style::default().fg(theme.palette.warning_color()),
+            ),
+        ]));
+    }
+    // File fill gauge.
+    if vol.files_total > 0 {
+        let fill_pct = (vol.files_available as f64 / vol.files_total as f64) * 100.0;
+        let mut row = vec![Span::styled("  fill        ", Style::default().fg(muted))];
+        row.extend(segmented_gauge(fill_pct, 20, &theme.palette));
+        lines.push(Line::from_spans(row));
+    }
+    Text::from_lines(lines)
+}
+
 fn frame_render_log_search(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
     let layout = build_log_search_layout(area.width, area.height);
+    let accent = theme.palette.tab_active_bg(Screen::LogSearch.number());
     for placement in layout.placements.iter().filter(|p| p.visible) {
         let pane_area = rect_in_body(area, placement.rect);
         if pane_area.width == 0 || pane_area.height == 0 {
             continue;
         }
         match placement.pane {
-            LogSearchPane::SearchBar => frame_render_text_pane(
+            LogSearchPane::SearchBar => frame_render_styled_pane(
                 theme,
                 pane_area,
-                "S6 Log Search",
-                frame_log_search_header_text(model),
-                false,
+                "Search",
+                frame_log_search_header_styled(model, theme),
+                None,
                 frame,
             ),
-            LogSearchPane::LogList => frame_render_text_pane(
+            LogSearchPane::LogList => frame_render_styled_pane(
                 theme,
                 pane_area,
-                "S6 Entries",
-                frame_log_search_list_text(model, theme, pane_body_rows(pane_area)),
-                true,
+                "Log Entries",
+                frame_log_search_list_styled(model, theme, pane_body_rows(pane_area)),
+                Some(accent),
                 frame,
             ),
-            LogSearchPane::EntryDetail => frame_render_text_pane(
+            LogSearchPane::EntryDetail => frame_render_styled_pane(
                 theme,
                 pane_area,
-                "S6 Entry Detail",
-                frame_log_search_detail_text(model, theme),
-                true,
+                "Entry Detail",
+                frame_log_search_detail_styled(model, theme),
+                Some(accent),
                 frame,
             ),
-            LogSearchPane::StatusFooter => frame_render_status_strip(
+            LogSearchPane::StatusFooter => frame_render_styled_status_strip(
                 theme,
                 pane_area,
-                String::from(
-                    "mouse wheel scrolls entries  click row focuses entry  Esc overlay->back->quit",
-                ),
+                &[("j/k", "scroll"), ("r", "refresh"), ("Esc", "back")],
+                accent,
                 frame,
             ),
         }
     }
 }
 
+#[allow(dead_code)]
 fn frame_log_search_header_text(model: &DashboardModel) -> String {
     format!(
         "query=<not-yet-editable>  source={}  timeline-events={}  mode=preview",
@@ -1486,6 +2685,7 @@ fn frame_log_entries(model: &DashboardModel) -> Vec<&TimelineEvent> {
     model.timeline_events.iter().collect()
 }
 
+#[allow(dead_code)]
 fn frame_log_search_list_text(model: &DashboardModel, theme: &Theme, rows: usize) -> String {
     use std::fmt::Write as _;
     let entries = frame_log_entries(model);
@@ -1510,6 +2710,7 @@ fn frame_log_search_list_text(model: &DashboardModel, theme: &Theme, rows: usize
     out
 }
 
+#[allow(dead_code)]
 fn frame_log_search_detail_text(model: &DashboardModel, theme: &Theme) -> String {
     let entries = frame_log_entries(model);
     let mut out = String::new();
@@ -1522,55 +2723,139 @@ fn frame_log_search_detail_text(model: &DashboardModel, theme: &Theme) -> String
     out
 }
 
+fn frame_log_search_header_styled(model: &DashboardModel, theme: &Theme) -> Text {
+    let row = vec![
+        Span::styled(
+            "query ",
+            Style::default().fg(theme.palette.text_secondary()),
+        ),
+        Span::styled(
+            "<not-yet-editable>",
+            Style::default().fg(theme.palette.muted_color()),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            "source ",
+            Style::default().fg(theme.palette.text_secondary()),
+        ),
+        styled_badge(
+            data_source_label(model.timeline_source),
+            theme.palette.accent_color(),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("events={}", model.timeline_events.len()),
+            Style::default().fg(theme.palette.text_secondary()),
+        ),
+    ];
+    Text::from_lines(vec![Line::from_spans(row)])
+}
+
+fn frame_log_search_list_styled(model: &DashboardModel, theme: &Theme, rows: usize) -> Text {
+    let accent = theme.palette.tab_active_bg(Screen::LogSearch.number());
+    let entries = frame_log_entries(model);
+    if entries.is_empty() {
+        return Text::from_lines(vec![Line::from(Span::styled(
+            "No log entries loaded. Timeline telemetry powers this preview.",
+            Style::default().fg(theme.palette.muted_color()),
+        ))]);
+    }
+    let mut lines = Vec::new();
+    let selected = model.timeline_selected.min(entries.len().saturating_sub(1));
+    let (start, end) = centered_window(selected, entries.len(), rows);
+    for (idx, event) in entries.iter().enumerate().take(end).skip(start) {
+        let is_selected = idx == selected;
+        let bg = if is_selected {
+            theme.palette.highlight_bg()
+        } else {
+            theme.palette.panel_bg()
+        };
+        let cursor_span = if is_selected {
+            Span::styled("\u{25B8} ", Style::default().fg(accent).bg(bg).bold())
+        } else {
+            Span::styled("  ", Style::default().bg(bg))
+        };
+        let time = extract_time(&event.timestamp);
+        let sev_color = severity_styled_color(&event.severity, theme);
+        let path_str = event.path.as_deref().map_or("-", |p| truncate_path(p, 24));
+        let row = vec![
+            cursor_span,
+            Span::styled(
+                format!("{time} "),
+                Style::default().fg(theme.palette.muted_color()).bg(bg),
+            ),
+            styled_badge_with_bg(&event.severity.to_ascii_uppercase(), sev_color, bg),
+            Span::styled(
+                format!(" {:<18} ", event.event_type),
+                Style::default().fg(theme.palette.text_primary()).bg(bg),
+            ),
+            Span::styled(
+                path_str.to_string(),
+                Style::default().fg(theme.palette.muted_color()).bg(bg),
+            ),
+        ];
+        lines.push(Line::from_spans(row));
+    }
+    Text::from_lines(lines)
+}
+
+fn frame_log_search_detail_styled(model: &DashboardModel, theme: &Theme) -> Text {
+    let entries = frame_log_entries(model);
+    if entries.is_empty() {
+        return Text::from_lines(vec![Line::from(Span::styled(
+            "No selected entry.",
+            Style::default().fg(theme.palette.muted_color()),
+        ))]);
+    }
+    let selected = model.timeline_selected.min(entries.len().saturating_sub(1));
+    styled_event_detail(entries[selected], theme)
+}
+
 fn frame_render_diagnostics(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
     let layout = build_diagnostics_layout(area.width, area.height);
+    let accent = theme.palette.tab_active_bg(Screen::Diagnostics.number());
     for placement in layout.placements.iter().filter(|p| p.visible) {
         let pane_area = rect_in_body(area, placement.rect);
         if pane_area.width == 0 || pane_area.height == 0 {
             continue;
         }
         match placement.pane {
-            DiagnosticsPane::HealthHeader => frame_render_text_pane(
+            DiagnosticsPane::HealthHeader => frame_render_styled_pane(
                 theme,
                 pane_area,
-                "S7 Health",
-                frame_diagnostics_health_text(model),
-                false,
+                "System Health",
+                frame_diagnostics_health_styled(model, theme),
+                None,
                 frame,
             ),
-            DiagnosticsPane::ThreadTable => frame_render_text_pane(
+            DiagnosticsPane::ThreadTable => frame_render_styled_pane(
                 theme,
                 pane_area,
-                "S7 Runtime/Adapters",
-                frame_diagnostics_runtime_text(model),
-                true,
+                "Runtime",
+                frame_diagnostics_runtime_styled(model, theme),
+                Some(accent),
                 frame,
             ),
             DiagnosticsPane::PerfPanel => frame_render_styled_pane(
                 theme,
                 pane_area,
-                "S7 Performance",
+                "Performance",
                 frame_diagnostics_perf_styled(model, theme),
-                true,
+                Some(accent),
                 frame,
             ),
-            DiagnosticsPane::StatusFooter => frame_render_status_strip(
+            DiagnosticsPane::StatusFooter => frame_render_styled_status_strip(
                 theme,
                 pane_area,
-                format!(
-                    "Shift-V verbose={}  r refresh  Esc overlay->back->quit",
-                    if model.diagnostics_verbose {
-                        "on"
-                    } else {
-                        "off"
-                    }
-                ),
+                &[("V", "verbose"), ("r", "refresh"), ("Esc", "back")],
+                accent,
                 frame,
             ),
         }
     }
 }
 
+#[allow(dead_code)]
 fn frame_diagnostics_health_text(model: &DashboardModel) -> String {
     use std::fmt::Write as _;
     let mut out = format!(
@@ -1603,6 +2888,7 @@ fn frame_diagnostics_health_text(model: &DashboardModel) -> String {
     out
 }
 
+#[allow(dead_code)]
 fn frame_diagnostics_runtime_text(model: &DashboardModel) -> String {
     use std::fmt::Write as _;
     let mut out = format!(
@@ -1639,6 +2925,157 @@ fn frame_diagnostics_runtime_text(model: &DashboardModel) -> String {
         );
     }
     out
+}
+
+fn frame_diagnostics_health_styled(model: &DashboardModel, theme: &Theme) -> Text {
+    let muted = theme.palette.muted_color();
+    let secondary = theme.palette.text_secondary();
+    let (mode_label, mode_color) = if model.degraded {
+        ("DEGRADED", theme.palette.warning_color())
+    } else {
+        ("NORMAL", theme.palette.success_color())
+    };
+    let mut header_spans = vec![
+        Span::styled("mode ", Style::default().fg(secondary)),
+        styled_badge(mode_label, mode_color),
+    ];
+    if model.degraded {
+        header_spans.push(Span::raw(" "));
+        header_spans.push(progress_indicator(model.tick, mode_color));
+    }
+    header_spans.push(Span::styled(
+        format!(
+            "  tick={} refresh={}ms",
+            model.tick,
+            model.refresh.as_millis()
+        ),
+        Style::default().fg(secondary),
+    ));
+    let mut lines = vec![Line::from_spans(header_spans)];
+    let fetch_age = model.last_fetch.map_or_else(
+        || String::from("never"),
+        |t| format!("{}ms", t.elapsed().as_millis()),
+    );
+    lines.push(Line::from_spans([Span::styled(
+        format!(
+            "last-fetch={fetch_age}  notifications={}  missed={}",
+            model.notifications.len(),
+            model.missed_ticks
+        ),
+        Style::default().fg(secondary),
+    )]));
+    if let Some(state) = &model.daemon_state {
+        let level_color = theme.palette.pressure_color(&state.pressure.overall);
+        let policy_color = policy_mode_color(&state.policy_mode, &theme.palette);
+        lines.push(Line::from_spans([
+            Span::styled("pressure ", Style::default().fg(secondary)),
+            styled_badge(&state.pressure.overall.to_ascii_uppercase(), level_color),
+            Span::raw("  "),
+            Span::styled("policy ", Style::default().fg(secondary)),
+            styled_badge(&state.policy_mode.to_ascii_uppercase(), policy_color),
+            Span::styled(
+                format!(
+                    "  pid={} rss={}",
+                    state.pid,
+                    human_bytes(state.memory_rss_bytes)
+                ),
+                Style::default().fg(muted),
+            ),
+        ]));
+    }
+    Text::from_lines(lines)
+}
+
+fn frame_diagnostics_runtime_styled(model: &DashboardModel, theme: &Theme) -> Text {
+    let muted = theme.palette.muted_color();
+    let secondary = theme.palette.text_secondary();
+    let mut lines = Vec::new();
+
+    // Adapter health.
+    let adapter_total = model.adapter_reads + model.adapter_errors;
+    #[allow(clippy::cast_precision_loss)]
+    let error_rate = if adapter_total > 0 {
+        (model.adapter_errors as f64 / adapter_total as f64) * 100.0
+    } else {
+        0.0
+    };
+    let (adapter_label, adapter_color) = if model.adapter_errors == 0 {
+        ("OK", theme.palette.success_color())
+    } else if error_rate < 10.0 {
+        ("DEGRADED", theme.palette.warning_color())
+    } else {
+        ("FAILING", theme.palette.danger_color())
+    };
+    lines.push(Line::from_spans([
+        Span::styled("adapter ", Style::default().fg(secondary)),
+        styled_badge(adapter_label, adapter_color),
+        Span::styled(
+            format!(
+                " reads={} errors={}",
+                model.adapter_reads, model.adapter_errors
+            ),
+            Style::default().fg(secondary),
+        ),
+    ]));
+
+    // Daemon counters.
+    if let Some(state) = &model.daemon_state {
+        lines.push(Line::from_spans([Span::styled(
+            format!(
+                "scans={} deletions={} errors={} dropped={}",
+                state.counters.scans,
+                state.counters.deletions,
+                state.counters.errors,
+                state.counters.dropped_log_events,
+            ),
+            Style::default().fg(secondary),
+        )]));
+    }
+
+    // Data sources.
+    let sources = [
+        ("timeline", model.timeline_source, model.timeline_partial),
+        (
+            "explain ",
+            model.explainability_source,
+            model.explainability_partial,
+        ),
+        (
+            "candidat",
+            model.candidates_source,
+            model.candidates_partial,
+        ),
+    ];
+    for (name, source, partial) in &sources {
+        let src_label = data_source_label(*source);
+        let (badge_label, badge_color) = if matches!(source, DataSource::None) {
+            ("INACTIVE", muted)
+        } else if *partial {
+            ("PARTIAL", theme.palette.warning_color())
+        } else {
+            ("OK", theme.palette.success_color())
+        };
+        lines.push(Line::from_spans([
+            Span::styled(format!("{name} "), Style::default().fg(muted)),
+            styled_badge(badge_label, badge_color),
+            Span::styled(format!(" {src_label}"), Style::default().fg(secondary)),
+        ]));
+    }
+
+    if model.diagnostics_verbose {
+        lines.push(Line::from_spans([Span::styled(
+            format!(
+                "screen={} history={} events={} decisions={} candidates={}",
+                screen_label(model.screen),
+                model.screen_history.len(),
+                model.timeline_events.len(),
+                model.explainability_decisions.len(),
+                model.candidates_list.len(),
+            ),
+            Style::default().fg(muted),
+        )]));
+    }
+    Text::from_lines(lines)
 }
 
 fn frame_diagnostics_perf_styled(model: &DashboardModel, theme: &Theme) -> Text {
@@ -1749,23 +3186,105 @@ fn frame_render_footer(model: &DashboardModel, theme: &Theme, area: Rect, frame:
         spans.extend(key_hint(key, label, accent));
     }
 
-    // Right-align screen position indicator.
-    let position = format!(
-        " {}/7 {} ",
-        model.screen.number(),
-        screen_tab_label(model.screen)
-    );
-    let used_width: usize = spans.iter().map(|s| s.content.len()).sum();
-    let pad = usize::from(area.width).saturating_sub(used_width + position.len());
-    if pad > 0 {
-        spans.push(Span::raw(" ".repeat(pad)));
+    // Right-align contextual screen info.
+    let mut right_spans: Vec<Span> = Vec::new();
+    match model.screen {
+        Screen::Overview => {
+            let mount_count = model
+                .daemon_state
+                .as_ref()
+                .map_or(0, |s| s.pressure.mounts.len());
+            right_spans.push(Span::styled(
+                format!("{mount_count} mounts "),
+                Style::default().fg(theme.palette.text_secondary()),
+            ));
+            if let Some(ref state) = model.daemon_state {
+                let level_color = theme.palette.pressure_color(&state.pressure.overall);
+                right_spans.push(styled_badge(
+                    &state.pressure.overall.to_ascii_uppercase(),
+                    level_color,
+                ));
+            }
+        }
+        Screen::Timeline => {
+            let total = model.timeline_events.len();
+            let filtered = model
+                .timeline_events
+                .iter()
+                .filter(|e| model.timeline_filter.matches(&e.severity))
+                .count();
+            right_spans.push(Span::styled(
+                format!("{filtered}/{total} events "),
+                Style::default().fg(theme.palette.text_secondary()),
+            ));
+            right_spans.push(styled_badge(
+                &model.timeline_filter.label().to_ascii_uppercase(),
+                accent,
+            ));
+        }
+        Screen::Explainability => {
+            let count = model.explainability_decisions.len();
+            right_spans.push(Span::styled(
+                format!("{count} decisions "),
+                Style::default().fg(theme.palette.text_secondary()),
+            ));
+            right_spans.push(styled_badge(
+                &data_source_label(model.timeline_source).to_ascii_uppercase(),
+                accent,
+            ));
+        }
+        Screen::Candidates => {
+            let count = model.candidates_list.len();
+            right_spans.push(Span::styled(
+                format!("{count} candidates "),
+                Style::default().fg(theme.palette.text_secondary()),
+            ));
+            right_spans.push(styled_badge(
+                &model.candidates_sort.label().to_ascii_uppercase(),
+                accent,
+            ));
+        }
+        Screen::Ballast => {
+            let count = model.ballast_volumes.len();
+            right_spans.push(Span::styled(
+                format!("{count} volumes "),
+                Style::default().fg(theme.palette.text_secondary()),
+            ));
+        }
+        Screen::LogSearch => {
+            let count = model.timeline_events.len();
+            right_spans.push(Span::styled(
+                format!("{count} entries "),
+                Style::default().fg(theme.palette.text_secondary()),
+            ));
+        }
+        Screen::Diagnostics => {
+            right_spans.push(Span::styled(
+                format!("tick {} ", model.tick),
+                Style::default().fg(theme.palette.text_secondary()),
+            ));
+            let mode_label = if model.degraded { "DEGRADED" } else { "NORMAL" };
+            let mode_color = if model.degraded {
+                theme.palette.warning_color()
+            } else {
+                theme.palette.success_color()
+            };
+            right_spans.push(styled_badge(mode_label, mode_color));
+        }
     }
-    spans.push(Span::styled(
-        position,
+    right_spans.push(Span::styled(
+        format!(" {}/7 ", model.screen.number()),
         Style::default()
             .fg(theme.palette.text_secondary())
             .bg(theme.palette.panel_bg()),
     ));
+    let right_width: usize = right_spans.iter().map(|s| s.content.len()).sum();
+    let used_width: usize = spans.iter().map(|s| s.content.len()).sum();
+    let pad = usize::from(area.width).saturating_sub(used_width + right_width);
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
+    spans.extend(right_spans);
 
     Paragraph::new(Line::from_spans(spans))
         .style(
@@ -1950,39 +3469,199 @@ fn frame_render_overlay(
             Paragraph::new(Text::from_lines(lines)).render(inner, frame);
         }
         super::model::Overlay::Voi => {
-            let voi_text = concat!(
-                "  VOI (Value-of-Information) Scan Scheduler\n",
-                "\n",
-                "  Allocates a limited scan budget to paths most\n",
-                "  likely to yield reclaimable space.\n",
-                "\n",
-                "  Budget:  5 paths per cycle (configurable)\n",
-                "  Split:   80% exploitation / 20% exploration\n",
-                "\n",
-                "  Exploitation selects paths with the highest\n",
-                "  expected reclaim weighted by IO cost and\n",
-                "  false-positive risk.\n",
-                "\n",
-                "  Exploration re-scans least-recently-visited\n",
-                "  paths to discover changed workloads.\n",
-                "\n",
-                "  Fallback: if forecast MAPE > 50% for 3\n",
-                "  windows, reverts to round-robin scheduling.\n",
-                "  Recovers after 5 clean windows.\n",
-                "\n",
-                "  Config: [scheduler] section in config.toml\n",
-                "  Esc or click closes overlay (then back/quit).",
-            );
-            Paragraph::new(voi_text)
-                .style(Style::default().fg(theme.palette.text_primary()))
-                .render(inner, frame);
+            let voi_accent = theme.palette.accent_color();
+            let muted = theme.palette.muted_color();
+            let secondary = theme.palette.text_secondary();
+            let lines = vec![
+                Line::from_spans([Span::styled(
+                    "VOI (Value-of-Information) Scan Scheduler",
+                    Style::default().fg(voi_accent).bold(),
+                )]),
+                Line::from(""),
+                Line::from_spans([Span::styled(
+                    "Allocates a limited scan budget to paths most likely",
+                    Style::default().fg(secondary),
+                )]),
+                Line::from_spans([Span::styled(
+                    "to yield reclaimable space.",
+                    Style::default().fg(secondary),
+                )]),
+                Line::from(""),
+                // Budget section.
+                Line::from_spans([Span::styled(
+                    "Budget",
+                    Style::default().fg(theme.palette.text_primary()).bold(),
+                )]),
+                Line::from_spans([
+                    Span::styled("  paths/cycle  ", Style::default().fg(muted)),
+                    styled_badge("5", voi_accent),
+                ]),
+                Line::from_spans([
+                    Span::styled("  split        ", Style::default().fg(muted)),
+                    styled_badge("80%", theme.palette.success_color()),
+                    Span::styled(" exploit  ", Style::default().fg(secondary)),
+                    styled_badge("20%", theme.palette.warning_color()),
+                    Span::styled(" explore", Style::default().fg(secondary)),
+                ]),
+                Line::from(""),
+                // Exploitation section.
+                Line::from_spans([Span::styled(
+                    "Exploitation",
+                    Style::default().fg(theme.palette.text_primary()).bold(),
+                )]),
+                Line::from_spans([Span::styled(
+                    "  Selects paths with highest expected reclaim",
+                    Style::default().fg(secondary),
+                )]),
+                Line::from_spans([Span::styled(
+                    "  weighted by IO cost and false-positive risk.",
+                    Style::default().fg(secondary),
+                )]),
+                Line::from(""),
+                // Exploration section.
+                Line::from_spans([Span::styled(
+                    "Exploration",
+                    Style::default().fg(theme.palette.text_primary()).bold(),
+                )]),
+                Line::from_spans([Span::styled(
+                    "  Re-scans least-recently-visited paths to",
+                    Style::default().fg(secondary),
+                )]),
+                Line::from_spans([Span::styled(
+                    "  discover changed workloads.",
+                    Style::default().fg(secondary),
+                )]),
+                Line::from(""),
+                // Fallback section.
+                Line::from_spans([Span::styled(
+                    "Fallback",
+                    Style::default().fg(theme.palette.text_primary()).bold(),
+                )]),
+                Line::from_spans([Span::styled(
+                    "  MAPE > 50% for 3 windows \u{2192} round-robin.",
+                    Style::default().fg(secondary),
+                )]),
+                Line::from_spans([Span::styled(
+                    "  Recovers after 5 clean windows.",
+                    Style::default().fg(secondary),
+                )]),
+                Line::from(""),
+                Line::from_spans([Span::styled(
+                    "Config: [scheduler] section in config.toml",
+                    Style::default().fg(muted),
+                )]),
+            ];
+            Paragraph::new(Text::from_lines(lines)).render(inner, frame);
         }
-        _ => {
-            Paragraph::new(format!(
-                "  {title} overlay\n\n  Esc or click closes overlay.\n  Next Esc closes detail or goes back.\n  Final Esc quits."
-            ))
-                .style(Style::default().fg(theme.palette.text_secondary()))
-                .render(inner, frame);
+        super::model::Overlay::Confirmation(action) => {
+            let (action_desc, action_color) = match action {
+                super::model::ConfirmAction::BallastRelease => (
+                    "Release selected ballast file",
+                    theme.palette.warning_color(),
+                ),
+                super::model::ConfirmAction::BallastReleaseAll => (
+                    "Release ALL ballast files on this mount",
+                    theme.palette.danger_color(),
+                ),
+            };
+            let mut lines = vec![
+                Line::from_spans([Span::styled(
+                    "\u{26A0}  Confirmation Required",
+                    Style::default().fg(action_color).bold(),
+                )]),
+                Line::from(""),
+                Line::from_spans([Span::styled(
+                    format!("  {action_desc}"),
+                    Style::default().fg(action_color).bold(),
+                )]),
+                Line::from(""),
+                Line::from_spans([Span::styled(
+                    "  Are you sure?",
+                    Style::default().fg(theme.palette.text_primary()),
+                )]),
+                Line::from(""),
+                separator_line(
+                    usize::from(inner.width).min(40),
+                    theme.palette.border_color(),
+                ),
+            ];
+            let mut hint_row = vec![Span::raw("  ")];
+            hint_row.extend(key_hint("Enter", "Confirm", action_color));
+            hint_row.push(Span::raw("  "));
+            hint_row.extend(key_hint("Esc", "Cancel", theme.palette.muted_color()));
+            lines.push(Line::from_spans(hint_row));
+            Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+        }
+        super::model::Overlay::IncidentPlaybook => {
+            let severity =
+                super::incident::IncidentSeverity::from_daemon_state(model.daemon_state.as_ref());
+            let entries = super::incident::playbook_for_severity(severity);
+            let severity_color = match severity {
+                super::incident::IncidentSeverity::Critical => theme.palette.danger_color(),
+                super::incident::IncidentSeverity::High
+                | super::incident::IncidentSeverity::Elevated => theme.palette.warning_color(),
+                super::incident::IncidentSeverity::Normal => theme.palette.success_color(),
+            };
+
+            let mut lines = vec![
+                Line::from_spans([
+                    Span::styled(
+                        "severity ",
+                        Style::default().fg(theme.palette.text_secondary()),
+                    ),
+                    styled_badge(severity.label(), severity_color),
+                    Span::styled(
+                        format!("  {} steps", entries.len()),
+                        Style::default().fg(theme.palette.muted_color()),
+                    ),
+                ]),
+                separator_line(
+                    usize::from(inner.width).min(50),
+                    theme.palette.border_color(),
+                ),
+            ];
+
+            for (i, entry) in entries.iter().enumerate() {
+                let selected = i == model.incident_playbook_selected;
+                let cursor = if selected { "\u{25B8} " } else { "  " };
+                let cursor_style = if selected {
+                    Style::default().fg(severity_color).bold()
+                } else {
+                    Style::default().fg(theme.palette.muted_color())
+                };
+                let label_style = if selected {
+                    Style::default()
+                        .fg(severity_color)
+                        .bg(theme.palette.highlight_bg())
+                        .bold()
+                } else {
+                    Style::default().fg(theme.palette.text_primary())
+                };
+                let target_color = theme.palette.tab_active_bg(entry.target.number());
+                lines.push(Line::from_spans([
+                    Span::styled(cursor, cursor_style),
+                    Span::styled(
+                        format!("{}. ", i + 1),
+                        Style::default().fg(theme.palette.muted_color()),
+                    ),
+                    Span::styled(entry.label, label_style),
+                    Span::raw(" "),
+                    styled_badge(screen_tab_label(entry.target), target_color),
+                ]));
+                lines.push(Line::from_spans([
+                    Span::raw("     "),
+                    Span::styled(
+                        entry.description,
+                        Style::default().fg(theme.palette.text_secondary()),
+                    ),
+                ]));
+            }
+
+            lines.push(Line::from(""));
+            let mut hint_row = vec![Span::raw("  ")];
+            hint_row.extend(key_hint("Enter", "navigate to step", severity_color));
+            lines.push(Line::from_spans(hint_row));
+            Paragraph::new(Text::from_lines(lines)).render(inner, frame);
         }
     }
 }

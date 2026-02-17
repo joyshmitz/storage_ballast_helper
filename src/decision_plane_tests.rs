@@ -1743,12 +1743,16 @@ fn fault_matrix_all_modes_all_faults() {
 
             let last = engine.trace.last().unwrap();
 
-            // Key invariant: observe mode and fallback mode never approve deletions.
-            let effective_mode = last.mode_after;
-            if !effective_mode.allows_deletion() {
+            // Key invariant: if the mode at evaluation *start* does not allow
+            // deletion, the result must contain zero approvals.  If the mode was
+            // Canary but transitioned to FallbackSafe mid-evaluation (e.g. canary
+            // budget exhaustion), the candidates approved *before* the transition
+            // are still legitimate.
+            let start_mode = last.mode_before;
+            if !start_mode.allows_deletion() {
                 assert_eq!(
                     last.approved_count, 0,
-                    "{mode}-{fault_name}: mode {effective_mode} must not approve deletions",
+                    "{mode}-{fault_name}: mode {start_mode} (at eval start) must not approve deletions",
                 );
             }
         }

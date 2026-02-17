@@ -40,6 +40,7 @@ use crate::monitor::guardrails::{
     AdaptiveGuard, CalibrationObservation, GuardDiagnostics, GuardStatus,
 };
 use crate::monitor::pid::{PidPressureController, PressureLevel, PressureReading};
+use crate::monitor::predictive::{PredictiveAction, PredictiveActionPolicy};
 use crate::monitor::special_locations::SpecialLocationRegistry;
 use crate::monitor::voi_scheduler::VoiScheduler;
 use crate::platform::pal::{MemoryInfo, Platform, detect_platform};
@@ -387,6 +388,8 @@ pub struct MonitoringDaemon {
     last_predictive_warning: Option<Instant>,
     last_predictive_level: Option<NotificationLevel>,
     last_ewma_confidence: f64,
+    predictive_policy: PredictiveActionPolicy,
+    last_predictive_action: PredictiveAction,
     last_swap_thrash_warning: Option<Instant>,
     swap_thrash_active: bool,
     self_monitor: SelfMonitor,
@@ -666,6 +669,7 @@ impl MonitoringDaemon {
         let shared_guard_diagnostics = Arc::new(RwLock::new(None));
 
         let cached_primary_path = compute_primary_path(&config);
+        let prediction_config = config.pressure.prediction.clone();
 
         Ok(Self {
             config,
@@ -693,6 +697,8 @@ impl MonitoringDaemon {
             last_predictive_warning: None,
             last_predictive_level: None,
             last_ewma_confidence: 0.0,
+            predictive_policy: PredictiveActionPolicy::from_config(prediction_config),
+            last_predictive_action: PredictiveAction::Clear,
             last_swap_thrash_warning: None,
             swap_thrash_active: false,
             self_monitor,
@@ -1025,6 +1031,8 @@ impl MonitoringDaemon {
         let now = Instant::now();
         let mut worst_response: Option<crate::monitor::pid::PressureResponse> = None;
         let mut worst_guard_diag: Option<GuardDiagnostics> = None;
+        // Reset per-tick predictive action so we track the worst across mounts.
+        self.last_predictive_action = PredictiveAction::Clear;
 
         // Update monitors for each active mount.
         for (mount_path, stats) in stats_by_mount {
@@ -1067,6 +1075,15 @@ impl MonitoringDaemon {
             let response = monitor
                 .pressure_controller
                 .update(reading, predicted_seconds, now);
+
+            // Evaluate predictive policy with full confidence/trend gating.
+            let free_pct = stats.free_pct();
+            let pred_action =
+                self.predictive_policy
+                    .evaluate(&rate_estimate, free_pct, mount_path.clone());
+            if pred_action.severity() > self.last_predictive_action.severity() {
+                self.last_predictive_action = pred_action;
+            }
 
             // Track worst response (highest urgency/severity).
             match worst_response {
@@ -1142,12 +1159,17 @@ impl MonitoringDaemon {
 
     // ──────────────────── pressure response ────────────────────
 
+    #[allow(clippy::too_many_lines)]
     fn handle_pressure(
         &mut self,
         response: &crate::monitor::pid::PressureResponse,
         scan_tx: &Sender<ScanRequest>,
         scan_rx: &Receiver<ScanRequest>,
     ) {
+        // Reset min_score to config default at the start of each tick;
+        // PreemptiveCleanup may lower it below.
+        self.shared_executor_config
+            .set_min_score(self.config.scoring.min_score);
         self.check_predictive_warning(response);
 
         // Determine scan targets: routine maintenance (Green) scans everything;
@@ -1222,10 +1244,29 @@ impl MonitoringDaemon {
                     }
                 }
 
-                // Predictive Safety Net: if urgency is high (prediction says we will crash soon),
-                // we MUST start scanning even if the current static level is Green.
-                // 0.8 corresponds to ~high urgency threshold (e.g. < 5 mins to saturation).
-                if response.urgency > 0.8 {
+                // Predictive Safety Net: use the PredictiveActionPolicy to decide
+                // whether to start scanning even when static pressure is Green.
+                // Extract values from the match before calling &mut self methods.
+                let predictive_min_score = match &self.last_predictive_action {
+                    PredictiveAction::PreemptiveCleanup {
+                        recommended_min_score,
+                        ..
+                    } => Some(*recommended_min_score),
+                    _ => None,
+                };
+                let predictive_ballast_mount = match &self.last_predictive_action {
+                    PredictiveAction::ImminentDanger { mount, .. } => Some(mount.clone()),
+                    _ => None,
+                };
+                let needs_scan = !matches!(self.last_predictive_action, PredictiveAction::Clear);
+
+                if let Some(min_score) = predictive_min_score {
+                    self.shared_executor_config.set_min_score(min_score);
+                }
+                if let Some(ref mount) = predictive_ballast_mount {
+                    let _ = self.release_ballast(mount, response);
+                }
+                if needs_scan {
                     self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
                 }
             }
@@ -1695,6 +1736,10 @@ impl MonitoringDaemon {
                     self.policy_engine
                         .lock()
                         .update_config(new_config.policy.clone());
+
+                    // Rebuild predictive policy with new thresholds.
+                    self.predictive_policy =
+                        PredictiveActionPolicy::from_config(new_config.pressure.prediction.clone());
 
                     // Propagate notification config (channels, webhook URLs, cooldowns).
                     self.notification_manager
@@ -2268,6 +2313,7 @@ impl RepeatDeletionTracker {
 ///
 /// Reads `dry_run`, `max_batch_size`, and `min_score` from shared atomics on each
 /// batch, so config reloads (SIGHUP) take effect without respawning the thread.
+#[allow(clippy::too_many_lines)]
 fn executor_thread_main(
     del_rx: &Receiver<DeletionBatch>,
     logger: &ActivityLoggerHandle,
@@ -2282,10 +2328,26 @@ fn executor_thread_main(
         Duration::from_secs(shared_config.repeat_max_cooldown_secs()),
     );
     let mut batch_count: u64 = 0;
+    let mut last_circuit_breaker_trip: Option<Instant> = None;
+    let circuit_breaker_cooldown = DeletionConfig::default().circuit_breaker_cooldown;
 
     while let Ok(batch) = del_rx.recv() {
         heartbeat.beat();
         batch_count += 1;
+
+        // Enforce circuit breaker cooldown from a previous trip. If the breaker
+        // tripped recently, skip this batch entirely and drain the channel.
+        if let Some(trip_time) = last_circuit_breaker_trip {
+            if trip_time.elapsed() < circuit_breaker_cooldown {
+                eprintln!(
+                    "[SBH-EXECUTOR] circuit breaker cooldown active ({:.0}s remaining), skipping batch",
+                    circuit_breaker_cooldown.as_secs_f64() - trip_time.elapsed().as_secs_f64(),
+                );
+                continue;
+            }
+            // Cooldown expired, reset.
+            last_circuit_breaker_trip = None;
+        }
 
         // Pick up live config reloads for repeat-deletion dampening.
         tracker.update_cooldowns(
@@ -2381,9 +2443,13 @@ fn executor_thread_main(
         });
 
         if report.circuit_breaker_tripped {
+            last_circuit_breaker_trip = Some(Instant::now());
             logger.send(ActivityEvent::Error {
                 code: "SBH-2003".to_string(),
-                message: "executor circuit breaker tripped".to_string(),
+                message: format!(
+                    "executor circuit breaker tripped, cooldown {:.0}s",
+                    circuit_breaker_cooldown.as_secs_f64(),
+                ),
             });
         }
 

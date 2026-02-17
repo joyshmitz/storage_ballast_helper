@@ -7,6 +7,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -150,6 +151,21 @@ impl NotificationEvent {
             Self::BallastReleased { .. } => NotificationLevel::Orange,
 
             Self::Error { .. } => NotificationLevel::Red,
+        }
+    }
+
+    /// Discriminant key for per-event-type throttling.
+    #[must_use]
+    pub fn type_key(&self) -> &'static str {
+        match self {
+            Self::PressureChanged { .. } => "pressure_changed",
+            Self::PredictiveWarning { .. } => "predictive_warning",
+            Self::CleanupCompleted { .. } => "cleanup_completed",
+            Self::BallastReleased { .. } => "ballast_released",
+            Self::BallastReplenished { .. } => "ballast_replenished",
+            Self::DaemonStarted { .. } => "daemon_started",
+            Self::DaemonStopped { .. } => "daemon_stopped",
+            Self::Error { .. } => "error",
         }
     }
 
@@ -644,7 +660,9 @@ impl Channel for WebhookChannel {
 pub struct NotificationManager {
     channels: Vec<Box<dyn Channel>>,
     enabled: bool,
-    last_send: Option<Instant>,
+    /// Per-event-type throttle timestamps. Keyed by `NotificationEvent::type_key()`.
+    /// Prevents a low-priority event type from blocking unrelated higher-priority ones.
+    last_send_by_type: HashMap<&'static str, Instant>,
     min_interval: Duration,
 }
 
@@ -656,7 +674,7 @@ impl NotificationManager {
             return Self {
                 channels: Vec::new(),
                 enabled: false,
-                last_send: None,
+                last_send_by_type: HashMap::new(),
                 min_interval: Duration::ZERO,
             };
         }
@@ -686,14 +704,19 @@ impl NotificationManager {
         Self {
             channels,
             enabled: true,
-            last_send: None,
+            last_send_by_type: HashMap::new(),
             min_interval: Duration::from_secs(config.min_notify_interval_secs),
         }
     }
 
     /// Replace this manager's configuration (e.g., after SIGHUP config reload).
+    ///
+    /// Preserves per-event-type throttle state so a config reload doesn't open
+    /// a burst window where previously throttled events can fire immediately.
     pub fn update_config(&mut self, config: &NotificationConfig) {
+        let throttle_state = std::mem::take(&mut self.last_send_by_type);
         *self = Self::from_config(config);
+        self.last_send_by_type = throttle_state;
     }
 
     /// Create a disabled (no-op) manager.
@@ -702,32 +725,35 @@ impl NotificationManager {
         Self {
             channels: Vec::new(),
             enabled: false,
-            last_send: None,
+            last_send_by_type: HashMap::new(),
             min_interval: Duration::ZERO,
         }
     }
 
     /// Dispatch a notification event to all enabled channels.
     ///
-    /// Events are throttled by `min_notify_interval_secs` (default 60s).
+    /// Events are throttled per-event-type by `min_notify_interval_secs` (default
+    /// 60s). Each event type has its own throttle window so a low-severity cleanup
+    /// notification cannot block an unrelated pressure warning.
     /// Red and Critical events bypass throttling to ensure timely alerts.
     pub fn notify(&mut self, event: &NotificationEvent) {
         if !self.enabled {
             return;
         }
 
-        // Throttle: skip if we sent recently, unless event is Red/Critical.
+        // Throttle: skip if we sent this event type recently, unless Red/Critical.
         let level = event.level();
         let bypass_throttle = level >= NotificationLevel::Red;
+        let type_key = event.type_key();
         if !bypass_throttle
             && !self.min_interval.is_zero()
-            && let Some(last) = self.last_send
+            && let Some(last) = self.last_send_by_type.get(type_key)
             && last.elapsed() < self.min_interval
         {
             return;
         }
 
-        self.last_send = Some(Instant::now());
+        self.last_send_by_type.insert(type_key, Instant::now());
 
         for channel in &self.channels {
             channel.send(event);
