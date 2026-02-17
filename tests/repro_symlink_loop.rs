@@ -1,11 +1,12 @@
+#![allow(missing_docs)]
+
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
 use std::time::Duration;
 use tempfile::TempDir;
 
 #[cfg(target_os = "linux")]
-use sbh_lib::scanner::walker::is_path_open;
+use storage_ballast_helper::scanner::walker::is_path_open;
 
 #[test]
 #[cfg(target_os = "linux")]
@@ -37,6 +38,6 @@ fn repro_symlink_loop_dos() {
     // If it takes more than 2 seconds, it's likely stuck in the loop.
     match rx.recv_timeout(Duration::from_secs(2)) {
         Ok(res) => assert!(!res, "Should not find open files"),
-        Err(_) => panic!("is_path_open timed out - likely stuck in symlink loop"),
+        Err(e) => panic!("is_path_open timed out - likely stuck in symlink loop: {e}"),
     }
 }

@@ -719,12 +719,12 @@ impl NotificationManager {
         // Throttle: skip if we sent recently, unless event is Red/Critical.
         let level = event.level();
         let bypass_throttle = level >= NotificationLevel::Red;
-        if !bypass_throttle && !self.min_interval.is_zero() {
-            if let Some(last) = self.last_send {
-                if last.elapsed() < self.min_interval {
-                    return;
-                }
-            }
+        if !bypass_throttle
+            && !self.min_interval.is_zero()
+            && let Some(last) = self.last_send
+            && last.elapsed() < self.min_interval
+        {
+            return;
         }
 
         self.last_send = Some(Instant::now());

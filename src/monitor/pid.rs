@@ -358,13 +358,19 @@ fn response_policy(
             Duration::from_millis((base_ms / 8).max(125)),
             if urgency > 0.85 { 5 } else { 3 },
             // Dynamic batch scaling: 20 base + up to 30 more based on urgency > 0.5
-            20 + ((urgency - 0.5).max(0.0) * 60.0) as usize,
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            {
+                20 + ((urgency - 0.5).max(0.0) * 60.0) as usize
+            },
         ),
         PressureLevel::Critical => (
-            Duration::from_millis(100), 
-            10, 
+            Duration::from_millis(100),
+            10,
             // Aggressive scaling: 40 base + up to 60 more
-            40 + ((urgency - 0.5).max(0.0) * 120.0) as usize
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            {
+                40 + ((urgency - 0.5).max(0.0) * 120.0) as usize
+            },
         ),
     }
 }
@@ -757,7 +763,10 @@ mod tests {
         // Red level
         let (_, _, low_red) = response_policy(base, PressureLevel::Red, 0.5);
         let (_, _, high_red) = response_policy(base, PressureLevel::Red, 1.0);
-        assert!(high_red > low_red, "Red batch size should scale with urgency (low={low_red}, high={high_red})");
+        assert!(
+            high_red > low_red,
+            "Red batch size should scale with urgency (low={low_red}, high={high_red})"
+        );
         assert_eq!(low_red, 20);
         // 20 + (0.5 * 60) = 50
         assert_eq!(high_red, 50);
@@ -765,7 +774,10 @@ mod tests {
         // Critical level
         let (_, _, low_crit) = response_policy(base, PressureLevel::Critical, 0.5);
         let (_, _, high_crit) = response_policy(base, PressureLevel::Critical, 1.0);
-        assert!(high_crit > low_crit, "Critical batch size should scale with urgency (low={low_crit}, high={high_crit})");
+        assert!(
+            high_crit > low_crit,
+            "Critical batch size should scale with urgency (low={low_crit}, high={high_crit})"
+        );
         assert_eq!(low_crit, 40);
         // 40 + (0.5 * 120) = 100
         assert_eq!(high_crit, 100);

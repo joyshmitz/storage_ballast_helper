@@ -2506,7 +2506,9 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
         Some(BallastCommand::Provision) => {
             let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
             let collector = FsStatsCollector::new(platform, std::time::Duration::from_millis(500));
+            #[allow(clippy::redundant_clone)]
             let ballast_dir = config.paths.ballast_dir.clone();
+            #[allow(clippy::cast_precision_loss)]
             let free_check = move || -> f64 {
                 collector
                     .collect(&ballast_dir)
@@ -2618,7 +2620,9 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
         Some(BallastCommand::Replenish) => {
             let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
             let collector = FsStatsCollector::new(platform, std::time::Duration::from_millis(500));
+            #[allow(clippy::redundant_clone)]
             let ballast_dir = config.paths.ballast_dir.clone();
+            #[allow(clippy::cast_precision_loss)]
             let free_check = move || -> f64 {
                 collector
                     .collect(&ballast_dir)

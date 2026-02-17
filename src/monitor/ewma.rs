@@ -32,6 +32,7 @@ pub struct RateEstimate {
 struct SampleState {
     free_bytes: u64,
     at: Instant,
+    #[allow(dead_code)]
     inst_rate: f64,
 }
 

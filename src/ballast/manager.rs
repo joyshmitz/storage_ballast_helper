@@ -416,22 +416,22 @@ impl BallastManager {
         };
 
         for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+            let Ok(entry) = entry else { continue };
             let path = entry.path();
             if !path.is_file() {
                 continue;
             }
 
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n,
-                None => continue,
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
             };
 
             // Check pattern: SBH_BALLAST_FILE_{index:05}.dat
-            if !name.starts_with("SBH_BALLAST_FILE_") || !name.ends_with(".dat") {
+            if !name.starts_with("SBH_BALLAST_FILE_")
+                || !std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("dat"))
+            {
                 continue;
             }
 
@@ -442,11 +442,11 @@ impl BallastManager {
             }
 
             let num_part = &name[prefix_len..name.len() - suffix_len];
-            if let Ok(index) = num_part.parse::<u32>() {
-                if index > self.config.file_count as u32 || index == 0 {
-                    // Orphan!
-                    let _ = fs::remove_file(&path);
-                }
+            if let Ok(index) = num_part.parse::<u32>()
+                && (index > self.config.file_count as u32 || index == 0)
+            {
+                // Orphan!
+                let _ = fs::remove_file(&path);
             }
         }
         Ok(())
@@ -646,8 +646,8 @@ fn try_fallocate_fd(file: &File, offset: u64, len: u64) -> bool {
     match fallocate(
         file.as_raw_fd(),
         FallocateFlags::empty(),
-        offset as i64,
-        len as i64,
+        offset.cast_signed(),
+        len.cast_signed(),
     ) {
         Ok(()) => true,
         Err(_) => false,

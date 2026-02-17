@@ -20,17 +20,12 @@ use storage_ballast_helper::daemon::self_monitor::{
     BallastState, Counters, DaemonState, LastScanState, MountPressure, PressureState,
 };
 
-#[cfg(feature = "tui")]
 use storage_ballast_helper::tui::adapters::{
     DashboardStateAdapter, SchemaWarnings, SnapshotSource, StateFreshness,
 };
-#[cfg(feature = "tui")]
 use storage_ballast_helper::tui::model::{DashboardModel, DashboardMsg, NotificationLevel, Screen};
-#[cfg(feature = "tui")]
 use storage_ballast_helper::tui::preferences::{self, LoadOutcome, UserPreferences};
-#[cfg(feature = "tui")]
 use storage_ballast_helper::tui::runtime::{DashboardRuntimeConfig, DashboardRuntimeMode};
-#[cfg(feature = "tui")]
 use storage_ballast_helper::tui::update::update;
 
 // ══════════════════════════════════════════════════════════════════
@@ -75,7 +70,6 @@ fn sample_daemon_state() -> DaemonState {
     }
 }
 
-#[cfg(feature = "tui")]
 fn test_model() -> DashboardModel {
     DashboardModel::new(
         PathBuf::from("/tmp/state.json"),
@@ -85,7 +79,6 @@ fn test_model() -> DashboardModel {
     )
 }
 
-#[cfg(feature = "tui")]
 fn mock_platform() -> Arc<dyn storage_ballast_helper::platform::pal::Platform> {
     use storage_ballast_helper::platform::pal::{
         FsStats, MemoryInfo, MockPlatform, MountPoint, PlatformPaths,
@@ -294,7 +287,6 @@ fn empty_kill_switch_env_var_is_not_active() {
 // when converting to legacy config for fallback operation.
 // ══════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "tui")]
 #[test]
 fn legacy_config_preserves_all_fields() {
     let cfg = DashboardRuntimeConfig {
@@ -319,7 +311,6 @@ fn legacy_config_preserves_all_fields() {
     assert_eq!(legacy.monitor_paths[2], PathBuf::from("/tmp"));
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn legacy_config_empty_monitor_paths() {
     let cfg = DashboardRuntimeConfig {
@@ -335,7 +326,6 @@ fn legacy_config_empty_monitor_paths() {
     assert!(legacy.monitor_paths.is_empty());
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn runtime_mode_default_is_new_cockpit() {
     assert_eq!(
@@ -351,7 +341,6 @@ fn runtime_mode_default_is_new_cockpit() {
 // message → model state transitions correctly.
 // ══════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "tui")]
 #[test]
 fn model_transitions_fresh_to_degraded_to_recovered() {
     let mut model = test_model();
@@ -381,7 +370,6 @@ fn model_transitions_fresh_to_degraded_to_recovered() {
     assert!(model.daemon_state.is_some());
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn consecutive_degraded_updates_accumulate_errors() {
     let mut model = test_model();
@@ -394,7 +382,6 @@ fn consecutive_degraded_updates_accumulate_errors() {
     assert_eq!(model.adapter_reads, 0);
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn model_rate_histories_pruned_on_mount_removal() {
     let mut model = test_model();
@@ -420,7 +407,6 @@ fn model_rate_histories_pruned_on_mount_removal() {
     assert!(!model.rate_histories.contains_key("/data"));
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn model_handles_none_rate_bps_gracefully() {
     let mut model = test_model();
@@ -436,7 +422,6 @@ fn model_handles_none_rate_bps_gracefully() {
     assert!((history.latest().unwrap() - 0.0).abs() < f64::EPSILON);
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn model_error_notification_is_ephemeral() {
     let mut model = test_model();
@@ -480,7 +465,6 @@ fn model_error_notification_is_ephemeral() {
 // that flow through to the model correctly.
 // ══════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "tui")]
 #[test]
 fn adapter_fresh_state_snapshot_feeds_model_correctly() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -510,7 +494,6 @@ fn adapter_fresh_state_snapshot_feeds_model_correctly() {
     assert_eq!(model.daemon_state.as_ref().unwrap().pid, 42);
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn adapter_stale_state_snapshot_still_provides_daemon_data() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -546,7 +529,6 @@ fn adapter_stale_state_snapshot_still_provides_daemon_data() {
     assert!(!model.degraded);
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn adapter_missing_state_snapshot_triggers_degraded_model() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -572,7 +554,6 @@ fn adapter_missing_state_snapshot_triggers_degraded_model() {
     assert_eq!(model.adapter_errors, 1);
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn adapter_malformed_state_snapshot_triggers_degraded_model() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -598,7 +579,6 @@ fn adapter_malformed_state_snapshot_triggers_degraded_model() {
     assert!(model.degraded);
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn adapter_schema_drift_does_not_block_model_update() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -645,7 +625,6 @@ fn adapter_schema_drift_does_not_block_model_update() {
 // prevent the dashboard from starting.
 // ══════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "tui")]
 #[test]
 fn preference_missing_file_returns_defaults() {
     let path = PathBuf::from("/tmp/nonexistent_prefs_12345.json");
@@ -658,7 +637,6 @@ fn preference_missing_file_returns_defaults() {
     assert_eq!(prefs, UserPreferences::default());
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn preference_corrupt_file_returns_defaults() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -674,7 +652,6 @@ fn preference_corrupt_file_returns_defaults() {
     assert_eq!(prefs, UserPreferences::default());
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn preference_empty_file_returns_corrupt() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -689,7 +666,6 @@ fn preference_empty_file_returns_corrupt() {
     );
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn preference_valid_empty_object_returns_defaults() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -705,7 +681,6 @@ fn preference_valid_empty_object_returns_defaults() {
     }
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn preference_save_then_load_roundtrip() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -734,7 +709,6 @@ fn preference_save_then_load_roundtrip() {
 // sequences without panicking or getting stuck.
 // ══════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "tui")]
 #[test]
 fn model_survives_rapid_state_oscillation() {
     let mut model = test_model();
@@ -756,7 +730,6 @@ fn model_survives_rapid_state_oscillation() {
     assert_eq!(model.adapter_reads + model.adapter_errors, 20);
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn model_navigation_works_during_degraded_state() {
     let mut model = test_model();
@@ -776,7 +749,6 @@ fn model_navigation_works_during_degraded_state() {
     assert_eq!(model.screen, Screen::Ballast);
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn model_overlays_work_during_degraded_state() {
     use storage_ballast_helper::tui::model::Overlay;
@@ -793,7 +765,6 @@ fn model_overlays_work_during_degraded_state() {
     assert_eq!(model.active_overlay, None);
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn model_handles_empty_daemon_state_with_zero_mounts() {
     let mut model = test_model();
@@ -810,7 +781,6 @@ fn model_handles_empty_daemon_state_with_zero_mounts() {
     assert_eq!(model.daemon_state.as_ref().unwrap().pid, 0);
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn model_force_refresh_works_in_any_state() {
     let mut model = test_model();
@@ -914,7 +884,6 @@ fn old_daemon_state_parses_with_missing_fields_defaulted() {
 // rollback safety net.
 // ══════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "tui")]
 #[test]
 fn schema_warnings_empty_is_no_drift() {
     let w = SchemaWarnings::default();
@@ -923,7 +892,6 @@ fn schema_warnings_empty_is_no_drift() {
     assert!(w.missing_fields.is_empty());
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn schema_warnings_unknown_only_is_drift() {
     let w = SchemaWarnings {
@@ -933,7 +901,6 @@ fn schema_warnings_unknown_only_is_drift() {
     assert!(w.has_drift());
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn schema_warnings_missing_only_is_drift() {
     let w = SchemaWarnings {
@@ -943,7 +910,6 @@ fn schema_warnings_missing_only_is_drift() {
     assert!(w.has_drift());
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn schema_warnings_both_unknown_and_missing() {
     let w = SchemaWarnings {
@@ -962,7 +928,6 @@ fn schema_warnings_both_unknown_and_missing() {
 // once without compounding failures.
 // ══════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "tui")]
 #[test]
 fn simultaneous_degraded_state_and_error_notification() {
     let mut model = test_model();
@@ -991,7 +956,6 @@ fn simultaneous_degraded_state_and_error_notification() {
     assert_eq!(model.notifications.len(), 1);
 }
 
-#[cfg(feature = "tui")]
 #[test]
 fn adapter_stale_plus_drift_snapshot_is_usable() {
     let tmp = tempfile::tempdir().expect("tempdir");

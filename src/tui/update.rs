@@ -111,27 +111,27 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
             // Synthesize ballast volume data from daemon state so the
             // Ballast screen (S5) has something to display even without
             // a telemetry adapter.
-            if let Some(ref ds) = model.daemon_state {
-                if ds.ballast.total > 0 && model.ballast_volumes.is_empty() {
-                    let mount = ds
-                        .pressure
-                        .mounts
-                        .first()
-                        .map_or_else(|| "/".to_string(), |m| m.path.clone());
-                    model.ballast_volumes = vec![BallastVolume {
-                        mount_point: mount,
-                        ballast_dir: String::new(),
-                        fs_type: String::new(),
-                        strategy: String::new(),
-                        files_available: ds.ballast.available,
-                        files_total: ds.ballast.total,
-                        releasable_bytes: 0,
-                        skipped: false,
-                        skip_reason: None,
-                    }];
-                    model.ballast_source =
-                        crate::tui::telemetry::DataSource::None;
-                }
+            if let Some(ref ds) = model.daemon_state
+                && ds.ballast.total > 0
+                && model.ballast_volumes.is_empty()
+            {
+                let mount = ds
+                    .pressure
+                    .mounts
+                    .first()
+                    .map_or_else(|| "/".to_string(), |m| m.path.clone());
+                model.ballast_volumes = vec![BallastVolume {
+                    mount_point: mount,
+                    ballast_dir: String::new(),
+                    fs_type: String::new(),
+                    strategy: String::new(),
+                    files_available: ds.ballast.available,
+                    files_total: ds.ballast.total,
+                    releasable_bytes: 0,
+                    skipped: false,
+                    skip_reason: None,
+                }];
+                model.ballast_source = crate::tui::telemetry::DataSource::None;
             }
 
             DashboardCmd::None

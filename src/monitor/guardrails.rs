@@ -863,7 +863,7 @@ mod tests {
             actual_tte: 300.0,
         };
         // Before fix, this returned INFINITY. Now should be 0.0.
-        assert_eq!(obs.rate_error_ratio(), 0.0);
+        assert!((obs.rate_error_ratio() - 0.0).abs() < f64::EPSILON);
 
         let obs2 = CalibrationObservation {
             predicted_rate: 0.0,
@@ -872,6 +872,6 @@ mod tests {
             actual_tte: 300.0,
         };
         // Should also be 0.0
-        assert_eq!(obs2.rate_error_ratio(), 0.0);
+        assert!((obs2.rate_error_ratio() - 0.0).abs() < f64::EPSILON);
     }
 }

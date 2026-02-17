@@ -494,10 +494,10 @@ impl<'a> StatsEngine<'a> {
 
         // Account for time from last sample to now (M7).
         let now_str = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        if let Some(last_dt) = timestamp_delta_secs(&samples[samples.len() - 1].0, &now_str) {
-            if last_dt > 0.0 {
-                *level_time.entry(prev_level).or_insert(0.0) += last_dt;
-            }
+        if let Some(last_dt) = timestamp_delta_secs(&samples[samples.len() - 1].0, &now_str)
+            && last_dt > 0.0
+        {
+            *level_time.entry(prev_level).or_insert(0.0) += last_dt;
         }
 
         let total_time: f64 = level_time.values().sum();

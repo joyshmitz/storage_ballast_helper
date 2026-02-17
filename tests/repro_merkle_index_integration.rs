@@ -1,11 +1,13 @@
+#![allow(missing_docs)]
+
 #[cfg(test)]
 mod tests {
-    use sbh::scanner::merkle::MerkleScanIndex;
-    use sbh::scanner::patterns::StructuralSignals;
-    use sbh::scanner::walker::{EntryMetadata, WalkEntry};
     use std::collections::HashSet;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
+    use storage_ballast_helper::scanner::merkle::MerkleScanIndex;
+    use storage_ballast_helper::scanner::patterns::StructuralSignals;
+    use storage_ballast_helper::scanner::walker::{EntryMetadata, WalkEntry};
 
     fn make_entry(path: &str, mtime_secs: u64) -> WalkEntry {
         WalkEntry {
@@ -36,11 +38,9 @@ mod tests {
         let entries = vec![make_entry("/tmp/a", 100), make_entry("/tmp/b", 100)];
 
         // Simulate scanner loop logic.
-        let mut seen = HashSet::new();
         let mut changed = Vec::new();
 
         for entry in &entries {
-            seen.insert(entry.path.clone());
             if !index.is_path_changed(&entry.path, entry) {
                 continue;
             }
@@ -67,11 +67,9 @@ mod tests {
             make_entry("/tmp/b", 200), // Changed mtime
         ];
 
-        let mut seen = HashSet::new();
         let mut changed = Vec::new();
 
         for entry in &entries_2 {
-            seen.insert(entry.path.clone());
             if !index.is_path_changed(&entry.path, entry) {
                 continue;
             }

@@ -44,7 +44,6 @@ use crate::monitor::special_locations::SpecialLocationRegistry;
 use crate::monitor::voi_scheduler::VoiScheduler;
 use crate::platform::pal::{MemoryInfo, Platform, detect_platform};
 use crate::scanner::deletion::{DeletionConfig, DeletionExecutor};
-use crate::scanner::merkle::MerkleScanIndex;
 use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry};
 use crate::scanner::protection::ProtectionRegistry;
 use crate::scanner::scoring::{CandidacyScore, ScoringEngine};
@@ -76,8 +75,9 @@ const SCAN_TIME_BUDGET_SECS: u64 = 60;
 const SWAP_THRASH_WARNING_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 /// Swap usage threshold that indicates probable paging thrash.
 const SWAP_THRASH_USED_PCT_THRESHOLD: f64 = 70.0;
-/// Maximum free RAM to consider high swap use as thrashing.
-const SWAP_THRASH_MAX_AVAILABLE_RAM_BYTES: u64 = 1 * 1024 * 1024 * 1024;
+/// Minimum free RAM for high swap use to indicate thrash (anomalous paging
+/// despite ample memory). Per README: "at least 8 GiB of RAM remains free".
+const SWAP_THRASH_MIN_AVAILABLE_RAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Even under high pressure, avoid deleting extremely fresh temp artifacts.
 const TEMP_FAST_TRACK_MIN_OBSERVED_AGE: Duration = Duration::from_secs(2 * 60);
 
@@ -426,7 +426,7 @@ fn is_swap_thrash_risk(memory: &MemoryInfo) -> bool {
         .saturating_sub(memory.swap_free_bytes);
     let swap_used_pct = bytes_to_pct(swap_used_bytes, memory.swap_total_bytes);
     swap_used_pct >= SWAP_THRASH_USED_PCT_THRESHOLD
-        && memory.available_bytes <= SWAP_THRASH_MAX_AVAILABLE_RAM_BYTES
+        && memory.available_bytes >= SWAP_THRASH_MIN_AVAILABLE_RAM_BYTES
 }
 
 fn normalized_path(path: &Path) -> Cow<'_, str> {
@@ -3008,31 +3008,30 @@ mod tests {
     fn test_swap_thrash_logic_correct_behavior() {
         use crate::platform::pal::MemoryInfo;
         // High swap (80%), High RAM (16GB).
-        // New logic: swap >= 70% AND available <= 1GB.
-        // This should RETURN FALSE (lazy swap is fine).
-        let lazy_swap = MemoryInfo {
+        // Per README: swap >= 70% AND available >= 8GB means anomalous paging
+        // (system had earlier pressure, now has free RAM but swap is still hot).
+        let anomalous_paging = MemoryInfo {
             total_bytes: 32 * 1024 * 1024 * 1024,
             available_bytes: 16 * 1024 * 1024 * 1024, // 16 GB
             swap_total_bytes: 10 * 1024 * 1024 * 1024,
             swap_free_bytes: 2 * 1024 * 1024 * 1024, // 80% used
         };
         assert!(
-            !super::is_swap_thrash_risk(&lazy_swap),
-            "Lazy swap should NOT trigger thrash warning"
+            super::is_swap_thrash_risk(&anomalous_paging),
+            "High swap with ample free RAM indicates anomalous paging"
         );
 
         // High swap (80%), Low RAM (100MB).
-        // This is REAL thrashing risk.
-        // New logic: available <= 1GB -> RETURNS TRUE.
-        let real_thrashing = MemoryInfo {
+        // Low available RAM means the system genuinely needs swap — not anomalous.
+        let genuine_pressure = MemoryInfo {
             total_bytes: 32 * 1024 * 1024 * 1024,
             available_bytes: 100 * 1024 * 1024, // 100 MB
             swap_total_bytes: 10 * 1024 * 1024 * 1024,
             swap_free_bytes: 2 * 1024 * 1024 * 1024, // 80% used
         };
         assert!(
-            super::is_swap_thrash_risk(&real_thrashing),
-            "Real thrashing should trigger warning"
+            !super::is_swap_thrash_risk(&genuine_pressure),
+            "Low RAM with high swap is genuine pressure, not anomalous paging"
         );
     }
 }

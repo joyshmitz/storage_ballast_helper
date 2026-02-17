@@ -818,10 +818,10 @@ fn pressure_escalation_through_levels() {
 
     // Simulate declining free space over time.
     let readings = [
-        (50, PressureLevel::Green),  // 50% free
-        (12, PressureLevel::Yellow), // 12% free
-        (8, PressureLevel::Orange),  // 8% free
-        (4, PressureLevel::Red),     // 4% free
+        (50, PressureLevel::Green),  // 50% free  (green  ≥ 20%)
+        (15, PressureLevel::Yellow), // 15% free  (yellow ≥ 14%, < 20%)
+        (11, PressureLevel::Orange), // 11% free  (orange ≥ 10%, < 14%)
+        (7, PressureLevel::Red),     //  7% free  (red    ≥  6%, < 10%)
     ];
 
     for (i, (free_pct, expected_level)) in readings.iter().enumerate() {
