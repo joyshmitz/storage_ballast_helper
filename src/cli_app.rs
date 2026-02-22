@@ -690,6 +690,21 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
         ));
     }
 
+    // System-scope systemd requires root; catch early with actionable guidance.
+    if args.systemd && !args.user {
+        #[cfg(unix)]
+        {
+            if !nix::unistd::geteuid().is_root() {
+                return Err(CliError::User(
+                    "Error: System-scope systemd requires root. \
+                     Use `sudo sbh install --systemd` (recommended) \
+                     or `sbh install --systemd --user` (user-scope)."
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
     // -- from-source build ----------------------------------------------------
     if args.from_source {
         use storage_ballast_helper::cli::from_source::{
