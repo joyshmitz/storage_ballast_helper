@@ -217,8 +217,13 @@ impl SystemdServiceManager {
                 eprintln!(
                     "[SBH-WARN] A non-root user could replace this binary and gain root privileges."
                 );
+                let group = if cfg!(target_os = "macos") {
+                    "wheel"
+                } else {
+                    "root"
+                };
                 eprintln!(
-                    "[SBH-WARN] Recommendation: 'sudo chown root:root {}'",
+                    "[SBH-WARN] Recommendation: 'sudo chown root:{group} {}'",
                     self.config.binary_path.display()
                 );
             }
