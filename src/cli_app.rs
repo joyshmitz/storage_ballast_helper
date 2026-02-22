@@ -676,6 +676,20 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
         ));
     }
 
+    // -- early platform gates -------------------------------------------------
+    // Validate service flags against the current platform BEFORE any expensive
+    // work (config loading, ballast provisioning, from-source builds).
+    if args.systemd && !cfg!(target_os = "linux") {
+        return Err(CliError::User(
+            "Error: --systemd is only supported on Linux. Use --launchd on macOS.".to_string(),
+        ));
+    }
+    if args.launchd && !cfg!(target_os = "macos") {
+        return Err(CliError::User(
+            "Error: --launchd is only supported on macOS. Use --systemd on Linux.".to_string(),
+        ));
+    }
+
     // -- from-source build ----------------------------------------------------
     if args.from_source {
         use storage_ballast_helper::cli::from_source::{
