@@ -342,6 +342,7 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
     // Drop restores the terminal even on panic or early return.
     let options = TtySessionOptions {
         alternate_screen: true,
+        intercept_signals: true,
         features: BackendFeatures {
             mouse_capture: true,
             ..Default::default()
