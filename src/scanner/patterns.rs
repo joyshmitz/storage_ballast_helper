@@ -451,6 +451,32 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
             confidence: 0.60,
             category: ArtifactCategory::TempDir,
         },
+        // rch (remote compilation helper) build artifacts — can be 70+ GB.
+        ArtifactPattern {
+            name: "rch-target-underscore",
+            kind: MatchKind::Prefix("rch_target_"),
+            confidence: 0.92,
+            category: ArtifactCategory::RustTarget,
+        },
+        ArtifactPattern {
+            name: "rch-target-dot",
+            kind: MatchKind::Prefix(".rch_target_"),
+            confidence: 0.92,
+            category: ArtifactCategory::RustTarget,
+        },
+        ArtifactPattern {
+            name: "rch-target-hyphen",
+            kind: MatchKind::Prefix("rch-target-"),
+            confidence: 0.92,
+            category: ArtifactCategory::RustTarget,
+        },
+        // codex agent build artifacts.
+        ArtifactPattern {
+            name: "target-codex",
+            kind: MatchKind::Prefix("target_codex"),
+            confidence: 0.88,
+            category: ArtifactCategory::RustTarget,
+        },
     ]
 }
 
@@ -487,6 +513,15 @@ pub fn extract_pattern_label(path: &str) -> String {
     }
     if lower.starts_with("br-build") {
         return "br-build*".to_string();
+    }
+    if lower.starts_with("rch_target_")
+        || lower.starts_with(".rch_target_")
+        || lower.starts_with("rch-target-")
+    {
+        return "rch_target_*".to_string();
+    }
+    if lower.starts_with("target_codex") {
+        return "target_codex*".to_string();
     }
     if lower.starts_with("frankenterm-") {
         return "frankenterm-*".to_string();
