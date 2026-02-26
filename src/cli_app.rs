@@ -112,6 +112,8 @@ enum Command {
 
     /// Post-install setup: PATH, completions, and verification.
     Setup(SetupArgs),
+    /// View activity log entries.
+    Log(LogArgs),
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -531,6 +533,19 @@ struct SetupArgs {
     dry_run: bool,
 }
 
+#[derive(Debug, Clone, Args, Serialize, Default)]
+struct LogArgs {
+    /// Number of recent log entries to display (default 50).
+    #[arg(long, short = 'n', default_value_t = 50, value_name = "N")]
+    tail: usize,
+    /// Follow the log file for new entries (like `tail -f`).
+    #[arg(long, short = 'f')]
+    follow: bool,
+    /// Filter by event type (deletion, scan, pressure, error).
+    #[arg(long, value_name = "TYPE")]
+    r#type: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputMode {
     Human,
@@ -605,6 +620,7 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
         }
         Command::Update(args) => run_update(cli, args),
         Command::Setup(args) => run_setup(cli, args),
+        Command::Log(args) => run_log(cli, args),
     }
 }
 
@@ -3013,17 +3029,29 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
 
     // I26: Check file modification time to detect stale state from a crashed daemon.
-    let daemon_running = daemon_state.is_some() && {
-        let stale_threshold = std::time::Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS);
-        std::fs::metadata(&config.paths.state_file)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .is_some_and(|modified| {
-                SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or_default()
-                    <= stale_threshold
-            })
+    let daemon_running = {
+        let state_file_fresh = daemon_state.is_some() && {
+            let stale_threshold =
+                std::time::Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS);
+            std::fs::metadata(&config.paths.state_file)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .is_some_and(|modified| {
+                    SystemTime::now()
+                        .duration_since(modified)
+                        .unwrap_or_default()
+                        <= stale_threshold
+                })
+        };
+
+        // Cross-user fallback: when the daemon runs as root (systemd) but CLI
+        // runs as ubuntu, the state file paths don't match. Try alternative
+        // detection methods.
+        if state_file_fresh {
+            true
+        } else {
+            detect_daemon_running_fallback()
+        }
     };
 
     // Open SQLite database for recent activity (optional).
@@ -3266,6 +3294,165 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
 }
 
 /// Map free percentage to pressure level string.
+fn run_log(cli: &Cli, args: &LogArgs) -> Result<(), CliError> {
+    let config =
+        Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let log_path = &config.paths.jsonl_log;
+
+    if !log_path.exists() {
+        return Err(CliError::Runtime(format!(
+            "log file not found: {}",
+            log_path.display()
+        )));
+    }
+
+    if args.follow {
+        // Follow mode: tail the file then watch for new lines.
+        // Print the last `tail` lines first, then follow.
+        print_tail_lines(log_path, args.tail, args.r#type.as_deref())?;
+
+        let file = std::fs::File::open(log_path)
+            .map_err(|e| CliError::Runtime(format!("failed to open log: {e}")))?;
+        let mut reader = io::BufReader::new(file);
+
+        // Seek to end.
+        use io::Seek;
+        reader
+            .seek(io::SeekFrom::End(0))
+            .map_err(|e| CliError::Runtime(format!("seek error: {e}")))?;
+
+        loop {
+            let mut line = String::new();
+            use io::BufRead;
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    // No new data; sleep briefly and retry.
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                Ok(_) => {
+                    let trimmed = line.trim_end();
+                    if !trimmed.is_empty() && matches_type_filter(trimmed, args.r#type.as_deref())
+                    {
+                        println!("{}", format_log_line(trimmed));
+                    }
+                }
+                Err(e) => {
+                    return Err(CliError::Runtime(format!("read error: {e}")));
+                }
+            }
+        }
+    } else {
+        print_tail_lines(log_path, args.tail, args.r#type.as_deref())?;
+    }
+
+    Ok(())
+}
+
+fn print_tail_lines(path: &Path, count: usize, type_filter: Option<&str>) -> Result<(), CliError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Runtime(format!("failed to read log: {e}")))?;
+
+    let lines: Vec<&str> = content
+        .lines()
+        .filter(|line| !line.trim().is_empty() && matches_type_filter(line, type_filter))
+        .collect();
+
+    let start = lines.len().saturating_sub(count);
+    for line in &lines[start..] {
+        println!("{}", format_log_line(line));
+    }
+
+    Ok(())
+}
+
+fn matches_type_filter(line: &str, type_filter: Option<&str>) -> bool {
+    let Some(filter) = type_filter else {
+        return true;
+    };
+    let filter_lower = filter.to_lowercase();
+    // Match against the "event" field in the JSONL line.
+    // Common event types: "deletion", "scan_started", "scan_completed",
+    // "pressure_changed", "error", "ballast_released", etc.
+    if let Ok(v) = serde_json::from_str::<Value>(line) {
+        if let Some(event) = v.get("event").and_then(|e| e.as_str()) {
+            let event_lower = event.to_lowercase();
+            return event_lower.contains(&filter_lower);
+        }
+    }
+    // Fallback: substring match on the raw line.
+    line.to_lowercase().contains(&filter_lower)
+}
+
+fn format_log_line(line: &str) -> String {
+    // Try to parse as JSON and format nicely; fall back to raw output.
+    if let Ok(v) = serde_json::from_str::<Value>(line) {
+        let ts = v
+            .get("timestamp")
+            .or_else(|| v.get("ts"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("?");
+        let event = v.get("event").and_then(|e| e.as_str()).unwrap_or("?");
+
+        // Build a compact summary from common fields.
+        let mut detail = String::new();
+        if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
+            detail = msg.to_string();
+        } else if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
+            detail = path.to_string();
+        } else if let Some(mount) = v.get("mount").and_then(|m| m.as_str()) {
+            detail = mount.to_string();
+        }
+
+        if detail.is_empty() {
+            format!("{ts}  {event}")
+        } else {
+            format!("{ts}  {event:<20}  {detail}")
+        }
+    } else {
+        line.to_string()
+    }
+}
+
+/// Cross-user daemon detection fallback: check systemd service and /proc.
+/// Used when the state file isn't found (e.g. daemon runs as root, CLI as ubuntu).
+fn detect_daemon_running_fallback() -> bool {
+    // Method 1: Check systemd service status.
+    if let Ok(output) = std::process::Command::new("systemctl")
+        .args(["is-active", "sbh.service"])
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.trim() == "active" {
+            return true;
+        }
+    }
+
+    // Method 2: Check for running `sbh daemon` process via /proc.
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            // Only check numeric dirs (PIDs).
+            if !name_str.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let cmdline_path = entry.path().join("cmdline");
+            if let Ok(cmdline) = std::fs::read(&cmdline_path) {
+                // cmdline is NUL-separated; join for substring matching.
+                let cmdline_str = String::from_utf8_lossy(&cmdline);
+                if cmdline_str.contains("sbh") && cmdline_str.contains("daemon") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 fn pressure_level_str(free_pct: f64, config: &Config) -> &'static str {
     if free_pct >= config.pressure.green_min_free_pct {
         "green"
@@ -3314,9 +3501,24 @@ fn is_swap_thrash_risk(memory: &MemoryInfo) -> bool {
         .swap_total_bytes
         .saturating_sub(memory.swap_free_bytes);
     let swap_used_pct = bytes_to_pct(swap_used_bytes, memory.swap_total_bytes);
+
+    if swap_used_pct < THRASH_SWAP_USED_PCT {
+        return false;
+    }
+
+    // Suppress false positive on zram: high swap usage with ample free RAM
+    // is normal when swap is backed by zram (compressed memory, not disk).
+    if Path::new("/sys/block/zram0").exists() {
+        #[allow(clippy::cast_precision_loss)]
+        let free_ram_pct = (memory.available_bytes as f64 * 100.0) / memory.total_bytes.max(1) as f64;
+        if free_ram_pct > 40.0 {
+            return false;
+        }
+    }
+
     // If swap is heavily used while plenty of RAM is still available, the host
     // likely experienced pressure and is now paging memory back in slowly.
-    swap_used_pct >= THRASH_SWAP_USED_PCT && memory.available_bytes >= MIN_AVAILABLE_RAM_BYTES
+    memory.available_bytes >= MIN_AVAILABLE_RAM_BYTES
 }
 
 fn ballast_total_pool_bytes(file_count: usize, file_size_bytes: u64) -> u64 {
