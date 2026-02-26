@@ -822,7 +822,108 @@ Parse: `file:line:col` -> location | fix suggestion | Exit 0/1 -> pass/fail
 
 ---
 
+## RCH — Remote Compilation Helper
+
+RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation commands to a fleet of 8 remote Contabo VPS workers instead of building locally. This prevents compilation storms from overwhelming csd when many agents run simultaneously.
+
+**RCH is installed at `~/.local/bin/rch` and is hooked into Claude Code's PreToolUse automatically.** Most of the time you don't need to do anything if you are Claude Code — builds are intercepted and offloaded transparently.
+
+To manually offload a build:
+```bash
+rch exec -- cargo build --release
+rch exec -- cargo test
+rch exec -- cargo clippy
+```
+
+Quick commands:
+```bash
+rch doctor                    # Health check
+rch workers probe --all       # Test connectivity to all 8 workers
+rch status                    # Overview of current state
+rch queue                     # See active/waiting builds
+```
+
+If rch or its workers are unavailable, it fails open — builds run locally as normal.
+
+**Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
+
+---
+
+## ast-grep vs ripgrep
+
+**Use `ast-grep` when structure matters.** It parses code and matches AST nodes, ignoring comments/strings, and can **safely rewrite** code.
+
+- Refactors/codemods: rename APIs, change import forms
+- Policy checks: enforce patterns across a repo
+- Editor/automation: LSP mode, `--json` output
+
+**Use `ripgrep` when text is enough.** Fastest way to grep literals/regex.
+
+- Recon: find strings, TODOs, log lines, config values
+- Pre-filter: narrow candidate files before ast-grep
+
+### Rule of Thumb
+
+- Need correctness or **applying changes** → `ast-grep`
+- Need raw speed or **hunting text** → `rg`
+- Often combine: `rg` to shortlist files, then `ast-grep` to match/modify
+
+### Rust Examples
+
+```bash
+# Find structured code (ignores comments)
+ast-grep run -l Rust -p 'fn $NAME($$ARGS) -> $RET { $$BODY }'
+
+# Find all unwrap() calls
+ast-grep run -l Rust -p '$EXPR.unwrap()'
+
+# Quick textual hunt
+rg -n 'println!' -t rust
+
+# Combine speed + precision
+rg -l -t rust 'unwrap\(' | xargs ast-grep run -l Rust -p '$X.unwrap()' --json
+```
+
+---
+
+## Morph Warp Grep — AI-Powered Code Search
+
+**Use `mcp__morph-mcp__warp_grep` for exploratory "how does X work?" questions.** An AI agent expands your query, greps the codebase, reads relevant files, and returns precise line ranges with full context.
+
+**Use `ripgrep` for targeted searches.** When you know exactly what you're looking for.
+
+**Use `ast-grep` for structural patterns.** When you need AST precision for matching/rewriting.
+
+### When to Use What
+
+| Scenario | Tool | Why |
+|----------|------|-----|
+| "How does the cancellation protocol work?" | `warp_grep` | Exploratory; don't know where to start |
+| "Where is the region close logic?" | `warp_grep` | Need to understand architecture |
+| "Find all uses of `Cx::trace`" | `ripgrep` | Targeted literal search |
+| "Find files with `println!`" | `ripgrep` | Simple pattern |
+| "Replace all `unwrap()` with `expect()`" | `ast-grep` | Structural refactor |
+
+### warp_grep Usage
+
+```
+mcp__morph-mcp__warp_grep(
+  repoPath: "/data/projects/storage_ballast_helper",
+  query: "How does the structured concurrency scope API work?"
+)
+```
+
+Returns structured results with file paths, line ranges, and extracted code snippets.
+
+### Anti-Patterns
+
+- **Don't** use `warp_grep` to find a specific function name → use `ripgrep`
+- **Don't** use `ripgrep` to understand "how does X work" → wastes time with manual reads
+- **Don't** use `ripgrep` for codemods → risks collateral edits
+
 <!-- bv-agent-instructions-v1 -->
+
+---
 
 ## Beads Workflow Integration
 
@@ -872,13 +973,13 @@ git add <files>         # Stage code changes
 br sync --flush-only    # Export beads to JSONL
 git add .beads/         # Stage beads changes
 git commit -m "..."     # Commit everything together
-git push origin main main:master  # Push to both branches
+git push                # Push to remote
 ```
 
 ### Best Practices
 
 - Check `br ready` at session start to find available work
-- Update status as you work (in_progress -> closed)
+- Update status as you work (in_progress → closed)
 - Create new issues with `br create` when you discover tasks
 - Use descriptive titles and set appropriate priority/type
 - Always `br sync --flush-only && git add .beads/` before ending session
@@ -914,6 +1015,34 @@ git push origin main main:master  # Push to both branches
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
 
+---
+
+## cass — Cross-Agent Session Search
+
+`cass` indexes prior agent conversations (Claude Code, Codex, Cursor, Gemini, ChatGPT, etc.) so we can reuse solved problems.
+
+**Rules:** Never run bare `cass` (TUI). Always use `--robot` or `--json`.
+
+### Examples
+
+```bash
+cass health
+cass search "async runtime" --robot --limit 5
+cass view /path/to/session.jsonl -n 42 --json
+cass expand /path/to/session.jsonl -n 42 -C 3 --json
+cass capabilities --json
+cass robot-docs guide
+```
+
+### Tips
+
+- Use `--fields minimal` for lean output
+- Filter by agent with `--agent`
+- Use `--days N` to limit to recent history
+
+stdout is data-only, stderr is diagnostics; exit code 0 means success.
+
+Treat cass as a way to avoid re-solving problems other agents already handled.
 
 ---
 
