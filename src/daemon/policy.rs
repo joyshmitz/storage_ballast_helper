@@ -10,7 +10,7 @@
 #![allow(clippy::cast_precision_loss)]
 
 use std::fmt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -189,12 +189,19 @@ pub enum Transition {
 
 // ──────────────────── policy engine ────────────────────
 
+/// Duration after which fallback_safe mode can be auto-escalated to canary
+/// when pressure remains at RED or Critical, breaking the deadlock where
+/// nothing can be deleted but pressure can't drop.
+const FALLBACK_EMERGENCY_ESCALATION_SECS: u64 = 15 * 60;
+
 /// The shadow-mode policy engine with progressive delivery gates.
 pub struct PolicyEngine {
     config: PolicyConfig,
     mode: ActiveMode,
     pre_fallback_mode: ActiveMode,
     fallback_reason: Option<FallbackReason>,
+    /// When fallback_safe mode was entered (for emergency escalation timer).
+    fallback_entered_at: Option<Instant>,
     builder: DecisionRecordBuilder,
     consecutive_clean_windows: usize,
     consecutive_breach_windows: usize,
@@ -230,6 +237,7 @@ impl PolicyEngine {
             mode: intended,
             pre_fallback_mode: intended,
             fallback_reason: None,
+            fallback_entered_at: None,
             builder: DecisionRecordBuilder::new(),
             consecutive_clean_windows: 0,
             consecutive_breach_windows: 0,
@@ -407,6 +415,47 @@ impl PolicyEngine {
         }
     }
 
+    /// Emergency escalation: break the fallback_safe deadlock.
+    ///
+    /// When `fallback_safe` has been active for longer than the escalation threshold
+    /// AND pressure is at RED or Critical, the engine cannot recover through normal
+    /// clean-window gates (nothing can be deleted, so pressure never drops, so
+    /// windows never become clean). This method auto-promotes to `Canary` mode,
+    /// which allows capped deletions to break the deadlock.
+    ///
+    /// Returns `true` if escalation occurred.
+    pub fn check_emergency_escalation(&mut self, pressure_is_critical: bool) -> bool {
+        if self.mode != ActiveMode::FallbackSafe || !pressure_is_critical {
+            return false;
+        }
+
+        // Don't escalate kill-switch fallbacks — those are operator-intended.
+        if self.fallback_reason == Some(FallbackReason::KillSwitch) {
+            return false;
+        }
+
+        let Some(entered_at) = self.fallback_entered_at else {
+            return false;
+        };
+
+        let threshold = Duration::from_secs(FALLBACK_EMERGENCY_ESCALATION_SECS);
+        if entered_at.elapsed() < threshold {
+            return false;
+        }
+
+        // Emergency escalation to Canary.
+        self.fallback_reason = None;
+        self.fallback_entered_at = None;
+        self.log_transition(
+            "emergency_escalate",
+            self.mode,
+            ActiveMode::Canary,
+            Some("fallback_safe deadlock: pressure sustained at RED/Critical".to_string()),
+        );
+        self.mode = ActiveMode::Canary;
+        true
+    }
+
     // ──────────── mode transitions ────────────
 
     /// Manually promote: observe→canary or canary→enforce.
@@ -449,6 +498,7 @@ impl PolicyEngine {
             self.pre_fallback_mode = self.mode;
             let reason_str = reason.to_string();
             self.fallback_reason = Some(reason);
+            self.fallback_entered_at = Some(Instant::now());
             self.total_fallback_entries += 1;
             self.consecutive_clean_windows = 0;
             self.log_transition(
@@ -573,6 +623,7 @@ impl PolicyEngine {
             other => other,
         };
         self.fallback_reason = None;
+        self.fallback_entered_at = None;
         self.log_transition("recover", self.mode, target, None);
         self.mode = target;
     }
