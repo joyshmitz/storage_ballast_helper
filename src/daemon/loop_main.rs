@@ -392,6 +392,7 @@ pub struct MonitoringDaemon {
     last_predictive_action: PredictiveAction,
     last_swap_thrash_warning: Option<Instant>,
     swap_thrash_active: bool,
+    last_scan_channel_warn: Option<Instant>,
     self_monitor: SelfMonitor,
     policy_engine: Arc<Mutex<PolicyEngine>>,
     shared_guard_diagnostics: Arc<RwLock<Option<GuardDiagnostics>>>,
@@ -428,8 +429,29 @@ fn is_swap_thrash_risk(memory: &MemoryInfo) -> bool {
         .swap_total_bytes
         .saturating_sub(memory.swap_free_bytes);
     let swap_used_pct = bytes_to_pct(swap_used_bytes, memory.swap_total_bytes);
-    swap_used_pct >= SWAP_THRASH_USED_PCT_THRESHOLD
-        && memory.available_bytes >= SWAP_THRASH_MIN_AVAILABLE_RAM_BYTES
+
+    if swap_used_pct < SWAP_THRASH_USED_PCT_THRESHOLD {
+        return false;
+    }
+
+    // Suppress false positive on zram: zram swap is compressed memory, not disk
+    // paging. High zram swap usage with plenty of free RAM is normal operation.
+    // Real thrash only happens when both swap is high AND RAM is exhausted.
+    if is_swap_zram_backed() {
+        let total_ram = memory.total_bytes.max(1);
+        #[allow(clippy::cast_precision_loss)]
+        let free_ram_pct = (memory.available_bytes as f64 * 100.0) / total_ram as f64;
+        if free_ram_pct > 40.0 {
+            return false;
+        }
+    }
+
+    memory.available_bytes >= SWAP_THRASH_MIN_AVAILABLE_RAM_BYTES
+}
+
+/// Check if swap is backed by zram (compressed memory, not disk).
+fn is_swap_zram_backed() -> bool {
+    std::path::Path::new("/sys/block/zram0").exists()
 }
 
 fn normalized_path(path: &Path) -> Cow<'_, str> {
@@ -498,6 +520,10 @@ fn should_fast_track_temp_age(
             | "pi-opus"
             | "cass-target"
             | "br-build"
+            | "rch-target-underscore"
+            | "rch-target-dot"
+            | "rch-target-hyphen"
+            | "target-codex"
     )
 }
 
@@ -701,6 +727,7 @@ impl MonitoringDaemon {
             last_predictive_action: PredictiveAction::Clear,
             last_swap_thrash_warning: None,
             swap_thrash_active: false,
+            last_scan_channel_warn: None,
             self_monitor,
             scanner_heartbeat,
             executor_heartbeat,
@@ -1078,9 +1105,18 @@ impl MonitoringDaemon {
 
             // Evaluate predictive policy with full confidence/trend gating.
             let free_pct = stats.free_pct();
-            let pred_action =
+            let mut pred_action =
                 self.predictive_policy
                     .evaluate(&rate_estimate, free_pct, mount_path.clone());
+
+            // Force low-confidence predictions to Clear so they don't trigger
+            // scans or other downstream actions (breaks scan saturation feedback loop).
+            if !matches!(pred_action, PredictiveAction::Clear)
+                && rate_estimate.confidence < self.config.pressure.prediction.min_confidence
+            {
+                pred_action = PredictiveAction::Clear;
+            }
+
             if pred_action.severity() > self.last_predictive_action.severity() {
                 self.last_predictive_action = pred_action;
             }
@@ -1107,7 +1143,20 @@ impl MonitoringDaemon {
         }
 
         if let Some(diag) = worst_guard_diag.as_ref() {
-            self.policy_engine.lock().observe_window(diag);
+            let mut policy = self.policy_engine.lock();
+            policy.observe_window(diag);
+
+            // Emergency escalation: break fallback_safe deadlock when pressure
+            // has been at RED/Critical for too long and recovery can't trigger.
+            if let Some(ref response) = worst_response {
+                let pressure_is_critical = response.level >= PressureLevel::Red;
+                if policy.check_emergency_escalation(pressure_is_critical) {
+                    eprintln!(
+                        "[SBH-DAEMON] emergency escalation: fallback_safe → canary \
+                         (pressure deadlock broken after sustained RED/Critical)"
+                    );
+                }
+            }
         }
         *self.shared_guard_diagnostics.write() = worst_guard_diag;
 
@@ -1340,9 +1389,8 @@ impl MonitoringDaemon {
         Ok(())
     }
 
-    #[allow(clippy::unused_self)]
     fn send_scan_request(
-        &self,
+        &mut self,
         scan_tx: &Sender<ScanRequest>,
         scan_rx: &Receiver<ScanRequest>,
         response: &crate::monitor::pid::PressureResponse,
@@ -1359,13 +1407,19 @@ impl MonitoringDaemon {
         let replace_on_full = response.level >= PressureLevel::Red || response.urgency >= 0.90;
         match enqueue_scan_request(scan_tx, scan_rx, request, replace_on_full) {
             ScanEnqueueStatus::Queued => {}
-            ScanEnqueueStatus::ReplacedStale => {
-                eprintln!(
-                    "[SBH-DAEMON] scan channel saturated, replaced stale queued request with urgent update"
-                );
-            }
-            ScanEnqueueStatus::DeferredFull => {
-                eprintln!("[SBH-DAEMON] scan channel full, request deferred to next tick");
+            ScanEnqueueStatus::ReplacedStale | ScanEnqueueStatus::DeferredFull => {
+                // Rate-limit these messages to once per 60s to avoid log spam
+                // when scans are saturated (fires every 1-2s otherwise).
+                let now = Instant::now();
+                let should_log = self
+                    .last_scan_channel_warn
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(60));
+                if should_log {
+                    self.last_scan_channel_warn = Some(now);
+                    eprintln!(
+                        "[SBH-DAEMON] scan channel saturated (request replaced or deferred)"
+                    );
+                }
             }
             ScanEnqueueStatus::Disconnected => {
                 eprintln!("[SBH-DAEMON] scan channel disconnected, dropping scan request");
@@ -2030,7 +2084,13 @@ fn scanner_thread_main(
         }
 
         // Scan budget: absolute deadline for this scan pass.
-        let scan_deadline = scan_start + Duration::from_secs(SCAN_TIME_BUDGET_SECS);
+        // Use configured budget, falling back to the built-in constant.
+        let budget_secs = if current_scanner_config.scan_time_budget_secs > 0 {
+            current_scanner_config.scan_time_budget_secs
+        } else {
+            SCAN_TIME_BUDGET_SECS
+        };
+        let scan_deadline = scan_start + Duration::from_secs(budget_secs);
 
         // Process entries with timeout to handle walker deadlocks.
         // The walker can deadlock when both worker threads block on a full work queue
