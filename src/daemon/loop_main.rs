@@ -384,7 +384,15 @@ pub struct MonitoringDaemon {
     cached_primary_path: PathBuf,
     start_time: Instant,
     last_pressure_level: PressureLevel,
+    /// Highest pressure level that was notified within the cooldown window.
+    /// Used to suppress oscillation noise: after notifying at Orange, we won't
+    /// re-notify at Yellow even if pressure dips to Green and comes back up.
+    last_notified_pressure_level: PressureLevel,
+    last_pressure_notify_time: Option<Instant>,
     last_special_scan: HashMap<PathBuf, Instant>,
+    /// Per-special-location notification cooldown: tracks (highest notified level, last notify time).
+    /// Prevents the same oscillation spam that the main pressure loop suppresses.
+    last_special_notify: HashMap<PathBuf, (PressureLevel, Instant)>,
     last_predictive_warning: Option<Instant>,
     last_predictive_level: Option<NotificationLevel>,
     last_ewma_confidence: f64,
@@ -421,6 +429,10 @@ fn bytes_to_pct(value: u64, total: u64) -> f64 {
 }
 
 fn is_swap_thrash_risk(memory: &MemoryInfo) -> bool {
+    is_swap_thrash_risk_inner(memory, is_swap_zram_backed())
+}
+
+fn is_swap_thrash_risk_inner(memory: &MemoryInfo, zram_backed: bool) -> bool {
     if memory.swap_total_bytes == 0 {
         return false;
     }
@@ -434,10 +446,12 @@ fn is_swap_thrash_risk(memory: &MemoryInfo) -> bool {
         return false;
     }
 
-    // Suppress false positive on zram: zram swap is compressed memory, not disk
-    // paging. High zram swap usage with plenty of free RAM is normal operation.
-    // Real thrash only happens when both swap is high AND RAM is exhausted.
-    if is_swap_zram_backed() {
+    // Suppress false positive when plenty of RAM is available: real swap thrash
+    // only happens when both swap is heavily used AND RAM is exhausted.  High
+    // swap with ample free RAM means cold pages were swapped out — normal.
+    // The zram-specific check is kept as an additional gate because zram swap
+    // is compressed memory (not disk paging), so the bar is even lower there.
+    if zram_backed {
         let total_ram = memory.total_bytes.max(1);
         #[allow(clippy::cast_precision_loss)]
         let free_ram_pct = (memory.available_bytes as f64 * 100.0) / total_ram as f64;
@@ -446,7 +460,9 @@ fn is_swap_thrash_risk(memory: &MemoryInfo) -> bool {
         }
     }
 
-    memory.available_bytes >= SWAP_THRASH_MIN_AVAILABLE_RAM_BYTES
+    // Thrash risk requires RAM to be low. If the system still has plenty of
+    // available RAM, swap usage alone doesn't indicate thrashing.
+    memory.available_bytes < SWAP_THRASH_MIN_AVAILABLE_RAM_BYTES
 }
 
 /// Check if swap is backed by zram (compressed memory, not disk).
@@ -719,7 +735,10 @@ impl MonitoringDaemon {
             shared_scanner_config,
             start_time,
             last_pressure_level: PressureLevel::Green,
+            last_notified_pressure_level: PressureLevel::Green,
+            last_pressure_notify_time: None,
             last_special_scan: HashMap::new(),
+            last_special_notify: HashMap::new(),
             last_predictive_warning: None,
             last_predictive_level: None,
             last_ewma_confidence: 0.0,
@@ -818,7 +837,29 @@ impl MonitoringDaemon {
 
             // 4. Log pressure transitions.
             if response.level != self.last_pressure_level {
-                self.log_pressure_change(&response);
+                // Suppress oscillation noise (e.g., Green→Orange→Green→Yellow→Green→Yellow).
+                // Within a 5-minute cooldown window, only notify if the new level
+                // exceeds the highest level already notified. This prevents:
+                // - After Green→Orange notification, repeated Green→Yellow noise
+                // - After Green→Red, repeated Green→Yellow→Green→Yellow cycling
+                let in_cooldown = self
+                    .last_pressure_notify_time
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(300));
+                let should_notify = if in_cooldown {
+                    // Only notify if this level exceeds what we already notified about.
+                    response.level > self.last_notified_pressure_level
+                } else {
+                    // Cooldown expired — reset and notify any change.
+                    self.last_notified_pressure_level = PressureLevel::Green;
+                    true
+                };
+                if should_notify {
+                    self.log_pressure_change(&response);
+                    self.last_pressure_notify_time = Some(Instant::now());
+                    if response.level > self.last_notified_pressure_level {
+                        self.last_notified_pressure_level = response.level;
+                    }
+                }
                 self.last_pressure_level = response.level;
             }
 
@@ -1446,10 +1487,13 @@ impl MonitoringDaemon {
 
     fn check_predictive_warning(&mut self, response: &crate::monitor::pid::PressureResponse) {
         let Some(seconds) = response.predicted_seconds else {
-            // Prediction cleared — reset stale state so the next real
-            // warning is not suppressed by an old severity/timestamp.
-            self.last_predictive_level = None;
-            self.last_predictive_warning = None;
+            // Prediction cleared — do NOT reset cooldown state here.
+            // When the disk hovers at the red threshold, predicted_seconds
+            // alternates between Some(tiny) and None on consecutive ticks.
+            // Resetting last_predictive_level/warning on each None tick
+            // defeats the 300-second cooldown, causing every-second CRIT spam.
+            // The cooldown expires naturally (300s) and the level gets updated
+            // when a new notification actually fires.
             return;
         };
 
@@ -1599,16 +1643,32 @@ impl MonitoringDaemon {
                         location.buffer_pct,
                     ),
                 });
-                // Use PressureChanged instead of Error so the notification
-                // respects the global throttle (Error is Red, which bypasses
-                // it — leading to a notification every 5 seconds).
-                self.notification_manager
-                    .notify(&NotificationEvent::PressureChanged {
-                        from: "Green".to_string(),
-                        to: format!("{pressure_level:?}"),
-                        mount: location.path.to_string_lossy().into_owned(),
-                        free_pct: stats.free_pct(),
-                    });
+                // Suppress oscillation noise the same way the main pressure loop does:
+                // within a 5-minute cooldown, only re-notify if the level exceeds the
+                // highest level already notified for this location.
+                let should_notify_special = if let Some((prev_level, prev_time)) =
+                    self.last_special_notify.get(&location.path)
+                {
+                    if prev_time.elapsed() < Duration::from_secs(300) {
+                        pressure_level > *prev_level
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                };
+
+                if should_notify_special {
+                    self.notification_manager
+                        .notify(&NotificationEvent::PressureChanged {
+                            from: "Green".to_string(),
+                            to: format!("{pressure_level:?}"),
+                            mount: location.path.to_string_lossy().into_owned(),
+                            free_pct: stats.free_pct(),
+                        });
+                    self.last_special_notify
+                        .insert(location.path.clone(), (pressure_level, now));
+                }
 
                 // Trigger root filesystem scan: special location pressure (e.g. /dev/shm
                 // full) indicates agent swarm activity that is likely also generating root
@@ -2976,26 +3036,29 @@ mod tests {
     }
 
     #[test]
-    fn swap_thrash_risk_requires_high_swap_and_free_ram() {
-        let risky = MemoryInfo {
+    fn swap_thrash_risk_requires_high_swap_and_low_ram() {
+        // High swap + ample RAM → NOT risky (cold pages swapped out, normal Linux behavior).
+        let not_risky = MemoryInfo {
             total_bytes: 128 * 1024 * 1024 * 1024,
             available_bytes: 24 * 1024 * 1024 * 1024,
             swap_total_bytes: 64 * 1024 * 1024 * 1024,
             swap_free_bytes: 8 * 1024 * 1024 * 1024,
         };
-        assert!(is_swap_thrash_risk(&risky));
+        assert!(!is_swap_thrash_risk_inner(&not_risky, false));
 
+        // Low swap usage → NOT risky regardless of RAM.
         let low_swap = MemoryInfo {
             swap_free_bytes: 40 * 1024 * 1024 * 1024,
-            ..risky
+            ..not_risky
         };
-        assert!(!is_swap_thrash_risk(&low_swap));
+        assert!(!is_swap_thrash_risk_inner(&low_swap, false));
 
-        let low_ram = MemoryInfo {
+        // High swap + low RAM → RISKY (genuine memory exhaustion with active paging).
+        let risky = MemoryInfo {
             available_bytes: 2 * 1024 * 1024 * 1024,
-            ..risky
+            ..not_risky
         };
-        assert!(!is_swap_thrash_risk(&low_ram));
+        assert!(is_swap_thrash_risk_inner(&risky, false));
     }
 
     // ──────────────────── repeat deletion dampening ────────────────────
@@ -3159,31 +3222,44 @@ mod tests {
     #[test]
     fn test_swap_thrash_logic_correct_behavior() {
         use crate::platform::pal::MemoryInfo;
-        // High swap (80%), High RAM (16GB).
-        // Per README: swap >= 70% AND available >= 8GB means anomalous paging
-        // (system had earlier pressure, now has free RAM but swap is still hot).
-        let anomalous_paging = MemoryInfo {
+        // High swap (80%), High RAM (16GB) → NOT risky.
+        // On Linux, cold pages are swapped out even with ample RAM. This is
+        // normal operation, not thrashing.
+        let cold_pages = MemoryInfo {
             total_bytes: 32 * 1024 * 1024 * 1024,
             available_bytes: 16 * 1024 * 1024 * 1024, // 16 GB
             swap_total_bytes: 10 * 1024 * 1024 * 1024,
             swap_free_bytes: 2 * 1024 * 1024 * 1024, // 80% used
         };
         assert!(
-            super::is_swap_thrash_risk(&anomalous_paging),
-            "High swap with ample free RAM indicates anomalous paging"
+            !super::is_swap_thrash_risk_inner(&cold_pages, false),
+            "High swap with ample free RAM is cold-page swap, not thrashing"
         );
 
-        // High swap (80%), Low RAM (100MB).
-        // Low available RAM means the system genuinely needs swap — not anomalous.
-        let genuine_pressure = MemoryInfo {
+        // High swap (80%), Low RAM (100MB) → RISKY.
+        // RAM is exhausted and swap is heavily used — genuine thrash risk.
+        let genuine_thrash = MemoryInfo {
             total_bytes: 32 * 1024 * 1024 * 1024,
             available_bytes: 100 * 1024 * 1024, // 100 MB
             swap_total_bytes: 10 * 1024 * 1024 * 1024,
             swap_free_bytes: 2 * 1024 * 1024 * 1024, // 80% used
         };
         assert!(
-            !super::is_swap_thrash_risk(&genuine_pressure),
-            "Low RAM with high swap is genuine pressure, not anomalous paging"
+            super::is_swap_thrash_risk_inner(&genuine_thrash, false),
+            "High swap with exhausted RAM is genuine thrash risk"
+        );
+
+        // Zram-backed, High swap (80%), High RAM (50% free) → suppressed.
+        assert!(
+            !super::is_swap_thrash_risk_inner(&cold_pages, true),
+            "High zram swap with plenty of free RAM should be suppressed"
+        );
+
+        // Zram-backed, High swap (80%), Low RAM (100MB) → RISKY.
+        // Even with zram, if RAM is exhausted, real paging is happening.
+        assert!(
+            super::is_swap_thrash_risk_inner(&genuine_thrash, true),
+            "Low RAM with high zram swap is genuine thrash risk"
         );
     }
 }

@@ -45,6 +45,10 @@ pub struct DiskRateEstimator {
     ewma_rate: f64,
     ewma_accel: f64,
     residual_ewma: f64,
+    /// EWMA of normalized prediction jitter (|Δprediction| / max(prediction, 60s)).
+    prediction_jitter_ewma: f64,
+    /// Previous seconds_to_threshold for computing prediction jitter.
+    last_predicted_secs: Option<f64>,
     min_samples: u64,
     samples: u64,
     last: Option<SampleState>,
@@ -60,6 +64,8 @@ impl DiskRateEstimator {
             ewma_rate: 0.0,
             ewma_accel: 0.0,
             residual_ewma: 0.0,
+            prediction_jitter_ewma: 0.0,
+            last_predicted_secs: None,
             min_samples,
             samples: 0,
             last: None,
@@ -137,13 +143,29 @@ impl DiskRateEstimator {
             inst_rate,
         });
 
-        let confidence = self.compute_confidence();
         let trend = classify_trend(self.ewma_rate, self.ewma_accel);
         let seconds_to_exhaustion =
             project_time(self.ewma_rate, self.ewma_accel, free_bytes as f64);
         let threshold_distance = free_bytes.saturating_sub(threshold_free_bytes);
         let seconds_to_threshold =
             project_time(self.ewma_rate, self.ewma_accel, threshold_distance as f64);
+
+        // Track prediction jitter: how much seconds_to_threshold changes between
+        // ticks, normalized by the prediction magnitude. Swings like 47m → 2m
+        // produce jitter near 1.0+, penalizing confidence.
+        if seconds_to_threshold.is_finite() {
+            if let Some(prev) = self.last_predicted_secs {
+                let change = (seconds_to_threshold - prev).abs();
+                // Normalize by the larger of the two predictions (floor at 60s to
+                // avoid division amplification near zero).
+                let scale = seconds_to_threshold.abs().max(prev.abs()).max(60.0);
+                let jitter = change / scale;
+                self.prediction_jitter_ewma = ewma(alpha, self.prediction_jitter_ewma, jitter);
+            }
+            self.last_predicted_secs = Some(seconds_to_threshold);
+        }
+
+        let confidence = self.compute_confidence();
         let fallback_active = self.samples < self.min_samples || confidence < 0.2;
 
         RateEstimate {
@@ -175,9 +197,10 @@ impl DiskRateEstimator {
         }
         let sample_term = (self.samples as f64 / self.min_samples.max(1) as f64).min(1.0);
         let residual_term = 1.0 / (1.0 + self.residual_ewma / (self.ewma_rate.abs() + 1.0));
-        0.7f64
-            .mul_add(sample_term, 0.3 * residual_term)
-            .clamp(0.0, 1.0)
+        // Prediction stability: 1.0 when predictions are consistent, drops toward
+        // 0.0 when predictions swing wildly between ticks (e.g. 47m → 2m).
+        let stability_term = 1.0 / (1.0 + 3.0 * self.prediction_jitter_ewma);
+        (0.5 * sample_term + 0.2 * residual_term + 0.3 * stability_term).clamp(0.0, 1.0)
     }
 
     fn fallback_estimate(&self, free_bytes: u64, threshold_free_bytes: u64) -> RateEstimate {

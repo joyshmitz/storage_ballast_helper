@@ -3516,9 +3516,10 @@ fn is_swap_thrash_risk(memory: &MemoryInfo) -> bool {
         }
     }
 
-    // If swap is heavily used while plenty of RAM is still available, the host
-    // likely experienced pressure and is now paging memory back in slowly.
-    memory.available_bytes >= MIN_AVAILABLE_RAM_BYTES
+    // Thrash risk requires RAM to be low. If the system still has plenty of
+    // available RAM, swap usage alone doesn't indicate thrashing — the kernel
+    // simply swapped out cold pages, which is normal Linux behavior.
+    memory.available_bytes < MIN_AVAILABLE_RAM_BYTES
 }
 
 fn ballast_total_pool_bytes(file_count: usize, file_size_bytes: u64) -> u64 {
@@ -6202,14 +6203,24 @@ mod tests {
     }
 
     #[test]
-    fn swap_thrash_risk_detects_high_swap_with_free_ram() {
-        let memory = MemoryInfo {
+    fn swap_thrash_risk_requires_high_swap_and_low_ram() {
+        // High swap + ample RAM → NOT risky (cold pages swapped, normal).
+        let cold_pages = MemoryInfo {
             total_bytes: 128 * 1024 * 1024 * 1024,
             available_bytes: 64 * 1024 * 1024 * 1024,
             swap_total_bytes: 72 * 1024 * 1024 * 1024,
             swap_free_bytes: 10 * 1024 * 1024 * 1024,
         };
-        assert!(is_swap_thrash_risk(&memory));
+        assert!(!is_swap_thrash_risk(&cold_pages));
+
+        // High swap + low RAM → RISKY (genuine memory exhaustion).
+        let thrashing = MemoryInfo {
+            total_bytes: 128 * 1024 * 1024 * 1024,
+            available_bytes: 2 * 1024 * 1024 * 1024,
+            swap_total_bytes: 72 * 1024 * 1024 * 1024,
+            swap_free_bytes: 10 * 1024 * 1024 * 1024,
+        };
+        assert!(is_swap_thrash_risk(&thrashing));
     }
 
     #[test]

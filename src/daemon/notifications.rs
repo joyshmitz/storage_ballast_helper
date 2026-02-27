@@ -127,9 +127,13 @@ impl NotificationEvent {
                 ..
             } => {
                 // Determine severity from time-to-exhaustion.
-                let time_level = if *minutes_remaining < 5.0 {
+                // Thresholds must match check_predictive_warning() in loop_main.rs
+                // to avoid level-mismatch where the journal shows [CRIT] but the
+                // cooldown logic considers the event Red, causing back-to-back CRITs.
+                // Defaults: critical < 2 min, red < 5 min, orange < 30 min.
+                let time_level = if *minutes_remaining < 2.0 {
                     NotificationLevel::Critical
-                } else if *minutes_remaining < 10.0 {
+                } else if *minutes_remaining < 5.0 {
                     NotificationLevel::Red
                 } else if *minutes_remaining < 30.0 {
                     NotificationLevel::Orange
@@ -205,9 +209,12 @@ impl NotificationEvent {
                 mount,
                 minutes_remaining,
                 confidence,
-            } => format!(
-                "Predicted disk full on {mount} in {minutes_remaining:.0}m (confidence: {confidence:.0}%)"
-            ),
+            } => {
+                let pct = confidence * 100.0;
+                format!(
+                    "Predicted disk full on {mount} in {minutes_remaining:.0}m (confidence: {pct:.0}%)"
+                )
+            }
             Self::CleanupCompleted {
                 items_deleted,
                 bytes_freed,
@@ -844,12 +851,24 @@ mod tests {
 
     #[test]
     fn event_level_predictive_warning_imminent() {
+        // 1.5 min < 2 min critical threshold → Critical
+        let event = NotificationEvent::PredictiveWarning {
+            mount: "/data".to_string(),
+            minutes_remaining: 1.5,
+            confidence: 0.92,
+        };
+        assert_eq!(event.level(), NotificationLevel::Critical);
+    }
+
+    #[test]
+    fn event_level_predictive_warning_red_zone() {
+        // 3 min: >= 2 (not critical) but < 5 (imminent) → Red
         let event = NotificationEvent::PredictiveWarning {
             mount: "/data".to_string(),
             minutes_remaining: 3.0,
             confidence: 0.92,
         };
-        assert_eq!(event.level(), NotificationLevel::Critical);
+        assert_eq!(event.level(), NotificationLevel::Red);
     }
 
     #[test]
@@ -860,6 +879,54 @@ mod tests {
             confidence: 0.85,
         };
         assert_eq!(event.level(), NotificationLevel::Orange);
+    }
+
+    #[test]
+    fn event_level_predictive_warning_low_confidence_caps_to_info() {
+        // confidence 0.10 (10%) < 0.3 → cap at Info, even though time says Critical.
+        let event = NotificationEvent::PredictiveWarning {
+            mount: "/".to_string(),
+            minutes_remaining: 0.5,
+            confidence: 0.10,
+        };
+        assert_eq!(event.level(), NotificationLevel::Info);
+    }
+
+    #[test]
+    fn event_level_predictive_warning_medium_confidence_caps_to_warning() {
+        // confidence 0.40 → cap at Warning, time says Critical.
+        let event = NotificationEvent::PredictiveWarning {
+            mount: "/".to_string(),
+            minutes_remaining: 1.0,
+            confidence: 0.40,
+        };
+        assert_eq!(event.level(), NotificationLevel::Warning);
+    }
+
+    #[test]
+    fn event_level_predictive_warning_high_confidence_no_cap() {
+        // confidence 0.92 → no cap, Critical from time stays.
+        let event = NotificationEvent::PredictiveWarning {
+            mount: "/".to_string(),
+            minutes_remaining: 1.0,
+            confidence: 0.92,
+        };
+        assert_eq!(event.level(), NotificationLevel::Critical);
+    }
+
+    #[test]
+    fn predictive_warning_summary_shows_confidence_as_percentage() {
+        let event = NotificationEvent::PredictiveWarning {
+            mount: "/data".to_string(),
+            minutes_remaining: 3.0,
+            confidence: 0.92,
+        };
+        let summary = event.summary();
+        // 0.92 * 100 = 92.0 → "92%"
+        assert!(
+            summary.contains("92%"),
+            "expected '92%' in summary: {summary}"
+        );
     }
 
     #[test]
