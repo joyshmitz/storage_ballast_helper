@@ -30,6 +30,8 @@ use crate::scanner::scoring::{
 fn observe_config() -> PolicyConfig {
     PolicyConfig {
         initial_mode: ActiveMode::Observe,
+        // Disable cooldown for unit tests so recovery is instant.
+        min_fallback_secs: 0,
         ..PolicyConfig::default()
     }
 }
@@ -423,6 +425,7 @@ fn policy_fallback_recovery_restores_mode() {
     let config = PolicyConfig {
         recovery_clean_windows: 1,
         initial_mode: ActiveMode::Observe,
+        min_fallback_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(config);
@@ -698,6 +701,7 @@ fn property_policy_engine_invariants_under_random_operations() {
             calibration_breach_windows: 2,
             max_canary_deletes_per_hour: 5,
             initial_mode: ActiveMode::Observe,
+            min_fallback_secs: 0,
             ..PolicyConfig::default()
         };
         let mut engine = PolicyEngine::new(config);
@@ -1492,7 +1496,13 @@ fn replay_observe_canary_enforce_lifecycle() {
         },
     ];
 
-    let mut engine = ReplayEngine::new(seed);
+    let config = PolicyConfig {
+        initial_mode: ActiveMode::Observe,
+        recovery_clean_windows: 3,
+        min_fallback_secs: 0,
+        ..PolicyConfig::default()
+    };
+    let mut engine = ReplayEngine::with_policy_config(seed, config);
     engine.replay(&steps);
 
     // Verify mode transitions.
@@ -1888,6 +1898,7 @@ fn replay_recovery_after_serialization_fault() {
     let config = PolicyConfig {
         recovery_clean_windows: 2,
         initial_mode: ActiveMode::Observe,
+        min_fallback_secs: 0,
         ..PolicyConfig::default()
     };
 
@@ -1977,6 +1988,7 @@ fn replay_multi_fault_sequence() {
         recovery_clean_windows: 1,
         max_canary_deletes_per_hour: 100, // High cap so canary budget doesn't trip during recovery test
         initial_mode: ActiveMode::Observe,
+        min_fallback_secs: 0,
         ..PolicyConfig::default()
     };
 

@@ -108,6 +108,7 @@ impl fmt::Display for FallbackReason {
 
 /// Configuration for the policy engine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct PolicyConfig {
     /// Initial mode on daemon start.
     pub initial_mode: ActiveMode,
@@ -129,6 +130,9 @@ pub struct PolicyConfig {
     pub loss_keep_abandoned: f64,
     /// Loss for review action (any state).
     pub loss_review: f64,
+    /// Minimum seconds to stay in FallbackSafe before attempting recovery.
+    /// Prevents rapid canary↔fallback thrashing on bursty workloads.
+    pub min_fallback_secs: u64,
     /// Whether the kill-switch is active (forces fallback_safe).
     pub kill_switch: bool,
 }
@@ -140,8 +144,9 @@ impl Default for PolicyConfig {
             max_candidates_per_loop: 100,
             max_hypothetical_deletes: 25,
             max_canary_deletes_per_hour: 10,
-            recovery_clean_windows: 3,
-            calibration_breach_windows: 3,
+            recovery_clean_windows: 30,
+            calibration_breach_windows: 15,
+            min_fallback_secs: 300,
             guard_penalty: 50.0,
             loss_delete_useful: 100.0,
             loss_keep_abandoned: 30.0,
@@ -396,9 +401,13 @@ impl PolicyEngine {
             self.consecutive_clean_windows += 1;
             self.consecutive_breach_windows = 0;
 
-            // Check recovery condition.
+            // Check recovery condition — require both enough clean windows AND
+            // a minimum cooldown period to prevent rapid canary↔fallback thrashing.
             if self.mode == ActiveMode::FallbackSafe
                 && self.consecutive_clean_windows >= self.config.recovery_clean_windows
+                && self.fallback_entered_at.is_none_or(|entered| {
+                    entered.elapsed() >= Duration::from_secs(self.config.min_fallback_secs)
+                })
             {
                 self.recover_from_fallback();
             }
@@ -495,6 +504,7 @@ impl PolicyEngine {
     /// Force fallback_safe mode with the given reason.
     pub fn enter_fallback(&mut self, reason: FallbackReason) {
         if self.mode != ActiveMode::FallbackSafe {
+            let from = self.mode;
             self.pre_fallback_mode = self.mode;
             let reason_str = reason.to_string();
             self.fallback_reason = Some(reason);
@@ -503,11 +513,14 @@ impl PolicyEngine {
             self.consecutive_clean_windows = 0;
             self.log_transition(
                 "fallback",
-                self.mode,
+                from,
                 ActiveMode::FallbackSafe,
-                Some(reason_str),
+                Some(reason_str.clone()),
             );
             self.mode = ActiveMode::FallbackSafe;
+            eprintln!(
+                "[SBH-POLICY] {from} → FallbackSafe (reason: {reason_str})"
+            );
         }
     }
 
@@ -595,11 +608,15 @@ impl PolicyEngine {
             }
         }
 
-        // Canary mode: check hourly budget.
+        // Canary mode: check hourly budget.  When the budget is exhausted,
+        // simply stop approving more deletions for the rest of the hour
+        // instead of entering FallbackSafe.  Entering FallbackSafe after a
+        // successful canary run is counterproductive — recovery requires
+        // consecutive clean guard windows, which may take hours on active
+        // machines.  The budget limit is sufficient safety.
         if self.mode == ActiveMode::Canary {
             self.rotate_canary_hour();
             if self.canary_deletes_this_hour >= self.config.max_canary_deletes_per_hour {
-                self.enter_fallback(FallbackReason::CanaryBudgetExhausted);
                 return DecisionAction::Keep;
             }
             self.canary_deletes_this_hour += 1;
@@ -622,10 +639,12 @@ impl PolicyEngine {
             ActiveMode::Enforce => ActiveMode::Canary,
             other => other,
         };
+        let from = self.mode;
         self.fallback_reason = None;
         self.fallback_entered_at = None;
-        self.log_transition("recover", self.mode, target, None);
+        self.log_transition("recover", from, target, None);
         self.mode = target;
+        eprintln!("[SBH-POLICY] {from} → {target} (recovered)");
     }
 
     fn apply_transition(&mut self, to: ActiveMode, kind: &str) {
@@ -702,6 +721,8 @@ mod tests {
     fn default_config() -> PolicyConfig {
         PolicyConfig {
             initial_mode: ActiveMode::Observe,
+            // Disable cooldown for unit tests so recovery is instant.
+            min_fallback_secs: 0,
             ..PolicyConfig::default()
         }
     }
@@ -993,9 +1014,11 @@ mod tests {
         let guard = passing_guard();
         let decision = engine.evaluate(&candidates, Some(&guard));
 
-        // Should approve 2, then enter fallback on the 3rd.
+        // Should approve 2, then cap (Keep) the 3rd. Stays in Canary
+        // rather than entering FallbackSafe — budget exhaustion is not
+        // a safety concern, just a rate limit.
         assert_eq!(decision.approved_for_deletion.len(), 2);
-        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+        assert_eq!(engine.mode(), ActiveMode::Canary);
     }
 
     #[test]

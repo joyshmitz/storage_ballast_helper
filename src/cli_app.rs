@@ -3285,6 +3285,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     })
                 }),
                 "recent_hour": recent,
+                "policy_mode": daemon_state.as_ref().and_then(|s| s.get("policy_mode")).and_then(|v| v.as_str()),
             });
             write_json_line(&payload)?;
         }

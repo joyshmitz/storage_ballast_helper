@@ -1683,6 +1683,7 @@ fn e2e_scenario_6_progressive_recovery() {
     let config = PolicyConfig {
         recovery_clean_windows: 3,
         initial_mode: ActiveMode::Observe,
+        min_fallback_secs: 0,
         ..PolicyConfig::default()
     };
     let mut policy = PolicyEngine::new(config);

@@ -1643,17 +1643,14 @@ impl MonitoringDaemon {
                         location.buffer_pct,
                     ),
                 });
-                // Suppress oscillation noise the same way the main pressure loop does:
-                // within a 5-minute cooldown, only re-notify if the level exceeds the
-                // highest level already notified for this location.
-                let should_notify_special = if let Some((prev_level, prev_time)) =
+                // Only notify when the level for this location actually changes.
+                // Within a 5-minute cooldown, only escalation (higher level) fires.
+                // After cooldown, any level change fires. But the SAME level at the
+                // same location does NOT re-fire — the condition hasn't changed.
+                let should_notify_special = if let Some((prev_level, _prev_time)) =
                     self.last_special_notify.get(&location.path)
                 {
-                    if prev_time.elapsed() < Duration::from_secs(300) {
-                        pressure_level > *prev_level
-                    } else {
-                        true
-                    }
+                    pressure_level != *prev_level
                 } else {
                     true
                 };
@@ -2453,6 +2450,7 @@ fn executor_thread_main(
     let mut batch_count: u64 = 0;
     let mut last_circuit_breaker_trip: Option<Instant> = None;
     let circuit_breaker_cooldown = DeletionConfig::default().circuit_breaker_cooldown;
+    let mut last_policy_reject_log: Option<Instant> = None;
 
     while let Ok(batch) = del_rx.recv() {
         heartbeat.beat();
@@ -2501,6 +2499,19 @@ fn executor_thread_main(
         }
 
         if approved_candidates.is_empty() {
+            // Rate-limit this message to once per 5 minutes.
+            let now = Instant::now();
+            let should_log = last_policy_reject_log
+                .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(300));
+            if should_log {
+                last_policy_reject_log = Some(now);
+                eprintln!(
+                    "[SBH-EXECUTOR] policy rejected {}/{} candidates (mode={})",
+                    batch.candidates.len(),
+                    batch.candidates.len(),
+                    policy_mode,
+                );
+            }
             continue;
         }
 

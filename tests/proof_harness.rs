@@ -813,17 +813,13 @@ fn fault_canary_budget_exhaustion() {
     ];
     let decision = engine.evaluate(&candidates, Some(&good_guard()));
 
-    // Should approve 2 then enter fallback.
+    // Should approve up to 2 then cap — stays in Canary (no longer enters FallbackSafe).
     assert_eq!(decision.approved_for_deletion.len(), 2);
     assert_eq!(
         engine.mode(),
-        ActiveMode::FallbackSafe,
-        "canary budget exhaustion must trigger fallback"
+        ActiveMode::Canary,
+        "canary budget exhaustion caps deletions but stays in Canary"
     );
-    assert!(matches!(
-        engine.fallback_reason(),
-        Some(FallbackReason::CanaryBudgetExhausted)
-    ));
 }
 
 // Fault family 5: Kill-switch engagement → immediate block
@@ -892,6 +888,7 @@ fn fault_recovery_after_drift() {
     let config = PolicyConfig {
         recovery_clean_windows: 2,
         initial_mode: ActiveMode::Observe,
+        min_fallback_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(config);
