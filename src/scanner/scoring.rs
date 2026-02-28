@@ -290,7 +290,11 @@ fn factor_location(path: &Path) -> f64 {
         raw
     };
 
-    if text.starts_with("/tmp") || text.starts_with("/var/tmp") || text.starts_with("/dev/shm") {
+    if text.starts_with("/tmp")
+        || text.starts_with("/var/tmp")
+        || text.starts_with("/data/tmp")
+        || text.starts_with("/dev/shm")
+    {
         0.95
     } else if text.contains("/data/projects/") && text.contains("/.tmp_") {
         0.90

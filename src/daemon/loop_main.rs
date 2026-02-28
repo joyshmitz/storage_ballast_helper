@@ -67,11 +67,13 @@ const EARLY_DISPATCH_MAX_WAIT: Duration = Duration::from_secs(10);
 /// Prevents the scanner from taking hours on massive directory trees (e.g. 500GB+
 /// of nested cargo targets). When the budget is reached, whatever candidates have
 /// been found so far are sent to the executor. The next scan request will continue.
-const SCAN_ENTRY_BUDGET: usize = 100_000;
+const SCAN_ENTRY_BUDGET: usize = 500_000;
 
 /// Maximum wall-clock time for a single scan pass (seconds).
 /// After this deadline, the scanner processes accumulated candidates and returns.
-const SCAN_TIME_BUDGET_SECS: u64 = 60;
+/// This is the fallback when the config value is 0; the default config value (300s)
+/// is preferred over this constant.
+const SCAN_TIME_BUDGET_SECS: u64 = 300;
 /// Cooldown between repeated swap-thrash warnings while pressure remains.
 const SWAP_THRASH_WARNING_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 /// Swap usage threshold that indicates probable paging thrash.
@@ -1193,7 +1195,7 @@ impl MonitoringDaemon {
                 let pressure_is_critical = response.level >= PressureLevel::Red;
                 if policy.check_emergency_escalation(pressure_is_critical) {
                     eprintln!(
-                        "[SBH-DAEMON] emergency escalation: fallback_safe → canary \
+                        "[SBH-DAEMON] emergency escalation: fallback_safe → enforce \
                          (pressure deadlock broken after sustained RED/Critical)"
                     );
                 }
@@ -2142,10 +2144,18 @@ fn scanner_thread_main(
 
         // Scan budget: absolute deadline for this scan pass.
         // Use configured budget, falling back to the built-in constant.
-        let budget_secs = if current_scanner_config.scan_time_budget_secs > 0 {
+        // Under high pressure, extend the budget so the scanner can find more
+        // candidates to free — timing out with too few candidates is exactly
+        // how the fallback_safe deadlock forms.
+        let base_budget_secs = if current_scanner_config.scan_time_budget_secs > 0 {
             current_scanner_config.scan_time_budget_secs
         } else {
             SCAN_TIME_BUDGET_SECS
+        };
+        let budget_secs = match request.pressure_level {
+            PressureLevel::Red | PressureLevel::Critical => base_budget_secs.saturating_mul(3).max(600),
+            PressureLevel::Orange => base_budget_secs.saturating_mul(2).max(300),
+            _ => base_budget_secs,
         };
         let scan_deadline = scan_start + Duration::from_secs(budget_secs);
 

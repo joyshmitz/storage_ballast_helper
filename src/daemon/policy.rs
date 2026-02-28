@@ -144,8 +144,8 @@ impl Default for PolicyConfig {
             max_candidates_per_loop: 100,
             max_hypothetical_deletes: 25,
             max_canary_deletes_per_hour: 10,
-            recovery_clean_windows: 30,
-            calibration_breach_windows: 15,
+            recovery_clean_windows: 3,
+            calibration_breach_windows: 8,
             min_fallback_secs: 300,
             guard_penalty: 50.0,
             loss_delete_useful: 100.0,
@@ -194,10 +194,15 @@ pub enum Transition {
 
 // ──────────────────── policy engine ────────────────────
 
-/// Duration after which fallback_safe mode can be auto-escalated to canary
+/// Duration after which fallback_safe mode can be auto-escalated to enforce
 /// when pressure remains at RED or Critical, breaking the deadlock where
 /// nothing can be deleted but pressure can't drop.
-const FALLBACK_EMERGENCY_ESCALATION_SECS: u64 = 15 * 60;
+const FALLBACK_EMERGENCY_ESCALATION_SECS: u64 = 5 * 60;
+
+/// Grace period after emergency escalation during which the engine will not
+/// re-enter FallbackSafe. This prevents the cycle where escalation → immediate
+/// calibration breach → FallbackSafe → escalation repeats endlessly.
+const EMERGENCY_GRACE_PERIOD_SECS: u64 = 30 * 60;
 
 /// The shadow-mode policy engine with progressive delivery gates.
 pub struct PolicyEngine {
@@ -207,6 +212,10 @@ pub struct PolicyEngine {
     fallback_reason: Option<FallbackReason>,
     /// When fallback_safe mode was entered (for emergency escalation timer).
     fallback_entered_at: Option<Instant>,
+    /// When emergency escalation last occurred. During the grace period after
+    /// escalation, the engine refuses to re-enter FallbackSafe to prevent the
+    /// deadlock cycle: escalate → breach → fallback → escalate → ...
+    emergency_escalated_at: Option<Instant>,
     builder: DecisionRecordBuilder,
     consecutive_clean_windows: usize,
     consecutive_breach_windows: usize,
@@ -243,6 +252,7 @@ impl PolicyEngine {
             pre_fallback_mode: intended,
             fallback_reason: None,
             fallback_entered_at: None,
+            emergency_escalated_at: None,
             builder: DecisionRecordBuilder::new(),
             consecutive_clean_windows: 0,
             consecutive_breach_windows: 0,
@@ -401,13 +411,9 @@ impl PolicyEngine {
             self.consecutive_clean_windows += 1;
             self.consecutive_breach_windows = 0;
 
-            // Check recovery condition — require both enough clean windows AND
-            // a minimum cooldown period to prevent rapid canary↔fallback thrashing.
+            // Check recovery condition.
             if self.mode == ActiveMode::FallbackSafe
                 && self.consecutive_clean_windows >= self.config.recovery_clean_windows
-                && self.fallback_entered_at.is_none_or(|entered| {
-                    entered.elapsed() >= Duration::from_secs(self.config.min_fallback_secs)
-                })
             {
                 self.recover_from_fallback();
             }
@@ -429,8 +435,9 @@ impl PolicyEngine {
     /// When `fallback_safe` has been active for longer than the escalation threshold
     /// AND pressure is at RED or Critical, the engine cannot recover through normal
     /// clean-window gates (nothing can be deleted, so pressure never drops, so
-    /// windows never become clean). This method auto-promotes to `Canary` mode,
-    /// which allows capped deletions to break the deadlock.
+    /// windows never become clean). This method auto-promotes to `Enforce` mode
+    /// and activates a grace period during which re-entry to FallbackSafe is
+    /// blocked, preventing the escalate→breach→fallback→escalate cycle.
     ///
     /// Returns `true` if escalation occurred.
     pub fn check_emergency_escalation(&mut self, pressure_is_critical: bool) -> bool {
@@ -452,16 +459,21 @@ impl PolicyEngine {
             return false;
         }
 
-        // Emergency escalation to Canary.
+        // Emergency escalation directly to Enforce (not Canary) — the disk is
+        // in crisis and the 10-deletes/hour canary budget is far too small to
+        // make a dent. Reset breach counters so calibration checks start fresh.
         self.fallback_reason = None;
         self.fallback_entered_at = None;
+        self.emergency_escalated_at = Some(Instant::now());
+        self.consecutive_breach_windows = 0;
+        self.consecutive_clean_windows = 0;
         self.log_transition(
             "emergency_escalate",
             self.mode,
-            ActiveMode::Canary,
+            ActiveMode::Enforce,
             Some("fallback_safe deadlock: pressure sustained at RED/Critical".to_string()),
         );
-        self.mode = ActiveMode::Canary;
+        self.mode = ActiveMode::Enforce;
         true
     }
 
@@ -502,8 +514,31 @@ impl PolicyEngine {
     }
 
     /// Force fallback_safe mode with the given reason.
+    ///
+    /// Respects the emergency escalation grace period: if the engine was recently
+    /// emergency-escalated from FallbackSafe, re-entry is blocked until the grace
+    /// period expires. This prevents the deadlock cycle where calibration breach
+    /// immediately re-triggers FallbackSafe after escalation. Kill-switch always
+    /// overrides the grace period.
     pub fn enter_fallback(&mut self, reason: FallbackReason) {
         if self.mode != ActiveMode::FallbackSafe {
+            // Respect emergency escalation grace period (kill-switch always overrides).
+            if reason != FallbackReason::KillSwitch {
+                if let Some(escalated_at) = self.emergency_escalated_at {
+                    let grace = Duration::from_secs(EMERGENCY_GRACE_PERIOD_SECS);
+                    if escalated_at.elapsed() < grace {
+                        eprintln!(
+                            "[SBH-POLICY] suppressing fallback ({reason}) — \
+                             emergency grace period active ({:.0}s remaining)",
+                            grace.as_secs_f64() - escalated_at.elapsed().as_secs_f64()
+                        );
+                        return;
+                    }
+                    // Grace period expired — clear the marker.
+                    self.emergency_escalated_at = None;
+                }
+            }
+
             let from = self.mode;
             self.pre_fallback_mode = self.mode;
             let reason_str = reason.to_string();
@@ -608,15 +643,11 @@ impl PolicyEngine {
             }
         }
 
-        // Canary mode: check hourly budget.  When the budget is exhausted,
-        // simply stop approving more deletions for the rest of the hour
-        // instead of entering FallbackSafe.  Entering FallbackSafe after a
-        // successful canary run is counterproductive — recovery requires
-        // consecutive clean guard windows, which may take hours on active
-        // machines.  The budget limit is sufficient safety.
+        // Canary mode: check hourly budget.
         if self.mode == ActiveMode::Canary {
             self.rotate_canary_hour();
             if self.canary_deletes_this_hour >= self.config.max_canary_deletes_per_hour {
+                self.enter_fallback(FallbackReason::CanaryBudgetExhausted);
                 return DecisionAction::Keep;
             }
             self.canary_deletes_this_hour += 1;
@@ -1014,11 +1045,9 @@ mod tests {
         let guard = passing_guard();
         let decision = engine.evaluate(&candidates, Some(&guard));
 
-        // Should approve 2, then cap (Keep) the 3rd. Stays in Canary
-        // rather than entering FallbackSafe — budget exhaustion is not
-        // a safety concern, just a rate limit.
+        // Should approve 2, then trigger FallbackSafe on the 3rd.
         assert_eq!(decision.approved_for_deletion.len(), 2);
-        assert_eq!(engine.mode(), ActiveMode::Canary);
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
     }
 
     #[test]

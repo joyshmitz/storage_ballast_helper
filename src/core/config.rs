@@ -345,6 +345,8 @@ impl Default for ScannerConfig {
                 PathBuf::from("/tmp"),
                 PathBuf::from("/data/tmp"),
                 PathBuf::from("/var/tmp"),
+                PathBuf::from("/home"),
+                PathBuf::from("/root"),
             ],
             excluded_paths: vec![
                 PathBuf::from("/"),
@@ -368,7 +370,7 @@ impl Default for ScannerConfig {
             max_delete_batch: 20,
             repeat_deletion_base_cooldown_secs: 300,
             repeat_deletion_max_cooldown_secs: 3600,
-            scan_time_budget_secs: 120,
+            scan_time_budget_secs: 300,
         }
     }
 }
@@ -376,7 +378,7 @@ impl Default for ScannerConfig {
 impl Default for ScoringConfig {
     fn default() -> Self {
         Self {
-            min_score: 0.45,
+            min_score: 0.35,
             location_weight: 0.25,
             name_weight: 0.25,
             age_weight: 0.20,
@@ -384,7 +386,7 @@ impl Default for ScoringConfig {
             structure_weight: 0.15,
             false_positive_loss: 50.0,
             false_negative_loss: 30.0,
-            calibration_floor: 0.55,
+            calibration_floor: 0.40,
         }
     }
 }
