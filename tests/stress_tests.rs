@@ -565,6 +565,7 @@ fn stress_decision_plane_drift() {
         initial_mode: ActiveMode::Observe,
         calibration_breach_windows: 3,
         recovery_clean_windows: 5,
+        min_fallback_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(policy_config);
@@ -593,6 +594,8 @@ fn stress_decision_plane_drift() {
     report.steps += 1;
 
     // Phase 3: Inject drift — 50 bad observations.
+    // Pressure must be non-green for check_guard_triggers to trigger fallback.
+    engine.set_pressure_green(false);
     let mut drift_steps = 0;
     let mut guard_fail_at: Option<usize> = None;
     for i in 0..50 {
@@ -612,6 +615,11 @@ fn stress_decision_plane_drift() {
         // Feed the guard state to the policy engine.
         let diag = guard.diagnostics();
         engine.observe_window(&diag, false);
+
+        // Evaluate candidates so check_guard_triggers() can detect
+        // e_process_alarm and transition to FallbackSafe.
+        let scored_drift = scoring.score_batch(&candidates, 0.6);
+        let _ = engine.evaluate(&scored_drift, Some(&diag));
 
         // Once in fallback, verify no deletions.
         if engine.mode() == ActiveMode::FallbackSafe {

@@ -1029,12 +1029,13 @@ fn warmup_to_mode(rng: &mut SeededRng, target: ActiveMode) -> Vec<ReplayStep> {
     let mut steps = Vec::new();
 
     // First: feed enough good observations to get guard to PASS.
+    // The default GuardrailConfig requires min_observations=30, so we feed 35.
     let candidates = random_candidates(rng, 5);
     steps.push(ReplayStep {
         label: "warmup-guard".to_string(),
         candidates: candidates.clone(),
         urgency: 0.3,
-        guard_observations: good_observations(15),
+        guard_observations: good_observations(35),
         ops: vec![PolicyOp::Evaluate],
     });
 
