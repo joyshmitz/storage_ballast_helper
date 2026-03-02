@@ -5,7 +5,7 @@
 </div>
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/storage_ballast_helper/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/storage_ballast_helper/main/scripts/install.sh | bash
 ```
 
 Cross-platform disk-pressure defense for AI coding workloads: predictive monitoring, safe cleanup, ballast release, and explainable policy decisions.
