@@ -38,6 +38,7 @@ use crate::monitor::ewma::{DiskRateEstimator, RateEstimate};
 use crate::monitor::fs_stats::FsStatsCollector;
 use crate::monitor::guardrails::{
     AdaptiveGuard, CalibrationObservation, GuardDiagnostics, GuardStatus,
+    PredictionScorecard,
 };
 use crate::monitor::pid::{PidPressureController, PressureLevel, PressureReading};
 use crate::monitor::predictive::{PredictiveAction, PredictiveActionPolicy};
@@ -250,11 +251,12 @@ struct GuardSample {
 
 impl MountMonitor {
     fn new(config: &Config) -> Self {
-        let rate_estimator = DiskRateEstimator::new(
+        let rate_estimator = DiskRateEstimator::with_history_cap(
             config.telemetry.ewma_base_alpha,
             config.telemetry.ewma_min_alpha,
             config.telemetry.ewma_max_alpha,
             config.telemetry.ewma_min_samples,
+            config.telemetry.ewma_rate_history_size,
         );
 
         let mut pressure_controller = PidPressureController::new(
@@ -275,10 +277,16 @@ impl MountMonitor {
                 .set_action_horizon_minutes(config.pressure.prediction.action_horizon_minutes);
         }
 
+        let guard_config = crate::monitor::guardrails::GuardrailConfig {
+            min_observations: config.telemetry.guardrail_min_observations,
+            window_size: config.telemetry.guardrail_window_size,
+            ..crate::monitor::guardrails::GuardrailConfig::default()
+        };
+
         Self {
             rate_estimator,
             pressure_controller,
-            guard: AdaptiveGuard::with_defaults(),
+            guard: AdaptiveGuard::new(guard_config),
             last_guard_sample: None,
         }
     }
@@ -408,6 +416,7 @@ pub struct MonitoringDaemon {
     shared_guard_diagnostics: Arc<RwLock<Option<GuardDiagnostics>>>,
     scanner_heartbeat: Arc<ThreadHeartbeat>,
     executor_heartbeat: Arc<ThreadHeartbeat>,
+    prediction_scorecard: PredictionScorecard,
 }
 
 fn compute_primary_path(config: &Config) -> PathBuf {
@@ -753,6 +762,7 @@ impl MonitoringDaemon {
             scanner_heartbeat,
             executor_heartbeat,
             shared_guard_diagnostics,
+            prediction_scorecard: PredictionScorecard::new(200),
         })
     }
 
@@ -1183,6 +1193,15 @@ impl MonitoringDaemon {
                     }
                 }
             }
+        }
+
+        // Record prediction scorecard outcome: was the previous tick's prediction
+        // realized? An actionable prediction (severity >= 2) is "realized" if the
+        // current tick's worst pressure is at Red or above.
+        if let Some(ref response) = worst_response {
+            let was_actionable = self.last_predictive_action.severity() >= 2;
+            let was_realized = response.level >= PressureLevel::Red;
+            self.prediction_scorecard.record(was_actionable, was_realized);
         }
 
         if let Some(diag) = worst_guard_diag.as_ref() {
@@ -2068,6 +2087,128 @@ fn scanner_thread_main(
 
         heartbeat.beat();
         let scan_start = Instant::now();
+
+        // ── Priority pre-scan pass ──
+        // Before the general walker, do a shallow (depth 1-2) scan of each root
+        // for known high-value cleanup targets. This ensures multi-GB dirs like
+        // `target/`, `node_modules/`, `rch_target_*` are found in seconds, not
+        // after 500K small files exhaust the entry budget.
+        let mut priority_candidates: Vec<CandidacyScore> = Vec::new();
+        {
+            let prescan_engine = ScoringEngine::from_config(
+                &current_scoring_config,
+                current_scanner_config.min_file_age_minutes,
+            );
+            for root in &request.paths {
+                if let Ok(entries) = std::fs::read_dir(root) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if !path.is_dir() {
+                            continue;
+                        }
+                        let classification =
+                            pattern_registry.classify(&path, Default::default());
+                        if classification.category
+                            == crate::scanner::patterns::ArtifactCategory::Unknown
+                        {
+                            continue;
+                        }
+                        // Also check depth-2 children for nested targets.
+                        let mut to_score = vec![path.clone()];
+                        if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                            for sub_entry in sub_entries.flatten() {
+                                let sub_path = sub_entry.path();
+                                if sub_path.is_dir() {
+                                    let sub_class = pattern_registry
+                                        .classify(&sub_path, Default::default());
+                                    if sub_class.category
+                                        != crate::scanner::patterns::ArtifactCategory::Unknown
+                                    {
+                                        to_score.push(sub_path);
+                                    }
+                                }
+                            }
+                        }
+
+                        for candidate_path in to_score {
+                            let candidate_class = pattern_registry
+                                .classify(&candidate_path, Default::default());
+                            if candidate_class.category
+                                == crate::scanner::patterns::ArtifactCategory::Unknown
+                            {
+                                continue;
+                            }
+                            let age = candidate_path
+                                .metadata()
+                                .and_then(|m| m.modified())
+                                .ok()
+                                .and_then(|t| t.elapsed().ok())
+                                .unwrap_or(Duration::ZERO);
+                            // For directories, metadata().len() only returns the
+                            // dir entry size (~4KB), not the recursive contents.
+                            // Use a heuristic floor: known artifact dirs (target/,
+                            // node_modules/) are typically 100MB+, so using 100MB
+                            // prevents the size factor from penalizing them.
+                            // The general walker will compute precise recursive
+                            // sizes if these candidates survive to that stage.
+                            const DIR_SIZE_FLOOR: u64 = 100 * 1_048_576; // 100 MiB
+                            let raw_size = candidate_path
+                                .metadata()
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            let size = if candidate_path.is_dir() {
+                                raw_size.max(DIR_SIZE_FLOOR)
+                            } else {
+                                raw_size
+                            };
+
+                            let input = crate::scanner::scoring::CandidateInput {
+                                path: candidate_path.clone(),
+                                size_bytes: size,
+                                age: adjusted_candidate_age(
+                                    age,
+                                    current_scanner_config.min_file_age_minutes,
+                                    request.pressure_level,
+                                    &candidate_path,
+                                    &candidate_class,
+                                ),
+                                classification: candidate_class,
+                                signals: Default::default(),
+                                is_open: false,
+                                excluded: false,
+                            };
+                            let score =
+                                prescan_engine.score_candidate(&input, request.urgency);
+                            if score.decision.action
+                                == crate::scanner::scoring::DecisionAction::Delete
+                            {
+                                priority_candidates.push(score);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Dispatch priority candidates immediately if any found.
+        if !priority_candidates.is_empty() {
+            let count = priority_candidates.len();
+            priority_candidates.sort_by(|a, b| {
+                b.total_score
+                    .partial_cmp(&a.total_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let batch = DeletionBatch {
+                candidates: priority_candidates,
+                pressure_level: request.pressure_level,
+                urgency: request.urgency,
+            };
+            if del_tx.try_send(batch).is_ok() {
+                eprintln!(
+                    "[SBH-SCANNER] priority pre-scan dispatched {count} high-value candidates"
+                );
+            }
+        }
 
         // Configure walker.
         let walker_config = WalkerConfig {

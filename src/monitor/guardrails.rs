@@ -114,8 +114,8 @@ pub struct GuardrailConfig {
 impl Default for GuardrailConfig {
     fn default() -> Self {
         Self {
-            min_observations: 10,
-            window_size: 50,
+            min_observations: 30,
+            window_size: 500,
             max_rate_error: 0.30,
             min_conservative_fraction: 0.70,
             e_process_threshold: 20.0,
@@ -426,6 +426,82 @@ impl ActionDecision {
         match self {
             Self::Allow { reason } | Self::Fallback { reason } | Self::Block { reason } => reason,
         }
+    }
+}
+
+// ──────────────────── prediction scorecard ────────────────────
+
+/// Tracks recent predictions vs. outcomes to compute realized accuracy.
+///
+/// Records whether actionable predictions (severity >= 2) were actually realized
+/// (did the disk threshold get breached within the predicted window?). Uses this
+/// to compute a false alarm rate and dynamically adjust the minimum confidence
+/// threshold — making the system self-correcting over time.
+pub struct PredictionScorecard {
+    /// Ring buffer of recent prediction outcomes: (was_actionable, was_realized).
+    outcomes: VecDeque<(bool, bool)>,
+    /// Maximum size of the outcomes buffer.
+    max_outcomes: usize,
+}
+
+impl PredictionScorecard {
+    /// Create a new scorecard with the given history size.
+    #[must_use]
+    pub fn new(max_outcomes: usize) -> Self {
+        Self {
+            outcomes: VecDeque::with_capacity(max_outcomes.min(1024)),
+            max_outcomes: max_outcomes.max(1),
+        }
+    }
+
+    /// Record a prediction outcome.
+    ///
+    /// - `was_actionable`: true if the prediction had severity >= 2
+    ///   (PreemptiveCleanup or ImminentDanger).
+    /// - `was_realized`: true if the disk actually hit the threshold within
+    ///   the predicted time window.
+    pub fn record(&mut self, was_actionable: bool, was_realized: bool) {
+        self.outcomes.push_back((was_actionable, was_realized));
+        while self.outcomes.len() > self.max_outcomes {
+            self.outcomes.pop_front();
+        }
+    }
+
+    /// Fraction of actionable predictions that were NOT realized (false alarms).
+    /// Returns 0.0 if there are no actionable predictions in history.
+    #[must_use]
+    pub fn false_alarm_rate(&self) -> f64 {
+        let actionable: Vec<_> = self.outcomes.iter().filter(|(a, _)| *a).collect();
+        if actionable.is_empty() {
+            return 0.0;
+        }
+        let false_alarms = actionable.iter().filter(|(_, r)| !r).count();
+        false_alarms as f64 / actionable.len() as f64
+    }
+
+    /// Dynamically adjust min_confidence based on false alarm rate.
+    ///
+    /// When false alarm rate exceeds 30%, raises the effective min_confidence
+    /// to reduce future false positives. The adjustment is proportional:
+    /// - false_alarm_rate = 0%   → base_confidence unchanged
+    /// - false_alarm_rate = 30%  → base_confidence unchanged (threshold)
+    /// - false_alarm_rate = 60%  → base_confidence + 0.10
+    /// - false_alarm_rate = 100% → base_confidence + 0.20 (capped at 0.95)
+    #[must_use]
+    pub fn dynamic_min_confidence(&self, base_confidence: f64) -> f64 {
+        let far = self.false_alarm_rate();
+        if far <= 0.30 {
+            return base_confidence;
+        }
+        // Scale penalty: 0.30→0, 1.0→0.20.
+        let penalty = ((far - 0.30) / 0.70) * 0.20;
+        (base_confidence + penalty).min(0.95)
+    }
+
+    /// Number of outcomes recorded.
+    #[must_use]
+    pub fn outcome_count(&self) -> usize {
+        self.outcomes.len()
     }
 }
 
@@ -873,5 +949,73 @@ mod tests {
         };
         // Should also be 0.0
         assert!((obs2.rate_error_ratio() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn scorecard_false_alarm_rate_tracks_correctly() {
+        let mut sc = PredictionScorecard::new(100);
+        // 10 actionable predictions: 3 false alarms (not realized).
+        for _ in 0..7 {
+            sc.record(true, true); // actionable + realized
+        }
+        for _ in 0..3 {
+            sc.record(true, false); // actionable + NOT realized (false alarm)
+        }
+        let far = sc.false_alarm_rate();
+        assert!(
+            (far - 0.3).abs() < 0.01,
+            "expected ~0.30 false alarm rate, got {far}"
+        );
+    }
+
+    #[test]
+    fn scorecard_no_actionable_returns_zero() {
+        let mut sc = PredictionScorecard::new(100);
+        // Only non-actionable predictions.
+        for _ in 0..10 {
+            sc.record(false, false);
+        }
+        assert!((sc.false_alarm_rate() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn scorecard_dynamic_confidence_raises_on_high_false_alarms() {
+        let mut sc = PredictionScorecard::new(100);
+        // 100% false alarm rate.
+        for _ in 0..10 {
+            sc.record(true, false);
+        }
+        let base = 0.70;
+        let adjusted = sc.dynamic_min_confidence(base);
+        assert!(
+            adjusted > base,
+            "confidence should be raised: base={base}, adjusted={adjusted}"
+        );
+        assert!(adjusted <= 0.95, "should be capped at 0.95: {adjusted}");
+    }
+
+    #[test]
+    fn scorecard_dynamic_confidence_unchanged_below_threshold() {
+        let mut sc = PredictionScorecard::new(100);
+        // 20% false alarm rate (below 30% threshold).
+        for _ in 0..8 {
+            sc.record(true, true);
+        }
+        for _ in 0..2 {
+            sc.record(true, false);
+        }
+        let base = 0.70;
+        let adjusted = sc.dynamic_min_confidence(base);
+        assert!(
+            (adjusted - base).abs() < f64::EPSILON,
+            "confidence should be unchanged: base={base}, adjusted={adjusted}"
+        );
+    }
+
+    #[test]
+    fn default_guardrail_config_larger_windows() {
+        let config = GuardrailConfig::default();
+        assert_eq!(config.min_observations, 30, "min_observations should be 30");
+        assert_eq!(config.window_size, 500, "window_size should be 500");
     }
 }

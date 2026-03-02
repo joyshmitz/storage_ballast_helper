@@ -219,6 +219,14 @@ pub struct TelemetryConfig {
     pub ewma_min_alpha: f64,
     pub ewma_max_alpha: f64,
     pub ewma_min_samples: u64,
+    /// Size of the EWMA rate history ring buffer for burst detection.
+    pub ewma_rate_history_size: usize,
+    /// Minimum confidence required during detected bursts (higher = more cautious).
+    pub burst_confidence_penalty: f64,
+    /// Rolling window size for the adaptive guard calibration tracking.
+    pub guardrail_window_size: usize,
+    /// Minimum observations before the adaptive guard can transition to PASS.
+    pub guardrail_min_observations: usize,
 }
 
 /// Update-check behavior, cache policy, and opt-out controls.
@@ -411,6 +419,10 @@ impl Default for TelemetryConfig {
             ewma_min_alpha: 0.10,
             ewma_max_alpha: 0.75,
             ewma_min_samples: 3,
+            ewma_rate_history_size: 200,
+            burst_confidence_penalty: 0.85,
+            guardrail_window_size: 500,
+            guardrail_min_observations: 30,
         }
     }
 }

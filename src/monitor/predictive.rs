@@ -235,6 +235,54 @@ impl PredictiveActionPolicy {
             return PredictiveAction::Clear;
         }
 
+        // ── Burst-aware prediction gating ──
+        // When the burst detector is calibrated and a burst is likely, use the
+        // historical median rate (not the burst-inflated EWMA) for time projection.
+        // This is the key fix: a 30-second rustc burst consuming 5GB/min will NOT
+        // trigger "disk full in 1m" because the median rate shows it's transient.
+        let bs = &estimate.burst_state;
+        if bs.calibrated && bs.burst_probability > 0.5 {
+            // Use median rate for time projection instead of burst-inflated EWMA.
+            let median_minutes = if bs.median_rate > 0.0 {
+                estimate.seconds_to_exhaustion
+                    * (estimate.bytes_per_second / bs.median_rate)
+                    / 60.0
+            } else {
+                f64::INFINITY
+            };
+
+            // If median-rate projection shows no danger, return Clear.
+            if median_minutes > self.config.warning_horizon_minutes {
+                return PredictiveAction::Clear;
+            }
+
+            // Take the more conservative (longer) estimate.
+            let ewma_minutes = estimate.seconds_to_exhaustion / 60.0;
+            let minutes_remaining = ewma_minutes.max(median_minutes);
+
+            if !minutes_remaining.is_finite() || minutes_remaining < 0.0 {
+                return PredictiveAction::Clear;
+            }
+
+            // Apply confidence penalty during bursts.
+            let effective_confidence = estimate.confidence * (1.0 - 0.3 * bs.burst_probability);
+
+            // Require higher confidence during bursts (0.85 vs normal 0.70).
+            let burst_min_confidence = self.config.min_confidence.max(0.85);
+            if effective_confidence < burst_min_confidence {
+                return PredictiveAction::Clear;
+            }
+
+            return self.classify(
+                minutes_remaining,
+                effective_confidence,
+                estimate.bytes_per_second,
+                estimate.trend,
+                current_free_pct,
+                mount,
+            );
+        }
+
         // Current free space already low override: if we're already in a good state
         // (lots of free space), we still respect the EWMA prediction.
         let minutes_remaining = estimate.seconds_to_exhaustion / 60.0;
@@ -323,7 +371,7 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::monitor::ewma::Trend;
+    use crate::monitor::ewma::{BurstState, Trend};
 
     fn default_policy() -> PredictiveActionPolicy {
         PredictiveActionPolicy::new(PredictiveConfig::default())
@@ -346,6 +394,34 @@ mod tests {
             trend,
             alpha_used: 0.3,
             fallback_active,
+            burst_state: BurstState::default(),
+        }
+    }
+
+    fn make_burst_estimate(
+        bytes_per_second: f64,
+        seconds_to_exhaustion: f64,
+        confidence: f64,
+        trend: Trend,
+        burst_probability: f64,
+        median_rate: f64,
+    ) -> RateEstimate {
+        RateEstimate {
+            bytes_per_second,
+            acceleration: 0.0,
+            seconds_to_exhaustion,
+            seconds_to_threshold: seconds_to_exhaustion * 0.8,
+            sample_count: 10,
+            confidence,
+            trend,
+            alpha_used: 0.3,
+            fallback_active: false,
+            burst_state: BurstState {
+                burst_probability,
+                median_rate,
+                burst_duration_samples: 3,
+                calibrated: true,
+            },
         }
     }
 
@@ -820,5 +896,73 @@ mod tests {
             PredictiveAction::Clear,
             "should not act when trend is Recovering"
         );
+    }
+
+    #[test]
+    fn burst_with_safe_median_returns_clear() {
+        let policy = default_policy();
+        // Burst: EWMA says 1 minute to exhaustion, but median rate (100 bytes/sec)
+        // projects hours of runway. Should return Clear.
+        let est = make_burst_estimate(
+            500_000_000.0, // burst-inflated EWMA rate
+            60.0,          // 1 minute to exhaustion per EWMA
+            0.95,          // high confidence
+            Trend::Stable,
+            0.9,   // high burst probability
+            100.0, // low median rate (steady baseline)
+        );
+        assert_eq!(
+            policy.evaluate(&est, 80.0, PathBuf::from("/data")),
+            PredictiveAction::Clear,
+            "burst with safe median rate should return Clear"
+        );
+    }
+
+    #[test]
+    fn burst_gating_is_conservative_even_with_dangerous_median() {
+        let policy = default_policy();
+        // During a detected burst (bp > 0.5), the confidence penalty makes it
+        // nearly impossible to pass the raised 0.85 confidence bar. This is
+        // intentional: "false alarms are just as bad as misses."
+        // The system will act once the burst subsides and bp drops below 0.5.
+        let est = make_burst_estimate(
+            500_000_000.0, // burst-inflated EWMA rate
+            60.0,          // 1 minute to exhaustion per EWMA
+            0.99,          // very high confidence
+            Trend::Stable,
+            0.6,           // moderate burst probability
+            400_000_000.0, // median rate is also dangerous
+        );
+        // effective_confidence = 0.99 * (1 - 0.3 * 0.6) = 0.99 * 0.82 = 0.812 < 0.85
+        let action = policy.evaluate(&est, 10.0, PathBuf::from("/data"));
+        assert_eq!(
+            action,
+            PredictiveAction::Clear,
+            "burst gating should be conservative — returns Clear during detected bursts"
+        );
+
+        // Without burst detection, the same rate triggers action.
+        let est_no_burst = make_estimate(500_000_000.0, 60.0, 0.95, Trend::Stable, false);
+        let action_no_burst = policy.evaluate(&est_no_burst, 10.0, PathBuf::from("/data"));
+        assert!(
+            action_no_burst.severity() >= 2,
+            "without burst flag, dangerous rate should trigger action: got {action_no_burst:?}"
+        );
+    }
+
+    #[test]
+    fn low_burst_probability_uses_normal_path() {
+        let policy = default_policy();
+        // burst_probability below 0.5 threshold — normal path.
+        let mut est = make_estimate(500_000_000.0, 60.0, 0.95, Trend::Accelerating, false);
+        est.burst_state = BurstState {
+            burst_probability: 0.3,
+            median_rate: 100.0,
+            burst_duration_samples: 1,
+            calibrated: true,
+        };
+        let action = policy.evaluate(&est, 10.0, PathBuf::from("/data"));
+        // Normal path with 1 min left → ImminentDanger.
+        assert!(matches!(action, PredictiveAction::ImminentDanger { .. }));
     }
 }

@@ -452,10 +452,17 @@ impl PolicyEngine {
                     && self.consecutive_breach_windows % self.config.calibration_breach_windows == 0
                 {
                     eprintln!(
-                        "[SBH-POLICY] calibration breach ({} consecutive windows) —                          continuing in current mode (advisory only)",
+                        "[SBH-POLICY] calibration breach ({} consecutive windows) — \
+                         continuing in current mode (advisory only)",
                         self.consecutive_breach_windows,
                     );
                 }
+            } else {
+                // Not a Fail breach — decay by 1 instead of accumulating.
+                // This means 20 breach windows from a 10-min burst unwind in
+                // ~10 min of non-Fail status, preventing unbounded accumulation.
+                self.consecutive_breach_windows =
+                    self.consecutive_breach_windows.saturating_sub(1);
             }
         }
     }

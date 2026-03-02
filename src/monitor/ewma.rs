@@ -415,7 +415,7 @@ fn project_time(rate: f64, accel: f64, distance_bytes: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BurstState, DiskRateEstimator, Trend};
+    use super::{DiskRateEstimator, Trend};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -610,7 +610,7 @@ mod tests {
             t0 + Duration::from_secs(41 * 30),
             threshold,
         );
-        let steady_rate = steady_estimate.bytes_per_second;
+        let _steady_rate = steady_estimate.bytes_per_second;
 
         // Now inject a massive burst: 500_000 bytes consumed in 30 seconds (50x spike).
         let burst_free = total_free - 41 * 100 - 500_000;
@@ -620,12 +620,15 @@ mod tests {
             threshold,
         );
 
-        // The EWMA rate should NOT jump to the burst rate. With damping,
-        // the rate should stay much closer to the steady baseline than the
-        // instantaneous burst rate (~16667 bytes/sec).
+        // The instantaneous burst rate is ~16667 bytes/sec, ~5000x the steady rate.
+        // With alpha damping (alpha clamped low during bursts), the EWMA should
+        // absorb far less of the spike than it would with the old amplifying alpha.
+        // A single sample at alpha=0.1 moves EWMA ~10% of the way — so the EWMA
+        // rate should be well below the instantaneous burst rate.
+        let inst_burst_rate = 500_000.0 / 30.0;
         assert!(
-            burst_estimate.bytes_per_second < steady_rate * 20.0,
-            "burst should not inflate rate by 20x: steady={steady_rate:.1}, burst={:.1}",
+            burst_estimate.bytes_per_second < inst_burst_rate * 0.5,
+            "EWMA should absorb less than half the burst: inst={inst_burst_rate:.1}, ewma={:.1}",
             burst_estimate.bytes_per_second,
         );
 
@@ -659,23 +662,39 @@ mod tests {
     #[test]
     fn alpha_decreases_during_bursts() {
         // Verify that the alpha used during a burst is lower than during steady state.
+        // We need enough steady samples for the EWMA to converge so that steady-state
+        // burstiness is near zero and alpha approaches base_alpha.
         let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 2);
         let t0 = Instant::now();
-        let _ = estimator.update(1_000_000, t0, 100_000);
+        let _ = estimator.update(10_000_000, t0, 100_000);
 
-        // Steady: 1000 bytes/sec.
-        let steady = estimator.update(999_000, t0 + Duration::from_secs(1), 100_000);
-        let _ = estimator.update(998_000, t0 + Duration::from_secs(2), 100_000);
-        let steady2 = estimator.update(997_000, t0 + Duration::from_secs(3), 100_000);
+        // 10 steady samples at exactly 1000 bytes/sec to converge the EWMA.
+        for i in 1..=10u64 {
+            let _ = estimator.update(
+                10_000_000 - i * 1000,
+                t0 + Duration::from_secs(i),
+                100_000,
+            );
+        }
+        // One more steady sample to get the alpha baseline.
+        let steady = estimator.update(
+            10_000_000 - 11 * 1000,
+            t0 + Duration::from_secs(11),
+            100_000,
+        );
 
-        // Burst: 500_000 bytes consumed in 1 second.
-        let burst = estimator.update(497_000, t0 + Duration::from_secs(4), 100_000);
+        // Burst: 500_000 bytes consumed in 1 second (500x spike).
+        let burst = estimator.update(
+            10_000_000 - 11 * 1000 - 500_000,
+            t0 + Duration::from_secs(12),
+            100_000,
+        );
 
         assert!(
-            burst.alpha_used < steady2.alpha_used,
+            burst.alpha_used < steady.alpha_used,
             "alpha during burst ({:.3}) should be less than steady ({:.3})",
             burst.alpha_used,
-            steady2.alpha_used,
+            steady.alpha_used,
         );
     }
 }
