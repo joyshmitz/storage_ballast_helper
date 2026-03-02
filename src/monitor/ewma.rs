@@ -3,6 +3,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 /// Trend classification for disk pressure dynamics.
@@ -12,6 +13,30 @@ pub enum Trend {
     Accelerating,
     Decelerating,
     Recovering,
+}
+
+/// Burst detection state derived from historical rate analysis.
+#[derive(Debug, Clone)]
+pub struct BurstState {
+    /// Probability that the current workload is a transient burst [0.0, 1.0].
+    pub burst_probability: f64,
+    /// Median instantaneous rate from the history buffer (long-term baseline bytes/sec).
+    pub median_rate: f64,
+    /// Consecutive recent samples that exceeded 3× the median rate.
+    pub burst_duration_samples: u32,
+    /// Whether enough history has accumulated (30+ samples) for reliable burst detection.
+    pub calibrated: bool,
+}
+
+impl Default for BurstState {
+    fn default() -> Self {
+        Self {
+            burst_probability: 0.0,
+            median_rate: 0.0,
+            burst_duration_samples: 0,
+            calibrated: false,
+        }
+    }
 }
 
 /// Output of the EWMA estimator.
@@ -26,6 +51,8 @@ pub struct RateEstimate {
     pub trend: Trend,
     pub alpha_used: f64,
     pub fallback_active: bool,
+    /// Burst detection state from historical rate analysis.
+    pub burst_state: BurstState,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -35,6 +62,12 @@ struct SampleState {
     #[allow(dead_code)]
     inst_rate: f64,
 }
+
+/// Default capacity for the rate history ring buffer used by burst detection.
+const DEFAULT_RATE_HISTORY_CAP: usize = 200;
+
+/// Minimum samples in rate_history before burst detection is considered calibrated.
+const BURST_CALIBRATION_MIN: usize = 30;
 
 /// Online EWMA estimator with adaptive alpha and fallback signaling.
 #[derive(Debug, Clone)]
@@ -52,11 +85,29 @@ pub struct DiskRateEstimator {
     min_samples: u64,
     samples: u64,
     last: Option<SampleState>,
+    /// Ring buffer of recent instantaneous rates for burst detection.
+    rate_history: VecDeque<f64>,
+    /// Maximum size of the rate_history ring buffer.
+    rate_history_cap: usize,
+    /// Count of consecutive recent samples exceeding 3× the median rate.
+    burst_duration_samples: u32,
 }
 
 impl DiskRateEstimator {
     #[must_use]
     pub fn new(base_alpha: f64, min_alpha: f64, max_alpha: f64, min_samples: u64) -> Self {
+        Self::with_history_cap(base_alpha, min_alpha, max_alpha, min_samples, DEFAULT_RATE_HISTORY_CAP)
+    }
+
+    /// Create an estimator with a custom rate history buffer size for burst detection.
+    #[must_use]
+    pub fn with_history_cap(
+        base_alpha: f64,
+        min_alpha: f64,
+        max_alpha: f64,
+        min_samples: u64,
+        rate_history_cap: usize,
+    ) -> Self {
         Self {
             base_alpha,
             min_alpha,
@@ -69,6 +120,9 @@ impl DiskRateEstimator {
             min_samples,
             samples: 0,
             last: None,
+            rate_history: VecDeque::with_capacity(rate_history_cap.min(1024)),
+            rate_history_cap: rate_history_cap.max(1),
+            burst_duration_samples: 0,
         }
     }
 
@@ -117,9 +171,11 @@ impl DiskRateEstimator {
         let consumed = previous.free_bytes as f64 - free_bytes as f64;
         let inst_rate = consumed / dt;
         let burstiness = ((inst_rate - self.ewma_rate).abs()) / (self.ewma_rate.abs() + 1.0);
-        let alpha = 0.20f64
-            .mul_add(burstiness, self.base_alpha)
-            .clamp(self.min_alpha, self.max_alpha);
+        // Damp alpha during bursts: high burstiness → lower alpha → stickier EWMA.
+        // burstiness=0 (steady): alpha=base_alpha (~0.30).
+        // burstiness=5 (burst):  alpha≈base_alpha/11 → clamped to min_alpha (~0.10).
+        let damping = 1.0 / (1.0 + 2.0 * burstiness);
+        let alpha = (self.base_alpha * damping).clamp(self.min_alpha, self.max_alpha);
 
         // Compute residual BEFORE updating ewma_rate so it measures
         // prediction error of the previous estimate.
@@ -142,6 +198,14 @@ impl DiskRateEstimator {
             at: observed_at,
             inst_rate,
         });
+
+        // Maintain rate history ring buffer for burst detection.
+        self.rate_history.push_back(inst_rate);
+        while self.rate_history.len() > self.rate_history_cap {
+            self.rate_history.pop_front();
+        }
+
+        let burst_state = self.compute_burst_state(inst_rate);
 
         let trend = classify_trend(self.ewma_rate, self.ewma_accel);
         let seconds_to_exhaustion =
@@ -178,6 +242,7 @@ impl DiskRateEstimator {
             trend,
             alpha_used: alpha,
             fallback_active,
+            burst_state,
         }
     }
 
@@ -223,6 +288,59 @@ impl DiskRateEstimator {
             trend: classify_trend(self.ewma_rate, self.ewma_accel),
             alpha_used: self.base_alpha,
             fallback_active: true,
+            burst_state: BurstState::default(),
+        }
+    }
+
+    /// Compute burst detection state from the rate history ring buffer.
+    fn compute_burst_state(&mut self, latest_rate: f64) -> BurstState {
+        let calibrated = self.rate_history.len() >= BURST_CALIBRATION_MIN;
+        if !calibrated || self.rate_history.is_empty() {
+            self.burst_duration_samples = 0;
+            return BurstState {
+                burst_probability: 0.0,
+                median_rate: 0.0,
+                burst_duration_samples: 0,
+                calibrated: false,
+            };
+        }
+
+        // Compute median of absolute rates in history.
+        let mut sorted: Vec<f64> = self.rate_history.iter().map(|r| r.abs()).collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_rate = if sorted.len() % 2 == 0 {
+            let mid = sorted.len() / 2;
+            f64::midpoint(sorted[mid - 1], sorted[mid])
+        } else {
+            sorted[sorted.len() / 2]
+        };
+
+        // Count consecutive recent samples above 3× median.
+        let threshold = median_rate * 3.0;
+        if latest_rate.abs() > threshold && threshold > 1.0 {
+            self.burst_duration_samples = self.burst_duration_samples.saturating_add(1);
+        } else {
+            self.burst_duration_samples = 0;
+        }
+
+        // Derive burst probability from deviation magnitude and duration.
+        // deviation_factor: how far above the median this sample is (0 if below threshold).
+        let deviation_factor = if median_rate > 1.0 {
+            ((latest_rate.abs() / median_rate) - 1.0).max(0.0)
+        } else {
+            0.0
+        };
+        // Duration decay: burst_probability ramps up with consecutive burst samples.
+        // 1 sample → weak signal, 5+ samples → strong.
+        let duration_weight = (self.burst_duration_samples as f64 / 5.0).min(1.0);
+        let burst_probability = (deviation_factor * duration_weight / (deviation_factor + 1.0))
+            .clamp(0.0, 1.0);
+
+        BurstState {
+            burst_probability,
+            median_rate,
+            burst_duration_samples: self.burst_duration_samples,
+            calibrated,
         }
     }
 }
@@ -297,7 +415,7 @@ fn project_time(rate: f64, accel: f64, distance_bytes: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiskRateEstimator, Trend};
+    use super::{BurstState, DiskRateEstimator, Trend};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -465,6 +583,99 @@ mod tests {
             "threshold {} should be reached before exhaustion {}",
             reading.seconds_to_threshold,
             reading.seconds_to_exhaustion,
+        );
+    }
+
+    #[test]
+    fn burst_spike_does_not_inflate_rate_estimate() {
+        // Simulate: 40 steady samples at ~100 bytes/sec, then a sudden 50x burst.
+        // The EWMA should damp the burst (low alpha) instead of amplifying it.
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 3);
+        let t0 = Instant::now();
+        let total_free = 10_000_000u64;
+        let threshold = 100_000u64;
+
+        // Seed.
+        let _ = estimator.update(total_free, t0, threshold);
+
+        // 40 steady samples: 100 bytes consumed per 30-second interval.
+        for i in 1..=40u64 {
+            let free = total_free - i * 100;
+            let time = t0 + Duration::from_secs(i * 30);
+            let _ = estimator.update(free, time, threshold);
+        }
+
+        let steady_estimate = estimator.update(
+            total_free - 41 * 100,
+            t0 + Duration::from_secs(41 * 30),
+            threshold,
+        );
+        let steady_rate = steady_estimate.bytes_per_second;
+
+        // Now inject a massive burst: 500_000 bytes consumed in 30 seconds (50x spike).
+        let burst_free = total_free - 41 * 100 - 500_000;
+        let burst_estimate = estimator.update(
+            burst_free,
+            t0 + Duration::from_secs(42 * 30),
+            threshold,
+        );
+
+        // The EWMA rate should NOT jump to the burst rate. With damping,
+        // the rate should stay much closer to the steady baseline than the
+        // instantaneous burst rate (~16667 bytes/sec).
+        assert!(
+            burst_estimate.bytes_per_second < steady_rate * 20.0,
+            "burst should not inflate rate by 20x: steady={steady_rate:.1}, burst={:.1}",
+            burst_estimate.bytes_per_second,
+        );
+
+        // Burst detection should flag this as a burst.
+        assert!(
+            burst_estimate.burst_state.calibrated,
+            "should be calibrated after 40+ samples"
+        );
+        assert!(
+            burst_estimate.burst_state.burst_duration_samples >= 1,
+            "burst should be detected"
+        );
+    }
+
+    #[test]
+    fn burst_state_uncalibrated_below_threshold() {
+        // With fewer than 30 samples, burst detection should report uncalibrated.
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 2);
+        let t0 = Instant::now();
+        let _ = estimator.update(100_000, t0, 10_000);
+
+        for i in 1..=10u64 {
+            let reading = estimator.update(100_000 - i * 1_000, t0 + Duration::from_secs(i), 10_000);
+            assert!(
+                !reading.burst_state.calibrated,
+                "should not be calibrated at sample {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn alpha_decreases_during_bursts() {
+        // Verify that the alpha used during a burst is lower than during steady state.
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 2);
+        let t0 = Instant::now();
+        let _ = estimator.update(1_000_000, t0, 100_000);
+
+        // Steady: 1000 bytes/sec.
+        let steady = estimator.update(999_000, t0 + Duration::from_secs(1), 100_000);
+        let _ = estimator.update(998_000, t0 + Duration::from_secs(2), 100_000);
+        let steady2 = estimator.update(997_000, t0 + Duration::from_secs(3), 100_000);
+
+        // Burst: 500_000 bytes consumed in 1 second.
+        let burst = estimator.update(497_000, t0 + Duration::from_secs(4), 100_000);
+
+        assert!(
+            burst.alpha_used < steady2.alpha_used,
+            "alpha during burst ({:.3}) should be less than steady ({:.3})",
+            burst.alpha_used,
+            steady2.alpha_used,
         );
     }
 }
