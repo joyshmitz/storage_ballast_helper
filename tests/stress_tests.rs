@@ -203,7 +203,7 @@ fn stress_rapid_fill_burst() {
 #[test]
 fn stress_sustained_low_pressure() {
     let total: u64 = 500_000_000_000; // 500 GB
-    let target_free: u64 = 100_000_000_000; // 20% free (green boundary)
+    let target_free: u64 = 40_000_000_000; // ~8% free (between red=6% and orange=10%)
 
     let mut ewma = make_ewma();
     let mut pid = make_pid();
