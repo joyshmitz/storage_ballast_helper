@@ -847,13 +847,14 @@ fn fault_kill_switch_blocks_everything() {
 // Fault family 6: Calibration breach cascade → fallback after N windows
 
 #[test]
-fn fault_calibration_breach_cascade() {
+fn fault_calibration_breach_cascade_is_advisory() {
     let config = PolicyConfig {
         calibration_breach_windows: 3,
         initial_mode: ActiveMode::Observe,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(config);
+    engine.bypass_startup_grace();
     engine.promote(); // canary
 
     let bad_guard = GuardDiagnostics {
@@ -872,17 +873,13 @@ fn fault_calibration_breach_cascade() {
     engine.observe_window(&bad_guard, false);
     assert_eq!(engine.mode(), ActiveMode::Canary);
     engine.observe_window(&bad_guard, false);
+    // CalibrationBreach is advisory-only — engine stays in Canary.
     assert_eq!(
         engine.mode(),
-        ActiveMode::FallbackSafe,
-        "3 consecutive breaches must trigger fallback"
+        ActiveMode::Canary,
+        "calibration breach is advisory — must NOT trigger fallback"
     );
-    assert!(matches!(
-        engine.fallback_reason(),
-        Some(FallbackReason::CalibrationBreach {
-            consecutive_windows: 3
-        })
-    ));
+    assert!(engine.fallback_reason().is_none());
 }
 
 // Fault family 7: Recovery after fault — clean windows restore mode
@@ -1002,6 +999,7 @@ fn fault_matrix_all_types_produce_expected_fallback() {
         });
         engine.promote();
         engine.promote(); // enforce
+        engine.bypass_startup_grace();
 
         engine.enter_fallback(case.reason.clone());
 
@@ -1558,6 +1556,7 @@ fn invariant_fallback_always_dominates() {
             for _ in 0..promotions {
                 engine.promote();
             }
+            engine.bypass_startup_grace();
             engine.enter_fallback(fault.clone());
 
             let candidates: Vec<CandidacyScore> = (0..5)

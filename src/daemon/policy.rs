@@ -195,7 +195,7 @@ pub enum Transition {
 // ──────────────────── policy engine ────────────────────
 
 /// Duration after which fallback_safe mode can be auto-escalated to enforce
-/// when pressure remains at RED or Critical, breaking the deadlock where
+/// when pressure remains at Yellow or above, breaking the deadlock where
 /// nothing can be deleted but pressure can't drop.
 const FALLBACK_EMERGENCY_ESCALATION_SECS: u64 = 5 * 60;
 
@@ -203,6 +203,12 @@ const FALLBACK_EMERGENCY_ESCALATION_SECS: u64 = 5 * 60;
 /// re-enter FallbackSafe. This prevents the cycle where escalation → immediate
 /// calibration breach → FallbackSafe → escalation repeats endlessly.
 const EMERGENCY_GRACE_PERIOD_SECS: u64 = 30 * 60;
+
+/// Startup grace period during which calibration breaches do not trigger
+/// FallbackSafe. On a fresh start the guard has no history, so every window
+/// reports Fail until enough scan data accumulates. Without this grace,
+/// the engine enters FallbackSafe within seconds of every restart.
+const STARTUP_CALIBRATION_GRACE_SECS: u64 = 10 * 60;
 
 /// The shadow-mode policy engine with progressive delivery gates.
 pub struct PolicyEngine {
@@ -216,6 +222,9 @@ pub struct PolicyEngine {
     /// escalation, the engine refuses to re-enter FallbackSafe to prevent the
     /// deadlock cycle: escalate → breach → fallback → escalate → ...
     emergency_escalated_at: Option<Instant>,
+    /// Timestamp when the engine was created. Calibration breaches during the
+    /// startup grace period are suppressed so the guard can accumulate history.
+    started_at: Instant,
     builder: DecisionRecordBuilder,
     consecutive_clean_windows: usize,
     consecutive_breach_windows: usize,
@@ -257,6 +266,7 @@ impl PolicyEngine {
             fallback_reason: None,
             fallback_entered_at: None,
             emergency_escalated_at: None,
+            started_at: Instant::now(),
             builder: DecisionRecordBuilder::new(),
             consecutive_clean_windows: 0,
             consecutive_breach_windows: 0,
@@ -438,10 +448,13 @@ impl PolicyEngine {
             // During green pressure, miscalibrated predictions are harmless.
             if guard.status == GuardStatus::Fail && !pressure_is_green {
                 self.consecutive_breach_windows += 1;
-                if self.consecutive_breach_windows >= self.config.calibration_breach_windows {
-                    self.enter_fallback(FallbackReason::CalibrationBreach {
-                        consecutive_windows: self.consecutive_breach_windows,
-                    });
+                if self.consecutive_breach_windows >= self.config.calibration_breach_windows
+                    && self.consecutive_breach_windows % self.config.calibration_breach_windows == 0
+                {
+                    eprintln!(
+                        "[SBH-POLICY] calibration breach ({} consecutive windows) —                          continuing in current mode (advisory only)",
+                        self.consecutive_breach_windows,
+                    );
                 }
             }
         }
@@ -450,7 +463,7 @@ impl PolicyEngine {
     /// Emergency escalation: break the fallback_safe deadlock.
     ///
     /// When `fallback_safe` has been active for longer than the escalation threshold
-    /// AND pressure is at RED or Critical, the engine cannot recover through normal
+    /// AND pressure is at Yellow or above, the engine cannot recover through normal
     /// clean-window gates (nothing can be deleted, so pressure never drops, so
     /// windows never become clean). This method auto-promotes to `Enforce` mode
     /// and activates a grace period during which re-entry to FallbackSafe is
@@ -488,7 +501,7 @@ impl PolicyEngine {
             "emergency_escalate",
             self.mode,
             ActiveMode::Enforce,
-            Some("fallback_safe deadlock: pressure sustained at RED/Critical".to_string()),
+            Some("fallback_safe deadlock: pressure sustained at Yellow+".to_string()),
         );
         self.mode = ActiveMode::Enforce;
         true
@@ -553,6 +566,21 @@ impl PolicyEngine {
                     }
                     // Grace period expired — clear the marker.
                     self.emergency_escalated_at = None;
+                }
+
+                // Suppress calibration-breach fallbacks during the startup grace
+                // period. The guard has no history on a fresh start so every window
+                // reports Fail, causing FallbackSafe within seconds of restart.
+                if matches!(reason, FallbackReason::CalibrationBreach { .. }) {
+                    let startup_grace = Duration::from_secs(STARTUP_CALIBRATION_GRACE_SECS);
+                    if self.started_at.elapsed() < startup_grace {
+                        eprintln!(
+                            "[SBH-POLICY] suppressing calibration breach fallback —                              startup grace period ({:.0}s remaining)",
+                            startup_grace.as_secs_f64() - self.started_at.elapsed().as_secs_f64()
+                        );
+                        self.consecutive_breach_windows = 0;
+                        return;
+                    }
                 }
             }
 
@@ -693,6 +721,12 @@ impl PolicyEngine {
     /// during green pressure.
     pub fn set_pressure_green(&mut self, green: bool) {
         self.pressure_is_green = green;
+    }
+
+    /// Expire the startup calibration grace period immediately.
+    /// Used by tests to verify calibration breach behavior without waiting.
+    pub fn bypass_startup_grace(&mut self) {
+        self.started_at = Instant::now() - Duration::from_secs(STARTUP_CALIBRATION_GRACE_SECS + 1);
     }
 
     fn recover_from_fallback(&mut self) {
@@ -992,10 +1026,11 @@ mod tests {
     }
 
     #[test]
-    fn calibration_breach_triggers_fallback() {
+    fn calibration_breach_is_advisory_only() {
         let mut config = default_config();
         config.calibration_breach_windows = 2;
         let mut engine = PolicyEngine::new(config);
+        engine.bypass_startup_grace();
         engine.promote(); // canary
 
         let bad = GuardDiagnostics {
@@ -1012,11 +1047,9 @@ mod tests {
         engine.observe_window(&bad, false);
         assert_eq!(engine.mode(), ActiveMode::Canary);
         engine.observe_window(&bad, false);
-        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
-        assert!(matches!(
-            engine.fallback_reason(),
-            Some(FallbackReason::CalibrationBreach { .. })
-        ));
+        // CalibrationBreach is advisory only — should NOT enter FallbackSafe.
+        assert_eq!(engine.mode(), ActiveMode::Canary);
+        assert!(engine.fallback_reason().is_none());
     }
 
     #[test]

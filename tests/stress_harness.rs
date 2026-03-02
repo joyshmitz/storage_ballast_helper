@@ -1094,16 +1094,17 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
             ));
         }
 
-        if !entered_fallback {
-            failures.push(format!("iter {iter}: policy never entered FallbackSafe"));
+        // CalibrationBreach is advisory-only — engine should NOT enter FallbackSafe.
+        if entered_fallback {
+            failures.push(format!("iter {iter}: policy unexpectedly entered FallbackSafe"));
         }
 
-        // Check transition_log has fallback entry.
+        // CalibrationBreach is advisory — no fallback entry expected.
         let log = policy.transition_log();
         let has_fallback_entry = log.iter().any(|e| e.to == "fallback_safe");
-        if !has_fallback_entry {
+        if has_fallback_entry {
             failures.push(format!(
-                "iter {iter}: transition_log missing fallback entry"
+                "iter {iter}: unexpected fallback entry in transition_log"
             ));
         }
 

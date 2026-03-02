@@ -29,7 +29,7 @@ use crate::ballast::release::BallastReleaseController;
 use crate::core::config::Config;
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::notifications::{NotificationEvent, NotificationLevel, NotificationManager};
-use crate::daemon::policy::PolicyEngine;
+use crate::daemon::policy::{ActiveMode, PolicyEngine};
 use crate::daemon::self_monitor::{SelfMonitor, ThreadHeartbeat};
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, spawn_logger};
@@ -1194,13 +1194,13 @@ impl MonitoringDaemon {
             policy.observe_window(diag, pressure_is_green);
 
             // Emergency escalation: break fallback_safe deadlock when pressure
-            // has been at RED/Critical for too long and recovery can't trigger.
+            // has been at Yellow+ for too long and recovery can't trigger.
             if let Some(ref response) = worst_response {
-                let pressure_is_critical = response.level >= PressureLevel::Red;
+                let pressure_is_critical = response.level >= PressureLevel::Yellow;
                 if policy.check_emergency_escalation(pressure_is_critical) {
                     eprintln!(
                         "[SBH-DAEMON] emergency escalation: fallback_safe → enforce \
-                         (pressure deadlock broken after sustained RED/Critical)"
+                         (pressure deadlock broken after sustained Yellow+)"
                     );
                 }
             }
@@ -1362,7 +1362,11 @@ impl MonitoringDaemon {
                 if let Some(ref mount) = predictive_ballast_mount {
                     let _ = self.release_ballast(mount, response);
                 }
-                if needs_scan {
+                // Force periodic scans when stuck in FallbackSafe at green
+                // pressure so that guard windows can update and recovery can
+                // trigger. Without this, FallbackSafe at green is permanent.
+                let in_fallback = self.policy_engine.lock().mode() == ActiveMode::FallbackSafe;
+                if needs_scan || in_fallback {
                     self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
                 }
             }

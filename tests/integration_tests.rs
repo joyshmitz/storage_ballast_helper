@@ -1521,7 +1521,7 @@ fn e2e_scenario_2_canary_bounded_impact() {
 // ── Scenario 3: Calibration drift causing guard fail and fallback ────────
 
 #[test]
-fn e2e_scenario_3_calibration_drift_fallback() {
+fn e2e_scenario_3_calibration_drift_stays_operational() {
     let scoring = e2e_scoring_engine();
     let config = PolicyConfig {
         calibration_breach_windows: 3,
@@ -1529,6 +1529,7 @@ fn e2e_scenario_3_calibration_drift_fallback() {
         ..PolicyConfig::default()
     };
     let mut policy = PolicyEngine::new(config);
+    policy.bypass_startup_grace();
     let mut guard = AdaptiveGuard::with_defaults();
 
     // Phase 1: Warmup with good data and promote to enforce.
@@ -1548,28 +1549,24 @@ fn e2e_scenario_3_calibration_drift_fallback() {
     }
 
     // Phase 3: Feed failing guard diagnostics.
+    // CalibrationBreach is advisory-only — engine stays in Enforce.
     let failing = failing_guard_diag();
     for _ in 0..4 {
         policy.observe_window(&failing, false);
     }
 
-    // Phase 4: Evaluate — should be in fallback.
+    // Phase 4: Engine should STAY in Enforce (CalibrationBreach is advisory).
+    assert_eq!(policy.mode(), ActiveMode::Enforce);
+
+    // Deletions should still be approved.
     let candidates = vec![e2e_candidate("/data/projects/drift/target", 5, 96, 0.9)];
     let scored = scoring.score_batch(&candidates, 0.9);
     let diag = guard.diagnostics();
     let decision = policy.evaluate(&scored, Some(&diag));
-
-    // Fallback should block all deletions.
     assert!(
-        decision.approved_for_deletion.is_empty(),
-        "fallback must block all deletions, got {} approved",
-        decision.approved_for_deletion.len()
+        !decision.approved_for_deletion.is_empty(),
+        "advisory-only calibration breach must not block deletions"
     );
-    assert_eq!(policy.mode(), ActiveMode::FallbackSafe);
-
-    // Verify the fallback reason is traceable.
-    let reason = policy.fallback_reason();
-    assert!(reason.is_some(), "fallback reason must be recorded");
 }
 
 // ── Scenario 4: Index corruption causing full-scan fallback ─────────────
