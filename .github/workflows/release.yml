@@ -9,6 +9,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -D warnings
+  # TUI feature depends on local-path frankentui crates unavailable in CI.
+  CI_FEATURES: --no-default-features --features cli,daemon,sqlite
 
 permissions:
   contents: write
@@ -51,9 +53,9 @@ jobs:
       - name: Build release binary
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
+            cross build $CI_FEATURES --release --target ${{ matrix.target }}
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build $CI_FEATURES --release --target ${{ matrix.target }}
           fi
 
       - name: Package archive
