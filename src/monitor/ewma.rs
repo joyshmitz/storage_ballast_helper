@@ -330,10 +330,17 @@ impl DiskRateEstimator {
         } else {
             0.0
         };
-        // Duration decay: burst_probability ramps up with consecutive burst samples.
-        // 1 sample → weak signal, 5+ samples → strong.
+        // Two-factor burst detection:
+        // 1. Magnitude: extreme spikes (>10× median) get immediate strong signal.
+        //    A 50× spike (deviation_factor=49) → magnitude_weight=1.0 → immediate detection.
+        //    A 5× spike (deviation_factor=4) → magnitude_weight=0.4 → needs duration help.
+        let magnitude_weight = (deviation_factor / 10.0).clamp(0.0, 1.0);
+        // 2. Duration: moderate bursts need sustained consecutive samples.
+        //    1 sample → 0.2, 3 samples → 0.6, 5+ → 1.0.
         let duration_weight = (self.burst_duration_samples as f64 / 5.0).min(1.0);
-        let burst_probability = (deviation_factor * duration_weight / (deviation_factor + 1.0))
+        // Combined: either strong magnitude OR sustained duration triggers detection.
+        let combined_weight = magnitude_weight.max(duration_weight);
+        let burst_probability = (deviation_factor * combined_weight / (deviation_factor + 1.0))
             .clamp(0.0, 1.0);
 
         BurstState {
@@ -657,6 +664,86 @@ mod tests {
                 "should not be calibrated at sample {i}"
             );
         }
+    }
+
+    #[test]
+    fn extreme_spike_detected_on_first_sample() {
+        // A single extreme spike (50×+ median) should immediately produce a
+        // burst_probability > 0.5, without needing multiple consecutive samples.
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 3);
+        let t0 = Instant::now();
+        let total_free = 10_000_000u64;
+        let threshold = 100_000u64;
+
+        // Seed.
+        let _ = estimator.update(total_free, t0, threshold);
+
+        // 40 steady samples at ~100 bytes per 30s interval.
+        for i in 1..=40u64 {
+            let free = total_free - i * 100;
+            let time = t0 + Duration::from_secs(i * 30);
+            let _ = estimator.update(free, time, threshold);
+        }
+
+        // Single extreme spike: 500_000 bytes consumed in 30 seconds (~50× the steady rate).
+        let burst_free = total_free - 40 * 100 - 500_000;
+        let spike_estimate = estimator.update(
+            burst_free,
+            t0 + Duration::from_secs(41 * 30),
+            threshold,
+        );
+
+        assert!(
+            spike_estimate.burst_state.calibrated,
+            "should be calibrated after 40+ samples"
+        );
+        assert!(
+            spike_estimate.burst_state.burst_probability > 0.5,
+            "extreme spike should produce burst_probability > 0.5 on first sample, got {:.3}",
+            spike_estimate.burst_state.burst_probability,
+        );
+        assert_eq!(
+            spike_estimate.burst_state.burst_duration_samples, 1,
+            "should be the first burst sample"
+        );
+    }
+
+    #[test]
+    fn moderate_burst_needs_multiple_samples() {
+        // A moderate spike (5× median) should NOT immediately trigger — needs
+        // sustained consecutive samples before burst_probability crosses 0.5.
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 3);
+        let t0 = Instant::now();
+        let total_free = 10_000_000u64;
+        let threshold = 100_000u64;
+
+        // Seed.
+        let _ = estimator.update(total_free, t0, threshold);
+
+        // 40 steady samples at ~1000 bytes per 30s interval.
+        for i in 1..=40u64 {
+            let free = total_free - i * 1000;
+            let time = t0 + Duration::from_secs(i * 30);
+            let _ = estimator.update(free, time, threshold);
+        }
+
+        // Single moderate spike: 5000 bytes consumed in 30s (5× the steady ~33 bytes/sec rate).
+        let first_spike = estimator.update(
+            total_free - 40 * 1000 - 5000,
+            t0 + Duration::from_secs(41 * 30),
+            threshold,
+        );
+
+        assert!(
+            first_spike.burst_state.calibrated,
+            "should be calibrated"
+        );
+        // Moderate spike: first sample should NOT cross 0.5.
+        assert!(
+            first_spike.burst_state.burst_probability < 0.5,
+            "moderate spike should NOT immediately trigger, got {:.3}",
+            first_spike.burst_state.burst_probability,
+        );
     }
 
     #[test]
