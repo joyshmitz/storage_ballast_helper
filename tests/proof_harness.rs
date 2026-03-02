@@ -410,7 +410,7 @@ fn execute_trace(trace: &[TraceOp]) -> Vec<TraceOutcome> {
                 }
             }
             TraceOp::PolicyObserveWindow(diag) => {
-                engine.observe_window(diag);
+                engine.observe_window(diag, false);
                 TraceOutcome {
                     step,
                     op_name: "observe_window".to_string(),
@@ -749,6 +749,8 @@ fn fault_stale_guard_unknown_blocks_adaptive() {
     });
     engine.promote();
     engine.promote(); // enforce
+    // Guard penalty only applies when pressure is above green.
+    engine.set_pressure_green(false);
 
     let stale_guard = GuardDiagnostics {
         status: GuardStatus::Unknown,
@@ -780,6 +782,8 @@ fn fault_eprocess_drift_forces_fallback() {
         ..PolicyConfig::default()
     });
     engine.promote(); // canary
+    // Guard drift only triggers fallback when pressure is above green.
+    engine.set_pressure_green(false);
 
     let drift_guard = failing_guard();
     let candidates = vec![make_scored(DecisionAction::Delete, 2.5)];
@@ -863,11 +867,11 @@ fn fault_calibration_breach_cascade() {
         reason: "calibration failed".to_string(),
     };
 
-    engine.observe_window(&bad_guard);
+    engine.observe_window(&bad_guard, false);
     assert_eq!(engine.mode(), ActiveMode::Canary);
-    engine.observe_window(&bad_guard);
+    engine.observe_window(&bad_guard, false);
     assert_eq!(engine.mode(), ActiveMode::Canary);
-    engine.observe_window(&bad_guard);
+    engine.observe_window(&bad_guard, false);
     assert_eq!(
         engine.mode(),
         ActiveMode::FallbackSafe,
@@ -899,12 +903,12 @@ fn fault_recovery_after_drift() {
     assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
 
     // One clean window — not enough.
-    engine.observe_window(&good_guard());
+    engine.observe_window(&good_guard(), false);
     assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
 
     // Second clean window — recovery.
     // Recovery caps at Canary (mandatory canary gate), not directly to Enforce.
-    engine.observe_window(&good_guard());
+    engine.observe_window(&good_guard(), false);
     assert_eq!(
         engine.mode(),
         ActiveMode::Canary,

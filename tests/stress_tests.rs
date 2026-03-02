@@ -611,7 +611,7 @@ fn stress_decision_plane_drift() {
 
         // Feed the guard state to the policy engine.
         let diag = guard.diagnostics();
-        engine.observe_window(&diag);
+        engine.observe_window(&diag, false);
 
         // Once in fallback, verify no deletions.
         if engine.mode() == ActiveMode::FallbackSafe {
@@ -646,7 +646,7 @@ fn stress_decision_plane_drift() {
             predicted_tte: 90.0,
             actual_tte: 100.0,
         });
-        engine.observe_window(&guard.diagnostics());
+        engine.observe_window(&guard.diagnostics(), false);
         recovery_steps += 1;
 
         if engine.mode() != ActiveMode::FallbackSafe {
@@ -1221,7 +1221,7 @@ fn stress_full_pipeline() {
 
         // Feed guard diagnostics to policy engine.
         let diag = guard.diagnostics();
-        engine.observe_window(&diag);
+        engine.observe_window(&diag, false);
 
         let reading = PressureReading {
             free_bytes: free,

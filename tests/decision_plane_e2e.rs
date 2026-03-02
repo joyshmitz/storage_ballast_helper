@@ -570,15 +570,15 @@ fn e2e_calibration_drift_fallback() {
 
     // Step 4: Policy observe_window with failing guard → should trigger fallback.
     let diag = guard.diagnostics();
-    engine.observe_window(&diag);
+    engine.observe_window(&diag, false);
     // Second consecutive breach window.
-    engine.observe_window(&diag);
+    engine.observe_window(&diag, false);
     let mut step_assertions = vec![];
     if engine.mode() == ActiveMode::FallbackSafe {
         step_assertions.push("policy entered FallbackSafe after breach windows".to_string());
     } else {
         // May need more breach windows depending on config.
-        engine.observe_window(&diag);
+        engine.observe_window(&diag, false);
         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
         step_assertions.push("policy entered FallbackSafe after 3 breach windows".to_string());
     }
@@ -899,7 +899,7 @@ fn e2e_progressive_recovery() {
 
     // Step 2: Feed clean windows — but fewer than required for recovery.
     for i in 0..2 {
-        engine.observe_window(&good_guard());
+        engine.observe_window(&good_guard(), false);
         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
         trace.steps.push(StepTrace {
             label: format!("clean_window_{}", i + 1),
@@ -915,7 +915,7 @@ fn e2e_progressive_recovery() {
     }
 
     // Step 3: Third clean window should trigger recovery.
-    engine.observe_window(&good_guard());
+    engine.observe_window(&good_guard(), false);
     let recovered_mode = engine.mode();
     let mut step_assertions = vec![];
     if recovered_mode == ActiveMode::Enforce {

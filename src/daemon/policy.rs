@@ -224,6 +224,10 @@ pub struct PolicyEngine {
     total_decisions: u64,
     total_fallback_entries: u64,
     transition_log: Vec<TransitionEntry>,
+    /// True when disk pressure is green (no urgency). Guard-triggered
+    /// fallbacks are suppressed during green pressure since miscalibrated
+    /// predictions are harmless when no deletions would occur.
+    pressure_is_green: bool,
 }
 
 /// Record of a mode transition.
@@ -261,6 +265,7 @@ impl PolicyEngine {
             total_decisions: 0,
             total_fallback_entries: 0,
             transition_log: Vec::new(),
+            pressure_is_green: true,
         };
 
         if engine.config.kill_switch {
@@ -406,20 +411,32 @@ impl PolicyEngine {
     }
 
     /// Apply a guard observation window and update breach/recovery counters.
-    pub fn observe_window(&mut self, guard: &GuardDiagnostics) {
+    ///
+    /// `pressure_is_green` suppresses calibration breach accumulation when disk
+    /// pressure is green — inaccurate predictions during green pressure are
+    /// harmless (no deletions would occur) and should not drive the engine into
+    /// FallbackSafe.
+    pub fn observe_window(&mut self, guard: &GuardDiagnostics, pressure_is_green: bool) {
         if guard.status == GuardStatus::Pass && !guard.e_process_alarm {
             self.consecutive_clean_windows += 1;
             self.consecutive_breach_windows = 0;
 
-            // Check recovery condition.
+            // Check recovery condition — require both enough clean windows AND
+            // a minimum cooldown period to prevent rapid canary↔fallback thrashing.
             if self.mode == ActiveMode::FallbackSafe
                 && self.consecutive_clean_windows >= self.config.recovery_clean_windows
+                && self.fallback_entered_at.is_none_or(|entered| {
+                    entered.elapsed()
+                        >= Duration::from_secs(self.config.min_fallback_secs)
+                })
             {
                 self.recover_from_fallback();
             }
         } else {
             self.consecutive_clean_windows = 0;
-            if guard.status == GuardStatus::Fail {
+            // Only accumulate breach windows when pressure is above green.
+            // During green pressure, miscalibrated predictions are harmless.
+            if guard.status == GuardStatus::Fail && !pressure_is_green {
                 self.consecutive_breach_windows += 1;
                 if self.consecutive_breach_windows >= self.config.calibration_breach_windows {
                     self.enter_fallback(FallbackReason::CalibrationBreach {
@@ -632,22 +649,28 @@ impl PolicyEngine {
             return DecisionAction::Keep;
         }
 
-        // Apply guard penalty check.
-        if let Some(diag) = guard
-            && !diag.status.adaptive_allowed()
-        {
-            let penalized_delete_loss =
-                candidate.decision.expected_loss_delete + self.config.guard_penalty;
-            if penalized_delete_loss >= candidate.decision.expected_loss_keep {
-                return DecisionAction::Keep;
+        // Apply guard penalty check — skip during green pressure since
+        // miscalibrated predictions are harmless when disk is healthy and
+        // proven build artifacts should still be cleanable proactively.
+        if !self.pressure_is_green {
+            if let Some(diag) = guard
+                && !diag.status.adaptive_allowed()
+            {
+                let penalized_delete_loss =
+                    candidate.decision.expected_loss_delete + self.config.guard_penalty;
+                if penalized_delete_loss >= candidate.decision.expected_loss_keep {
+                    return DecisionAction::Keep;
+                }
             }
         }
 
         // Canary mode: check hourly budget.
+        // Budget exhaustion caps further deletions this hour but does NOT
+        // enter FallbackSafe — that would block ALL actions and require a
+        // long recovery cycle for what is just normal rate limiting.
         if self.mode == ActiveMode::Canary {
             self.rotate_canary_hour();
             if self.canary_deletes_this_hour >= self.config.max_canary_deletes_per_hour {
-                self.enter_fallback(FallbackReason::CanaryBudgetExhausted);
                 return DecisionAction::Keep;
             }
             self.canary_deletes_this_hour += 1;
@@ -657,9 +680,19 @@ impl PolicyEngine {
     }
 
     fn check_guard_triggers(&mut self, diag: &GuardDiagnostics) {
-        if diag.e_process_alarm && self.mode != ActiveMode::FallbackSafe {
+        // Suppress guard-triggered fallback during green pressure — drift in
+        // predictions is harmless when no deletions are being considered.
+        if diag.e_process_alarm && self.mode != ActiveMode::FallbackSafe && !self.pressure_is_green
+        {
             self.enter_fallback(FallbackReason::GuardrailDrift);
         }
+    }
+
+    /// Update the cached pressure state. Call this each monitoring tick
+    /// so that guard triggers and calibration breach checks can skip
+    /// during green pressure.
+    pub fn set_pressure_green(&mut self, green: bool) {
+        self.pressure_is_green = green;
     }
 
     fn recover_from_fallback(&mut self) {
@@ -926,9 +959,9 @@ mod tests {
         engine.enter_fallback(FallbackReason::GuardrailDrift);
 
         let good = passing_guard();
-        engine.observe_window(&good);
+        engine.observe_window(&good, false);
         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
-        engine.observe_window(&good);
+        engine.observe_window(&good, false);
         assert_eq!(engine.mode(), ActiveMode::Canary);
         assert!(engine.fallback_reason().is_none());
     }
@@ -948,8 +981,8 @@ mod tests {
         // Recovery must return to Canary, NOT Enforce — the mandatory
         // canary gate must be re-traversed after a fallback event.
         let good = passing_guard();
-        engine.observe_window(&good);
-        engine.observe_window(&good);
+        engine.observe_window(&good, false);
+        engine.observe_window(&good, false);
         assert_eq!(engine.mode(), ActiveMode::Canary);
         assert!(engine.fallback_reason().is_none());
 
@@ -976,9 +1009,9 @@ mod tests {
             reason: "bad calibration".to_string(),
         };
 
-        engine.observe_window(&bad);
+        engine.observe_window(&bad, false);
         assert_eq!(engine.mode(), ActiveMode::Canary);
-        engine.observe_window(&bad);
+        engine.observe_window(&bad, false);
         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
         assert!(matches!(
             engine.fallback_reason(),
@@ -990,6 +1023,8 @@ mod tests {
     fn drift_alarm_triggers_fallback() {
         let mut engine = PolicyEngine::new(default_config());
         engine.promote(); // canary
+        // Guard drift only triggers fallback when pressure is above green.
+        engine.set_pressure_green(false);
         let drift = failing_guard();
         engine.evaluate(&[], Some(&drift));
         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
@@ -1045,9 +1080,9 @@ mod tests {
         let guard = passing_guard();
         let decision = engine.evaluate(&candidates, Some(&guard));
 
-        // Should approve 2, then trigger FallbackSafe on the 3rd.
+        // Should approve 2, then cap further deletions (stays in Canary).
         assert_eq!(decision.approved_for_deletion.len(), 2);
-        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+        assert_eq!(engine.mode(), ActiveMode::Canary);
     }
 
     #[test]
@@ -1093,6 +1128,8 @@ mod tests {
         let mut engine = PolicyEngine::new(default_config());
         engine.promote();
         engine.promote(); // enforce
+        // Guard penalty only applies when pressure is above green.
+        engine.set_pressure_green(false);
 
         let candidate = sample_candidate(DecisionAction::Delete, 2.5);
         // expected_loss_delete=1.3, guard_penalty=50.0 → penalized=51.3 > keep=8.7
@@ -1256,10 +1293,10 @@ mod tests {
             ..failing_guard()
         };
 
-        engine.observe_window(&good);
-        engine.observe_window(&good);
+        engine.observe_window(&good, false);
+        engine.observe_window(&good, false);
         assert_eq!(engine.consecutive_clean_windows, 2);
-        engine.observe_window(&bad);
+        engine.observe_window(&bad, false);
         assert_eq!(engine.consecutive_clean_windows, 0);
         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
     }

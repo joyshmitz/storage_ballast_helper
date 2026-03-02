@@ -443,7 +443,7 @@ fn policy_fallback_recovery_restores_mode() {
         consecutive_clean: 3,
         reason: "ok".to_string(),
     };
-    engine.observe_window(&good);
+    engine.observe_window(&good, false);
     assert_eq!(
         engine.mode(),
         ActiveMode::Canary,
@@ -748,7 +748,7 @@ fn property_policy_engine_invariants_under_random_operations() {
                         consecutive_clean: if good { 5 } else { 0 },
                         reason: "test".to_string(),
                     };
-                    engine.observe_window(&guard);
+                    engine.observe_window(&guard, false);
                 }
                 _ => {
                     let mode_before = engine.mode();
@@ -917,7 +917,7 @@ impl ReplayEngine {
                     self.policy.enter_fallback(reason.clone());
                 }
                 PolicyOp::ObserveWindow(guard_diag) => {
-                    self.policy.observe_window(guard_diag);
+                    self.policy.observe_window(guard_diag, false);
                 }
                 PolicyOp::Evaluate => {
                     last_decision = Some(self.policy.evaluate(&scored, Some(&diag)));

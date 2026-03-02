@@ -243,6 +243,8 @@ fn make_policy() -> PolicyEngine {
         initial_mode: ActiveMode::Observe,
         recovery_clean_windows: 2,
         calibration_breach_windows: 2,
+        // Disable cooldown for tests — scenarios run in simulated seconds.
+        min_fallback_secs: 0,
         ..PolicyConfig::default()
     })
 }
@@ -494,7 +496,7 @@ fn run_scenario_b(seed: u64, iterations: usize) -> ScenarioResult {
             });
 
             let diag = guard.diagnostics();
-            policy.observe_window(&diag);
+            policy.observe_window(&diag, false);
             if policy.mode() != prev_mode {
                 policy_transitions += 1;
             }
@@ -802,7 +804,7 @@ fn run_scenario_d(seed: u64, iterations: usize) -> ScenarioResult {
             });
             let diag = guard.diagnostics();
             let prev_mode = policy.mode();
-            policy.observe_window(&diag);
+            policy.observe_window(&diag, false);
             if policy.mode() != prev_mode {
                 policy_transitions += 1;
             }
@@ -1013,7 +1015,7 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
             });
             let diag = guard.diagnostics();
             let prev = policy.mode();
-            policy.observe_window(&diag);
+            policy.observe_window(&diag, false);
             if policy.mode() != prev {
                 transition_count += 1;
             }
@@ -1031,7 +1033,7 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
             });
             let diag = guard.diagnostics();
             let prev = policy.mode();
-            policy.observe_window(&diag);
+            policy.observe_window(&diag, false);
             if policy.mode() != prev {
                 transition_count += 1;
                 if policy.mode() == ActiveMode::FallbackSafe {
@@ -1067,7 +1069,7 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
             });
             let diag = guard.diagnostics();
             let prev = policy.mode();
-            policy.observe_window(&diag);
+            policy.observe_window(&diag, false);
             if policy.mode() != prev {
                 transition_count += 1;
                 if prev == ActiveMode::FallbackSafe {
