@@ -61,6 +61,9 @@ pub struct PredictionConfig {
     pub imminent_danger_minutes: f64,
     /// Threshold below which imminent danger becomes critical.
     pub critical_danger_minutes: f64,
+    /// Minimum confidence required during detected bursts. Higher than normal
+    /// min_confidence to avoid false alarms from transient compilation spikes.
+    pub burst_min_confidence: f64,
 }
 
 /// Scanner behavior and safety constraints.
@@ -221,8 +224,6 @@ pub struct TelemetryConfig {
     pub ewma_min_samples: u64,
     /// Size of the EWMA rate history ring buffer for burst detection.
     pub ewma_rate_history_size: usize,
-    /// Minimum confidence required during detected bursts (higher = more cautious).
-    pub burst_confidence_penalty: f64,
     /// Rolling window size for the adaptive guard calibration tracking.
     pub guardrail_window_size: usize,
     /// Minimum observations before the adaptive guard can transition to PASS.
@@ -341,6 +342,7 @@ impl Default for PredictionConfig {
             min_samples: 5,
             imminent_danger_minutes: 5.0,
             critical_danger_minutes: 2.0,
+            burst_min_confidence: 0.85,
         }
     }
 }
@@ -420,7 +422,6 @@ impl Default for TelemetryConfig {
             ewma_max_alpha: 0.75,
             ewma_min_samples: 3,
             ewma_rate_history_size: 200,
-            burst_confidence_penalty: 0.85,
             guardrail_window_size: 500,
             guardrail_min_observations: 30,
         }

@@ -41,6 +41,9 @@ pub struct PredictiveConfig {
     pub imminent_danger_minutes: f64,
     /// Minutes-remaining threshold below which `ImminentDanger` is critical (release ALL ballast).
     pub critical_danger_minutes: f64,
+    /// Minimum confidence required during detected bursts. Higher than normal
+    /// `min_confidence` because burst-inflated predictions are inherently less reliable.
+    pub burst_min_confidence: f64,
 }
 
 impl Default for PredictiveConfig {
@@ -53,6 +56,7 @@ impl Default for PredictiveConfig {
             min_samples: 5,
             imminent_danger_minutes: 5.0,
             critical_danger_minutes: 2.0,
+            burst_min_confidence: 0.85,
         }
     }
 }
@@ -150,6 +154,7 @@ impl From<crate::core::config::PredictionConfig> for PredictiveConfig {
             min_samples: cfg.min_samples,
             imminent_danger_minutes: cfg.imminent_danger_minutes,
             critical_danger_minutes: cfg.critical_danger_minutes,
+            burst_min_confidence: cfg.burst_min_confidence,
         }
     }
 }
@@ -267,8 +272,9 @@ impl PredictiveActionPolicy {
             // Apply confidence penalty during bursts.
             let effective_confidence = estimate.confidence * (1.0 - 0.3 * bs.burst_probability);
 
-            // Require higher confidence during bursts (0.85 vs normal 0.70).
-            let burst_min_confidence = self.config.min_confidence.max(0.85);
+            // Require higher confidence during bursts — use the configured burst
+            // threshold, but never lower than the normal min_confidence.
+            let burst_min_confidence = self.config.min_confidence.max(self.config.burst_min_confidence);
             if effective_confidence < burst_min_confidence {
                 return PredictiveAction::Clear;
             }
