@@ -431,16 +431,36 @@ impl ActionDecision {
 
 // ──────────────────── prediction scorecard ────────────────────
 
+/// Outcome category for a single prediction tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PredictionOutcome {
+    /// Non-actionable prediction — not counted in false alarm rate.
+    Inactive,
+    /// Actionable prediction that was realized (pressure reached Red+).
+    Realized,
+    /// Actionable prediction where intervention occurred (cleanup ran) and pressure
+    /// dropped. This is a SUCCESS, not a false alarm — the system did its job.
+    Intervened,
+    /// Actionable prediction with NO intervention that was NOT realized.
+    /// This is a genuine false alarm — the system cried wolf.
+    FalseAlarm,
+}
+
 /// Tracks recent predictions vs. outcomes to compute realized accuracy.
 ///
-/// Records whether actionable predictions (severity >= 2) were actually realized
-/// (did the disk threshold get breached within the predicted window?). Uses this
-/// to compute a false alarm rate and dynamically adjust the minimum confidence
-/// threshold — making the system self-correcting over time.
+/// Solves the "self-defeating prophecy" problem: when an actionable prediction
+/// triggers cleanup that prevents disk exhaustion, the naive approach records
+/// it as a false alarm, gradually suppressing all predictions. Instead, this
+/// scorecard tracks three outcomes:
+/// - **Realized**: pressure actually hit the danger zone — prediction was correct.
+/// - **Intervened**: cleanup ran and pressure dropped — prediction was correct AND
+///   the system successfully prevented the problem.
+/// - **FalseAlarm**: no cleanup ran but pressure never approached danger — prediction
+///   was genuinely wrong.
+///
+/// Only `FalseAlarm` outcomes count toward the false alarm rate.
 pub struct PredictionScorecard {
-    /// Ring buffer of recent prediction outcomes: (was_actionable, was_realized).
-    outcomes: VecDeque<(bool, bool)>,
-    /// Maximum size of the outcomes buffer.
+    outcomes: VecDeque<PredictionOutcome>,
     max_outcomes: usize,
 }
 
@@ -459,24 +479,54 @@ impl PredictionScorecard {
     /// - `was_actionable`: true if the prediction had severity >= 2
     ///   (PreemptiveCleanup or ImminentDanger).
     /// - `was_realized`: true if the disk actually hit the threshold within
-    ///   the predicted time window.
-    pub fn record(&mut self, was_actionable: bool, was_realized: bool) {
-        self.outcomes.push_back((was_actionable, was_realized));
+    ///   the predicted time window (pressure >= Red).
+    /// - `cleanup_ran`: true if any cleanup was performed during this tick
+    ///   (deletions dispatched or ballast released).
+    pub fn record(&mut self, was_actionable: bool, was_realized: bool, cleanup_ran: bool) {
+        let outcome = if !was_actionable {
+            PredictionOutcome::Inactive
+        } else if was_realized {
+            PredictionOutcome::Realized
+        } else if cleanup_ran {
+            // Prediction triggered cleanup and pressure didn't hit Red.
+            // This is the system working correctly, NOT a false alarm.
+            PredictionOutcome::Intervened
+        } else {
+            // Prediction said danger, no cleanup ran, and pressure never hit Red.
+            // This is a genuine false alarm.
+            PredictionOutcome::FalseAlarm
+        };
+        self.outcomes.push_back(outcome);
         while self.outcomes.len() > self.max_outcomes {
             self.outcomes.pop_front();
         }
     }
 
-    /// Fraction of actionable predictions that were NOT realized (false alarms).
-    /// Returns 0.0 if there are no actionable predictions in history.
+    /// Fraction of actionable predictions that were genuine false alarms.
+    ///
+    /// Denominator is (Realized + Intervened + FalseAlarm). Numerator is FalseAlarm only.
+    /// Intervened outcomes are excluded from the false alarm count because they
+    /// represent successful predictions that prevented the problem.
     #[must_use]
     pub fn false_alarm_rate(&self) -> f64 {
-        let actionable: Vec<_> = self.outcomes.iter().filter(|(a, _)| *a).collect();
-        if actionable.is_empty() {
+        let mut total_actionable = 0usize;
+        let mut false_alarms = 0usize;
+        for outcome in &self.outcomes {
+            match outcome {
+                PredictionOutcome::Realized | PredictionOutcome::Intervened => {
+                    total_actionable += 1;
+                }
+                PredictionOutcome::FalseAlarm => {
+                    total_actionable += 1;
+                    false_alarms += 1;
+                }
+                PredictionOutcome::Inactive => {}
+            }
+        }
+        if total_actionable == 0 {
             return 0.0;
         }
-        let false_alarms = actionable.iter().filter(|(_, r)| !r).count();
-        false_alarms as f64 / actionable.len() as f64
+        false_alarms as f64 / total_actionable as f64
     }
 
     /// Dynamically adjust min_confidence based on false alarm rate.
@@ -954,12 +1004,12 @@ mod tests {
     #[test]
     fn scorecard_false_alarm_rate_tracks_correctly() {
         let mut sc = PredictionScorecard::new(100);
-        // 10 actionable predictions: 3 false alarms (not realized).
+        // 10 actionable predictions: 7 realized, 3 false alarms (no cleanup, no realization).
         for _ in 0..7 {
-            sc.record(true, true); // actionable + realized
+            sc.record(true, true, false); // actionable + realized
         }
         for _ in 0..3 {
-            sc.record(true, false); // actionable + NOT realized (false alarm)
+            sc.record(true, false, false); // actionable + NOT realized + no cleanup = false alarm
         }
         let far = sc.false_alarm_rate();
         assert!(
@@ -969,11 +1019,46 @@ mod tests {
     }
 
     #[test]
+    fn scorecard_intervention_is_not_false_alarm() {
+        let mut sc = PredictionScorecard::new(100);
+        // 10 actionable predictions where cleanup ran and pressure dropped.
+        // These are successful interventions, NOT false alarms.
+        for _ in 0..10 {
+            sc.record(true, false, true); // actionable + not realized + cleanup ran
+        }
+        assert!(
+            (sc.false_alarm_rate() - 0.0).abs() < f64::EPSILON,
+            "interventions should not count as false alarms, got {}",
+            sc.false_alarm_rate(),
+        );
+    }
+
+    #[test]
+    fn scorecard_mixed_outcomes() {
+        let mut sc = PredictionScorecard::new(100);
+        for _ in 0..3 {
+            sc.record(true, true, false); // realized
+        }
+        for _ in 0..4 {
+            sc.record(true, false, true); // intervened (success)
+        }
+        for _ in 0..3 {
+            sc.record(true, false, false); // false alarm
+        }
+        // 10 actionable total, 3 false alarms → 30%.
+        let far = sc.false_alarm_rate();
+        assert!(
+            (far - 0.3).abs() < 0.01,
+            "expected ~0.30 with interventions excluded, got {far}"
+        );
+    }
+
+    #[test]
     fn scorecard_no_actionable_returns_zero() {
         let mut sc = PredictionScorecard::new(100);
         // Only non-actionable predictions.
         for _ in 0..10 {
-            sc.record(false, false);
+            sc.record(false, false, false);
         }
         assert!((sc.false_alarm_rate() - 0.0).abs() < f64::EPSILON);
     }
@@ -981,9 +1066,9 @@ mod tests {
     #[test]
     fn scorecard_dynamic_confidence_raises_on_high_false_alarms() {
         let mut sc = PredictionScorecard::new(100);
-        // 100% false alarm rate.
+        // 100% false alarm rate (no cleanup, no realization).
         for _ in 0..10 {
-            sc.record(true, false);
+            sc.record(true, false, false);
         }
         let base = 0.70;
         let adjusted = sc.dynamic_min_confidence(base);
@@ -999,10 +1084,10 @@ mod tests {
         let mut sc = PredictionScorecard::new(100);
         // 20% false alarm rate (below 30% threshold).
         for _ in 0..8 {
-            sc.record(true, true);
+            sc.record(true, true, false);
         }
         for _ in 0..2 {
-            sc.record(true, false);
+            sc.record(true, false, false);
         }
         let base = 0.70;
         let adjusted = sc.dynamic_min_confidence(base);

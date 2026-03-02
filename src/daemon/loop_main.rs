@@ -408,6 +408,9 @@ pub struct MonitoringDaemon {
     last_ewma_confidence: f64,
     predictive_policy: PredictiveActionPolicy,
     last_predictive_action: PredictiveAction,
+    /// Whether any cleanup was dispatched in the previous tick (scan or ballast release).
+    /// Used by the prediction scorecard to distinguish interventions from false alarms.
+    last_tick_cleanup_ran: bool,
     last_swap_thrash_warning: Option<Instant>,
     swap_thrash_active: bool,
     last_scan_channel_warn: Option<Instant>,
@@ -755,6 +758,7 @@ impl MonitoringDaemon {
             last_ewma_confidence: 0.0,
             predictive_policy: PredictiveActionPolicy::from_config(prediction_config),
             last_predictive_action: PredictiveAction::Clear,
+            last_tick_cleanup_ran: false,
             last_swap_thrash_warning: None,
             swap_thrash_active: false,
             last_scan_channel_warn: None,
@@ -1164,8 +1168,14 @@ impl MonitoringDaemon {
 
             // Force low-confidence predictions to Clear so they don't trigger
             // scans or other downstream actions (breaks scan saturation feedback loop).
+            // The effective confidence floor is raised by the prediction scorecard
+            // when false alarm rate is high — this dynamically tightens the gate
+            // based on realized accuracy.
+            let effective_min_conf = self.prediction_scorecard.dynamic_min_confidence(
+                self.config.pressure.prediction.min_confidence,
+            );
             if !matches!(pred_action, PredictiveAction::Clear)
-                && rate_estimate.confidence < self.config.pressure.prediction.min_confidence
+                && rate_estimate.confidence < effective_min_conf
             {
                 pred_action = PredictiveAction::Clear;
             }
@@ -1198,11 +1208,17 @@ impl MonitoringDaemon {
         // Record prediction scorecard outcome: was the previous tick's prediction
         // realized? An actionable prediction (severity >= 2) is "realized" if the
         // current tick's worst pressure is at Red or above.
+        // The cleanup_ran flag distinguishes successful interventions (prediction
+        // triggered cleanup that prevented the problem) from false alarms (prediction
+        // said danger but nothing was happening).
         if let Some(ref response) = worst_response {
             let was_actionable = self.last_predictive_action.severity() >= 2;
             let was_realized = response.level >= PressureLevel::Red;
-            self.prediction_scorecard.record(was_actionable, was_realized);
+            self.prediction_scorecard
+                .record(was_actionable, was_realized, self.last_tick_cleanup_ran);
         }
+        // Reset cleanup flag for next tick — it gets set below when we dispatch scans/ballast.
+        self.last_tick_cleanup_ran = false;
 
         if let Some(diag) = worst_guard_diag.as_ref() {
             let mut policy = self.policy_engine.lock();
@@ -1380,6 +1396,7 @@ impl MonitoringDaemon {
                 }
                 if let Some(ref mount) = predictive_ballast_mount {
                     let _ = self.release_ballast(mount, response);
+                    self.last_tick_cleanup_ran = true;
                 }
                 // Force periodic scans when stuck in FallbackSafe at green
                 // pressure so that guard windows can update and recovery can
@@ -1387,6 +1404,9 @@ impl MonitoringDaemon {
                 let in_fallback = self.policy_engine.lock().mode() == ActiveMode::FallbackSafe;
                 if needs_scan || in_fallback {
                     self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
+                    if needs_scan {
+                        self.last_tick_cleanup_ran = true;
+                    }
                 }
             }
             PressureLevel::Yellow => {
@@ -1396,21 +1416,25 @@ impl MonitoringDaemon {
                     let _ = self.release_ballast(&response.causing_mount, response);
                 }
                 self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
+                self.last_tick_cleanup_ran = true;
             }
             PressureLevel::Orange => {
                 // Start scanning + gentle cleanup + early ballast release.
                 let _ = self.release_ballast(&response.causing_mount, response);
                 self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
+                self.last_tick_cleanup_ran = true;
             }
             PressureLevel::Red => {
                 // Release ballast + aggressive scan + delete.
                 let _ = self.release_ballast(&response.causing_mount, response);
                 self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
+                self.last_tick_cleanup_ran = true;
             }
             PressureLevel::Critical => {
                 // Emergency: release all ballast + delete everything safe.
                 let _ = self.release_ballast(&response.causing_mount, response);
                 self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
+                self.last_tick_cleanup_ran = true;
 
                 let primary = self.primary_path();
                 let actual_free_pct = self
