@@ -545,7 +545,7 @@ fn e2e_calibration_drift_stays_operational() {
     for _ in 0..15 {
         guard.observe(bad_observation());
     }
-    let diag = guard.diagnostics();
+    let _diag = guard.diagnostics();
     let mut step_assertions = vec![];
     assert_eq!(guard.status(), GuardStatus::Fail);
     step_assertions.push("guard transitions to Fail after bad observations".to_string());

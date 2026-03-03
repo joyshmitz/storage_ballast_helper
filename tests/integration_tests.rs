@@ -1052,6 +1052,7 @@ fn predictive_pipeline_detects_imminent_danger() {
         min_samples: 3,
         imminent_danger_minutes: 5.0,
         critical_danger_minutes: 2.0,
+        burst_min_confidence: 0.85,
     });
 
     let t0 = Instant::now();

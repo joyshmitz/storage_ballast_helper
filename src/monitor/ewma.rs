@@ -316,8 +316,11 @@ impl DiskRateEstimator {
         };
 
         // Count consecutive recent samples above 3× median.
+        // Guard: when median_rate is negligible (< 0.33 bytes/sec), threshold is
+        // < 1.0 — skip burst counting to avoid false positives from idle noise
+        // and ensure the counter resets instead of going stale.
         let threshold = median_rate * 3.0;
-        if latest_rate.abs() > threshold && threshold > 1.0 {
+        if threshold > 1.0 && latest_rate.abs() > threshold {
             self.burst_duration_samples = self.burst_duration_samples.saturating_add(1);
         } else {
             self.burst_duration_samples = 0;
