@@ -50,7 +50,7 @@ impl Default for DeletionConfig {
             max_batch_size: 10,
             dry_run: false,
             min_score: 0.5,
-            circuit_breaker_threshold: 3,
+            circuit_breaker_threshold: 5,
             circuit_breaker_cooldown: Duration::from_secs(30),
             check_open_files: true,
         }
@@ -237,6 +237,11 @@ impl DeletionExecutor {
                 Ok(()) => {}
                 Err(skip) => {
                     report.items_skipped += 1;
+                    // Reset consecutive failure counter on skip — a skipped candidate
+                    // is not a failure and shouldn't let unrelated failures accumulate
+                    // across different path prefixes (e.g. FUSE mount failures shouldn't
+                    // trip the breaker for normal /tmp deletions).
+                    consecutive_failures = 0;
                     self.log_event(ActivityEvent::ArtifactDeletionFailed {
                         path: candidate.path.to_string_lossy().to_string(),
                         error_code: "SBH-2003".to_string(),

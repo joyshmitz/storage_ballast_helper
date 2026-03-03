@@ -144,12 +144,14 @@ impl DirectoryWalker {
     pub fn stream(&self) -> Result<channel::Receiver<WalkEntry>> {
         let parallelism = self.config.parallelism.max(1);
 
-        // Channels: work items (bounded) and results (unbounded for throughput).
+        // Channels: work items (bounded) and results (bounded for memory safety).
         // Queue sized to hold children from multiple root paths without starvation.
         // Per-directory iteration cap (MAX_ENTRIES_PER_DIR) prevents any single huge
         // directory (e.g. /data/tmp with 60K+ children) from monopolizing the queue.
+        // Result channel bounded to 10,000 entries to prevent unbounded memory growth
+        // on large trees (previously unbounded, causing 14GB+ RSS on trj).
         let (work_tx, work_rx) = channel::bounded::<WorkItem>(4096);
-        let (result_tx, result_rx) = channel::unbounded::<WalkEntry>();
+        let (result_tx, result_rx) = channel::bounded::<WalkEntry>(10_000);
 
         // Track in-flight work items so workers know when to stop.
         let in_flight = Arc::new(AtomicUsize::new(0));

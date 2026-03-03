@@ -448,7 +448,21 @@ impl PolicyEngine {
             // During green pressure, miscalibrated predictions are harmless.
             if guard.status == GuardStatus::Fail && !pressure_is_green {
                 self.consecutive_breach_windows += 1;
-                if self.consecutive_breach_windows >= self.config.calibration_breach_windows
+
+                // After 100 consecutive breach windows, the guard model is
+                // clearly miscalibrated for the current workload. Reset the
+                // breach counter to prevent unbounded accumulation (previously
+                // seen reaching 1296+ on production machines) and log a
+                // recalibration notice. The guard will re-learn naturally
+                // from fresh observations.
+                if self.consecutive_breach_windows >= 100 {
+                    eprintln!(
+                        "[SBH-POLICY] recalibrating after {} consecutive breach windows — \
+                         resetting breach counter (guard will re-learn from fresh data)",
+                        self.consecutive_breach_windows,
+                    );
+                    self.consecutive_breach_windows = 0;
+                } else if self.consecutive_breach_windows >= self.config.calibration_breach_windows
                     && self.consecutive_breach_windows % self.config.calibration_breach_windows == 0
                 {
                     eprintln!(

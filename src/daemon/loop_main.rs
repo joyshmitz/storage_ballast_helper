@@ -14,7 +14,7 @@
 #![allow(clippy::cast_precision_loss)]
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -414,12 +414,32 @@ pub struct MonitoringDaemon {
     last_swap_thrash_warning: Option<Instant>,
     swap_thrash_active: bool,
     last_scan_channel_warn: Option<Instant>,
+    last_summary_report: Instant,
+    summary_scans: u64,
+    summary_scan_timeouts: u64,
+    summary_candidates: u64,
+    summary_deleted: u64,
+    summary_failed: u64,
+    summary_bytes_freed: u64,
     self_monitor: SelfMonitor,
     policy_engine: Arc<Mutex<PolicyEngine>>,
     shared_guard_diagnostics: Arc<RwLock<Option<GuardDiagnostics>>>,
     scanner_heartbeat: Arc<ThreadHeartbeat>,
     executor_heartbeat: Arc<ThreadHeartbeat>,
     prediction_scorecard: PredictionScorecard,
+}
+
+/// Read the current process's RSS in megabytes from /proc/self/status.
+/// Returns 0 on non-Linux platforms or if the read fails.
+fn read_rss_mb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("VmRSS:") {
+            let trimmed = value.trim().strip_suffix("kB").unwrap_or(value.trim()).trim();
+            return trimmed.parse::<u64>().ok().map(|kb| kb / 1024);
+        }
+    }
+    None
 }
 
 fn compute_primary_path(config: &Config) -> PathBuf {
@@ -525,6 +545,21 @@ fn should_fast_track_temp_age(
         ArtifactCategory::NodeModules | ArtifactCategory::PythonCache
     ) {
         return false;
+    }
+
+    // Under Orange+ pressure, fast-track all classified build artifacts in
+    // tmp-like paths. The open-file check in the executor is the real safety
+    // net for in-progress builds; the age floor is a secondary guard that
+    // causes unnecessary delays when disk is critically low.
+    if matches!(
+        classification.category,
+        ArtifactCategory::RustTarget
+            | ArtifactCategory::BuildOutput
+            | ArtifactCategory::CacheDir
+            | ArtifactCategory::AgentWorkspace
+            | ArtifactCategory::TempDir
+    ) {
+        return true;
     }
 
     if classification.name_confidence >= 0.85 {
@@ -762,6 +797,13 @@ impl MonitoringDaemon {
             last_swap_thrash_warning: None,
             swap_thrash_active: false,
             last_scan_channel_warn: None,
+            last_summary_report: Instant::now(),
+            summary_scans: 0,
+            summary_scan_timeouts: 0,
+            summary_candidates: 0,
+            summary_deleted: 0,
+            summary_failed: 0,
+            summary_bytes_freed: 0,
             self_monitor,
             scanner_heartbeat,
             executor_heartbeat,
@@ -902,6 +944,8 @@ impl MonitoringDaemon {
                         duration,
                         root_stats,
                     } => {
+                        self.summary_scans += 1;
+                        self.summary_candidates += candidates as u64;
                         self.self_monitor.record_scan(candidates, 0, duration);
                         let now = Instant::now();
                         #[allow(clippy::cast_possible_truncation)]
@@ -922,6 +966,9 @@ impl MonitoringDaemon {
                         bytes_freed,
                         failed,
                     } => {
+                        self.summary_deleted += deleted;
+                        self.summary_failed += failed;
+                        self.summary_bytes_freed += bytes_freed;
                         self.self_monitor.record_deletions(deleted, bytes_freed);
                         if deleted > 0 {
                             // Best effort: we don't have the mount point here easily without tracking
@@ -1065,7 +1112,32 @@ impl MonitoringDaemon {
                 }
             }
 
-            // 10. Sleep for the PID-adjusted interval.
+            // 10. Periodic summary report (every 5 minutes).
+            if self.last_summary_report.elapsed() >= Duration::from_secs(300) {
+                let rss_mb = read_rss_mb().unwrap_or(0);
+                eprintln!(
+                    "[SBH-SUMMARY] scans={} timeouts={} candidates={} deleted={} \
+                     failed={} freed={}B pressure={:?} rss={}MB uptime={}s",
+                    self.summary_scans,
+                    self.summary_scan_timeouts,
+                    self.summary_candidates,
+                    self.summary_deleted,
+                    self.summary_failed,
+                    self.summary_bytes_freed,
+                    response.level,
+                    rss_mb,
+                    self.start_time.elapsed().as_secs(),
+                );
+                self.summary_scans = 0;
+                self.summary_scan_timeouts = 0;
+                self.summary_candidates = 0;
+                self.summary_deleted = 0;
+                self.summary_failed = 0;
+                self.summary_bytes_freed = 0;
+                self.last_summary_report = Instant::now();
+            }
+
+            // 11. Sleep for the PID-adjusted interval.
             thread::sleep(response.scan_interval);
         }
 
@@ -1490,6 +1562,13 @@ impl MonitoringDaemon {
         response: &crate::monitor::pid::PressureResponse,
         paths: Vec<PathBuf>,
     ) {
+        // Under Green/Yellow pressure, skip enqueue entirely if the channel is
+        // already full — a scan is already in progress and there's no urgency.
+        // This eliminates most "scan channel saturated" log noise.
+        if response.level < PressureLevel::Orange && scan_tx.is_full() {
+            return;
+        }
+
         let request = ScanRequest {
             paths,
             urgency: response.urgency,
@@ -2076,6 +2155,93 @@ fn dispatch_top_candidates(
     }
 }
 
+/// Incremental scan cursor — persists across scan iterations within the scanner
+/// thread to avoid re-walking large directory subtrees that contained zero
+/// cleanup candidates on the previous pass.
+///
+/// After a scan that timed out, directories that were visited but yielded no
+/// classified artifacts are cached as "barren". On the next scan, these are
+/// injected into the walker's excluded_paths so it skips them, effectively
+/// resuming from where the previous scan left off.
+///
+/// Entries expire after `ttl` to allow re-discovery when new artifacts appear.
+struct ScanCursor {
+    /// Directories confirmed barren (no classified children) on a recent pass.
+    barren_dirs: HashMap<PathBuf, Instant>,
+    /// How long to trust a barren classification before re-scanning.
+    ttl: Duration,
+    /// Maximum entries to cache (prevents unbounded growth on huge trees).
+    max_entries: usize,
+}
+
+impl ScanCursor {
+    fn new() -> Self {
+        Self {
+            barren_dirs: HashMap::new(),
+            ttl: Duration::from_secs(30 * 60), // 30 minutes
+            max_entries: 50_000,
+        }
+    }
+
+    /// Return non-expired barren directories to exclude from the next walk.
+    fn barren_exclusions(&self) -> HashSet<PathBuf> {
+        let now = Instant::now();
+        self.barren_dirs
+            .iter()
+            .filter(|&(_, &ts)| now.duration_since(ts) < self.ttl)
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
+
+    /// Update the cache after a scan pass.
+    ///
+    /// `visited_dirs` — all directories the walker emitted entries for.
+    /// `dirs_with_candidates` — directories that had at least one classified child.
+    /// `timed_out` — whether the scan hit its time/entry budget.
+    ///
+    /// Only caches barren dirs when the scan timed out (no point caching if the
+    /// scan completed — next scan should be fresh). On a full completion, the
+    /// cache is cleared to allow re-discovery.
+    fn update(
+        &mut self,
+        visited_dirs: &HashSet<PathBuf>,
+        dirs_with_candidates: &HashSet<PathBuf>,
+        timed_out: bool,
+    ) {
+        if !timed_out {
+            // Full scan completed — clear cache so next scan is fresh.
+            self.barren_dirs.clear();
+            return;
+        }
+
+        let now = Instant::now();
+
+        // Add newly discovered barren dirs.
+        for dir in visited_dirs {
+            if !dirs_with_candidates.contains(dir) {
+                self.barren_dirs.entry(dir.clone()).or_insert(now);
+            }
+        }
+
+        // Remove dirs that turned out to have candidates (they may have been
+        // cached as barren from a prior pass but gained artifacts since).
+        for dir in dirs_with_candidates {
+            self.barren_dirs.remove(dir);
+        }
+
+        // Expire old entries.
+        self.barren_dirs.retain(|_, ts| now.duration_since(*ts) < self.ttl);
+
+        // Cap size: if over limit, drop oldest entries.
+        if self.barren_dirs.len() > self.max_entries {
+            let mut entries: Vec<_> = self.barren_dirs.drain().collect();
+            entries.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
+            entries.truncate(self.max_entries);
+            self.barren_dirs = entries.into_iter().collect();
+        }
+    }
+}
+
 /// Scanner thread: receives scan requests, walks directories, scores candidates,
 /// and sends deletion batches to the executor.
 ///
@@ -2093,6 +2259,10 @@ fn scanner_thread_main(
 ) {
     // Initialize pattern registry (default built-ins).
     let pattern_registry = ArtifactPatternRegistry::default();
+
+    // Incremental scan cursor — persists across scan iterations to skip
+    // barren directory subtrees that yielded no candidates on a prior pass.
+    let mut scan_cursor = ScanCursor::new();
 
     while let Ok(request) = scan_rx.recv() {
         // Read latest config at the start of each scan.
@@ -2241,11 +2411,26 @@ fn scanner_thread_main(
             follow_symlinks: current_scanner_config.follow_symlinks,
             cross_devices: current_scanner_config.cross_devices,
             parallelism: current_scanner_config.parallelism,
-            excluded_paths: current_scanner_config
-                .excluded_paths
-                .iter()
-                .cloned()
-                .collect(),
+            excluded_paths: {
+                let mut excluded: HashSet<PathBuf> = current_scanner_config
+                    .excluded_paths
+                    .iter()
+                    .cloned()
+                    .collect();
+                // Merge barren directories from the incremental scan cursor.
+                // These are subtrees that yielded zero candidates on a prior
+                // timed-out pass — skipping them lets the walker explore new
+                // territory instead of re-walking known-empty subtrees.
+                let barren = scan_cursor.barren_exclusions();
+                if !barren.is_empty() {
+                    eprintln!(
+                        "[SBH-SCANNER] incremental cursor: skipping {} barren dirs from prior pass",
+                        barren.len()
+                    );
+                }
+                excluded.extend(barren);
+                excluded
+            },
         };
 
         // Initialize protection registry (reload from config + markers are discovered during walk).
@@ -2283,6 +2468,11 @@ fn scanner_thread_main(
         let mut candidates_found = 0;
         let mut scored: Vec<CandidacyScore> = Vec::with_capacity(1024);
         let mut scanner_should_exit = false;
+        let mut scan_timed_out = false;
+
+        // Track directories for the incremental scan cursor.
+        let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
+        let mut dirs_with_candidates: HashSet<PathBuf> = HashSet::new();
         let dispatch_threshold = request
             .max_delete_batch
             .max(1)
@@ -2343,6 +2533,7 @@ fn scanner_thread_main(
                     // No entries for 2 seconds — check if budget is exhausted.
                     if Instant::now() >= scan_deadline {
                         cancel_token.store(true, Ordering::Relaxed);
+                        scan_timed_out = true;
                         eprintln!(
                             "[SBH-SCANNER] scan timed out ({paths_scanned} entries, \
                              {candidates_found} candidates, {:.1}s) — cancelling walker threads",
@@ -2359,12 +2550,18 @@ fn scanner_thread_main(
             // Budget check: stop processing if we've exceeded entry count or time limits.
             if paths_scanned >= SCAN_ENTRY_BUDGET || Instant::now() >= scan_deadline {
                 cancel_token.store(true, Ordering::Relaxed);
+                scan_timed_out = true;
                 eprintln!(
                     "[SBH-SCANNER] scan budget reached ({paths_scanned} entries, \
                      {candidates_found} candidates, {:.1}s) — cancelling walker threads",
                     scan_start.elapsed().as_secs_f64()
                 );
                 break;
+            }
+
+            // Track visited directories for the incremental scan cursor.
+            if entry.metadata.is_dir {
+                visited_dirs.insert(entry.path.clone());
             }
 
             let age = entry
@@ -2379,6 +2576,12 @@ fn scanner_thread_main(
             // Skip unknown artifacts to save scoring cycles.
             if classification.category == crate::scanner::patterns::ArtifactCategory::Unknown {
                 continue;
+            }
+
+            // This entry is classified — mark its parent as having candidates
+            // so the scan cursor knows NOT to cache it as barren.
+            if let Some(parent) = entry.path.parent() {
+                dirs_with_candidates.insert(parent.to_path_buf());
             }
 
             // Lazy-join the /proc scan thread on first classified entry.
@@ -2462,9 +2665,15 @@ fn scanner_thread_main(
 
         eprintln!(
             "[SBH-SCANNER] scan complete: {paths_scanned} entries, \
-             {candidates_found} candidates, {:.1}s",
-            total_scan_duration.as_secs_f64()
+             {candidates_found} candidates, {:.1}s{}",
+            total_scan_duration.as_secs_f64(),
+            if scan_timed_out { " (timed out)" } else { "" },
         );
+
+        // Update the incremental scan cursor. On timeout, barren dirs are
+        // cached so the next pass skips them. On full completion, cache is
+        // cleared for a fresh scan.
+        scan_cursor.update(&visited_dirs, &dirs_with_candidates, scan_timed_out);
 
         // Log scan completion.
         logger.send(ActivityEvent::ScanCompleted {
@@ -2632,8 +2841,11 @@ fn executor_thread_main(
     );
     let mut batch_count: u64 = 0;
     let mut last_circuit_breaker_trip: Option<Instant> = None;
-    let circuit_breaker_cooldown = DeletionConfig::default().circuit_breaker_cooldown;
+    let base_circuit_breaker_cooldown = DeletionConfig::default().circuit_breaker_cooldown;
+    let mut circuit_breaker_cooldown = base_circuit_breaker_cooldown;
+    let max_circuit_breaker_cooldown = Duration::from_secs(300); // 5 minutes cap
     let mut last_policy_reject_log: Option<Instant> = None;
+    let mut last_cb_cooldown_log: Option<Instant> = None;
 
     while let Ok(batch) = del_rx.recv() {
         heartbeat.beat();
@@ -2643,14 +2855,21 @@ fn executor_thread_main(
         // tripped recently, skip this batch entirely and drain the channel.
         if let Some(trip_time) = last_circuit_breaker_trip {
             if trip_time.elapsed() < circuit_breaker_cooldown {
-                eprintln!(
-                    "[SBH-EXECUTOR] circuit breaker cooldown active ({:.0}s remaining), skipping batch",
-                    circuit_breaker_cooldown.as_secs_f64() - trip_time.elapsed().as_secs_f64(),
-                );
+                // Rate-limit this message: log once per 60s during cooldown
+                let should_log = last_cb_cooldown_log
+                    .map_or(true, |t| t.elapsed() >= Duration::from_secs(60));
+                if should_log {
+                    eprintln!(
+                        "[SBH-EXECUTOR] circuit breaker cooldown active ({:.0}s remaining), skipping batches",
+                        circuit_breaker_cooldown.as_secs_f64() - trip_time.elapsed().as_secs_f64(),
+                    );
+                    last_cb_cooldown_log = Some(Instant::now());
+                }
                 continue;
             }
             // Cooldown expired, reset.
             last_circuit_breaker_trip = None;
+            last_cb_cooldown_log = None;
         }
 
         // Pick up live config reloads for repeat-deletion dampening.
@@ -2764,10 +2983,17 @@ fn executor_thread_main(
             logger.send(ActivityEvent::Error {
                 code: "SBH-2003".to_string(),
                 message: format!(
-                    "executor circuit breaker tripped, cooldown {:.0}s",
+                    "executor circuit breaker tripped, cooldown {:.0}s (exponential backoff)",
                     circuit_breaker_cooldown.as_secs_f64(),
                 ),
             });
+            // Exponential backoff: double cooldown on each consecutive trip,
+            // capped at max. Reset to base on successful batch (below).
+            circuit_breaker_cooldown =
+                (circuit_breaker_cooldown * 2).min(max_circuit_breaker_cooldown);
+        } else if report.items_deleted > 0 {
+            // Successful deletion — reset exponential backoff to base.
+            circuit_breaker_cooldown = base_circuit_breaker_cooldown;
         }
 
         // Periodic pruning of expired dampening entries.

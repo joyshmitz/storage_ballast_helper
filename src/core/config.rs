@@ -326,7 +326,7 @@ impl Default for PressureConfig {
             yellow_min_free_pct: 14.0,
             orange_min_free_pct: 10.0,
             red_min_free_pct: 6.0,
-            poll_interval_ms: 1_000,
+            poll_interval_ms: 5_000,
             prediction: PredictionConfig::default(),
         }
     }
@@ -370,7 +370,7 @@ impl Default for ScannerConfig {
                 PathBuf::from("/var/log"),
             ],
             protected_paths: Vec::new(),
-            min_file_age_minutes: 10,
+            min_file_age_minutes: 5,
             max_depth: 10,
             parallelism: std::thread::available_parallelism()
                 .map_or(2, |n| n.get().saturating_div(2).max(1)),
@@ -380,7 +380,7 @@ impl Default for ScannerConfig {
             max_delete_batch: 20,
             repeat_deletion_base_cooldown_secs: 300,
             repeat_deletion_max_cooldown_secs: 3600,
-            scan_time_budget_secs: 300,
+            scan_time_budget_secs: 600,
         }
     }
 }
