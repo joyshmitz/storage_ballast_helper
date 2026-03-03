@@ -200,6 +200,7 @@ enum WorkerReport {
         candidates: usize,
         duration: Duration,
         root_stats: Vec<RootScanResult>,
+        timed_out: bool,
     },
     /// Executor completed a deletion batch.
     DeletionCompleted {
@@ -943,8 +944,12 @@ impl MonitoringDaemon {
                         candidates,
                         duration,
                         root_stats,
+                        timed_out,
                     } => {
                         self.summary_scans += 1;
+                        if timed_out {
+                            self.summary_scan_timeouts += 1;
+                        }
                         self.summary_candidates += candidates as u64;
                         self.self_monitor.record_scan(candidates, 0, duration);
                         let now = Instant::now();
@@ -2687,6 +2692,7 @@ fn scanner_thread_main(
             candidates: candidates_found,
             duration: total_scan_duration,
             root_stats: root_stats_map.into_values().collect(),
+            timed_out: scan_timed_out,
         });
 
         // Flush remaining candidates in bounded batches.
@@ -2980,6 +2986,11 @@ fn executor_thread_main(
 
         if report.circuit_breaker_tripped {
             last_circuit_breaker_trip = Some(Instant::now());
+            // Exponential backoff: double cooldown on each consecutive trip,
+            // capped at max. Reset to base on successful batch (below).
+            // Double BEFORE logging so the logged value matches what's enforced.
+            circuit_breaker_cooldown =
+                (circuit_breaker_cooldown * 2).min(max_circuit_breaker_cooldown);
             logger.send(ActivityEvent::Error {
                 code: "SBH-2003".to_string(),
                 message: format!(
@@ -2987,10 +2998,6 @@ fn executor_thread_main(
                     circuit_breaker_cooldown.as_secs_f64(),
                 ),
             });
-            // Exponential backoff: double cooldown on each consecutive trip,
-            // capped at max. Reset to base on successful batch (below).
-            circuit_breaker_cooldown =
-                (circuit_breaker_cooldown * 2).min(max_circuit_breaker_cooldown);
         } else if report.items_deleted > 0 {
             // Successful deletion — reset exponential backoff to base.
             circuit_breaker_cooldown = base_circuit_breaker_cooldown;
