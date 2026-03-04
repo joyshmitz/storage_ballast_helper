@@ -1435,4 +1435,33 @@ mod tests {
 
         assert_eq!(engine.config.max_canary_deletes_per_hour, 50);
     }
+
+    #[test]
+    fn green_pressure_allows_recovery_from_fallback_despite_unknown_guard() {
+        let mut engine = PolicyEngine::new(default_config());
+        engine.bypass_startup_grace();
+        engine.enter_fallback(FallbackReason::GuardrailDrift);
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+
+        // Fast-forward past min_fallback_secs.
+        engine.fallback_entered_at =
+            Some(Instant::now() - Duration::from_secs(engine.config.min_fallback_secs + 1));
+
+        // Simulate enough "clean" windows during green pressure with Unknown guard.
+        let unknown_guard = GuardDiagnostics {
+            status: GuardStatus::Unknown,
+            observation_count: 0,
+            median_rate_error: 0.0,
+            conservative_fraction: 0.0,
+            e_process_value: 0.0,
+            e_process_alarm: false,
+            consecutive_clean: 0,
+        };
+        for _ in 0..=engine.config.recovery_clean_windows {
+            engine.observe_window(&unknown_guard, true);
+        }
+        // Should recover because green pressure + non-Fail guard = clean.
+        assert_ne!(engine.mode(), ActiveMode::FallbackSafe,
+            "should recover from fallback during green pressure with Unknown guard");
+    }
 }
