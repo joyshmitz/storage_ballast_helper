@@ -1623,6 +1623,13 @@ impl MonitoringDaemon {
     }
 
     fn check_predictive_warning(&mut self, response: &crate::monitor::pid::PressureResponse) {
+        // If the predictive policy (with burst/free-space/confidence gates)
+        // already decided Clear, don't emit a raw notification — the policy
+        // has better context than the raw seconds-to-threshold value.
+        if matches!(self.last_predictive_action, PredictiveAction::Clear) {
+            return;
+        }
+
         let Some(seconds) = response.predicted_seconds else {
             // Prediction cleared — do NOT reset cooldown state here.
             // When the disk hovers at the red threshold, predicted_seconds
