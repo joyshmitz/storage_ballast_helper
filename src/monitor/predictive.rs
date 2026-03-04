@@ -308,7 +308,7 @@ impl PredictiveActionPolicy {
         if bs.calibrated
             && bs.burst_probability < 0.5
             && current_free_pct > 20.0
-            && minutes_remaining < self.config.action_horizon_minutes
+            && minutes_remaining <= self.config.action_horizon_minutes
         {
             let implied_rate_pct_per_min = current_free_pct / minutes_remaining;
             // Gate kicks in above 5%/min implied consumption — that's consuming

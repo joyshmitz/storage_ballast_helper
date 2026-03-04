@@ -1456,6 +1456,7 @@ mod tests {
             e_process_value: 0.0,
             e_process_alarm: false,
             consecutive_clean: 0,
+            reason: String::new(),
         };
         for _ in 0..=engine.config.recovery_clean_windows {
             engine.observe_window(&unknown_guard, true);
