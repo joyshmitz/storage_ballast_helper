@@ -240,6 +240,14 @@ impl PredictiveActionPolicy {
             return PredictiveAction::Clear;
         }
 
+        // Hard gate: if more than half the disk is free, no prediction can be
+        // credible unless confidence is very high (>0.95). Consuming 50%+ of a
+        // disk in minutes is physically implausible for normal workloads.
+        // This is checked early so it also covers the burst-aware path below.
+        if current_free_pct > 50.0 && estimate.confidence < 0.95 {
+            return PredictiveAction::Clear;
+        }
+
         // ── Burst-aware prediction gating ──
         // When the burst detector is calibrated and a burst is likely, use the
         // historical median rate (not the burst-inflated EWMA) for time projection.
@@ -293,15 +301,6 @@ impl PredictiveActionPolicy {
 
         // Guard against infinite or nonsensical values.
         if !minutes_remaining.is_finite() || minutes_remaining < 0.0 {
-            return PredictiveAction::Clear;
-        }
-
-        // Hard gate: if more than half the disk is free, no prediction can be
-        // credible unless confidence is very high (>0.95). Consuming 50%+ of a
-        // disk in minutes is physically implausible for normal workloads.
-        // Production evidence: vmi1167313 at 55% free predicted "disk full in
-        // 3m" — a burst-inflated EWMA spike, not real danger.
-        if current_free_pct > 50.0 && estimate.confidence < 0.95 {
             return PredictiveAction::Clear;
         }
 
