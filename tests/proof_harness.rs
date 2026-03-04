@@ -208,7 +208,7 @@ fn good_guard() -> GuardDiagnostics {
 fn failing_guard() -> GuardDiagnostics {
     GuardDiagnostics {
         status: GuardStatus::Fail,
-        observation_count: 25,
+        observation_count: 50,
         median_rate_error: 0.45,
         conservative_fraction: 0.55,
         e_process_value: 25.0,
@@ -224,6 +224,7 @@ fn good_observation() -> CalibrationObservation {
         actual_rate: 1050.0,
         predicted_tte: 100.0,
         actual_tte: 110.0,
+        burst_outlier: false,
     }
 }
 
@@ -233,6 +234,7 @@ fn bad_observation() -> CalibrationObservation {
         actual_rate: 5000.0,
         predicted_tte: 100.0,
         actual_tte: 20.0,
+        burst_outlier: false,
     }
 }
 

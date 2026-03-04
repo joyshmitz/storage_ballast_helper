@@ -26,6 +26,13 @@ pub struct BurstState {
     pub burst_duration_samples: u32,
     /// Whether enough history has accumulated (30+ samples) for reliable burst detection.
     pub calibrated: bool,
+    /// MAD (Median Absolute Deviation) of rates × 1.4826 (Gaussian consistency factor).
+    /// Robust scale estimate: unaffected by burst outliers unlike standard deviation.
+    pub mad_rate: f64,
+    /// Robust upper bound = median_rate + 3 × mad_rate.
+    /// Observations with rates above this are burst outliers and should be discounted
+    /// by downstream calibration systems (guard, predictive).
+    pub robust_upper_bound: f64,
 }
 
 impl Default for BurstState {
@@ -35,7 +42,17 @@ impl Default for BurstState {
             median_rate: 0.0,
             burst_duration_samples: 0,
             calibrated: false,
+            mad_rate: 0.0,
+            robust_upper_bound: f64::INFINITY,
         }
+    }
+}
+
+impl BurstState {
+    /// Whether the given rate is a burst outlier (above robust upper bound).
+    #[must_use]
+    pub fn is_burst_outlier(&self, rate: f64) -> bool {
+        self.calibrated && rate.abs() > self.robust_upper_bound
     }
 }
 
@@ -297,12 +314,7 @@ impl DiskRateEstimator {
         let calibrated = self.rate_history.len() >= BURST_CALIBRATION_MIN;
         if !calibrated || self.rate_history.is_empty() {
             self.burst_duration_samples = 0;
-            return BurstState {
-                burst_probability: 0.0,
-                median_rate: 0.0,
-                burst_duration_samples: 0,
-                calibrated: false,
-            };
+            return BurstState::default();
         }
 
         // Compute median of absolute rates in history.
@@ -314,6 +326,22 @@ impl DiskRateEstimator {
         } else {
             sorted[sorted.len() / 2]
         };
+
+        // MAD (Median Absolute Deviation) × 1.4826 (Gaussian consistency factor).
+        // Robust scale estimator: unlike standard deviation, a single 50× burst spike
+        // does not inflate MAD because it only affects one deviation from the median.
+        let mut deviations: Vec<f64> = sorted.iter().map(|r| (r - median_rate).abs()).collect();
+        deviations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mad_raw = if deviations.len() % 2 == 0 {
+            let mid = deviations.len() / 2;
+            f64::midpoint(deviations[mid - 1], deviations[mid])
+        } else {
+            deviations[deviations.len() / 2]
+        };
+        // 1.4826 is the consistency factor for the normal distribution:
+        // MAD * 1.4826 ≈ standard deviation when data is Gaussian.
+        let mad_rate = mad_raw * 1.4826;
+        let robust_upper_bound = median_rate + 3.0 * mad_rate;
 
         // Count consecutive recent samples above 3× median.
         // Guard: when median_rate is negligible (< 0.33 bytes/sec), threshold is
@@ -351,6 +379,8 @@ impl DiskRateEstimator {
             median_rate,
             burst_duration_samples: self.burst_duration_samples,
             calibrated,
+            mad_rate,
+            robust_upper_bound,
         }
     }
 }
@@ -746,6 +776,60 @@ mod tests {
             first_spike.burst_state.burst_probability < 0.5,
             "moderate spike should NOT immediately trigger, got {:.3}",
             first_spike.burst_state.burst_probability,
+        );
+    }
+
+    #[test]
+    fn mad_rate_robust_to_outliers() {
+        // MAD should be small during steady state and remain small even after a burst spike.
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 3);
+        let t0 = Instant::now();
+        let total_free = 10_000_000u64;
+        let threshold = 100_000u64;
+
+        let _ = estimator.update(total_free, t0, threshold);
+
+        // 40 steady samples at ~100 bytes/30s (≈3.33 bytes/sec).
+        for i in 1..=40u64 {
+            let free = total_free - i * 100;
+            let time = t0 + Duration::from_secs(i * 30);
+            let _ = estimator.update(free, time, threshold);
+        }
+
+        let steady = estimator.update(
+            total_free - 41 * 100,
+            t0 + Duration::from_secs(41 * 30),
+            threshold,
+        );
+        let steady_mad = steady.burst_state.mad_rate;
+        let steady_bound = steady.burst_state.robust_upper_bound;
+        assert!(steady.burst_state.calibrated);
+        assert!(steady_mad < 10.0, "MAD should be small during steady state: {steady_mad}");
+        assert!(steady_bound > 0.0, "robust bound must be positive");
+
+        // Inject a massive burst: 500_000 bytes consumed in 30 seconds.
+        let burst_free = total_free - 41 * 100 - 500_000;
+        let burst = estimator.update(
+            burst_free,
+            t0 + Duration::from_secs(42 * 30),
+            threshold,
+        );
+        // MAD should not be wildly inflated by a single outlier.
+        // With 42 samples where 41 are ~3.33 and 1 is ~16667, the median barely
+        // moves and the MAD barely moves (the outlier is just 1/42 of deviations).
+        // When all steady rates are near-identical, MAD ≈ 0 — this is correct
+        // (no dispersion). A single outlier can't push MAD above a small bound.
+        assert!(
+            burst.burst_state.mad_rate < 50.0,
+            "MAD should resist outlier inflation: burst_mad={:.2}",
+            burst.burst_state.mad_rate,
+        );
+        // The burst rate should be above the robust upper bound.
+        let inst_burst_rate = 500_000.0 / 30.0;
+        assert!(
+            burst.burst_state.is_burst_outlier(inst_burst_rate),
+            "burst rate {inst_burst_rate:.0} should be above robust bound {:.0}",
+            burst.burst_state.robust_upper_bound,
         );
     }
 

@@ -138,6 +138,7 @@ fn good_observation() -> CalibrationObservation {
         actual_rate: 1050.0,
         predicted_tte: 100.0,
         actual_tte: 110.0,
+        burst_outlier: false,
     }
 }
 
@@ -147,6 +148,7 @@ fn bad_observation() -> CalibrationObservation {
         actual_rate: 5000.0,
         predicted_tte: 100.0,
         actual_tte: 20.0,
+        burst_outlier: false,
     }
 }
 

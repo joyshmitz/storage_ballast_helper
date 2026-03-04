@@ -578,6 +578,7 @@ fn stress_decision_plane_drift() {
             actual_rate: 1050.0,
             predicted_tte: 90.0,
             actual_tte: 100.0,
+            burst_outlier: false,
         });
     }
     assert_eq!(guard.status(), GuardStatus::Pass);
@@ -605,6 +606,7 @@ fn stress_decision_plane_drift() {
             actual_rate: drift_idx.mul_add(100.0, 3000.0),
             predicted_tte: 100.0,
             actual_tte: 15.0,
+            burst_outlier: false,
         });
         drift_steps += 1;
 
@@ -653,6 +655,7 @@ fn stress_decision_plane_drift() {
             actual_rate: 1020.0,
             predicted_tte: 90.0,
             actual_tte: 100.0,
+            burst_outlier: false,
         });
         engine.observe_window(&guard.diagnostics(), false);
         recovery_steps += 1;
@@ -705,6 +708,7 @@ fn stress_guard_integrity_failure() {
             actual_rate: 1050.0,
             predicted_tte: 90.0,
             actual_tte: 100.0,
+            burst_outlier: false,
         });
     }
     assert_eq!(guard.status(), GuardStatus::Unknown);
@@ -1181,6 +1185,7 @@ fn stress_full_pipeline() {
             actual_rate: 1050.0,
             predicted_tte: 90.0,
             actual_tte: 100.0,
+            burst_outlier: false,
         });
     }
 
@@ -1224,6 +1229,7 @@ fn stress_full_pipeline() {
             } else {
                 f64::MAX
             },
+            burst_outlier: false,
         };
         guard.observe(obs);
 

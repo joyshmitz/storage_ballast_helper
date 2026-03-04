@@ -59,6 +59,12 @@ pub struct CalibrationObservation {
     pub predicted_tte: f64,
     /// Actual time elapsed before threshold breach (seconds), or `f64::INFINITY` if no breach.
     pub actual_tte: f64,
+    /// Whether this observation was taken during a detected burst (actual rate exceeds
+    /// the MAD-based robust upper bound). During bursts, large prediction errors are
+    /// expected behavior — the EWMA intentionally damps the spike. Marking these as
+    /// burst outliers prevents them from poisoning the guard window and causing
+    /// permanent Fail status on machines with bursty workloads (rustc, cargo, etc.).
+    pub burst_outlier: bool,
 }
 
 impl CalibrationObservation {
@@ -188,8 +194,14 @@ impl AdaptiveGuard {
 
     /// Record a new forecast-vs-actual observation and update guard status.
     pub fn observe(&mut self, obs: CalibrationObservation) {
-        let obs_good =
-            obs.rate_error_ratio() <= self.config.max_rate_error && obs.tte_conservative();
+        // Burst outliers are always "good" for calibration purposes.
+        // During bursts, the EWMA intentionally damps the spike, so the predicted
+        // rate diverges from actual — this is correct adaptive behavior, not
+        // miscalibration. Counting burst observations as failures causes the guard
+        // to permanently fail on machines with bursty workloads (production: 600+
+        // consecutive breach windows on machines running rustc compilations).
+        let obs_good = obs.burst_outlier
+            || (obs.rate_error_ratio() <= self.config.max_rate_error && obs.tte_conservative());
 
         // Maintain rolling window.
         self.observations.push_back(obs);
@@ -567,6 +579,7 @@ mod tests {
             actual_rate: 105.0,
             predicted_tte: 300.0,
             actual_tte: 320.0,
+            burst_outlier: false,
         }
     }
 
@@ -576,6 +589,7 @@ mod tests {
             actual_rate: 200.0,
             predicted_tte: 300.0,
             actual_tte: 150.0,
+            burst_outlier: false,
         }
     }
 
@@ -585,6 +599,7 @@ mod tests {
             actual_rate: 105.0,
             predicted_tte: 200.0,
             actual_tte: 300.0,
+            burst_outlier: false,
         }
     }
 
@@ -862,6 +877,7 @@ mod tests {
             actual_rate: 0.0,
             predicted_tte: 300.0,
             actual_tte: 300.0,
+            burst_outlier: false,
         };
         assert!(obs.rate_error_ratio().is_infinite());
     }
@@ -873,6 +889,7 @@ mod tests {
             actual_rate: 0.0,
             predicted_tte: 300.0,
             actual_tte: 300.0,
+            burst_outlier: false,
         };
         assert!((obs.rate_error_ratio() - 0.0).abs() < f64::EPSILON);
     }
@@ -884,6 +901,7 @@ mod tests {
             actual_rate: 100.0,
             predicted_tte: 200.0,
             actual_tte: 300.0,
+            burst_outlier: false,
         };
         assert!(conservative.tte_conservative());
 
@@ -892,6 +910,7 @@ mod tests {
             actual_rate: 100.0,
             predicted_tte: 400.0,
             actual_tte: 300.0,
+            burst_outlier: false,
         };
         assert!(!non_conservative.tte_conservative());
     }
@@ -987,6 +1006,7 @@ mod tests {
             actual_rate: 0.0,    // Idle
             predicted_tte: 300.0,
             actual_tte: 300.0,
+            burst_outlier: false,
         };
         // Before fix, this returned INFINITY. Now should be 0.0.
         assert!((obs.rate_error_ratio() - 0.0).abs() < f64::EPSILON);
@@ -996,9 +1016,78 @@ mod tests {
             actual_rate: 0.5, // Tiny noise
             predicted_tte: 300.0,
             actual_tte: 300.0,
+            burst_outlier: false,
         };
         // Should also be 0.0
         assert!((obs2.rate_error_ratio() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn burst_outlier_observations_do_not_trigger_fail() {
+        // Simulate production scenario: guard is at PASS, then a burst hits.
+        // Burst observations have huge rate error (predicted=100, actual=50000)
+        // but are marked as burst_outlier=true. Guard should stay at PASS.
+        let config = GuardrailConfig {
+            min_observations: 5,
+            ..Default::default()
+        };
+        let mut guard = AdaptiveGuard::new(config);
+
+        // Establish PASS with good observations.
+        for _ in 0..10 {
+            guard.observe(good_obs());
+        }
+        assert_eq!(guard.status(), GuardStatus::Pass);
+
+        // Inject 20 burst outlier observations with massive rate error.
+        for _ in 0..20 {
+            guard.observe(CalibrationObservation {
+                predicted_rate: 100.0,
+                actual_rate: 50_000.0, // 500× error — normally fatal for guard
+                predicted_tte: 300.0,
+                actual_tte: 5.0, // non-conservative
+                burst_outlier: true, // but it's a known burst
+            });
+        }
+
+        // Guard should still be PASS — burst outliers count as "good".
+        assert_eq!(
+            guard.status(),
+            GuardStatus::Pass,
+            "burst outlier observations should not trigger guard failure"
+        );
+    }
+
+    #[test]
+    fn burst_outlier_false_still_penalizes() {
+        // Same scenario but burst_outlier=false — guard should fail.
+        let config = GuardrailConfig {
+            min_observations: 5,
+            window_size: 30,
+            ..Default::default()
+        };
+        let mut guard = AdaptiveGuard::new(config);
+
+        for _ in 0..10 {
+            guard.observe(good_obs());
+        }
+        assert_eq!(guard.status(), GuardStatus::Pass);
+
+        for _ in 0..20 {
+            guard.observe(CalibrationObservation {
+                predicted_rate: 100.0,
+                actual_rate: 50_000.0,
+                predicted_tte: 300.0,
+                actual_tte: 5.0,
+                burst_outlier: false, // NOT a burst — should count as bad
+            });
+        }
+
+        assert_eq!(
+            guard.status(),
+            GuardStatus::Fail,
+            "non-burst bad observations should trigger guard failure"
+        );
     }
 
     #[test]

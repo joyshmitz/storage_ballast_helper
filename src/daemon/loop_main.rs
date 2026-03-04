@@ -338,11 +338,18 @@ impl MountMonitor {
                 } else {
                     f64::INFINITY
                 };
+                // Mark observation as a burst outlier when the actual rate
+                // exceeds the MAD-based robust upper bound. During bursts,
+                // prediction error is expected (EWMA damps the spike) — counting
+                // these as calibration failures permanently poisons the guard on
+                // machines with bursty workloads (rustc, cargo build, etc.).
+                let burst_outlier = rate_estimate.burst_state.is_burst_outlier(actual_rate);
                 self.guard.observe(CalibrationObservation {
                     predicted_rate: previous.predicted_rate,
                     actual_rate,
                     predicted_tte: previous.predicted_tte,
                     actual_tte,
+                    burst_outlier,
                 });
             }
         }

@@ -241,6 +241,10 @@ pub struct PolicyEngine {
     /// fallbacks are suppressed during green pressure since miscalibrated
     /// predictions are harmless when no deletions would occur.
     pressure_is_green: bool,
+    /// Last time a "suppressing fallback" message was logged. Rate-limited to
+    /// once per 5 minutes to prevent log spam when grace periods are active
+    /// and enter_fallback is called every scan cycle (5-8 times per cycle).
+    last_suppression_log: Option<Instant>,
 }
 
 /// Record of a mode transition.
@@ -281,6 +285,7 @@ impl PolicyEngine {
             total_fallback_entries: 0,
             transition_log: Vec::new(),
             pressure_is_green: true,
+            last_suppression_log: None,
         };
 
         if engine.config.kill_switch {
@@ -603,11 +608,18 @@ impl PolicyEngine {
                 if let Some(escalated_at) = self.emergency_escalated_at {
                     let grace = Duration::from_secs(EMERGENCY_GRACE_PERIOD_SECS);
                     if escalated_at.elapsed() < grace {
-                        eprintln!(
-                            "[SBH-POLICY] suppressing fallback ({reason}) — \
-                             emergency grace period active ({:.0}s remaining)",
-                            grace.as_secs_f64() - escalated_at.elapsed().as_secs_f64()
-                        );
+                        // Rate-limit suppression logs to once per 5 minutes.
+                        // Without this, the message fires 5-8 times per scan cycle
+                        // (every observe_window call) across all machines with
+                        // active grace periods, flooding systemd journal.
+                        if self.last_suppression_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(300)) {
+                            eprintln!(
+                                "[SBH-POLICY] suppressing fallback ({reason}) — \
+                                 emergency grace period active ({:.0}s remaining)",
+                                grace.as_secs_f64() - escalated_at.elapsed().as_secs_f64()
+                            );
+                            self.last_suppression_log = Some(Instant::now());
+                        }
                         return;
                     }
                     // Grace period expired — clear the marker.
@@ -620,10 +632,14 @@ impl PolicyEngine {
                 if matches!(reason, FallbackReason::CalibrationBreach { .. }) {
                     let startup_grace = Duration::from_secs(STARTUP_CALIBRATION_GRACE_SECS);
                     if self.started_at.elapsed() < startup_grace {
-                        eprintln!(
-                            "[SBH-POLICY] suppressing calibration breach fallback —                              startup grace period ({:.0}s remaining)",
-                            startup_grace.as_secs_f64() - self.started_at.elapsed().as_secs_f64()
-                        );
+                        if self.last_suppression_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(300)) {
+                            eprintln!(
+                                "[SBH-POLICY] suppressing calibration breach fallback — \
+                                 startup grace period ({:.0}s remaining)",
+                                startup_grace.as_secs_f64() - self.started_at.elapsed().as_secs_f64()
+                            );
+                            self.last_suppression_log = Some(Instant::now());
+                        }
                         self.consecutive_breach_windows = 0;
                         return;
                     }

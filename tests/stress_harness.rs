@@ -493,6 +493,7 @@ fn run_scenario_b(seed: u64, iterations: usize) -> ScenarioResult {
                 actual_tte: estimate
                     .seconds_to_exhaustion
                     .mul_add(rng.next_f64().mul_add(0.1, 1.0), 0.0),
+                burst_outlier: false,
             });
 
             let diag = guard.diagnostics();
@@ -801,6 +802,7 @@ fn run_scenario_d(seed: u64, iterations: usize) -> ScenarioResult {
                 actual_tte: estimate
                     .seconds_to_exhaustion
                     .mul_add(rng.next_f64().mul_add(0.2, 0.9), 0.0),
+                burst_outlier: false,
             });
             let diag = guard.diagnostics();
             let prev_mode = policy.mode();
@@ -1012,6 +1014,7 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
                 actual_rate: 1000.0 * rng.next_f64().mul_add(0.15, 0.9),
                 predicted_tte: 600.0,
                 actual_tte: 600.0 * rng.next_f64().mul_add(0.1, 1.0),
+                burst_outlier: false,
             });
             let diag = guard.diagnostics();
             let prev = policy.mode();
@@ -1030,6 +1033,7 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
                 actual_rate: rng.next_f64().mul_add(2000.0, 3000.0), // 3x-5x error
                 predicted_tte: 600.0,
                 actual_tte: rng.next_f64().mul_add(50.0, 100.0), // way off
+                burst_outlier: false,
             });
             let diag = guard.diagnostics();
             let prev = policy.mode();
@@ -1066,6 +1070,7 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
                 actual_rate: 1000.0 * rng.next_f64().mul_add(0.16, 0.92),
                 predicted_tte: 600.0,
                 actual_tte: 600.0 * rng.next_f64().mul_add(0.08, 1.0),
+                burst_outlier: false,
             });
             let diag = guard.diagnostics();
             let prev = policy.mode();

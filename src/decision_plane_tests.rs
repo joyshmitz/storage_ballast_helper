@@ -304,6 +304,7 @@ fn guard_needs_min_observations_for_pass() {
             actual_rate: 1050.0,
             predicted_tte: 100.0,
             actual_tte: 110.0,
+            burst_outlier: false,
         });
     }
     assert_eq!(
@@ -318,6 +319,7 @@ fn guard_needs_min_observations_for_pass() {
         actual_rate: 1050.0,
         predicted_tte: 100.0,
         actual_tte: 110.0,
+        burst_outlier: false,
     });
     assert_eq!(guard.diagnostics().status, GuardStatus::Pass);
 }
@@ -338,6 +340,7 @@ fn guard_fail_requires_recovery() {
             actual_rate: 1050.0,
             predicted_tte: 100.0,
             actual_tte: 110.0,
+            burst_outlier: false,
         });
     }
     assert_eq!(guard.diagnostics().status, GuardStatus::Pass);
@@ -349,6 +352,7 @@ fn guard_fail_requires_recovery() {
             actual_rate: 5000.0, // 400% error
             predicted_tte: 100.0,
             actual_tte: 20.0, // non-conservative
+            burst_outlier: false,
         });
     }
     assert_eq!(guard.diagnostics().status, GuardStatus::Fail);
@@ -359,6 +363,7 @@ fn guard_fail_requires_recovery() {
         actual_rate: 1050.0,
         predicted_tte: 90.0,
         actual_tte: 110.0,
+        burst_outlier: false,
     });
     // May still be Fail; recovery needs consecutive clean observations.
     let status = guard.diagnostics().status;
@@ -1003,6 +1008,7 @@ fn good_observations(count: usize) -> Vec<CalibrationObservation> {
                 actual_rate: i_f.mul_add(10.0, 1050.0),
                 predicted_tte: i_f + 90.0,
                 actual_tte: i_f + 110.0,
+                burst_outlier: false,
             }
         })
         .collect()
@@ -1019,6 +1025,7 @@ fn bad_observations(count: usize, error_factor: f64) -> Vec<CalibrationObservati
                 actual_rate: predicted_rate * error_factor,
                 predicted_tte: 100.0,
                 actual_tte: 20.0, // non-conservative: predicted > actual
+                burst_outlier: false,
             }
         })
         .collect()

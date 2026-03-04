@@ -365,6 +365,43 @@ impl PredictiveActionPolicy {
             }
         }
 
+        // Median-rate cross-check: when the burst detector is calibrated and
+        // we have plenty of free space (>25%), cross-validate the EWMA-based
+        // prediction against the robust median rate. If the EWMA rate diverges
+        // >3× from the median, the EWMA is tracking a transient spike.
+        //
+        // Production evidence: trj at 32% free predicted "disk full on /data
+        // in 37m at 74% confidence" — burst_probability was only 0.3 (below
+        // the 0.5 threshold for the burst-aware path), but the EWMA was
+        // inflated by a rustc compilation burst. The median rate (which is
+        // robust to outliers) showed no danger.
+        if bs.calibrated
+            && bs.median_rate > 0.0
+            && current_free_pct > 25.0
+            && minutes_remaining <= self.config.warning_horizon_minutes
+        {
+            let rate_divergence = estimate.bytes_per_second / bs.median_rate;
+            if rate_divergence > 3.0 {
+                // EWMA is >3× the robust median — likely spike-inflated.
+                // Re-project using median rate: if median says no danger, gate it.
+                let median_seconds = estimate.seconds_to_exhaustion * rate_divergence;
+                let median_minutes = median_seconds / 60.0;
+                if median_minutes > self.config.warning_horizon_minutes {
+                    return PredictiveAction::Clear;
+                }
+                // Median also says danger — use the more conservative (longer) estimate.
+                let conservative_minutes = minutes_remaining.max(median_minutes);
+                return self.classify(
+                    conservative_minutes,
+                    estimate.confidence,
+                    estimate.bytes_per_second,
+                    estimate.trend,
+                    current_free_pct,
+                    mount,
+                );
+            }
+        }
+
         self.classify(
             minutes_remaining,
             estimate.confidence,
@@ -494,6 +531,7 @@ mod tests {
                 median_rate,
                 burst_duration_samples: 3,
                 calibrated: true,
+                ..BurstState::default()
             },
         }
     }
@@ -1034,6 +1072,7 @@ mod tests {
             median_rate: 100.0,
             burst_duration_samples: 1,
             calibrated: true,
+            ..BurstState::default()
         };
         let action = policy.evaluate(&est, 10.0, PathBuf::from("/data"));
         // Normal path with 1 min left → ImminentDanger.
@@ -1051,6 +1090,7 @@ mod tests {
             median_rate: 1000.0,
             burst_duration_samples: 2,
             calibrated: true,
+            ..BurstState::default()
         };
         let action = policy.evaluate(&est, 31.0, PathBuf::from("/data"));
         // Implied rate = 31%/2min = 15.5%/min > 5.
@@ -1070,6 +1110,7 @@ mod tests {
             median_rate: 1000.0,
             burst_duration_samples: 0,
             calibrated: true,
+            ..BurstState::default()
         };
         let action = policy.evaluate(&est, 25.0, PathBuf::from("/data"));
         // Implied rate = 25%/3min = 8.3%/min > 5, but confidence 0.98 > required.
@@ -1087,5 +1128,73 @@ mod tests {
         // Should use normal path without free-space gating.
         assert!(action.severity() >= 1,
             "uncalibrated burst detector should not trigger gate: got {action:?}");
+    }
+
+    #[test]
+    fn median_rate_crosscheck_gates_spike_inflated_ewma() {
+        let policy = default_policy();
+        // Production scenario: trj at 32% free, "disk full in 37m at 74%
+        // confidence". EWMA rate is spike-inflated (10× median rate) from a
+        // rustc burst, but burst_probability is only 0.3 (below 0.5 threshold).
+        // The median rate (100 bytes/sec) projects hours of runway.
+        let ewma_rate = 1000.0; // 10× the median
+        let seconds_to_exhaustion = 37.0 * 60.0; // 37 minutes per EWMA
+        let mut est = make_estimate(ewma_rate, seconds_to_exhaustion, 0.74, Trend::Stable, false);
+        est.burst_state = BurstState {
+            burst_probability: 0.3,
+            median_rate: 100.0, // robust baseline: 10× lower than EWMA
+            burst_duration_samples: 1,
+            calibrated: true,
+            ..BurstState::default()
+        };
+        // 32% free, EWMA diverges 10× from median → median projects 370 min → Clear.
+        let action = policy.evaluate(&est, 32.0, PathBuf::from("/data"));
+        assert_eq!(
+            action,
+            PredictiveAction::Clear,
+            "spike-inflated EWMA should be gated by median-rate cross-check: got {action:?}"
+        );
+    }
+
+    #[test]
+    fn median_rate_crosscheck_allows_when_both_agree() {
+        let policy = default_policy();
+        // When EWMA and median rate agree (within 3×), normal path proceeds.
+        let ewma_rate = 500.0;
+        let seconds_to_exhaustion = 20.0 * 60.0; // 20 min
+        let mut est = make_estimate(ewma_rate, seconds_to_exhaustion, 0.85, Trend::Stable, false);
+        est.burst_state = BurstState {
+            burst_probability: 0.1,
+            median_rate: 300.0, // 1.67× — within the 3× threshold
+            burst_duration_samples: 0,
+            calibrated: true,
+            ..BurstState::default()
+        };
+        let action = policy.evaluate(&est, 30.0, PathBuf::from("/data"));
+        assert!(
+            action.severity() >= 2,
+            "agreeing rates should allow prediction: got {action:?}"
+        );
+    }
+
+    #[test]
+    fn median_rate_crosscheck_inactive_at_low_free_space() {
+        let policy = default_policy();
+        // When free space is low (<25%), the cross-check doesn't apply —
+        // we need to act even if rates diverge.
+        let mut est = make_estimate(1000.0, 10.0 * 60.0, 0.85, Trend::Stable, false);
+        est.burst_state = BurstState {
+            burst_probability: 0.2,
+            median_rate: 100.0, // 10× divergence
+            burst_duration_samples: 1,
+            calibrated: true,
+            ..BurstState::default()
+        };
+        // 15% free — cross-check should NOT gate.
+        let action = policy.evaluate(&est, 15.0, PathBuf::from("/data"));
+        assert!(
+            action.severity() >= 2,
+            "low free space should bypass median cross-check: got {action:?}"
+        );
     }
 }

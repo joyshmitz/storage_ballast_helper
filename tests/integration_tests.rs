@@ -1314,6 +1314,7 @@ fn e2e_good_observations(count: usize) -> Vec<CalibrationObservation> {
                 actual_rate: idx.mul_add(10.0, 1050.0),
                 predicted_tte: 90.0 + idx,
                 actual_tte: 85.0 + idx,
+                burst_outlier: false,
             }
         })
         .collect()
@@ -1329,6 +1330,7 @@ fn e2e_bad_observations(count: usize, error_factor: f64) -> Vec<CalibrationObser
                 actual_rate: predicted_rate * error_factor,
                 predicted_tte: 100.0,
                 actual_tte: 30.0,
+                burst_outlier: false,
             }
         })
         .collect()
