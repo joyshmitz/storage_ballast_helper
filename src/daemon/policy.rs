@@ -470,9 +470,10 @@ impl PolicyEngine {
                         self.consecutive_breach_windows,
                     );
                     self.consecutive_breach_windows = 0;
-                } else if self.consecutive_breach_windows >= self.config.calibration_breach_windows
-                    && self.consecutive_breach_windows % self.config.calibration_breach_windows == 0
-                {
+                } else if self.consecutive_breach_windows == self.config.calibration_breach_windows {
+                    // Log only on the first breach threshold crossing, not
+                    // on every multiple — the repeated "advisory only" messages
+                    // were flooding journals with hundreds of messages per minute.
                     eprintln!(
                         "[SBH-POLICY] calibration breach ({} consecutive windows) — \
                          continuing in current mode (advisory only)",
@@ -737,9 +738,16 @@ impl PolicyEngine {
     }
 
     fn check_guard_triggers(&mut self, diag: &GuardDiagnostics) {
-        // Suppress guard-triggered fallback during green pressure — drift in
-        // predictions is harmless when no deletions are being considered.
-        if diag.e_process_alarm && self.mode != ActiveMode::FallbackSafe && !self.pressure_is_green
+        // Suppress guard-triggered fallback when:
+        // - Pressure is green (drift is harmless, no deletions considered)
+        // - Guard has too few observations to be meaningful (< 30). On fresh
+        //   start the guard gets rate prediction observations every tick, but
+        //   these are unreliable until the EWMA stabilizes. Letting a freshly
+        //   started guard trigger FallbackSafe creates a deadlock.
+        if diag.e_process_alarm
+            && self.mode != ActiveMode::FallbackSafe
+            && !self.pressure_is_green
+            && diag.observation_count >= 30
         {
             self.enter_fallback(FallbackReason::GuardrailDrift);
         }
