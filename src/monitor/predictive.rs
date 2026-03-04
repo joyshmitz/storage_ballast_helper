@@ -296,6 +296,15 @@ impl PredictiveActionPolicy {
             return PredictiveAction::Clear;
         }
 
+        // Hard gate: if more than half the disk is free, no prediction can be
+        // credible unless confidence is very high (>0.95). Consuming 50%+ of a
+        // disk in minutes is physically implausible for normal workloads.
+        // Production evidence: vmi1167313 at 55% free predicted "disk full in
+        // 3m" — a burst-inflated EWMA spike, not real danger.
+        if current_free_pct > 50.0 && estimate.confidence < 0.95 {
+            return PredictiveAction::Clear;
+        }
+
         // Implied-rate sanity gate: when the predicted consumption rate implies
         // consuming a large fraction of free space per minute, the prediction
         // is almost certainly a transient EWMA spike (e.g. a rustc burst).
@@ -588,8 +597,9 @@ mod tests {
     fn exhaustion_within_action_horizon_returns_preemptive_cleanup() {
         let policy = default_policy();
         // 20 minutes: within 30-minute action horizon, above 5-minute imminent threshold.
+        // Disk 78% full (22% free).
         let est = make_estimate(500_000_000.0, 20.0 * 60.0, 0.90, Trend::Accelerating, false);
-        let action = policy.evaluate(&est, 78.0, PathBuf::from("/data"));
+        let action = policy.evaluate(&est, 22.0, PathBuf::from("/data"));
         match action {
             PredictiveAction::PreemptiveCleanup {
                 minutes_remaining,
@@ -922,21 +932,21 @@ mod tests {
         // 15 min: within custom 20-min warning, beyond custom 10-min action.
         let est = make_estimate(100_000.0, 15.0 * 60.0, 0.90, Trend::Stable, false);
         assert!(matches!(
-            policy.evaluate(&est, 80.0, PathBuf::from("/data")),
+            policy.evaluate(&est, 25.0, PathBuf::from("/data")),
             PredictiveAction::EarlyWarning { .. }
         ));
 
         // 8 min: within custom 10-min action, above custom 3-min imminent.
         let est2 = make_estimate(100_000.0, 8.0 * 60.0, 0.90, Trend::Stable, false);
         assert!(matches!(
-            policy.evaluate(&est2, 80.0, PathBuf::from("/data")),
+            policy.evaluate(&est2, 25.0, PathBuf::from("/data")),
             PredictiveAction::PreemptiveCleanup { .. }
         ));
 
         // 2.5 min: below custom 3-min imminent, above custom 2-min critical.
         let est3 = make_estimate(100_000.0, 2.5 * 60.0, 0.90, Trend::Stable, false);
         assert!(matches!(
-            policy.evaluate(&est3, 80.0, PathBuf::from("/data")),
+            policy.evaluate(&est3, 25.0, PathBuf::from("/data")),
             PredictiveAction::ImminentDanger {
                 critical: false,
                 ..
@@ -946,7 +956,7 @@ mod tests {
         // 1.5 min: below custom 2-min critical threshold.
         let est4 = make_estimate(100_000.0, 1.5 * 60.0, 0.90, Trend::Stable, false);
         assert!(matches!(
-            policy.evaluate(&est4, 80.0, PathBuf::from("/data")),
+            policy.evaluate(&est4, 25.0, PathBuf::from("/data")),
             PredictiveAction::ImminentDanger { critical: true, .. }
         ));
     }
