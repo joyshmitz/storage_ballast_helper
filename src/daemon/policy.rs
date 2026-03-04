@@ -443,7 +443,11 @@ impl PolicyEngine {
         if is_clean {
             self.consecutive_clean_windows += 1;
             self.consecutive_breach_windows = 0;
-            self.recalibration_count = 0;
+            // Note: recalibration_count is intentionally NOT reset on clean
+            // windows. On machines with persistently miscalibrated guards,
+            // brief non-Fail flickers happen between breach cycles. Resetting
+            // the count on these would restart the log spam each time.
+            // The counter resets naturally on daemon restart.
 
             // Check recovery condition — require both enough clean windows AND
             // a minimum cooldown period to prevent rapid canary↔fallback thrashing.
