@@ -242,11 +242,16 @@ impl DeletionExecutor {
                     // across different path prefixes (e.g. FUSE mount failures shouldn't
                     // trip the breaker for normal /tmp deletions).
                     consecutive_failures = 0;
-                    self.log_event(ActivityEvent::ArtifactDeletionFailed {
-                        path: candidate.path.to_string_lossy().to_string(),
-                        error_code: "SBH-2003".to_string(),
-                        error_message: format!("skipped: {skip:?}"),
-                    });
+                    // Only log unexpected skip reasons. PathGone (parent deleted) and
+                    // ContainsGit (project root) are normal conditions that produce
+                    // excessive log noise when logged as errors.
+                    if !matches!(skip, SkipReason::PathGone | SkipReason::ContainsGit) {
+                        self.log_event(ActivityEvent::ArtifactDeletionFailed {
+                            path: candidate.path.to_string_lossy().to_string(),
+                            error_code: "SBH-2003".to_string(),
+                            error_message: format!("skipped: {skip:?}"),
+                        });
+                    }
                     continue;
                 }
             }

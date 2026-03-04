@@ -380,7 +380,7 @@ impl Default for ScannerConfig {
             max_delete_batch: 20,
             repeat_deletion_base_cooldown_secs: 300,
             repeat_deletion_max_cooldown_secs: 3600,
-            scan_time_budget_secs: 600,
+            scan_time_budget_secs: 300,
         }
     }
 }
@@ -406,7 +406,7 @@ impl Default for BallastConfig {
         Self {
             file_count: 10,
             file_size_bytes: 1_073_741_824,
-            replenish_cooldown_minutes: 30,
+            replenish_cooldown_minutes: 10,
             auto_provision: true,
             overrides: BTreeMap::new(),
         }

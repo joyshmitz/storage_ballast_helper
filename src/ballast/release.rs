@@ -33,6 +33,10 @@ struct MountReleaseState {
     green_since: Option<Instant>,
     /// Last time a file was replenished.
     last_replenish_time: Option<Instant>,
+    /// Count of non-green ticks since green_since was set. Allows brief
+    /// pressure spikes (e.g. compilation bursts) without resetting the
+    /// entire replenishment cooldown.
+    non_green_interruptions: u32,
 }
 
 /// Tracks release/replenishment state across monitoring loop iterations.
@@ -184,9 +188,17 @@ impl BallastReleaseController {
     ) -> bool {
         let state = self.states.entry(mount_path.to_path_buf()).or_default();
 
-        // Only replenish when green.
         if current_level != PressureLevel::Green {
-            state.green_since = None;
+            // Allow up to 3 brief non-green interruptions during the cooldown
+            // window (e.g. compilation bursts that spike to Yellow for one tick).
+            // Beyond that, reset the cooldown entirely.
+            if state.green_since.is_some() {
+                state.non_green_interruptions += 1;
+                if state.non_green_interruptions > 3 {
+                    state.green_since = None;
+                    state.non_green_interruptions = 0;
+                }
+            }
             return false;
         }
 
@@ -376,7 +388,16 @@ mod tests {
             .unwrap();
         let count_after_first = mgr.available_count();
 
-        // Pressure rises — green_since resets.
+        // Brief pressure spike is tolerated (up to 3 interruptions).
+        ctrl.maybe_replenish(mount, &mut mgr, PressureLevel::Orange, &|| 50.0)
+            .unwrap();
+        assert!(ctrl.states.get(mount).and_then(|s| s.green_since).is_some());
+
+        // 4+ interruptions reset green_since.
+        ctrl.maybe_replenish(mount, &mut mgr, PressureLevel::Orange, &|| 50.0)
+            .unwrap();
+        ctrl.maybe_replenish(mount, &mut mgr, PressureLevel::Orange, &|| 50.0)
+            .unwrap();
         ctrl.maybe_replenish(mount, &mut mgr, PressureLevel::Orange, &|| 50.0)
             .unwrap();
         assert!(ctrl.states.get(mount).and_then(|s| s.green_since).is_none());

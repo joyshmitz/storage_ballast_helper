@@ -2269,6 +2269,12 @@ fn scanner_thread_main(
     // barren directory subtrees that yielded no candidates on a prior pass.
     let mut scan_cursor = ScanCursor::new();
 
+    // Cache of directories known to contain .git — these are valid project
+    // roots that should never be deleted. Persists across scan passes to
+    // avoid re-discovering and re-rejecting the same paths every 10 minutes
+    // (previously caused thousands of ContainsGit log entries per hour).
+    let mut known_git_dirs: HashSet<PathBuf> = HashSet::new();
+
     while let Ok(request) = scan_rx.recv() {
         // Read latest config at the start of each scan.
         let current_scoring_config = shared_scoring_config.read().clone();
@@ -2305,11 +2311,21 @@ fn scanner_thread_main(
                         if !path.is_dir() {
                             continue;
                         }
+                        // Skip directories already known to contain .git.
+                        if known_git_dirs.contains(&path) {
+                            continue;
+                        }
                         let classification =
                             pattern_registry.classify(&path, Default::default());
                         if classification.category
                             == crate::scanner::patterns::ArtifactCategory::Unknown
                         {
+                            continue;
+                        }
+                        // Check for .git before investing in scoring —
+                        // project roots should never be deletion candidates.
+                        if path.join(".git").exists() {
+                            known_git_dirs.insert(path.clone());
                             continue;
                         }
                         // Also check depth-2 children for nested targets.
@@ -2318,6 +2334,12 @@ fn scanner_thread_main(
                             for sub_entry in sub_entries.flatten() {
                                 let sub_path = sub_entry.path();
                                 if sub_path.is_dir() {
+                                    if known_git_dirs.contains(&sub_path)
+                                        || sub_path.join(".git").exists()
+                                    {
+                                        known_git_dirs.insert(sub_path);
+                                        continue;
+                                    }
                                     let sub_class = pattern_registry
                                         .classify(&sub_path, Default::default());
                                     if sub_class.category
@@ -2575,11 +2597,24 @@ fn scanner_thread_main(
                 .elapsed()
                 .unwrap_or(Duration::ZERO);
 
+            // Skip directories already known to contain .git (project roots).
+            if entry.metadata.is_dir && known_git_dirs.contains(&entry.path) {
+                continue;
+            }
+
             // Classify.
             let classification = pattern_registry.classify(&entry.path, entry.structural_signals);
 
             // Skip unknown artifacts to save scoring cycles.
             if classification.category == crate::scanner::patterns::ArtifactCategory::Unknown {
+                continue;
+            }
+
+            // Check for .git before scoring — project roots should never be
+            // deletion candidates. This catches cases the priority pre-scan
+            // missed (deeper directories, newly created repos).
+            if entry.metadata.is_dir && entry.path.join(".git").exists() {
+                known_git_dirs.insert(entry.path.clone());
                 continue;
             }
 

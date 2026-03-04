@@ -289,13 +289,38 @@ impl PredictiveActionPolicy {
             );
         }
 
-        // Current free space already low override: if we're already in a good state
-        // (lots of free space), we still respect the EWMA prediction.
         let minutes_remaining = estimate.seconds_to_exhaustion / 60.0;
 
         // Guard against infinite or nonsensical values.
         if !minutes_remaining.is_finite() || minutes_remaining < 0.0 {
             return PredictiveAction::Clear;
+        }
+
+        // Free-space sanity gate: when the burst detector is calibrated but
+        // hasn't flagged a burst (probability < 0.5), and the implied
+        // consumption rate is unrealistically high, the EWMA is likely
+        // tracking a transient spike. Require higher confidence proportional
+        // to the implied rate to suppress false "disk full in Xm" alarms.
+        //
+        // This specifically targets the production failure mode: 31% free,
+        // "disk full in 5m" at 73% confidence — a rustc compilation burst
+        // that the burst detector scored at 0.3 (below the 0.5 threshold).
+        if bs.calibrated
+            && bs.burst_probability < 0.5
+            && current_free_pct > 20.0
+            && minutes_remaining < self.config.action_horizon_minutes
+        {
+            let implied_rate_pct_per_min = current_free_pct / minutes_remaining;
+            // Gate kicks in above 5%/min implied consumption — that's consuming
+            // 50% of a 1TB disk in 10 minutes, which is almost always a burst.
+            if implied_rate_pct_per_min > 5.0 {
+                let severity = ((implied_rate_pct_per_min - 5.0) / 10.0).clamp(0.0, 1.0);
+                let required =
+                    self.config.min_confidence + severity * (0.95 - self.config.min_confidence);
+                if estimate.confidence < required {
+                    return PredictiveAction::Clear;
+                }
+            }
         }
 
         self.classify(
@@ -970,5 +995,52 @@ mod tests {
         let action = policy.evaluate(&est, 10.0, PathBuf::from("/data"));
         // Normal path with 1 min left → ImminentDanger.
         assert!(matches!(action, PredictiveAction::ImminentDanger { .. }));
+    }
+
+    #[test]
+    fn free_space_sanity_gate_blocks_false_alarms() {
+        let policy = default_policy();
+        // Simulate the production failure: 31% free, "disk full in 5 min",
+        // 75% confidence, calibrated burst detector that scored 0.3 probability.
+        let mut est = make_estimate(100_000.0, 5.0 * 60.0, 0.75, Trend::Stable, false);
+        est.burst_state = BurstState {
+            burst_probability: 0.3,
+            median_rate: 1000.0,
+            burst_duration_samples: 2,
+            calibrated: true,
+        };
+        let action = policy.evaluate(&est, 31.0, PathBuf::from("/data"));
+        // Implied rate = 31%/5min = 6.2%/min > 5, and confidence 0.75 < required.
+        assert_eq!(action, PredictiveAction::Clear,
+            "should suppress false alarm: 31% free in 5 min with 75% confidence");
+    }
+
+    #[test]
+    fn free_space_gate_allows_high_confidence_predictions() {
+        let policy = default_policy();
+        // Same scenario but with very high confidence — should NOT be gated.
+        let mut est = make_estimate(100_000.0, 3.0 * 60.0, 0.98, Trend::Accelerating, false);
+        est.burst_state = BurstState {
+            burst_probability: 0.1,
+            median_rate: 1000.0,
+            burst_duration_samples: 0,
+            calibrated: true,
+        };
+        let action = policy.evaluate(&est, 25.0, PathBuf::from("/data"));
+        // Implied rate = 25%/3min = 8.3%/min > 5, but confidence 0.98 > required.
+        assert!(action.severity() >= 3,
+            "high-confidence prediction should not be gated: got {action:?}");
+    }
+
+    #[test]
+    fn free_space_gate_inactive_when_burst_uncalibrated() {
+        let policy = default_policy();
+        // Burst detector not calibrated — gate should not apply.
+        let est = make_estimate(100_000.0, 4.0 * 60.0, 0.75, Trend::Stable, false);
+        // Default BurstState has calibrated=false.
+        let action = policy.evaluate(&est, 30.0, PathBuf::from("/data"));
+        // Should use normal path without free-space gating.
+        assert!(action.severity() >= 1,
+            "uncalibrated burst detector should not trigger gate: got {action:?}");
     }
 }

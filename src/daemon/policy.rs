@@ -427,7 +427,15 @@ impl PolicyEngine {
     /// harmless (no deletions would occur) and should not drive the engine into
     /// FallbackSafe.
     pub fn observe_window(&mut self, guard: &GuardDiagnostics, pressure_is_green: bool) {
-        if guard.status == GuardStatus::Pass && !guard.e_process_alarm {
+        // A window is "clean" when the guard passes normally, OR when pressure
+        // is green and the guard isn't actively failing (Unknown is OK during
+        // green — miscalibrated predictions are harmless with plenty of free
+        // space, and blocking recovery on guard calibration that can never
+        // happen without deletions creates a deadlock).
+        let is_clean = (guard.status == GuardStatus::Pass && !guard.e_process_alarm)
+            || (pressure_is_green && guard.status != GuardStatus::Fail);
+
+        if is_clean {
             self.consecutive_clean_windows += 1;
             self.consecutive_breach_windows = 0;
 
