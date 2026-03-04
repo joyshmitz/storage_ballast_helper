@@ -1000,9 +1000,9 @@ mod tests {
     #[test]
     fn free_space_sanity_gate_blocks_false_alarms() {
         let policy = default_policy();
-        // Simulate the production failure: 31% free, "disk full in 5 min",
-        // 75% confidence, calibrated burst detector that scored 0.3 probability.
-        let mut est = make_estimate(100_000.0, 5.0 * 60.0, 0.75, Trend::Stable, false);
+        // Simulate the production failure: 31% free, "disk full in 2 min",
+        // 73% confidence, calibrated burst detector that scored 0.3 probability.
+        let mut est = make_estimate(100_000.0, 2.0 * 60.0, 0.73, Trend::Stable, false);
         est.burst_state = BurstState {
             burst_probability: 0.3,
             median_rate: 1000.0,
@@ -1010,9 +1010,11 @@ mod tests {
             calibrated: true,
         };
         let action = policy.evaluate(&est, 31.0, PathBuf::from("/data"));
-        // Implied rate = 31%/5min = 6.2%/min > 5, and confidence 0.75 < required.
+        // Implied rate = 31%/2min = 15.5%/min > 5.
+        // severity = (15.5-5)/10 = 1.0 (clamped), required = 0.7+0.25 = 0.95.
+        // Confidence 0.73 < 0.95 → gated.
         assert_eq!(action, PredictiveAction::Clear,
-            "should suppress false alarm: 31% free in 5 min with 75% confidence");
+            "should suppress false alarm: 31% free in 2 min with 73% confidence");
     }
 
     #[test]
