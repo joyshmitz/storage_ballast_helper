@@ -228,6 +228,10 @@ pub struct PolicyEngine {
     builder: DecisionRecordBuilder,
     consecutive_clean_windows: usize,
     consecutive_breach_windows: usize,
+    /// How many times the breach counter has hit 100 and reset.
+    /// After 3 recalibrations, all breach/reset logging is suppressed
+    /// since the guard is persistently miscalibrated for this workload.
+    recalibration_count: u32,
     canary_deletes_this_hour: usize,
     canary_hour_start: Instant,
     total_decisions: u64,
@@ -270,6 +274,7 @@ impl PolicyEngine {
             builder: DecisionRecordBuilder::new(),
             consecutive_clean_windows: 0,
             consecutive_breach_windows: 0,
+            recalibration_count: 0,
             canary_deletes_this_hour: 0,
             canary_hour_start: Instant::now(),
             total_decisions: 0,
@@ -438,6 +443,7 @@ impl PolicyEngine {
         if is_clean {
             self.consecutive_clean_windows += 1;
             self.consecutive_breach_windows = 0;
+            self.recalibration_count = 0;
 
             // Check recovery condition — require both enough clean windows AND
             // a minimum cooldown period to prevent rapid canary↔fallback thrashing.
@@ -464,16 +470,22 @@ impl PolicyEngine {
                 // recalibration notice. The guard will re-learn naturally
                 // from fresh observations.
                 if self.consecutive_breach_windows >= 100 {
-                    eprintln!(
-                        "[SBH-POLICY] recalibrating after {} consecutive breach windows — \
-                         resetting breach counter (guard will re-learn from fresh data)",
-                        self.consecutive_breach_windows,
-                    );
+                    self.recalibration_count += 1;
+                    // Only log the first 3 recalibration cycles. After that,
+                    // the guard is persistently miscalibrated for this workload
+                    // and logging it just floods the journal.
+                    if self.recalibration_count <= 3 {
+                        eprintln!(
+                            "[SBH-POLICY] recalibrating after {} consecutive breach windows — \
+                             resetting breach counter (cycle {}, guard will re-learn from fresh data)",
+                            self.consecutive_breach_windows,
+                            self.recalibration_count,
+                        );
+                    }
                     self.consecutive_breach_windows = 0;
-                } else if self.consecutive_breach_windows == self.config.calibration_breach_windows {
-                    // Log only on the first breach threshold crossing, not
-                    // on every multiple — the repeated "advisory only" messages
-                    // were flooding journals with hundreds of messages per minute.
+                } else if self.consecutive_breach_windows == self.config.calibration_breach_windows
+                    && self.recalibration_count < 3
+                {
                     eprintln!(
                         "[SBH-POLICY] calibration breach ({} consecutive windows) — \
                          continuing in current mode (advisory only)",
@@ -921,7 +933,7 @@ mod tests {
     fn failing_guard() -> GuardDiagnostics {
         GuardDiagnostics {
             status: GuardStatus::Fail,
-            observation_count: 25,
+            observation_count: 30,
             median_rate_error: 0.45,
             conservative_fraction: 0.55,
             e_process_value: 25.0,

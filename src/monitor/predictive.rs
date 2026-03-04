@@ -296,6 +296,40 @@ impl PredictiveActionPolicy {
             return PredictiveAction::Clear;
         }
 
+        // Implied-rate sanity gate: when the predicted consumption rate implies
+        // consuming a large fraction of free space per minute, the prediction
+        // is almost certainly a transient EWMA spike (e.g. a rustc burst).
+        // This gate is unconditional — it fires even before the burst
+        // detector is calibrated, which is critical during the first 15+
+        // minutes after daemon restart.
+        //
+        // Production evidence: vmi1264463 at 73% free predicted "disk full in
+        // 53m" (86% conf, implied 1.4%/min), vmi1152480 at 35% free predicted
+        // "disk full in 54m" (78% conf, implied 0.65%/min).
+        if current_free_pct > 20.0
+            && minutes_remaining > self.config.imminent_danger_minutes
+        {
+            let implied_rate_pct_per_min = current_free_pct / minutes_remaining;
+            // Two tiers:
+            // 1. Moderate rate (>1%/min with >40% free): require 0.90+ confidence.
+            //    Catches most false alarms from burst EWMA spikes.
+            // 2. Extreme rate (>5%/min): require confidence proportional to severity.
+            //    Catches remaining extreme cases even at lower free space.
+            if implied_rate_pct_per_min > 1.0 && current_free_pct > 40.0 {
+                if estimate.confidence < 0.90 {
+                    return PredictiveAction::Clear;
+                }
+            }
+            if implied_rate_pct_per_min > 5.0 {
+                let severity = ((implied_rate_pct_per_min - 5.0) / 10.0).clamp(0.0, 1.0);
+                let required =
+                    self.config.min_confidence + severity * (0.95 - self.config.min_confidence);
+                if estimate.confidence < required {
+                    return PredictiveAction::Clear;
+                }
+            }
+        }
+
         // Free-space sanity gate: when the burst detector is calibrated but
         // hasn't flagged a burst (probability < 0.5), and the implied
         // consumption rate is unrealistically high, the EWMA is likely
@@ -536,7 +570,7 @@ mod tests {
         let policy = default_policy();
         // 42 minutes: within 60-minute warning horizon, beyond 30-minute action horizon.
         let est = make_estimate(100_000.0, 42.0 * 60.0, 0.85, Trend::Stable, false);
-        let action = policy.evaluate(&est, 80.0, PathBuf::from("/data"));
+        let action = policy.evaluate(&est, 25.0, PathBuf::from("/data"));
         match action {
             PredictiveAction::EarlyWarning {
                 minutes_remaining,
@@ -580,7 +614,7 @@ mod tests {
         let policy = default_policy();
         // Exactly 30 minutes: right at the action horizon boundary.
         let est = make_estimate(500_000.0, 30.0 * 60.0, 0.80, Trend::Stable, false);
-        let action = policy.evaluate(&est, 50.0, PathBuf::from("/data"));
+        let action = policy.evaluate(&est, 25.0, PathBuf::from("/data"));
         assert!(matches!(action, PredictiveAction::PreemptiveCleanup { .. }));
     }
 
@@ -625,9 +659,9 @@ mod tests {
     #[test]
     fn high_consumption_at_80pct_full_triggers_preemptive_cleanup() {
         let policy = default_policy();
-        // 500 MB/s consumption, disk 80% full, ~28 minutes to exhaustion.
+        // 500 MB/s consumption, disk 80% full (20% free), ~28 minutes to exhaustion.
         let est = make_estimate(500_000_000.0, 28.0 * 60.0, 0.88, Trend::Accelerating, false);
-        let action = policy.evaluate(&est, 80.0, PathBuf::from("/data"));
+        let action = policy.evaluate(&est, 20.0, PathBuf::from("/data"));
         assert!(
             matches!(action, PredictiveAction::PreemptiveCleanup { .. }),
             "expected PreemptiveCleanup at 80% full with 28 min left"
