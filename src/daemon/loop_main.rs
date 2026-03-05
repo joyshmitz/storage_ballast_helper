@@ -1593,12 +1593,13 @@ impl MonitoringDaemon {
         match enqueue_scan_request(scan_tx, scan_rx, request, replace_on_full) {
             ScanEnqueueStatus::Queued => {}
             ScanEnqueueStatus::ReplacedStale | ScanEnqueueStatus::DeferredFull => {
-                // Rate-limit these messages to once per 60s to avoid log spam
-                // when scans are saturated (fires every 1-2s otherwise).
+                // Rate-limit to once per 5 minutes. Scans can take 600s while
+                // monitor ticks every 60s, so this fires 9/10 ticks during long
+                // scans — logging once per 60s is still spammy (9+ lines/scan).
                 let now = Instant::now();
                 let should_log = self
                     .last_scan_channel_warn
-                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(60));
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(300));
                 if should_log {
                     self.last_scan_channel_warn = Some(now);
                     eprintln!(

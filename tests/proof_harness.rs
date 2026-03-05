@@ -17,6 +17,7 @@ use storage_ballast_helper::core::config::ScoringConfig;
 use storage_ballast_helper::daemon::policy::{
     ActiveMode, FallbackReason, PolicyConfig, PolicyEngine,
 };
+use storage_ballast_helper::monitor::pid::PressureLevel;
 use storage_ballast_helper::monitor::guardrails::{
     AdaptiveGuard, CalibrationObservation, GuardDiagnostics, GuardStatus, GuardrailConfig,
 };
@@ -412,7 +413,7 @@ fn execute_trace(trace: &[TraceOp]) -> Vec<TraceOutcome> {
                 }
             }
             TraceOp::PolicyObserveWindow(diag) => {
-                engine.observe_window(diag, false);
+                engine.observe_window(diag);
                 TraceOutcome {
                     step,
                     op_name: "observe_window".to_string(),

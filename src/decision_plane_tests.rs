@@ -922,7 +922,7 @@ impl ReplayEngine {
                     self.policy.enter_fallback(reason.clone());
                 }
                 PolicyOp::ObserveWindow(guard_diag) => {
-                    self.policy.observe_window(guard_diag, false);
+                    self.policy.observe_window(guard_diag);
                 }
                 PolicyOp::Evaluate => {
                     last_decision = Some(self.policy.evaluate(&scored, Some(&diag)));
