@@ -1127,14 +1127,19 @@ impl MonitoringDaemon {
             // 10. Periodic summary report (every 5 minutes).
             if self.last_summary_report.elapsed() >= Duration::from_secs(300) {
                 let rss_mb = read_rss_mb().unwrap_or(0);
-                let guard_str = self
-                    .shared_guard_diagnostics
-                    .read()
+                let guard_diag_snapshot = self.shared_guard_diagnostics.read().clone();
+                let guard_str = guard_diag_snapshot
                     .as_ref()
-                    .map_or("none", |d| match d.status {
-                        GuardStatus::Pass => "pass",
-                        GuardStatus::Fail => "FAIL",
-                        GuardStatus::Unknown => "unknown",
+                    .map_or_else(|| "none".to_string(), |d| {
+                        format!(
+                            "{}(e={:.1} med_err={:.2} cons={:.0}% obs={} clean={})",
+                            d.status,
+                            d.e_process_value,
+                            d.median_rate_error,
+                            d.conservative_fraction * 100.0,
+                            d.observation_count,
+                            d.consecutive_clean,
+                        )
                     });
                 let mode_str = self.policy_engine.lock().mode();
                 eprintln!(

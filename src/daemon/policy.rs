@@ -1186,8 +1186,8 @@ mod tests {
     fn drift_alarm_triggers_fallback() {
         let mut engine = PolicyEngine::new(default_config());
         engine.promote(); // canary
-        // Guard drift only triggers fallback when pressure is above green.
-        engine.set_pressure_level(PressureLevel::Yellow);
+        // Guard drift only triggers fallback at Orange+ pressure (v0.3.8+).
+        engine.set_pressure_level(PressureLevel::Orange);
         let drift = failing_guard();
         engine.evaluate(&[], Some(&drift));
         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);

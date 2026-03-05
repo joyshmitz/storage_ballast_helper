@@ -68,11 +68,26 @@ pub struct CalibrationObservation {
 }
 
 impl CalibrationObservation {
-    /// Absolute relative error of the rate prediction.
-    fn rate_error_ratio(self) -> f64 {
+    /// Directional rate error: only penalizes UNDERESTIMATION of disk consumption.
+    ///
+    /// For a cleanup system, overestimation (predicted > actual) is the safe direction:
+    /// the system predicts more filling than reality, triggering earlier cleanup. Only
+    /// underestimation (actual > predicted, disk fills faster than predicted) is dangerous.
+    ///
+    /// This prevents post-burst EWMA decay (predicted >> actual, EWMA still elevated
+    /// while reality returns to baseline) from poisoning the guard. During this phase,
+    /// the EWMA is correctly recovering — its overestimation is safe, not miscalibration.
+    fn rate_danger_ratio(self) -> f64 {
         // Ignore errors when rates are trivial (< 1 byte/sec) to prevent
         // floating-point noise during idle periods from triggering calibration failure.
         if self.actual_rate.abs() < 1.0 && self.predicted_rate.abs() < 1.0 {
+            return 0.0;
+        }
+
+        // Only penalize underestimation: actual consumption exceeds prediction.
+        let underestimation = self.actual_rate - self.predicted_rate;
+        if underestimation <= 0.0 {
+            // EWMA overestimates or matches actual — safe direction for cleanup.
             return 0.0;
         }
 
@@ -82,7 +97,7 @@ impl CalibrationObservation {
             }
             return f64::INFINITY;
         }
-        ((self.predicted_rate - self.actual_rate) / self.actual_rate).abs()
+        underestimation / self.actual_rate.abs()
     }
 
     /// Whether the TTE prediction was conservative (predicted <= actual).
@@ -126,7 +141,10 @@ impl Default for GuardrailConfig {
             min_conservative_fraction: 0.70,
             e_process_threshold: 20.0,
             e_process_penalty: 1.5,
-            e_process_reward: 0.75,
+            // Symmetric in log-space: ln(1/1.5) = -ln(1.5).
+            // This ensures good observations recover as fast as bad ones accumulate,
+            // preventing permanent drift alarm on machines with bursty workloads.
+            e_process_reward: 2.0_f64 / 3.0,
             recovery_clean_windows: 3,
         }
     }
@@ -201,7 +219,7 @@ impl AdaptiveGuard {
         // to permanently fail on machines with bursty workloads (production: 600+
         // consecutive breach windows on machines running rustc compilations).
         let obs_good = obs.burst_outlier
-            || (obs.rate_error_ratio() <= self.config.max_rate_error && obs.tte_conservative());
+            || (obs.rate_danger_ratio() <= self.config.max_rate_error && obs.tte_conservative());
 
         // Maintain rolling window.
         self.observations.push_back(obs);
@@ -340,15 +358,26 @@ impl AdaptiveGuard {
     }
 
     fn calibration_metrics(&self) -> (f64, f64) {
-        if self.observations.is_empty() {
-            return (f64::INFINITY, 0.0);
-        }
-
-        // Compute median rate error.
-        let mut errors: Vec<f64> = self
+        // Exclude burst outlier observations from calibration metrics.
+        // During bursts, both rate error and TTE are expected to diverge —
+        // the EWMA intentionally damps the spike. Including them would
+        // permanently skew the calibration window on bursty machines.
+        let non_burst: Vec<&CalibrationObservation> = self
             .observations
             .iter()
-            .map(|o| o.rate_error_ratio())
+            .filter(|o| !o.burst_outlier)
+            .collect();
+
+        if non_burst.is_empty() {
+            // All observations are burst outliers (or no observations at all).
+            // Return neutral metrics that won't trigger calibration failure.
+            return (0.0, 1.0);
+        }
+
+        // Compute median rate danger (underestimation only).
+        let mut errors: Vec<f64> = non_burst
+            .iter()
+            .map(|o| o.rate_danger_ratio())
             .collect();
         errors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median_error = if errors.len().is_multiple_of(2) {
@@ -358,13 +387,12 @@ impl AdaptiveGuard {
             errors[errors.len() / 2]
         };
 
-        // Compute conservative TTE fraction.
-        let conservative_count = self
-            .observations
+        // Compute conservative TTE fraction (burst outliers excluded).
+        let conservative_count = non_burst
             .iter()
             .filter(|o| o.tte_conservative())
             .count();
-        let conservative_frac = conservative_count as f64 / self.observations.len() as f64;
+        let conservative_frac = conservative_count as f64 / non_burst.len() as f64;
 
         (median_error, conservative_frac)
     }
@@ -871,7 +899,8 @@ mod tests {
     }
 
     #[test]
-    fn rate_error_ratio_handles_zero_actual() {
+    fn rate_danger_ratio_overestimation_is_safe() {
+        // predicted=100 but actual=0: EWMA overestimates consumption → safe direction.
         let obs = CalibrationObservation {
             predicted_rate: 100.0,
             actual_rate: 0.0,
@@ -879,11 +908,14 @@ mod tests {
             actual_tte: 300.0,
             burst_outlier: false,
         };
-        assert!(obs.rate_error_ratio().is_infinite());
+        assert!(
+            (obs.rate_danger_ratio() - 0.0).abs() < f64::EPSILON,
+            "overestimation should return 0 (safe direction)"
+        );
     }
 
     #[test]
-    fn rate_error_ratio_handles_both_zero() {
+    fn rate_danger_ratio_handles_both_zero() {
         let obs = CalibrationObservation {
             predicted_rate: 0.0,
             actual_rate: 0.0,
@@ -891,7 +923,40 @@ mod tests {
             actual_tte: 300.0,
             burst_outlier: false,
         };
-        assert!((obs.rate_error_ratio() - 0.0).abs() < f64::EPSILON);
+        assert!((obs.rate_danger_ratio() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rate_danger_ratio_underestimation_penalized() {
+        // actual=1000, predicted=100: EWMA underestimates consumption → dangerous.
+        let obs = CalibrationObservation {
+            predicted_rate: 100.0,
+            actual_rate: 1000.0,
+            predicted_tte: 300.0,
+            actual_tte: 300.0,
+            burst_outlier: false,
+        };
+        assert!(
+            obs.rate_danger_ratio() > 0.30,
+            "underestimation of 90% should exceed threshold"
+        );
+    }
+
+    #[test]
+    fn rate_danger_ratio_post_burst_decay_is_safe() {
+        // Post-burst: EWMA still elevated at 5000, reality back to 10 bytes/sec.
+        // This is EWMA correctly recovering, not miscalibration.
+        let obs = CalibrationObservation {
+            predicted_rate: 5000.0,
+            actual_rate: 10.0,
+            predicted_tte: 60.0,
+            actual_tte: f64::INFINITY,
+            burst_outlier: false,
+        };
+        assert!(
+            (obs.rate_danger_ratio() - 0.0).abs() < f64::EPSILON,
+            "post-burst EWMA decay (overestimation) should be safe"
+        );
     }
 
     #[test]
@@ -1000,7 +1065,7 @@ mod tests {
     }
 
     #[test]
-    fn rate_error_ratio_ignores_idle_noise() {
+    fn rate_danger_ratio_ignores_idle_noise() {
         let obs = CalibrationObservation {
             predicted_rate: 0.5, // Tiny noise
             actual_rate: 0.0,    // Idle
@@ -1008,8 +1073,7 @@ mod tests {
             actual_tte: 300.0,
             burst_outlier: false,
         };
-        // Before fix, this returned INFINITY. Now should be 0.0.
-        assert!((obs.rate_error_ratio() - 0.0).abs() < f64::EPSILON);
+        assert!((obs.rate_danger_ratio() - 0.0).abs() < f64::EPSILON);
 
         let obs2 = CalibrationObservation {
             predicted_rate: 0.0,
@@ -1018,8 +1082,7 @@ mod tests {
             actual_tte: 300.0,
             burst_outlier: false,
         };
-        // Should also be 0.0
-        assert!((obs2.rate_error_ratio() - 0.0).abs() < f64::EPSILON);
+        assert!((obs2.rate_danger_ratio() - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1087,6 +1150,91 @@ mod tests {
             guard.status(),
             GuardStatus::Fail,
             "non-burst bad observations should trigger guard failure"
+        );
+    }
+
+    #[test]
+    fn guard_recovers_after_burst_with_ewma_decay() {
+        // Simulate the production scenario: guard is at PASS, burst hits (burst_outlier
+        // marks it good), then EWMA decays slowly (predicted >> actual, not burst_outlier).
+        // With directional error, the post-burst decay is safe (overestimation) and
+        // should NOT cause guard to enter FAIL.
+        let config = GuardrailConfig {
+            min_observations: 5,
+            ..Default::default()
+        };
+        let mut guard = AdaptiveGuard::new(config);
+
+        // Establish PASS with good observations.
+        for _ in 0..10 {
+            guard.observe(good_obs());
+        }
+        assert_eq!(guard.status(), GuardStatus::Pass);
+
+        // Burst phase: actual >> predicted, but marked as burst_outlier.
+        for _ in 0..5 {
+            guard.observe(CalibrationObservation {
+                predicted_rate: 100.0,
+                actual_rate: 50_000.0,
+                predicted_tte: 300.0,
+                actual_tte: 5.0,
+                burst_outlier: true,
+            });
+        }
+        assert_eq!(guard.status(), GuardStatus::Pass, "burst_outlier should keep PASS");
+
+        // Post-burst EWMA decay: predicted still elevated, actual back to baseline.
+        // These are NOT burst outliers (actual rate is low). With the old symmetric
+        // rate_error_ratio, these would be "bad" (huge error) and cause FAIL.
+        // With directional rate_danger_ratio, these are "good" (overestimation is safe).
+        for _ in 0..20 {
+            guard.observe(CalibrationObservation {
+                predicted_rate: 5000.0,  // EWMA still elevated
+                actual_rate: 10.0,       // reality: disk idle
+                predicted_tte: 60.0,     // EWMA predicts filling
+                actual_tte: f64::INFINITY, // reality: not filling
+                burst_outlier: false,    // NOT a burst outlier (actual is low)
+            });
+        }
+
+        assert_eq!(
+            guard.status(),
+            GuardStatus::Pass,
+            "post-burst EWMA decay (overestimation) should not cause guard FAIL"
+        );
+    }
+
+    #[test]
+    fn e_process_symmetric_recovery() {
+        // With symmetric penalty/reward, recovery from max clamp should take
+        // the same number of observations as it took to reach max clamp.
+        let config = GuardrailConfig {
+            min_observations: 3,
+            recovery_clean_windows: 1,
+            ..Default::default()
+        };
+        let mut guard = AdaptiveGuard::new(config);
+
+        // Drive to FAIL with bad observations.
+        for _ in 0..5 {
+            guard.observe(bad_obs());
+        }
+        assert_eq!(guard.status(), GuardStatus::Fail);
+
+        // Count how many good observations to recover.
+        // With symmetric rewards, 5 bad + 5 good should bring e_process_log ~0.
+        let mut count = 0;
+        for _ in 0..20 {
+            guard.observe(good_obs());
+            count += 1;
+            if guard.status() == GuardStatus::Pass {
+                break;
+            }
+        }
+        // Should recover within ~8 observations (5 to cancel + 1 for recovery window).
+        assert!(
+            count <= 10,
+            "symmetric e_process should allow recovery within 10 observations, took {count}"
         );
     }
 
