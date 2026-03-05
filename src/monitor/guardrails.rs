@@ -78,9 +78,11 @@ impl CalibrationObservation {
     /// while reality returns to baseline) from poisoning the guard. During this phase,
     /// the EWMA is correctly recovering — its overestimation is safe, not miscalibration.
     fn rate_danger_ratio(self) -> f64 {
-        // Ignore errors when rates are trivial (< 1 byte/sec) to prevent
-        // floating-point noise during idle periods from triggering calibration failure.
-        if self.actual_rate.abs() < 1.0 && self.predicted_rate.abs() < 1.0 {
+        // Ignore errors when rates are trivial (< 10 bytes/sec) to prevent
+        // floating-point noise and minor EWMA lag during idle periods from
+        // triggering calibration failure. Production: trj had predicted≈-2,
+        // actual≈0 producing infinite error from noise-level disagreement.
+        if self.actual_rate.abs() < 10.0 && self.predicted_rate.abs() < 10.0 {
             return 0.0;
         }
 
@@ -91,13 +93,12 @@ impl CalibrationObservation {
             return 0.0;
         }
 
-        if self.actual_rate.abs() < 1e-9 {
-            if self.predicted_rate.abs() < 1e-9 {
-                return 0.0;
-            }
-            return f64::INFINITY;
-        }
-        underestimation / self.actual_rate.abs()
+        // Use max(|actual|, |predicted|) as denominator for bounded ratios.
+        // This prevents infinity when actual ≈ 0 and predicted is negative
+        // (EWMA recovery lag), while preserving meaningful ratios when both
+        // rates are significant.
+        let denominator = self.actual_rate.abs().max(self.predicted_rate.abs()).max(1.0);
+        underestimation / denominator
     }
 
     /// Whether the TTE prediction was conservative (predicted <= actual).
@@ -912,6 +913,22 @@ mod tests {
             (obs.rate_danger_ratio() - 0.0).abs() < f64::EPSILON,
             "overestimation should return 0 (safe direction)"
         );
+
+        // predicted=-500 (EWMA says recovering) but actual≈0 (idle):
+        // underestimation = 0 - (-500) = 500, denominator = max(0, 500, 1) = 500.
+        // Ratio = 500/500 = 1.0 — bounded, not infinity.
+        let obs2 = CalibrationObservation {
+            predicted_rate: -500.0,
+            actual_rate: 0.0,
+            predicted_tte: f64::INFINITY,
+            actual_tte: f64::INFINITY,
+            burst_outlier: false,
+        };
+        let ratio = obs2.rate_danger_ratio();
+        assert!(
+            ratio.is_finite() && ratio <= 1.0,
+            "idle-vs-recovery mismatch should produce bounded ratio: got {ratio}"
+        );
     }
 
     #[test]
@@ -1083,6 +1100,17 @@ mod tests {
             burst_outlier: false,
         };
         assert!((obs2.rate_danger_ratio() - 0.0).abs() < f64::EPSILON);
+
+        // Production case: EWMA at -2 bytes/sec (slight recovery), actual idle.
+        // Both rates < 10 bytes/sec → trivial noise, should return 0.
+        let obs3 = CalibrationObservation {
+            predicted_rate: -2.0,
+            actual_rate: 0.0,
+            predicted_tte: f64::INFINITY,
+            actual_tte: f64::INFINITY,
+            burst_outlier: false,
+        };
+        assert!((obs3.rate_danger_ratio() - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
