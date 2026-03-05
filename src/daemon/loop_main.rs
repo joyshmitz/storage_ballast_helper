@@ -3015,6 +3015,13 @@ fn executor_thread_main(
         }
 
         if approved_candidates.is_empty() {
+            if !dampened.is_empty() {
+                eprintln!(
+                    "[SBH-EXECUTOR] all {} approved candidates were dampened (pressure={:?})",
+                    dampened.len(),
+                    batch.pressure_level,
+                );
+            }
             continue;
         }
 
@@ -3023,6 +3030,7 @@ fn executor_thread_main(
         let max_batch_size = shared_config.max_batch_size.load(Ordering::Relaxed);
         let min_score = shared_config.min_score();
 
+        let pre_plan_count = approved_candidates.len();
         let executor = DeletionExecutor::new(
             DeletionConfig {
                 max_batch_size,
@@ -3037,6 +3045,10 @@ fn executor_thread_main(
         let plan = executor.plan(approved_candidates);
 
         if plan.candidates.is_empty() {
+            eprintln!(
+                "[SBH-EXECUTOR] plan() filtered all {pre_plan_count} approved candidates \
+                 (min_score={min_score:.2}, dry_run={dry_run})",
+            );
             continue;
         }
 

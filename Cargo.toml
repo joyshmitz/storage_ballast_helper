@@ -1,29 +1,25 @@
 [package]
 name = "storage_ballast_helper"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2024"
 license = "MIT"
 description = "System service that prevents disk-full scenarios from coding agent swarms via ballast files, artifact scanning, and special location monitoring."
 readme = "README.md"
 keywords = ["disk", "ballast", "cleanup", "daemon", "storage"]
 categories = ["command-line-utilities", "filesystem"]
-
 [lib]
 name = "storage_ballast_helper"
 path = "src/lib.rs"
-
 [[bin]]
 name = "sbh"
 path = "src/main.rs"
 required-features = ["cli"]
-
 [features]
 default = ["cli", "daemon", "sqlite", "tui"]
 cli = ["dep:clap", "dep:clap_complete", "dep:colored", "dep:crossterm", "sqlite", "daemon"]
 daemon = ["dep:signal-hook"]
 sqlite = ["dep:rusqlite"]
 tui = ["dep:ftui", "dep:ftui-backend", "dep:ftui-tty"]
-
 [dependencies]
 # CLI (optional — gated behind "cli" feature)
 clap = { version = "4.5", features = ["derive"], optional = true }
@@ -57,29 +53,24 @@ sha2 = "0.10"
 signal-hook = { version = "0.3", optional = true }
 # Ballast generation and randomized test fixtures (core)
 rand = "0.9"
-
 # Platform-specific
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["fs", "signal", "user"] }
 libc = "0.2"
-
 [dev-dependencies]
 tempfile = "3.17"
 proptest = "1.6"
 filetime = "0.2"
-
 [profile.release]
 opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
-
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
 unused = { level = "warn", priority = -1 }
-
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
