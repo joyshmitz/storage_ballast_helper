@@ -819,15 +819,26 @@ impl PolicyEngine {
     }
 
     fn check_guard_triggers(&mut self, diag: &GuardDiagnostics) {
-        // Suppress guard-triggered fallback when:
-        // - Pressure is green (drift is harmless, no deletions considered)
-        // - Guard has too few observations to be meaningful (< 30). On fresh
-        //   start the guard gets rate prediction observations every tick, but
-        //   these are unreliable until the EWMA stabilizes. Letting a freshly
-        //   started guard trigger FallbackSafe creates a deadlock.
+        // Only enter FallbackSafe from guard drift alarm at Orange+ pressure.
+        //
+        // At Yellow pressure (10-20% free), guard drift alarms are common during
+        // compilation bursts — EWMA rate volatility poisons calibration even when
+        // the disk isn't in genuine danger. Entering FallbackSafe at Yellow blocks
+        // ALL deletions, creating a deadlock: disk can't be cleaned because guard
+        // is alarmed, guard stays alarmed because disk stays full.
+        //
+        // At Yellow, the penalty-scaled guard override (0.25× penalty) in
+        // enforce_policy already handles uncertain guard state by allowing
+        // high-confidence candidates through. FallbackSafe is reserved for
+        // genuine danger (Orange+) where we need full safety lockdown.
+        //
+        // Also suppressed when:
+        // - Already in FallbackSafe (no-op)
+        // - Guard has too few observations (< 30) — freshly started guard
+        //   with unreliable EWMA should not trigger FallbackSafe
         if diag.e_process_alarm
             && self.mode != ActiveMode::FallbackSafe
-            && self.pressure_level != PressureLevel::Green
+            && self.pressure_level >= PressureLevel::Orange
             && diag.observation_count >= 30
         {
             self.enter_fallback(FallbackReason::GuardrailDrift);

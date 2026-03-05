@@ -1643,12 +1643,17 @@ impl MonitoringDaemon {
     }
 
     fn check_predictive_warning(&mut self, response: &crate::monitor::pid::PressureResponse) {
-        // Suppress predictions at Green pressure entirely. When the pressure
-        // controller says Green (>20% free), "disk full in 5m" predictions
-        // are EWMA spike artifacts from compilation bursts — false alarms
-        // that pollute logs and desensitize operators. The pressure system
-        // will escalate to Yellow+ before disk danger is real.
-        if response.level == PressureLevel::Green {
+        // Suppress prediction notifications at Green and Yellow pressure.
+        //
+        // At Green (>20% free), "disk full in 5m" is clearly an EWMA spike
+        // artifact from compilation bursts — false alarms that desensitize.
+        //
+        // At Yellow (10-20% free), the same EWMA spikes produce false alarms
+        // because burst consumption rates are transiently high. The pressure
+        // system already escalates to Orange+ before real danger, and the
+        // predictive policy's burst detector handles actual threat assessment.
+        // Notification spam at Yellow provides no actionable signal.
+        if response.level <= PressureLevel::Yellow {
             return;
         }
 
