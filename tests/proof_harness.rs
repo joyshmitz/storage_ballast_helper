@@ -311,6 +311,7 @@ struct ReplayMismatch {
 fn execute_trace(trace: &[TraceOp]) -> Vec<TraceOutcome> {
     let mut engine = PolicyEngine::new(PolicyConfig {
         initial_mode: ActiveMode::Observe,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     });
     let scoring = default_engine();
@@ -717,6 +718,7 @@ fn fault_serialization_failure_triggers_conservative_action() {
     // fallback-safe decisions (no deletions approved).
     let mut engine = PolicyEngine::new(PolicyConfig {
         initial_mode: ActiveMode::Observe,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     });
     engine.promote();
@@ -748,6 +750,7 @@ fn fault_serialization_failure_triggers_conservative_action() {
 fn fault_stale_guard_unknown_blocks_adaptive() {
     let mut engine = PolicyEngine::new(PolicyConfig {
         initial_mode: ActiveMode::Observe,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     });
     engine.promote();
@@ -782,6 +785,7 @@ fn fault_stale_guard_unknown_blocks_adaptive() {
 fn fault_eprocess_drift_forces_fallback() {
     let mut engine = PolicyEngine::new(PolicyConfig {
         initial_mode: ActiveMode::Observe,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     });
     engine.promote(); // canary
@@ -807,6 +811,7 @@ fn fault_canary_budget_exhaustion() {
     let config = PolicyConfig {
         max_canary_deletes_per_hour: 2,
         initial_mode: ActiveMode::Observe,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(config);
@@ -836,6 +841,7 @@ fn fault_kill_switch_blocks_everything() {
     let config = PolicyConfig {
         kill_switch: true,
         initial_mode: ActiveMode::Enforce,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let engine = PolicyEngine::new(config);
@@ -854,6 +860,7 @@ fn fault_calibration_breach_cascade_is_advisory() {
     let config = PolicyConfig {
         calibration_breach_windows: 3,
         initial_mode: ActiveMode::Observe,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(config);
@@ -893,6 +900,7 @@ fn fault_recovery_after_drift() {
         recovery_clean_windows: 2,
         initial_mode: ActiveMode::Observe,
         min_fallback_secs: 0,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(config);
@@ -998,6 +1006,7 @@ fn fault_matrix_all_types_produce_expected_fallback() {
     for case in &cases {
         let mut engine = PolicyEngine::new(PolicyConfig {
             initial_mode: ActiveMode::Observe,
+            observe_min_interval_secs: 0,
             ..PolicyConfig::default()
         });
         engine.promote();
@@ -1409,6 +1418,7 @@ fn benchmark_policy_evaluation() {
     let report = benchmark_operation("policy_eval_3", iterations, || {
         let mut engine = PolicyEngine::new(PolicyConfig {
             initial_mode: ActiveMode::Observe,
+            observe_min_interval_secs: 0,
             ..PolicyConfig::default()
         });
         engine.promote();
@@ -1552,6 +1562,7 @@ fn invariant_fallback_always_dominates() {
         for fault in &faults {
             let mut engine = PolicyEngine::new(PolicyConfig {
                 initial_mode: ActiveMode::Observe,
+                observe_min_interval_secs: 0,
                 ..PolicyConfig::default()
             });
             // Randomly promote before fallback.
@@ -1582,6 +1593,7 @@ fn invariant_fallback_always_dominates() {
 fn invariant_decision_ids_are_globally_monotonic() {
     let mut engine = PolicyEngine::new(PolicyConfig {
         initial_mode: ActiveMode::Observe,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     });
     let candidates = vec![
@@ -1667,6 +1679,7 @@ fn invariant_all_records_serialize_and_roundtrip() {
 fn invariant_transition_log_is_append_only() {
     let mut engine = PolicyEngine::new(PolicyConfig {
         initial_mode: ActiveMode::Observe,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     });
 

@@ -136,6 +136,10 @@ pub struct PolicyConfig {
     pub min_fallback_secs: u64,
     /// Whether the kill-switch is active (forces fallback_safe).
     pub kill_switch: bool,
+    /// Minimum seconds between guard observation windows. Under pressure the
+    /// main loop ticks at 100-250ms, which would flood the guard's statistical
+    /// machinery. Set to 0 in tests to allow back-to-back calls.
+    pub observe_min_interval_secs: u64,
 }
 
 impl Default for PolicyConfig {
@@ -153,6 +157,7 @@ impl Default for PolicyConfig {
             loss_keep_abandoned: 30.0,
             loss_review: 5.0,
             kill_switch: false,
+            observe_min_interval_secs: MIN_OBSERVE_INTERVAL_SECS,
         }
     }
 }
@@ -211,6 +216,15 @@ const EMERGENCY_GRACE_PERIOD_SECS: u64 = 30 * 60;
 /// the engine enters FallbackSafe within seconds of every restart.
 const STARTUP_CALIBRATION_GRACE_SECS: u64 = 10 * 60;
 
+/// Minimum interval between guard observation windows. The guard's statistical
+/// calibration assumes observations arrive at roughly the base poll interval
+/// (~30s). Under pressure, the main loop ticks at 100-250ms (Critical=100ms,
+/// Orange=250ms), which floods the guard with 4-10 observations per second
+/// and makes breach counters, calibration windows, and recovery logic
+/// meaningless — 100 breach windows in 10-25 seconds instead of ~50 minutes.
+/// This floor ensures guard statistics remain valid regardless of tick rate.
+const MIN_OBSERVE_INTERVAL_SECS: u64 = 10;
+
 /// The shadow-mode policy engine with progressive delivery gates.
 pub struct PolicyEngine {
     config: PolicyConfig,
@@ -247,6 +261,10 @@ pub struct PolicyEngine {
     /// once per 5 minutes to prevent log spam when grace periods are active
     /// and enter_fallback is called every scan cycle (5-8 times per cycle).
     last_suppression_log: Option<Instant>,
+    /// Last time `observe_window` actually processed an observation. Calls
+    /// within `MIN_OBSERVE_INTERVAL_SECS` are silently skipped to prevent
+    /// the high-frequency pressure tick loop from flooding the guard.
+    last_observe_time: Option<Instant>,
 }
 
 /// Record of a mode transition.
@@ -288,6 +306,7 @@ impl PolicyEngine {
             transition_log: Vec::new(),
             pressure_level: PressureLevel::Green,
             last_suppression_log: None,
+            last_observe_time: None,
         };
 
         if engine.config.kill_switch {
@@ -438,6 +457,19 @@ impl PolicyEngine {
     /// suppress calibration breach accumulation during green pressure —
     /// inaccurate predictions are harmless when no deletions would occur.
     pub fn observe_window(&mut self, guard: &GuardDiagnostics) {
+        // Rate-limit observations to prevent the high-frequency pressure tick
+        // loop (100ms at Critical, 250ms at Orange) from flooding the guard.
+        if self.config.observe_min_interval_secs > 0 {
+            if let Some(last) = self.last_observe_time {
+                if last.elapsed()
+                    < Duration::from_secs(self.config.observe_min_interval_secs)
+                {
+                    return;
+                }
+            }
+            self.last_observe_time = Some(Instant::now());
+        }
+
         let pressure_is_green = self.pressure_level == PressureLevel::Green;
         // A window is "clean" when the guard passes normally, OR when pressure
         // is green and the guard isn't actively failing (Unknown is OK during
@@ -904,6 +936,7 @@ mod tests {
             initial_mode: ActiveMode::Observe,
             // Disable cooldown for unit tests so recovery is instant.
             min_fallback_secs: 0,
+            observe_min_interval_secs: 0,
             ..PolicyConfig::default()
         }
     }

@@ -566,6 +566,7 @@ fn stress_decision_plane_drift() {
         calibration_breach_windows: 3,
         recovery_clean_windows: 5,
         min_fallback_secs: 0,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(policy_config);
@@ -696,6 +697,7 @@ fn stress_guard_integrity_failure() {
     let mut guard = AdaptiveGuard::new(guard_config);
     let policy_config = PolicyConfig {
         initial_mode: ActiveMode::Observe,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(policy_config);
@@ -774,6 +776,7 @@ fn stress_multi_agent_swarm() {
     let policy_config = PolicyConfig {
         initial_mode: ActiveMode::Observe,
         max_canary_deletes_per_hour: 50,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(policy_config);
@@ -856,6 +859,7 @@ fn stress_multi_agent_swarm() {
     let mut engine2 = PolicyEngine::new(PolicyConfig {
         initial_mode: ActiveMode::Observe,
         max_canary_deletes_per_hour: 50,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     });
     engine2.promote();
@@ -1163,6 +1167,7 @@ fn stress_full_pipeline() {
         calibration_breach_windows: 3,
         recovery_clean_windows: 3,
         max_canary_deletes_per_hour: 20,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(policy_config);

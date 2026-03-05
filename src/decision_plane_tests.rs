@@ -32,6 +32,7 @@ fn observe_config() -> PolicyConfig {
         initial_mode: ActiveMode::Observe,
         // Disable cooldown for unit tests so recovery is instant.
         min_fallback_secs: 0,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     }
 }
@@ -431,6 +432,7 @@ fn policy_fallback_recovery_restores_mode() {
         recovery_clean_windows: 1,
         initial_mode: ActiveMode::Observe,
         min_fallback_secs: 0,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(config);
@@ -461,6 +463,7 @@ fn policy_fallback_from_any_active_mode() {
     for initial in [ActiveMode::Observe, ActiveMode::Canary, ActiveMode::Enforce] {
         let config = PolicyConfig {
             initial_mode: initial,
+            observe_min_interval_secs: 0,
             ..PolicyConfig::default()
         };
         let mut engine = PolicyEngine::new(config);
@@ -561,6 +564,7 @@ fn decision_records_carry_correct_policy_mode() {
     for (active, expected_policy) in modes {
         let config = PolicyConfig {
             initial_mode: active,
+            observe_min_interval_secs: 0,
             ..PolicyConfig::default()
         };
         let mut engine = PolicyEngine::new(config);
@@ -707,6 +711,7 @@ fn property_policy_engine_invariants_under_random_operations() {
             max_canary_deletes_per_hour: 5,
             initial_mode: ActiveMode::Observe,
             min_fallback_secs: 0,
+            observe_min_interval_secs: 0,
             ..PolicyConfig::default()
         };
         let mut engine = PolicyEngine::new(config);
@@ -1508,6 +1513,7 @@ fn replay_observe_canary_enforce_lifecycle() {
         initial_mode: ActiveMode::Observe,
         recovery_clean_windows: 3,
         min_fallback_secs: 0,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = ReplayEngine::with_policy_config(seed, config);
@@ -1543,6 +1549,7 @@ fn replay_canary_budget_exhaustion() {
     let config = PolicyConfig {
         max_canary_deletes_per_hour: 3, // Low budget to trigger exhaustion.
         initial_mode: ActiveMode::Canary,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
 
@@ -1907,6 +1914,7 @@ fn replay_recovery_after_serialization_fault() {
         recovery_clean_windows: 2,
         initial_mode: ActiveMode::Observe,
         min_fallback_secs: 0,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
 
@@ -1997,6 +2005,7 @@ fn replay_multi_fault_sequence() {
         max_canary_deletes_per_hour: 100, // High cap so canary budget doesn't trip during recovery test
         initial_mode: ActiveMode::Observe,
         min_fallback_secs: 0,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
 

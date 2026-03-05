@@ -245,6 +245,7 @@ fn make_policy() -> PolicyEngine {
         calibration_breach_windows: 2,
         // Disable cooldown for tests — scenarios run in simulated seconds.
         min_fallback_secs: 0,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     })
 }

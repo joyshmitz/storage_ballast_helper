@@ -223,6 +223,7 @@ fn e2e_burst_growth_shadow_mode() {
     let scoring = default_engine();
     let config = PolicyConfig {
         initial_mode: ActiveMode::Observe,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(config);
@@ -353,6 +354,7 @@ fn e2e_canary_bounded_impact() {
     let config = PolicyConfig {
         initial_mode: ActiveMode::Observe,
         max_canary_deletes_per_hour: 3,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(config);
@@ -504,6 +506,7 @@ fn e2e_calibration_drift_stays_operational() {
         initial_mode: ActiveMode::Observe,
         calibration_breach_windows: 2,
         recovery_clean_windows: 3,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(policy_config);
@@ -627,6 +630,7 @@ fn e2e_stale_index_safe_fallback() {
     let scoring = default_engine();
     let config = PolicyConfig {
         initial_mode: ActiveMode::Observe,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(config);
@@ -741,6 +745,7 @@ fn e2e_io_fault_safe_degradation() {
     let config = PolicyConfig {
         initial_mode: ActiveMode::Observe,
         recovery_clean_windows: 3,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(config);
@@ -859,6 +864,7 @@ fn e2e_progressive_recovery() {
     let config = PolicyConfig {
         initial_mode: ActiveMode::Observe,
         recovery_clean_windows: 3,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(config);

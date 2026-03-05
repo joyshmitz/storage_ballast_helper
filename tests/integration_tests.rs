@@ -1416,6 +1416,7 @@ fn e2e_scenario_1_burst_growth_shadow_safe() {
     let scoring = e2e_scoring_engine();
     let mut policy = PolicyEngine::new(PolicyConfig {
         initial_mode: ActiveMode::Observe,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     });
     let mut guard = AdaptiveGuard::with_defaults();
@@ -1479,6 +1480,7 @@ fn e2e_scenario_2_canary_bounded_impact() {
     let config = PolicyConfig {
         max_canary_deletes_per_hour: 3,
         initial_mode: ActiveMode::Observe,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut policy = PolicyEngine::new(config);
@@ -1529,6 +1531,7 @@ fn e2e_scenario_3_calibration_drift_stays_operational() {
     let config = PolicyConfig {
         calibration_breach_windows: 3,
         initial_mode: ActiveMode::Observe,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut policy = PolicyEngine::new(config);
@@ -1582,6 +1585,7 @@ fn e2e_scenario_4_index_corruption_full_scan() {
     let scoring = e2e_scoring_engine();
     let _policy = PolicyEngine::new(PolicyConfig {
         initial_mode: ActiveMode::Observe,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     });
 
@@ -1628,6 +1632,7 @@ fn e2e_scenario_5_fault_injection_safe_degradation() {
     let scoring = e2e_scoring_engine();
     let mut policy = PolicyEngine::new(PolicyConfig {
         initial_mode: ActiveMode::Observe,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     });
     let mut guard = AdaptiveGuard::with_defaults();
@@ -1665,6 +1670,7 @@ fn e2e_scenario_5_fault_injection_safe_degradation() {
     // Simulate serializer fault — enter fallback again.
     let mut policy2 = PolicyEngine::new(PolicyConfig {
         initial_mode: ActiveMode::Observe,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     });
     policy2.enter_fallback(FallbackReason::SerializationFailure);
@@ -1684,6 +1690,7 @@ fn e2e_scenario_6_progressive_recovery() {
         recovery_clean_windows: 3,
         initial_mode: ActiveMode::Observe,
         min_fallback_secs: 0,
+        observe_min_interval_secs: 0,
         ..PolicyConfig::default()
     };
     let mut policy = PolicyEngine::new(config);
