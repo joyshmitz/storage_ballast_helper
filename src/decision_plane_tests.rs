@@ -448,7 +448,7 @@ fn policy_fallback_recovery_restores_mode() {
         consecutive_clean: 3,
         reason: "ok".to_string(),
     };
-    engine.observe_window(&good, false);
+    engine.observe_window(&good);
     assert_eq!(
         engine.mode(),
         ActiveMode::Canary,
@@ -753,7 +753,7 @@ fn property_policy_engine_invariants_under_random_operations() {
                         consecutive_clean: if good { 5 } else { 0 },
                         reason: "test".to_string(),
                     };
-                    engine.observe_window(&guard, false);
+                    engine.observe_window(&guard);
                 }
                 _ => {
                     let mode_before = engine.mode();

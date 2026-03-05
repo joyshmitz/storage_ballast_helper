@@ -1489,7 +1489,7 @@ fn e2e_scenario_2_canary_bounded_impact() {
         guard.observe(obs);
     }
     let passing = passing_guard_diag();
-    policy.observe_window(&passing, false);
+    policy.observe_window(&passing);
     policy.promote(); // observe → canary
     assert_eq!(policy.mode(), ActiveMode::Canary);
 
@@ -1540,9 +1540,9 @@ fn e2e_scenario_3_calibration_drift_stays_operational() {
         guard.observe(obs);
     }
     let passing = passing_guard_diag();
-    policy.observe_window(&passing, false);
+    policy.observe_window(&passing);
     policy.promote(); // observe → canary
-    policy.observe_window(&passing, false);
+    policy.observe_window(&passing);
     policy.promote(); // canary → enforce
     assert_eq!(policy.mode(), ActiveMode::Enforce);
 
@@ -1555,7 +1555,7 @@ fn e2e_scenario_3_calibration_drift_stays_operational() {
     // CalibrationBreach is advisory-only — engine stays in Enforce.
     let failing = failing_guard_diag();
     for _ in 0..4 {
-        policy.observe_window(&failing, false);
+        policy.observe_window(&failing);
     }
 
     // Phase 4: Engine should STAY in Enforce (CalibrationBreach is advisory).
@@ -1637,9 +1637,9 @@ fn e2e_scenario_5_fault_injection_safe_degradation() {
         guard.observe(obs);
     }
     let passing = passing_guard_diag();
-    policy.observe_window(&passing, false);
+    policy.observe_window(&passing);
     policy.promote(); // observe → canary
-    policy.observe_window(&passing, false);
+    policy.observe_window(&passing);
     policy.promote(); // canary → enforce
     assert_eq!(policy.mode(), ActiveMode::Enforce);
 
@@ -1694,16 +1694,16 @@ fn e2e_scenario_6_progressive_recovery() {
         guard.observe(obs);
     }
     let passing = passing_guard_diag();
-    policy.observe_window(&passing, false);
+    policy.observe_window(&passing);
     policy.promote(); // observe → canary
-    policy.observe_window(&passing, false);
+    policy.observe_window(&passing);
     policy.promote(); // canary → enforce
     policy.enter_fallback(FallbackReason::GuardrailDrift);
     assert_eq!(policy.mode(), ActiveMode::FallbackSafe);
 
     // Phase 2: Feed clean windows to trigger recovery.
     for _ in 0..4 {
-        policy.observe_window(&passing, false);
+        policy.observe_window(&passing);
     }
 
     // Phase 3: The policy should have recovered from fallback.

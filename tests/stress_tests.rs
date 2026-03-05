@@ -596,7 +596,7 @@ fn stress_decision_plane_drift() {
 
     // Phase 3: Inject drift — 50 bad observations.
     // Pressure must be non-green for check_guard_triggers to trigger fallback.
-    engine.set_pressure_green(false);
+    engine.set_pressure_level(PressureLevel::Yellow);
     let mut drift_steps = 0;
     let mut guard_fail_at: Option<usize> = None;
     for i in 0..50 {
@@ -616,7 +616,7 @@ fn stress_decision_plane_drift() {
 
         // Feed the guard state to the policy engine.
         let diag = guard.diagnostics();
-        engine.observe_window(&diag, false);
+        engine.observe_window(&diag);
 
         // Evaluate candidates so check_guard_triggers() can detect
         // e_process_alarm and transition to FallbackSafe.
@@ -657,7 +657,7 @@ fn stress_decision_plane_drift() {
             actual_tte: 100.0,
             burst_outlier: false,
         });
-        engine.observe_window(&guard.diagnostics(), false);
+        engine.observe_window(&guard.diagnostics());
         recovery_steps += 1;
 
         if engine.mode() != ActiveMode::FallbackSafe {
@@ -1235,7 +1235,7 @@ fn stress_full_pipeline() {
 
         // Feed guard diagnostics to policy engine.
         let diag = guard.diagnostics();
-        engine.observe_window(&diag, false);
+        engine.observe_window(&diag);
 
         let reading = PressureReading {
             free_bytes: free,

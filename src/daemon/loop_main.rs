@@ -1306,11 +1306,11 @@ impl MonitoringDaemon {
 
         if let Some(diag) = worst_guard_diag.as_ref() {
             let mut policy = self.policy_engine.lock();
-            let pressure_is_green = worst_response
+            let pressure_level = worst_response
                 .as_ref()
-                .is_none_or(|r| r.level == PressureLevel::Green);
-            policy.set_pressure_green(pressure_is_green);
-            policy.observe_window(diag, pressure_is_green);
+                .map_or(PressureLevel::Green, |r| r.level);
+            policy.set_pressure_level(pressure_level);
+            policy.observe_window(diag);
 
             // Emergency escalation: break fallback_safe deadlock when pressure
             // has been at Yellow+ for too long and recovery can't trigger.

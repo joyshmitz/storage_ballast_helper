@@ -497,7 +497,7 @@ fn run_scenario_b(seed: u64, iterations: usize) -> ScenarioResult {
             });
 
             let diag = guard.diagnostics();
-            policy.observe_window(&diag, false);
+            policy.observe_window(&diag);
             if policy.mode() != prev_mode {
                 policy_transitions += 1;
             }
@@ -806,7 +806,7 @@ fn run_scenario_d(seed: u64, iterations: usize) -> ScenarioResult {
             });
             let diag = guard.diagnostics();
             let prev_mode = policy.mode();
-            policy.observe_window(&diag, false);
+            policy.observe_window(&diag);
             if policy.mode() != prev_mode {
                 policy_transitions += 1;
             }
@@ -1018,7 +1018,7 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
             });
             let diag = guard.diagnostics();
             let prev = policy.mode();
-            policy.observe_window(&diag, false);
+            policy.observe_window(&diag);
             if policy.mode() != prev {
                 transition_count += 1;
             }
@@ -1037,7 +1037,7 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
             });
             let diag = guard.diagnostics();
             let prev = policy.mode();
-            policy.observe_window(&diag, false);
+            policy.observe_window(&diag);
             if policy.mode() != prev {
                 transition_count += 1;
                 if policy.mode() == ActiveMode::FallbackSafe {
@@ -1074,7 +1074,7 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
             });
             let diag = guard.diagnostics();
             let prev = policy.mode();
-            policy.observe_window(&diag, false);
+            policy.observe_window(&diag);
             if policy.mode() != prev {
                 transition_count += 1;
                 if prev == ActiveMode::FallbackSafe {
