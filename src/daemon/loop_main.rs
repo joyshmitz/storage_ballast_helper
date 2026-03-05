@@ -1127,9 +1127,19 @@ impl MonitoringDaemon {
             // 10. Periodic summary report (every 5 minutes).
             if self.last_summary_report.elapsed() >= Duration::from_secs(300) {
                 let rss_mb = read_rss_mb().unwrap_or(0);
+                let guard_str = self
+                    .shared_guard_diagnostics
+                    .read()
+                    .as_ref()
+                    .map_or("none", |d| match d.status {
+                        GuardStatus::Pass => "pass",
+                        GuardStatus::Fail => "FAIL",
+                        GuardStatus::Unknown => "unknown",
+                    });
+                let mode_str = self.policy_engine.lock().mode();
                 eprintln!(
                     "[SBH-SUMMARY] scans={} timeouts={} candidates={} deleted={} \
-                     failed={} freed={}B pressure={:?} rss={}MB uptime={}s",
+                     failed={} freed={}B pressure={:?} guard={} mode={} rss={}MB uptime={}s",
                     self.summary_scans,
                     self.summary_scan_timeouts,
                     self.summary_candidates,
@@ -1137,6 +1147,8 @@ impl MonitoringDaemon {
                     self.summary_failed,
                     self.summary_bytes_freed,
                     response.level,
+                    guard_str,
+                    mode_str,
                     rss_mb,
                     self.start_time.elapsed().as_secs(),
                 );
@@ -1631,6 +1643,15 @@ impl MonitoringDaemon {
     }
 
     fn check_predictive_warning(&mut self, response: &crate::monitor::pid::PressureResponse) {
+        // Suppress predictions at Green pressure entirely. When the pressure
+        // controller says Green (>20% free), "disk full in 5m" predictions
+        // are EWMA spike artifacts from compilation bursts — false alarms
+        // that pollute logs and desensitize operators. The pressure system
+        // will escalate to Yellow+ before disk danger is real.
+        if response.level == PressureLevel::Green {
+            return;
+        }
+
         // If the predictive policy (with burst/free-space/confidence gates)
         // already decided Clear, don't emit a raw notification — the policy
         // has better context than the raw seconds-to-threshold value.
@@ -2957,10 +2978,13 @@ fn executor_thread_main(
         }
 
         if approved_candidates.is_empty() {
-            // Rate-limit this message to once per 5 minutes.
+            // Rate-limit this message to once per 30 minutes. On machines with
+            // permanent guard drift alarm, the same rejection logs every scan
+            // cycle (~5 min) indefinitely — pure noise. 30 min still surfaces
+            // the issue without flooding the journal.
             let now = Instant::now();
             let should_log = last_policy_reject_log
-                .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(300));
+                .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1800));
             if should_log {
                 last_policy_reject_log = Some(now);
                 eprintln!(

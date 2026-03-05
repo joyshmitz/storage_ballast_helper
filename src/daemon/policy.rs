@@ -779,8 +779,11 @@ impl PolicyEngine {
         // deleting a regenerable build artifact.
         //
         // At Green: skip guard entirely (no urgency, no deletions anyway).
-        // At Yellow: full guard penalty (standard behavior).
-        // At Orange: guard penalty × 0.25 (urgency rising, tolerate uncertainty).
+        // At Yellow: guard penalty × 0.25 — machine needs cleanup, but guard
+        //   is often in permanent drift alarm from EWMA rate volatility at
+        //   higher disk usage. Full penalty (1.0) caused rejection deadlocks
+        //   on 3 production machines (vmi1156319/1227854/1149989 in v0.3.5-6).
+        // At Orange: guard penalty × 0.10 (urgency high, strong candidates pass).
         // At Red/Critical: guard penalty = 0 (bypass guard, survival mode).
         if self.pressure_level >= PressureLevel::Yellow {
             if let Some(diag) = guard
@@ -788,8 +791,8 @@ impl PolicyEngine {
             {
                 let penalty_scale = match self.pressure_level {
                     PressureLevel::Green => 0.0, // unreachable due to outer if
-                    PressureLevel::Yellow => 1.0,
-                    PressureLevel::Orange => 0.25,
+                    PressureLevel::Yellow => 0.25,
+                    PressureLevel::Orange => 0.10,
                     PressureLevel::Red | PressureLevel::Critical => 0.0,
                 };
                 let penalized_delete_loss = candidate.decision.expected_loss_delete
