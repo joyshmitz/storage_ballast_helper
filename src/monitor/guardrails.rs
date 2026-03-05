@@ -136,7 +136,7 @@ pub struct GuardrailConfig {
 impl Default for GuardrailConfig {
     fn default() -> Self {
         Self {
-            min_observations: 30,
+            min_observations: 60,
             window_size: 500,
             max_rate_error: 0.30,
             min_conservative_fraction: 0.70,
@@ -1365,7 +1365,7 @@ mod tests {
     #[test]
     fn default_guardrail_config_larger_windows() {
         let config = GuardrailConfig::default();
-        assert_eq!(config.min_observations, 30, "min_observations should be 30");
+        assert_eq!(config.min_observations, 60, "min_observations should be 60");
         assert_eq!(config.window_size, 500, "window_size should be 500");
     }
 }

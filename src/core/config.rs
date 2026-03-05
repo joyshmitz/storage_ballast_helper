@@ -423,7 +423,7 @@ impl Default for TelemetryConfig {
             ewma_min_samples: 3,
             ewma_rate_history_size: 200,
             guardrail_window_size: 500,
-            guardrail_min_observations: 30,
+            guardrail_min_observations: 60,
         }
     }
 }

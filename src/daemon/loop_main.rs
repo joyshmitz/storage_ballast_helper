@@ -2339,6 +2339,9 @@ fn scanner_thread_main(
         heartbeat.beat();
         let scan_start = Instant::now();
 
+        // Track total candidates found (priority pre-scan + general walker).
+        let mut candidates_found = 0;
+
         // ── Priority pre-scan pass ──
         // Before the general walker, do a shallow (depth 1-2) scan of each root
         // for known high-value cleanup targets. This ensures multi-GB dirs like
@@ -2471,6 +2474,7 @@ fn scanner_thread_main(
                 urgency: request.urgency,
             };
             if del_tx.try_send(batch).is_ok() {
+                candidates_found += count;
                 eprintln!(
                     "[SBH-SCANNER] priority pre-scan dispatched {count} high-value candidates"
                 );
@@ -2538,7 +2542,6 @@ fn scanner_thread_main(
         };
 
         let mut paths_scanned = 0;
-        let mut candidates_found = 0;
         let mut scored: Vec<CandidacyScore> = Vec::with_capacity(1024);
         let mut scanner_should_exit = false;
         let mut scan_timed_out = false;
