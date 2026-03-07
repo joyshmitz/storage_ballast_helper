@@ -229,18 +229,29 @@ impl AdaptiveGuard {
         }
 
         // Update e-process with the new observation.
+        // Good observations get full reward; bad observations get proportional penalty
+        // scaled by how far the rate_danger_ratio exceeds the threshold.
+        // This prevents barely-bad observations (ratio=0.31 vs threshold=0.30)
+        // from accumulating the same penalty as catastrophically-bad ones (ratio=1.0).
         let lr = if obs_good {
             self.config.e_process_reward.ln()
         } else {
-            self.config.e_process_penalty.ln()
+            let ratio = obs.rate_danger_ratio();
+            let severity = ((ratio - self.config.max_rate_error)
+                / (1.0 - self.config.max_rate_error))
+                .clamp(0.0, 1.0);
+            // Scale: severity 0.0 → 30% of base penalty, severity 1.0 → 100%.
+            let scale = 0.3 + 0.7 * severity;
+            self.config.e_process_penalty.ln() * scale
         };
         self.e_process_log += lr;
         // Clamp to ensure responsiveness.
         // - Lower bound (-5.0): prevents "banking" too much credit (exp(-5) ~ 0.0067),
         //   ensuring we can detect drift within ~10-15 bad observations.
-        // - Upper bound (5.0): prevents runaway alarm state (exp(5) ~ 148),
-        //   ensuring we can recover within ~10 good observations after the anomaly passes.
-        self.e_process_log = self.e_process_log.clamp(-5.0, 5.0);
+        // - Upper bound (3.5): prevents prolonged alarm state (exp(3.5) ~ 33),
+        //   ensuring we can recover within ~7 good observations after the anomaly passes.
+        //   (Prior cap of 5.0 → exp(5)=148 caused prolonged FAIL on Green machines.)
+        self.e_process_log = self.e_process_log.clamp(-5.0, 3.5);
 
         // Recompute guard status.
         self.recompute_status(obs_good);
@@ -1259,10 +1270,12 @@ mod tests {
                 break;
             }
         }
-        // Should recover within ~8 observations (5 to cancel + 1 for recovery window).
+        // Should recover within a small number of observations. With proportional penalty
+        // (bad_obs has severity ~0.5), 5 bad obs accumulate ~1.0 in e_process_log. Recovery
+        // takes ~3 good observations to zero out + 1 for recovery_clean_windows=1.
         assert!(
             count <= 10,
-            "symmetric e_process should allow recovery within 10 observations, took {count}"
+            "e_process should allow recovery within 10 observations, took {count}"
         );
     }
 

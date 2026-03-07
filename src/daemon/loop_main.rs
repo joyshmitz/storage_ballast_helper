@@ -422,6 +422,7 @@ pub struct MonitoringDaemon {
     last_swap_thrash_warning: Option<Instant>,
     swap_thrash_active: bool,
     last_scan_channel_warn: Option<Instant>,
+    scan_channel_warn_suppressed: u64,
     last_summary_report: Instant,
     summary_scans: u64,
     summary_scan_timeouts: u64,
@@ -805,6 +806,7 @@ impl MonitoringDaemon {
             last_swap_thrash_warning: None,
             swap_thrash_active: false,
             last_scan_channel_warn: None,
+            scan_channel_warn_suppressed: 0,
             last_summary_report: Instant::now(),
             summary_scans: 0,
             summary_scan_timeouts: 0,
@@ -1610,18 +1612,29 @@ impl MonitoringDaemon {
         match enqueue_scan_request(scan_tx, scan_rx, request, replace_on_full) {
             ScanEnqueueStatus::Queued => {}
             ScanEnqueueStatus::ReplacedStale | ScanEnqueueStatus::DeferredFull => {
-                // Rate-limit to once per 5 minutes. Scans can take 600s while
-                // monitor ticks every 60s, so this fires 9/10 ticks during long
-                // scans — logging once per 60s is still spammy (9+ lines/scan).
+                // Rate-limit to once per hour. Scans routinely take 300-600s
+                // while monitor ticks every 60s, so this condition fires on
+                // nearly every tick during active scanning — expected behavior,
+                // not worth logging frequently.
                 let now = Instant::now();
                 let should_log = self
                     .last_scan_channel_warn
-                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(300));
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(3600));
                 if should_log {
+                    let suppressed = self.scan_channel_warn_suppressed;
+                    self.scan_channel_warn_suppressed = 0;
                     self.last_scan_channel_warn = Some(now);
-                    eprintln!(
-                        "[SBH-DAEMON] scan channel saturated (request replaced or deferred)"
-                    );
+                    if suppressed > 0 {
+                        eprintln!(
+                            "[SBH-DAEMON] scan channel saturated ({suppressed} deferred requests since last log)"
+                        );
+                    } else {
+                        eprintln!(
+                            "[SBH-DAEMON] scan channel saturated (request replaced or deferred)"
+                        );
+                    }
+                } else {
+                    self.scan_channel_warn_suppressed += 1;
                 }
             }
             ScanEnqueueStatus::Disconnected => {
@@ -2592,8 +2605,8 @@ fn scanner_thread_main(
             SCAN_TIME_BUDGET_SECS
         };
         let budget_secs = match request.pressure_level {
-            PressureLevel::Red | PressureLevel::Critical => base_budget_secs.saturating_mul(3).max(600),
-            PressureLevel::Orange => base_budget_secs.saturating_mul(2).max(300),
+            PressureLevel::Red | PressureLevel::Critical => base_budget_secs.saturating_mul(2).min(600),
+            PressureLevel::Orange => base_budget_secs.saturating_mul(2).min(600),
             _ => base_budget_secs,
         };
         let scan_deadline = scan_start + Duration::from_secs(budget_secs);
@@ -2780,7 +2793,16 @@ fn scanner_thread_main(
         });
 
         // Flush remaining candidates in bounded batches.
+        // Hard cap: never spend more than 30s flushing after the scan loop ends.
+        let flush_deadline = Instant::now() + Duration::from_secs(30);
         while !scored.is_empty() {
+            if Instant::now() >= flush_deadline {
+                eprintln!(
+                    "[SBH-SCANNER] flush deadline reached; {} candidates will be rediscovered on next pass",
+                    scored.len()
+                );
+                break;
+            }
             let pending_before = scored.len();
             if !dispatch_top_candidates(&mut scored, &request, del_tx) {
                 scanner_should_exit = true;
