@@ -423,12 +423,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ftui-i18n"
+version = "0.2.1"
+
+[[package]]
 name = "ftui-layout"
 version = "0.2.1"
 dependencies = [
  "ftui-core",
  "rustc-hash",
  "serde",
+ "smallvec",
 ]
 
 [[package]]
@@ -442,6 +447,24 @@ dependencies = [
  "memchr",
  "smallvec",
  "unicode-segmentation",
+ "web-time",
+]
+
+[[package]]
+name = "ftui-runtime"
+version = "0.2.1"
+dependencies = [
+ "arc-swap",
+ "ftui-backend",
+ "ftui-core",
+ "ftui-i18n",
+ "ftui-layout",
+ "ftui-render",
+ "ftui-style",
+ "ftui-text",
+ "tracing",
+ "unicode-segmentation",
+ "unicode-width",
  "web-time",
 ]
 
@@ -493,6 +516,7 @@ dependencies = [
  "ftui-core",
  "ftui-layout",
  "ftui-render",
+ "ftui-runtime",
  "ftui-style",
  "ftui-text",
  "unicode-segmentation",
@@ -1159,7 +1183,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "storage_ballast_helper"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "chrono",
  "clap",

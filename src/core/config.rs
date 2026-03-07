@@ -432,9 +432,8 @@ impl Default for UpdateConfig {
     fn default() -> Self {
         let home_dir = env::var_os("HOME").map_or_else(
             || {
-                eprintln!(
-                    "[SBH-CONFIG] WARNING: HOME not set, falling back to /var/lib/sbh for update paths"
-                );
+                // No HOME is expected when running as a systemd service.
+                // Use /var/lib/sbh as the canonical system-wide data directory.
                 PathBuf::from("/var/lib/sbh")
             },
             PathBuf::from,
@@ -458,9 +457,8 @@ impl Default for PathsConfig {
     fn default() -> Self {
         let home_dir = env::var_os("HOME").map_or_else(
             || {
-                eprintln!(
-                    "[SBH-CONFIG] WARNING: HOME not set, falling back to /var/lib/sbh for data paths"
-                );
+                // No HOME is expected when running as a systemd service.
+                // Use /var/lib/sbh as the canonical system-wide data directory.
                 PathBuf::from("/var/lib/sbh")
             },
             PathBuf::from,
