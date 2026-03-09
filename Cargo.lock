@@ -401,6 +401,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ftui-a11y"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "ftui-core",
+]
+
+[[package]]
 name = "ftui-backend"
 version = "0.2.1"
 dependencies = [
@@ -513,6 +521,7 @@ version = "0.2.1"
 dependencies = [
  "ahash",
  "bitflags",
+ "ftui-a11y",
  "ftui-core",
  "ftui-layout",
  "ftui-render",
@@ -1183,7 +1192,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "storage_ballast_helper"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "chrono",
  "clap",

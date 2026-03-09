@@ -2373,25 +2373,29 @@ fn scanner_thread_main(
                         if !path.is_dir() {
                             continue;
                         }
-                        // Skip directories already known to contain .git.
-                        if known_git_dirs.contains(&path) {
-                            continue;
+                        // Track whether depth-1 dir is a git repo (project root).
+                        // Project roots themselves must never be deletion candidates,
+                        // but we still need to check their children for artifacts
+                        // like `target/` and `node_modules/`.
+                        let is_git_repo = known_git_dirs.contains(&path)
+                            || path.join(".git").exists();
+                        if is_git_repo {
+                            known_git_dirs.insert(path.clone());
                         }
                         let classification =
                             pattern_registry.classify(&path, Default::default());
-                        if classification.category
-                            == crate::scanner::patterns::ArtifactCategory::Unknown
-                        {
-                            continue;
-                        }
-                        // Check for .git before investing in scoring —
-                        // project roots should never be deletion candidates.
-                        if path.join(".git").exists() {
-                            known_git_dirs.insert(path.clone());
-                            continue;
-                        }
-                        // Also check depth-2 children for nested targets.
-                        let mut to_score = vec![path.clone()];
+                        let depth1_is_artifact = !is_git_repo
+                            && classification.category
+                                != crate::scanner::patterns::ArtifactCategory::Unknown;
+                        // Start with depth-1 dir only if it is itself an artifact
+                        // (not a git repo).
+                        let mut to_score = if depth1_is_artifact {
+                            vec![path.clone()]
+                        } else {
+                            Vec::new()
+                        };
+                        // Always check depth-2 children for nested targets
+                        // (e.g., /data/projects/myproject/target).
                         if let Ok(sub_entries) = std::fs::read_dir(&path) {
                             for sub_entry in sub_entries.flatten() {
                                 let sub_path = sub_entry.path();
@@ -2411,6 +2415,10 @@ fn scanner_thread_main(
                                     }
                                 }
                             }
+                        }
+
+                        if to_score.is_empty() {
+                            continue;
                         }
 
                         for candidate_path in to_score {
