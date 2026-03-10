@@ -639,10 +639,12 @@ const MAX_ENTRIES_PER_DIR: u32 = 65_536;
 /// Maximum time to spend scanning /proc for open file ancestors.
 /// On agent swarms with many processes, /proc scanning can take minutes.
 /// A 5-second budget captures enough data for reliable veto decisions.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const OPEN_FILES_SCAN_BUDGET: Duration = Duration::from_secs(5);
 
 /// Maximum number of PIDs to scan before bailing out.
 /// Increased to 50,000 to handle busy swarm machines without false-negative open checks.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const OPEN_FILES_MAX_PIDS: usize = 50_000;
 
 /// Collect absolute open-path ancestors for open file descriptors under `root_paths`.
@@ -771,6 +773,7 @@ pub fn is_path_open_by_ancestor<S: std::hash::BuildHasher>(
 }
 
 /// Memoized open-file detector for repeated path checks during one scan pass.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct OpenPathCache<'a, S = std::collections::hash_map::RandomState> {
     open_inodes: &'a HashSet<(u64, u64), S>,
     dir_cache: HashMap<PathBuf, bool>,

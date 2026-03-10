@@ -2419,7 +2419,9 @@ fn scanner_thread_main(
                                             for d3_entry in d3_entries.flatten() {
                                                 let d3_path = d3_entry.path();
                                                 if d3_path.is_dir() {
-                                                    if d3_path.join(".git").exists() {
+                                                    if known_git_dirs.contains(&d3_path)
+                                                        || d3_path.join(".git").exists()
+                                                    {
                                                         known_git_dirs.insert(d3_path);
                                                         continue;
                                                     }
