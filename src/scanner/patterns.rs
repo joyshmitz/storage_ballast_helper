@@ -477,6 +477,13 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
             confidence: 0.88,
             category: ArtifactCategory::RustTarget,
         },
+        // Claude Code session caches — can grow to 100+ GB in /tmp/claude-<uid>/.
+        ArtifactPattern {
+            name: "claude-session-cache",
+            kind: MatchKind::Prefix("claude-"),
+            confidence: 0.88,
+            category: ArtifactCategory::CacheDir,
+        },
     ]
 }
 
@@ -537,6 +544,9 @@ pub fn extract_pattern_label(path: &str) -> String {
     }
     if lower.starts_with(".tmp_target") {
         return ".tmp_target*".to_string();
+    }
+    if lower.starts_with("claude-") {
+        return "claude-*".to_string();
     }
     if lower == "node_modules" {
         return "node_modules/".to_string();

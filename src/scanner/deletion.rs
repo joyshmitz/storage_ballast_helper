@@ -246,6 +246,11 @@ impl DeletionExecutor {
                     // ContainsGit (project root) are normal conditions that produce
                     // excessive log noise when logged as errors.
                     if !matches!(skip, SkipReason::PathGone | SkipReason::ContainsGit) {
+                        eprintln!(
+                            "[SBH-EXECUTOR] skip: {} ({:?})",
+                            candidate.path.display(),
+                            skip
+                        );
                         self.log_event(ActivityEvent::ArtifactDeletionFailed {
                             path: candidate.path.to_string_lossy().to_string(),
                             error_code: "SBH-2003".to_string(),
@@ -279,6 +284,11 @@ impl DeletionExecutor {
                 Err(e) => {
                     report.items_failed += 1;
                     consecutive_failures += 1;
+                    eprintln!(
+                        "[SBH-EXECUTOR] fail: {} ({})",
+                        candidate.path.display(),
+                        e
+                    );
                     let error = DeletionError {
                         path: candidate.path.clone(),
                         error: e.to_string(),
