@@ -2412,6 +2412,27 @@ fn scanner_thread_main(
                                         != crate::scanner::patterns::ArtifactCategory::Unknown
                                     {
                                         to_score.push(sub_path);
+                                    } else {
+                                        // Depth 3: check children of Unknown depth-2 dirs
+                                        // (catches workspace patterns like crates/foo/target).
+                                        if let Ok(d3_entries) = std::fs::read_dir(&sub_path) {
+                                            for d3_entry in d3_entries.flatten() {
+                                                let d3_path = d3_entry.path();
+                                                if d3_path.is_dir() {
+                                                    if d3_path.join(".git").exists() {
+                                                        known_git_dirs.insert(d3_path);
+                                                        continue;
+                                                    }
+                                                    let d3_class = pattern_registry
+                                                        .classify(&d3_path, Default::default());
+                                                    if d3_class.category
+                                                        != crate::scanner::patterns::ArtifactCategory::Unknown
+                                                    {
+                                                        to_score.push(d3_path);
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -2484,6 +2505,23 @@ fn scanner_thread_main(
         // Dispatch priority candidates immediately if any found.
         if !priority_candidates.is_empty() {
             let count = priority_candidates.len();
+            // Build pattern frequency breakdown for the log line.
+            let mut pattern_counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for c in &priority_candidates {
+                let label = crate::scanner::patterns::extract_pattern_label(
+                    &c.path.to_string_lossy(),
+                );
+                *pattern_counts.entry(label).or_insert(0) += 1;
+            }
+            let mut breakdown: Vec<_> = pattern_counts.into_iter().collect();
+            breakdown.sort_by(|a, b| b.1.cmp(&a.1));
+            let breakdown_str: String = breakdown
+                .iter()
+                .map(|(label, n)| format!("{label}\u{00d7}{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+
             priority_candidates.sort_by(|a, b| {
                 b.total_score
                     .partial_cmp(&a.total_score)
@@ -2497,7 +2535,7 @@ fn scanner_thread_main(
             if del_tx.try_send(batch).is_ok() {
                 candidates_found += count;
                 eprintln!(
-                    "[SBH-SCANNER] priority pre-scan dispatched {count} high-value candidates"
+                    "[SBH-SCANNER] priority pre-scan dispatched {count} candidates ({breakdown_str})"
                 );
             }
         }
