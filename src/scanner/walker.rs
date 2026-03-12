@@ -238,7 +238,7 @@ fn walker_thread(
             Ok((dir_path, depth, root_dev)) => {
                 process_directory(
                     &dir_path, depth, root_dev, work_tx, result_tx, in_flight, config, protection,
-                    cancel,
+                    heartbeat, cancel,
                 );
                 // Mark this work item as completed.
                 let remaining = in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -275,6 +275,7 @@ fn process_directory(
     in_flight: &AtomicUsize,
     config: &WalkerConfig,
     protection: &parking_lot::RwLock<ProtectionRegistry>,
+    heartbeat: Option<&Arc<dyn Fn() + Send + Sync>>,
     cancel: &AtomicBool,
 ) {
     // Check exclusion list.
@@ -331,6 +332,21 @@ fn process_directory(
     let mut pending_children: Vec<PathBuf> = Vec::new();
 
     for entry_result in entries {
+        // Large flat directories can take a long time to iterate. Honor
+        // cancellation during the hot loop so the daemon can stop promptly
+        // when a scan budget expires instead of waiting for the entire
+        // directory to finish.
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Keep the daemon heartbeat alive while iterating a huge directory.
+        if total_count % 256 == 0
+            && let Some(hb) = heartbeat
+        {
+            hb();
+        }
+
         let Ok(entry) = entry_result else {
             continue;
         };
@@ -433,7 +449,10 @@ fn process_directory(
         }
         in_flight.fetch_add(1, Ordering::Release);
         loop {
-            match work_tx.send_timeout((child_path.clone(), depth + 1, root_dev), Duration::from_millis(100)) {
+            match work_tx.send_timeout(
+                (child_path.clone(), depth + 1, root_dev),
+                Duration::from_millis(100),
+            ) {
                 Ok(()) => break,
                 Err(channel::SendTimeoutError::Timeout(_)) => {
                     // Channel full — check cancel before retrying.
@@ -467,13 +486,25 @@ fn process_directory(
         if emeta.is_dir && content_size > 0 {
             emeta.content_size_bytes = content_size;
         }
-        let _ = result_tx.send(WalkEntry {
+        let walk_entry = WalkEntry {
             path: dir_path.to_path_buf(),
             metadata: emeta,
             depth,
             structural_signals: signals,
             is_open: false, // Caller sets this after walk using /proc scan.
-        });
+        };
+
+        loop {
+            match result_tx.send_timeout(walk_entry.clone(), Duration::from_millis(100)) {
+                Ok(()) => break,
+                Err(channel::SendTimeoutError::Timeout(_)) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
+                Err(channel::SendTimeoutError::Disconnected(_)) => return,
+            }
+        }
     }
 }
 
@@ -1067,6 +1098,84 @@ mod tests {
         let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
         let entries = walker.walk().unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn process_directory_exits_when_result_channel_is_backpressured_and_cancelled() {
+        use crossbeam_channel as channel;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("file.bin"), b"payload").unwrap();
+
+        let (work_tx, work_rx) = channel::bounded::<WorkItem>(1);
+        let (result_tx, result_rx) = channel::bounded::<WalkEntry>(1);
+        drop(work_rx);
+
+        // Fill the result channel so the directory emitter must wait.
+        result_tx
+            .send(WalkEntry {
+                path: tmp.path().join("placeholder"),
+                metadata: EntryMetadata {
+                    size_bytes: 0,
+                    content_size_bytes: 0,
+                    modified: SystemTime::UNIX_EPOCH,
+                    created: None,
+                    is_dir: true,
+                    inode: 0,
+                    device_id: 0,
+                    permissions: 0,
+                },
+                depth: 1,
+                structural_signals: StructuralSignals::default(),
+                is_open: false,
+            })
+            .unwrap();
+
+        let in_flight = AtomicUsize::new(0);
+        let protection = parking_lot::RwLock::new(ProtectionRegistry::marker_only());
+        let config = WalkerConfig {
+            root_paths: vec![tmp.path().to_path_buf()],
+            max_depth: 4,
+            follow_symlinks: false,
+            cross_devices: false,
+            parallelism: 1,
+            excluded_paths: HashSet::new(),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+
+        let dir_clone = dir.clone();
+        let start = Instant::now();
+        let join = thread::spawn(move || {
+            process_directory(
+                &dir_clone,
+                1,
+                0,
+                &work_tx,
+                &result_tx,
+                &in_flight,
+                &config,
+                &protection,
+                None,
+                &worker_cancel,
+            );
+        });
+
+        thread::sleep(Duration::from_millis(150));
+        cancel.store(true, Ordering::Relaxed);
+        join.join().unwrap();
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "process_directory should stop promptly when cancellation is requested",
+        );
+        assert_eq!(result_rx.len(), 1, "no extra entries should be emitted");
     }
 
     #[test]
