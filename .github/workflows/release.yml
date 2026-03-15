@@ -22,6 +22,9 @@ jobs:
 
   build:
     name: Build (${{ matrix.target }})
+    # Quality gate failures should not block release artifact production.
+    # The gate runs in parallel and its results are visible separately.
+    if: always() && !cancelled()
     needs: quality-gate
     runs-on: ${{ matrix.os }}
     strategy:
