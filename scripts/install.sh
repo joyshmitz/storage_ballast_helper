@@ -834,7 +834,7 @@ main() {
         # SHA256SUMS.txt contains lines like: <hash>  <filename>
         # Find the line matching our asset name.
         local expected actual
-        expected="$(grep -F "$ASSET_NAME" "$checksum_path" | awk '{print $1; exit}' || true)"
+        expected="$(awk -v name="$ASSET_NAME" '$2 == name || $2 == "./"name || $2 == "*"name { print $1; exit }' "$checksum_path")"
         if [[ -z "$expected" ]]; then
           # Single-entry checksum file — take the first hash
           expected="$(awk '{print $1; exit}' "$checksum_path")"
