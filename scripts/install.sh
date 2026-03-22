@@ -350,26 +350,127 @@ normalize_tag() {
   fi
 }
 
-build_urls() {
-  local asset checksum
-  asset="${PROGRAM}-${TARGET_TRIPLE}.tar.xz"
-  checksum="${asset}.sha256"
+map_target_to_raw_name() {
+  # Maps a Rust target triple to the raw binary asset naming convention
+  # used in some releases (e.g., v0.2.8): sbh-{os}-{arch}
+  local triple="$1"
+  case "$triple" in
+    x86_64-unknown-linux-gnu)   printf '%s' "${PROGRAM}-linux-x86_64" ;;
+    aarch64-unknown-linux-gnu)  printf '%s' "${PROGRAM}-linux-aarch64" ;;
+    x86_64-apple-darwin)        printf '%s' "${PROGRAM}-darwin-x86_64" ;;
+    aarch64-apple-darwin)       printf '%s' "${PROGRAM}-darwin-aarch64" ;;
+    *)                          printf '%s' "${PROGRAM}-${triple}" ;;
+  esac
+}
 
+probe_release_assets() {
+  # Queries the GitHub API to discover what assets actually exist in the
+  # target release, then sets ASSET_FORMAT to one of:
+  #   "archive"  -- .tar.xz with per-file .sha256 sidecar
+  #   "raw"      -- raw binary with SHA256SUMS.txt manifest
+  #   "none"     -- no matching asset found
+  # Also sets ASSET_NAME, CHECKSUM_NAME, and the download base URL.
+
+  ASSET_FORMAT="none"
+  ASSET_NAME=""
+  CHECKSUM_NAME=""
+
+  # Allow override via environment (tests / airgapped)
   if [[ -n "${SBH_INSTALLER_ASSET_URL:-}" ]]; then
     ASSET_URL="${SBH_INSTALLER_ASSET_URL}"
-  elif [[ "$RELEASE_LOCATOR" == "latest" ]]; then
-    ASSET_URL="https://github.com/${REPO}/releases/latest/download/${asset}"
-  else
-    ASSET_URL="https://github.com/${REPO}/releases/download/${RELEASE_LOCATOR}/${asset}"
+    CHECKSUM_URL="${SBH_INSTALLER_CHECKSUM_URL:-}"
+    # Infer format from URL
+    if [[ "$ASSET_URL" == *.tar.xz ]]; then
+      ASSET_FORMAT="archive"
+    else
+      ASSET_FORMAT="raw"
+    fi
+    return 0
   fi
 
-  if [[ -n "${SBH_INSTALLER_CHECKSUM_URL:-}" ]]; then
-    CHECKSUM_URL="${SBH_INSTALLER_CHECKSUM_URL}"
-  elif [[ "$RELEASE_LOCATOR" == "latest" ]]; then
-    CHECKSUM_URL="https://github.com/${REPO}/releases/latest/download/${checksum}"
+  # Build the GitHub API endpoint for this release
+  local api_path
+  if [[ "$RELEASE_LOCATOR" == "latest" ]]; then
+    api_path="repos/${REPO}/releases/latest"
   else
-    CHECKSUM_URL="https://github.com/${REPO}/releases/download/${RELEASE_LOCATOR}/${checksum}"
+    api_path="repos/${REPO}/releases/tags/${RELEASE_LOCATOR}"
   fi
+
+  # Fetch the asset list (best-effort; falls back to URL guessing on failure)
+  local asset_json=""
+  if command -v gh >/dev/null 2>&1; then
+    asset_json="$(gh api "$api_path" --jq '.assets[].name' 2>/dev/null || true)"
+  fi
+  if [[ -z "$asset_json" ]] && command -v curl >/dev/null 2>&1; then
+    asset_json="$(curl -fsSL "https://api.github.com/$api_path" 2>/dev/null \
+                  | sed -n 's/.*"name" *: *"\([^"]*\)".*/\1/p' || true)"
+  fi
+
+  # Determine download base URL
+  local base_url
+  if [[ "$RELEASE_LOCATOR" == "latest" ]]; then
+    base_url="https://github.com/${REPO}/releases/latest/download"
+  else
+    base_url="https://github.com/${REPO}/releases/download/${RELEASE_LOCATOR}"
+  fi
+
+  # Probe strategy 1: .tar.xz archive (original naming)
+  local archive_name="${PROGRAM}-${TARGET_TRIPLE}.tar.xz"
+  local archive_checksum="${archive_name}.sha256"
+
+  if printf '%s\n' "$asset_json" | grep -qxF "$archive_name" 2>/dev/null; then
+    ASSET_FORMAT="archive"
+    ASSET_NAME="$archive_name"
+    CHECKSUM_NAME="$archive_checksum"
+    ASSET_URL="${base_url}/${ASSET_NAME}"
+    CHECKSUM_URL="${base_url}/${CHECKSUM_NAME}"
+    return 0
+  fi
+
+  # Probe strategy 2: raw binary (newer naming, e.g. sbh-linux-x86_64)
+  local raw_name
+  raw_name="$(map_target_to_raw_name "$TARGET_TRIPLE")"
+
+  if printf '%s\n' "$asset_json" | grep -qxF "$raw_name" 2>/dev/null; then
+    ASSET_FORMAT="raw"
+    ASSET_NAME="$raw_name"
+    CHECKSUM_NAME="SHA256SUMS.txt"
+    ASSET_URL="${base_url}/${ASSET_NAME}"
+    CHECKSUM_URL="${base_url}/${CHECKSUM_NAME}"
+    return 0
+  fi
+
+  # If the API call failed (no gh, no curl, rate-limited) fall back to
+  # guessing with HEAD requests.
+  if [[ -z "$asset_json" ]]; then
+    # Try archive first
+    if curl -fsSL --head "${base_url}/${archive_name}" >/dev/null 2>&1; then
+      ASSET_FORMAT="archive"
+      ASSET_NAME="$archive_name"
+      CHECKSUM_NAME="$archive_checksum"
+      ASSET_URL="${base_url}/${ASSET_NAME}"
+      CHECKSUM_URL="${base_url}/${CHECKSUM_NAME}"
+      return 0
+    fi
+    # Try raw binary
+    if curl -fsSL --head "${base_url}/${raw_name}" >/dev/null 2>&1; then
+      ASSET_FORMAT="raw"
+      ASSET_NAME="$raw_name"
+      CHECKSUM_NAME="SHA256SUMS.txt"
+      ASSET_URL="${base_url}/${ASSET_NAME}"
+      CHECKSUM_URL="${base_url}/${CHECKSUM_NAME}"
+      return 0
+    fi
+  fi
+
+  # No matching asset found
+  ASSET_FORMAT="none"
+  ASSET_URL=""
+  CHECKSUM_URL=""
+}
+
+build_urls() {
+  probe_release_assets
 }
 
 sha256_file() {
@@ -646,7 +747,6 @@ main() {
   start_phase "prepare" "resolving prerequisites and installer contract"
 
   require_cmd curl
-  require_cmd tar
   require_cmd install
   require_cmd mktemp
 
@@ -664,9 +764,15 @@ main() {
     start_phase "dry_run" "rendering dry-run execution plan"
     if [[ "$JSON_MODE" -eq 0 ]]; then
       log_header "sbh installer (dry-run)"
-      log_info "Would download: ${ASSET_URL}"
-      if [[ "$VERIFY" -eq 1 ]]; then
-        log_info "Would download checksum: ${CHECKSUM_URL}"
+      if [[ "$ASSET_FORMAT" == "none" ]]; then
+        log_info "No pre-built binary found for ${TARGET_TRIPLE}"
+        log_info "Would fall back to: cargo install storage_ballast_helper"
+      else
+        log_info "Asset format: ${ASSET_FORMAT}"
+        log_info "Would download: ${ASSET_URL}"
+        if [[ "$VERIFY" -eq 1 && -n "$CHECKSUM_URL" ]]; then
+          log_info "Would download checksum: ${CHECKSUM_URL}"
+        fi
       fi
       log_info "Would install to: ${DEST_DIR}/${PROGRAM}"
       log_info "Would install skill to: ~/.claude/skills/sbh/"
@@ -681,48 +787,124 @@ main() {
   WORKDIR="$(mktemp -d)"
   trap 'if [[ -n "${WORKDIR:-}" ]]; then rm -rf "$WORKDIR"; fi' EXIT
 
-  local archive_path checksum_path extract_dir binary_path target_path expected actual
-  archive_path="${WORKDIR}/artifact.tar.xz"
-  checksum_path="${WORKDIR}/artifact.sha256"
-  extract_dir="${WORKDIR}/extract"
+  local target_path
   target_path="${DEST_DIR}/${PROGRAM}"
 
-  start_phase "download_artifact" "downloading release artifact"
-  log_header "Downloading release artifact"
-  if ! download_with_retry "$ASSET_URL" "$archive_path"; then
-    die "Failed to download release artifact from ${ASSET_URL}"
-  fi
-  finish_phase "release artifact downloaded"
-
-  if [[ "$VERIFY" -eq 1 ]]; then
-    start_phase "verify_artifact" "verifying artifact checksum"
-    log_header "Verifying checksum"
-    if ! download_with_retry "$CHECKSUM_URL" "$checksum_path"; then
-      die "Failed to download checksum from ${CHECKSUM_URL}"
+  if [[ "$ASSET_FORMAT" == "none" ]]; then
+    # ── Fallback: cargo install ──────────────────────────────────────────────
+    start_phase "cargo_install" "no release binary found; falling back to cargo install"
+    log_header "No pre-built binary for ${TARGET_TRIPLE} — building from source"
+    if ! command -v cargo >/dev/null 2>&1; then
+      die "No release binary for ${TARGET_TRIPLE} and cargo is not installed. Install Rust via https://rustup.rs and retry, or manually download from https://github.com/${REPO}/releases"
     fi
-    expected="$(awk '{print $1; exit}' "$checksum_path")"
-    [[ -n "$expected" ]] || die "Checksum file is empty or malformed"
-    actual="$(sha256_file "$archive_path")"
-    if [[ "$expected" != "$actual" ]]; then
-      die "Checksum mismatch for downloaded artifact. Expected ${expected}, got ${actual}."
+    log_info "Running: cargo install storage_ballast_helper"
+    if ! cargo install storage_ballast_helper 2>&1; then
+      die "cargo install storage_ballast_helper failed"
     fi
-    finish_phase "artifact checksum verified"
+    finish_phase "built and installed via cargo"
+    INSTALL_CHANGED=true
+    # cargo install puts the binary on PATH via ~/.cargo/bin — update
+    # DEST_DIR and ASSET_URL for the summary.
+    DEST_DIR="$(dirname "$(command -v sbh 2>/dev/null || echo "${HOME}/.cargo/bin/sbh")")"
+    ASSET_URL="(cargo install)"
+    install_skill
+    print_summary "installed ${PROGRAM} via cargo to ${DEST_DIR}/${PROGRAM}" true
+    emit_event "complete" "success" "installer completed via cargo install" 0
+    return 0
   fi
 
-  start_phase "extract_artifact" "extracting release archive"
-  log_header "Extracting archive"
-  mkdir -p "$extract_dir"
-  if ! tar -xJf "$archive_path" -C "$extract_dir"; then
-    die "Failed to extract downloaded archive"
-  fi
-  binary_path="$(find "$extract_dir" -type f -name "$PROGRAM" | head -n 1 || true)"
-  [[ -n "$binary_path" ]] || die "Downloaded archive does not contain '${PROGRAM}' binary"
-  finish_phase "release archive extracted"
+  if [[ "$ASSET_FORMAT" == "raw" ]]; then
+    # ── Raw binary download ────────────────────────────────────────────────
+    local binary_path checksum_path
+    binary_path="${WORKDIR}/${PROGRAM}"
+    checksum_path="${WORKDIR}/SHA256SUMS.txt"
 
-  start_phase "install_binary" "installing sbh binary"
-  log_header "Installing binary"
-  install_binary "$binary_path" "$target_path"
-  finish_phase "binary install phase completed"
+    start_phase "download_artifact" "downloading release binary"
+    log_header "Downloading release binary (raw)"
+    if ! download_with_retry "$ASSET_URL" "$binary_path"; then
+      die "Failed to download release binary from ${ASSET_URL}"
+    fi
+    chmod +x "$binary_path"
+    finish_phase "release binary downloaded"
+
+    if [[ "$VERIFY" -eq 1 ]]; then
+      start_phase "verify_artifact" "verifying artifact checksum"
+      log_header "Verifying checksum"
+      if [[ -n "$CHECKSUM_URL" ]] && download_with_retry "$CHECKSUM_URL" "$checksum_path"; then
+        # SHA256SUMS.txt contains lines like: <hash>  <filename>
+        # Find the line matching our asset name.
+        local expected actual
+        expected="$(grep -F "$ASSET_NAME" "$checksum_path" | awk '{print $1; exit}' || true)"
+        if [[ -z "$expected" ]]; then
+          # Single-entry checksum file — take the first hash
+          expected="$(awk '{print $1; exit}' "$checksum_path")"
+        fi
+        [[ -n "$expected" ]] || die "Checksum file is empty or does not contain entry for ${ASSET_NAME}"
+        actual="$(sha256_file "$binary_path")"
+        if [[ "$expected" != "$actual" ]]; then
+          die "Checksum mismatch for downloaded binary. Expected ${expected}, got ${actual}."
+        fi
+        finish_phase "artifact checksum verified"
+      else
+        log_warn "Checksum file not available — skipping verification"
+        finish_phase "checksum file unavailable; skipped"
+      fi
+    fi
+
+    start_phase "install_binary" "installing sbh binary"
+    log_header "Installing binary"
+    install_binary "$binary_path" "$target_path"
+    finish_phase "binary install phase completed"
+
+  else
+    # ── Archive (.tar.xz) download ────────────────────────────────────────
+    local archive_path checksum_path extract_dir binary_path
+    archive_path="${WORKDIR}/artifact.tar.xz"
+    checksum_path="${WORKDIR}/artifact.sha256"
+    extract_dir="${WORKDIR}/extract"
+
+    if ! command -v tar >/dev/null 2>&1; then
+      die "tar is required to extract .tar.xz archives but is not installed"
+    fi
+
+    start_phase "download_artifact" "downloading release artifact"
+    log_header "Downloading release artifact (archive)"
+    if ! download_with_retry "$ASSET_URL" "$archive_path"; then
+      die "Failed to download release artifact from ${ASSET_URL}"
+    fi
+    finish_phase "release artifact downloaded"
+
+    if [[ "$VERIFY" -eq 1 ]]; then
+      start_phase "verify_artifact" "verifying artifact checksum"
+      log_header "Verifying checksum"
+      if ! download_with_retry "$CHECKSUM_URL" "$checksum_path"; then
+        die "Failed to download checksum from ${CHECKSUM_URL}"
+      fi
+      local expected actual
+      expected="$(awk '{print $1; exit}' "$checksum_path")"
+      [[ -n "$expected" ]] || die "Checksum file is empty or malformed"
+      actual="$(sha256_file "$archive_path")"
+      if [[ "$expected" != "$actual" ]]; then
+        die "Checksum mismatch for downloaded artifact. Expected ${expected}, got ${actual}."
+      fi
+      finish_phase "artifact checksum verified"
+    fi
+
+    start_phase "extract_artifact" "extracting release archive"
+    log_header "Extracting archive"
+    mkdir -p "$extract_dir"
+    if ! tar -xJf "$archive_path" -C "$extract_dir"; then
+      die "Failed to extract downloaded archive"
+    fi
+    binary_path="$(find "$extract_dir" -type f -name "$PROGRAM" | head -n 1 || true)"
+    [[ -n "$binary_path" ]] || die "Downloaded archive does not contain '${PROGRAM}' binary"
+    finish_phase "release archive extracted"
+
+    start_phase "install_binary" "installing sbh binary"
+    log_header "Installing binary"
+    install_binary "$binary_path" "$target_path"
+    finish_phase "binary install phase completed"
+  fi
 
   install_skill
 
