@@ -284,11 +284,7 @@ impl DeletionExecutor {
                 Err(e) => {
                     report.items_failed += 1;
                     consecutive_failures += 1;
-                    eprintln!(
-                        "[SBH-EXECUTOR] fail: {} ({})",
-                        candidate.path.display(),
-                        e
-                    );
+                    eprintln!("[SBH-EXECUTOR] fail: {} ({})", candidate.path.display(), e);
                     let error = DeletionError {
                         path: candidate.path.clone(),
                         error: e.to_string(),

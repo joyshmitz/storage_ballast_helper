@@ -113,7 +113,13 @@ pub struct DiskRateEstimator {
 impl DiskRateEstimator {
     #[must_use]
     pub fn new(base_alpha: f64, min_alpha: f64, max_alpha: f64, min_samples: u64) -> Self {
-        Self::with_history_cap(base_alpha, min_alpha, max_alpha, min_samples, DEFAULT_RATE_HISTORY_CAP)
+        Self::with_history_cap(
+            base_alpha,
+            min_alpha,
+            max_alpha,
+            min_samples,
+            DEFAULT_RATE_HISTORY_CAP,
+        )
     }
 
     /// Create an estimator with a custom rate history buffer size for burst detection.
@@ -371,8 +377,8 @@ impl DiskRateEstimator {
         let duration_weight = (self.burst_duration_samples as f64 / 5.0).min(1.0);
         // Combined: either strong magnitude OR sustained duration triggers detection.
         let combined_weight = magnitude_weight.max(duration_weight);
-        let burst_probability = (deviation_factor * combined_weight / (deviation_factor + 1.0))
-            .clamp(0.0, 1.0);
+        let burst_probability =
+            (deviation_factor * combined_weight / (deviation_factor + 1.0)).clamp(0.0, 1.0);
 
         BurstState {
             burst_probability,
@@ -654,11 +660,8 @@ mod tests {
 
         // Now inject a massive burst: 500_000 bytes consumed in 30 seconds (50x spike).
         let burst_free = total_free - 41 * 100 - 500_000;
-        let burst_estimate = estimator.update(
-            burst_free,
-            t0 + Duration::from_secs(42 * 30),
-            threshold,
-        );
+        let burst_estimate =
+            estimator.update(burst_free, t0 + Duration::from_secs(42 * 30), threshold);
 
         // The instantaneous burst rate is ~16667 bytes/sec, ~5000x the steady rate.
         // With alpha damping (alpha clamped low during bursts), the EWMA should
@@ -691,7 +694,8 @@ mod tests {
         let _ = estimator.update(100_000, t0, 10_000);
 
         for i in 1..=10u64 {
-            let reading = estimator.update(100_000 - i * 1_000, t0 + Duration::from_secs(i), 10_000);
+            let reading =
+                estimator.update(100_000 - i * 1_000, t0 + Duration::from_secs(i), 10_000);
             assert!(
                 !reading.burst_state.calibrated,
                 "should not be calibrated at sample {i}"
@@ -720,11 +724,8 @@ mod tests {
 
         // Single extreme spike: 500_000 bytes consumed in 30 seconds (~50× the steady rate).
         let burst_free = total_free - 40 * 100 - 500_000;
-        let spike_estimate = estimator.update(
-            burst_free,
-            t0 + Duration::from_secs(41 * 30),
-            threshold,
-        );
+        let spike_estimate =
+            estimator.update(burst_free, t0 + Duration::from_secs(41 * 30), threshold);
 
         assert!(
             spike_estimate.burst_state.calibrated,
@@ -767,10 +768,7 @@ mod tests {
             threshold,
         );
 
-        assert!(
-            first_spike.burst_state.calibrated,
-            "should be calibrated"
-        );
+        assert!(first_spike.burst_state.calibrated, "should be calibrated");
         // Moderate spike: first sample should NOT cross 0.5.
         assert!(
             first_spike.burst_state.burst_probability < 0.5,
@@ -804,16 +802,15 @@ mod tests {
         let steady_mad = steady.burst_state.mad_rate;
         let steady_bound = steady.burst_state.robust_upper_bound;
         assert!(steady.burst_state.calibrated);
-        assert!(steady_mad < 10.0, "MAD should be small during steady state: {steady_mad}");
+        assert!(
+            steady_mad < 10.0,
+            "MAD should be small during steady state: {steady_mad}"
+        );
         assert!(steady_bound > 0.0, "robust bound must be positive");
 
         // Inject a massive burst: 500_000 bytes consumed in 30 seconds.
         let burst_free = total_free - 41 * 100 - 500_000;
-        let burst = estimator.update(
-            burst_free,
-            t0 + Duration::from_secs(42 * 30),
-            threshold,
-        );
+        let burst = estimator.update(burst_free, t0 + Duration::from_secs(42 * 30), threshold);
         // MAD should not be wildly inflated by a single outlier.
         // With 42 samples where 41 are ~3.33 and 1 is ~16667, the median barely
         // moves and the MAD barely moves (the outlier is just 1/42 of deviations).
@@ -844,11 +841,7 @@ mod tests {
 
         // 10 steady samples at exactly 1000 bytes/sec to converge the EWMA.
         for i in 1..=10u64 {
-            let _ = estimator.update(
-                10_000_000 - i * 1000,
-                t0 + Duration::from_secs(i),
-                100_000,
-            );
+            let _ = estimator.update(10_000_000 - i * 1000, t0 + Duration::from_secs(i), 100_000);
         }
         // One more steady sample to get the alpha baseline.
         let steady = estimator.update(

@@ -2975,7 +2975,9 @@ fn run_new_dashboard_runtime(request: &DashboardRuntimeRequest) -> Result<(), Cl
 
 #[cfg(not(feature = "tui"))]
 fn run_new_dashboard_runtime(_request: &DashboardRuntimeRequest) -> Result<(), CliError> {
-    Err(CliError::Runtime("TUI feature not enabled. Rebuild with --features tui".to_string()))
+    Err(CliError::Runtime(
+        "TUI feature not enabled. Rebuild with --features tui".to_string(),
+    ))
 }
 
 fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
@@ -3031,8 +3033,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
     // I26: Check file modification time to detect stale state from a crashed daemon.
     let daemon_running = {
         let state_file_fresh = daemon_state.is_some() && {
-            let stale_threshold =
-                std::time::Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS);
+            let stale_threshold = std::time::Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS);
             std::fs::metadata(&config.paths.state_file)
                 .ok()
                 .and_then(|m| m.modified().ok())
@@ -3331,8 +3332,7 @@ fn run_log(cli: &Cli, args: &LogArgs) -> Result<(), CliError> {
                 }
                 Ok(_) => {
                     let trimmed = line.trim_end();
-                    if !trimmed.is_empty() && matches_type_filter(trimmed, args.r#type.as_deref())
-                    {
+                    if !trimmed.is_empty() && matches_type_filter(trimmed, args.r#type.as_deref()) {
                         println!("{}", format_log_line(trimmed));
                     }
                 }
@@ -3511,7 +3511,8 @@ fn is_swap_thrash_risk(memory: &MemoryInfo) -> bool {
     // is normal when swap is backed by zram (compressed memory, not disk).
     if Path::new("/sys/block/zram0").exists() {
         #[allow(clippy::cast_precision_loss)]
-        let free_ram_pct = (memory.available_bytes as f64 * 100.0) / memory.total_bytes.max(1) as f64;
+        let free_ram_pct =
+            (memory.available_bytes as f64 * 100.0) / memory.total_bytes.max(1) as f64;
         if free_ram_pct > 40.0 {
             return false;
         }

@@ -1102,7 +1102,9 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
 
         // CalibrationBreach is advisory-only — engine should NOT enter FallbackSafe.
         if entered_fallback {
-            failures.push(format!("iter {iter}: policy unexpectedly entered FallbackSafe"));
+            failures.push(format!(
+                "iter {iter}: policy unexpectedly entered FallbackSafe"
+            ));
         }
 
         // CalibrationBreach is advisory — no fallback entry expected.

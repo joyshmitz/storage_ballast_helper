@@ -37,8 +37,7 @@ use crate::logger::jsonl::JsonlConfig;
 use crate::monitor::ewma::{DiskRateEstimator, RateEstimate};
 use crate::monitor::fs_stats::FsStatsCollector;
 use crate::monitor::guardrails::{
-    AdaptiveGuard, CalibrationObservation, GuardDiagnostics, GuardStatus,
-    PredictionScorecard,
+    AdaptiveGuard, CalibrationObservation, GuardDiagnostics, GuardStatus, PredictionScorecard,
 };
 use crate::monitor::pid::{PidPressureController, PressureLevel, PressureReading};
 use crate::monitor::predictive::{PredictiveAction, PredictiveActionPolicy};
@@ -444,7 +443,11 @@ fn read_rss_mb() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     for line in status.lines() {
         if let Some(value) = line.strip_prefix("VmRSS:") {
-            let trimmed = value.trim().strip_suffix("kB").unwrap_or(value.trim()).trim();
+            let trimmed = value
+                .trim()
+                .strip_suffix("kB")
+                .unwrap_or(value.trim())
+                .trim();
             return trimmed.parse::<u64>().ok().map(|kb| kb / 1024);
         }
     }
@@ -1130,9 +1133,9 @@ impl MonitoringDaemon {
             if self.last_summary_report.elapsed() >= Duration::from_secs(300) {
                 let rss_mb = read_rss_mb().unwrap_or(0);
                 let guard_diag_snapshot = self.shared_guard_diagnostics.read().clone();
-                let guard_str = guard_diag_snapshot
-                    .as_ref()
-                    .map_or_else(|| "none".to_string(), |d| {
+                let guard_str = guard_diag_snapshot.as_ref().map_or_else(
+                    || "none".to_string(),
+                    |d| {
                         format!(
                             "{}(e={:.1} med_err={:.2} cons={:.0}% obs={} clean={})",
                             d.status,
@@ -1142,7 +1145,8 @@ impl MonitoringDaemon {
                             d.observation_count,
                             d.consecutive_clean,
                         )
-                    });
+                    },
+                );
                 let mode_str = self.policy_engine.lock().mode();
                 eprintln!(
                     "[SBH-SUMMARY] scans={} timeouts={} candidates={} deleted={} \
@@ -1274,9 +1278,9 @@ impl MonitoringDaemon {
             // The effective confidence floor is raised by the prediction scorecard
             // when false alarm rate is high — this dynamically tightens the gate
             // based on realized accuracy.
-            let effective_min_conf = self.prediction_scorecard.dynamic_min_confidence(
-                self.config.pressure.prediction.min_confidence,
-            );
+            let effective_min_conf = self
+                .prediction_scorecard
+                .dynamic_min_confidence(self.config.pressure.prediction.min_confidence);
             if !matches!(pred_action, PredictiveAction::Clear)
                 && rate_estimate.confidence < effective_min_conf
             {
@@ -1317,8 +1321,11 @@ impl MonitoringDaemon {
         if let Some(ref response) = worst_response {
             let was_actionable = self.last_predictive_action.severity() >= 2;
             let was_realized = response.level >= PressureLevel::Red;
-            self.prediction_scorecard
-                .record(was_actionable, was_realized, self.last_tick_cleanup_ran);
+            self.prediction_scorecard.record(
+                was_actionable,
+                was_realized,
+                self.last_tick_cleanup_ran,
+            );
         }
         // Reset cleanup flag for next tick — it gets set below when we dispatch scans/ballast.
         self.last_tick_cleanup_ran = false;
@@ -2294,7 +2301,8 @@ impl ScanCursor {
         }
 
         // Expire old entries.
-        self.barren_dirs.retain(|_, ts| now.duration_since(*ts) < self.ttl);
+        self.barren_dirs
+            .retain(|_, ts| now.duration_since(*ts) < self.ttl);
 
         // Cap size: if over limit, drop oldest entries.
         if self.barren_dirs.len() > self.max_entries {
@@ -2377,13 +2385,12 @@ fn scanner_thread_main(
                         // Project roots themselves must never be deletion candidates,
                         // but we still need to check their children for artifacts
                         // like `target/` and `node_modules/`.
-                        let is_git_repo = known_git_dirs.contains(&path)
-                            || path.join(".git").exists();
+                        let is_git_repo =
+                            known_git_dirs.contains(&path) || path.join(".git").exists();
                         if is_git_repo {
                             known_git_dirs.insert(path.clone());
                         }
-                        let classification =
-                            pattern_registry.classify(&path, Default::default());
+                        let classification = pattern_registry.classify(&path, Default::default());
                         let depth1_is_artifact = !is_git_repo
                             && classification.category
                                 != crate::scanner::patterns::ArtifactCategory::Unknown;
@@ -2406,8 +2413,8 @@ fn scanner_thread_main(
                                         known_git_dirs.insert(sub_path);
                                         continue;
                                     }
-                                    let sub_class = pattern_registry
-                                        .classify(&sub_path, Default::default());
+                                    let sub_class =
+                                        pattern_registry.classify(&sub_path, Default::default());
                                     if sub_class.category
                                         != crate::scanner::patterns::ArtifactCategory::Unknown
                                     {
@@ -2445,8 +2452,8 @@ fn scanner_thread_main(
                         }
 
                         for candidate_path in to_score {
-                            let candidate_class = pattern_registry
-                                .classify(&candidate_path, Default::default());
+                            let candidate_class =
+                                pattern_registry.classify(&candidate_path, Default::default());
                             if candidate_class.category
                                 == crate::scanner::patterns::ArtifactCategory::Unknown
                             {
@@ -2466,10 +2473,7 @@ fn scanner_thread_main(
                             // The general walker will compute precise recursive
                             // sizes if these candidates survive to that stage.
                             const DIR_SIZE_FLOOR: u64 = 100 * 1_048_576; // 100 MiB
-                            let raw_size = candidate_path
-                                .metadata()
-                                .map(|m| m.len())
-                                .unwrap_or(0);
+                            let raw_size = candidate_path.metadata().map(|m| m.len()).unwrap_or(0);
                             let size = if candidate_path.is_dir() {
                                 raw_size.max(DIR_SIZE_FLOOR)
                             } else {
@@ -2491,8 +2495,7 @@ fn scanner_thread_main(
                                 is_open: false,
                                 excluded: false,
                             };
-                            let score =
-                                prescan_engine.score_candidate(&input, request.urgency);
+                            let score = prescan_engine.score_candidate(&input, request.urgency);
                             if score.decision.action
                                 == crate::scanner::scoring::DecisionAction::Delete
                             {
@@ -2511,9 +2514,8 @@ fn scanner_thread_main(
             let mut pattern_counts: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
             for c in &priority_candidates {
-                let label = crate::scanner::patterns::extract_pattern_label(
-                    &c.path.to_string_lossy(),
-                );
+                let label =
+                    crate::scanner::patterns::extract_pattern_label(&c.path.to_string_lossy());
                 *pattern_counts.entry(label).or_insert(0) += 1;
             }
             let mut breakdown: Vec<_> = pattern_counts.into_iter().collect();
@@ -2653,7 +2655,9 @@ fn scanner_thread_main(
             SCAN_TIME_BUDGET_SECS
         };
         let budget_secs = match request.pressure_level {
-            PressureLevel::Red | PressureLevel::Critical => base_budget_secs.saturating_mul(2).min(600),
+            PressureLevel::Red | PressureLevel::Critical => {
+                base_budget_secs.saturating_mul(2).min(600)
+            }
             PressureLevel::Orange => base_budget_secs.saturating_mul(2).min(600),
             _ => base_budget_secs,
         };
@@ -3016,8 +3020,8 @@ fn executor_thread_main(
         if let Some(trip_time) = last_circuit_breaker_trip {
             if trip_time.elapsed() < circuit_breaker_cooldown {
                 // Rate-limit this message: log once per 60s during cooldown
-                let should_log = last_cb_cooldown_log
-                    .map_or(true, |t| t.elapsed() >= Duration::from_secs(60));
+                let should_log =
+                    last_cb_cooldown_log.map_or(true, |t| t.elapsed() >= Duration::from_secs(60));
                 if should_log {
                     eprintln!(
                         "[SBH-EXECUTOR] circuit breaker cooldown active ({:.0}s remaining), skipping batches",

@@ -97,7 +97,11 @@ impl CalibrationObservation {
         // This prevents infinity when actual ≈ 0 and predicted is negative
         // (EWMA recovery lag), while preserving meaningful ratios when both
         // rates are significant.
-        let denominator = self.actual_rate.abs().max(self.predicted_rate.abs()).max(1.0);
+        let denominator = self
+            .actual_rate
+            .abs()
+            .max(self.predicted_rate.abs())
+            .max(1.0);
         underestimation / denominator
     }
 
@@ -387,10 +391,7 @@ impl AdaptiveGuard {
         }
 
         // Compute median rate danger (underestimation only).
-        let mut errors: Vec<f64> = non_burst
-            .iter()
-            .map(|o| o.rate_danger_ratio())
-            .collect();
+        let mut errors: Vec<f64> = non_burst.iter().map(|o| o.rate_danger_ratio()).collect();
         errors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median_error = if errors.len().is_multiple_of(2) {
             let mid = errors.len() / 2;
@@ -400,10 +401,7 @@ impl AdaptiveGuard {
         };
 
         // Compute conservative TTE fraction (burst outliers excluded).
-        let conservative_count = non_burst
-            .iter()
-            .filter(|o| o.tte_conservative())
-            .count();
+        let conservative_count = non_burst.iter().filter(|o| o.tte_conservative()).count();
         let conservative_frac = conservative_count as f64 / non_burst.len() as f64;
 
         (median_error, conservative_frac)
@@ -1147,7 +1145,7 @@ mod tests {
                 predicted_rate: 100.0,
                 actual_rate: 50_000.0, // 500× error — normally fatal for guard
                 predicted_tte: 300.0,
-                actual_tte: 5.0, // non-conservative
+                actual_tte: 5.0,     // non-conservative
                 burst_outlier: true, // but it's a known burst
             });
         }
@@ -1220,7 +1218,11 @@ mod tests {
                 burst_outlier: true,
             });
         }
-        assert_eq!(guard.status(), GuardStatus::Pass, "burst_outlier should keep PASS");
+        assert_eq!(
+            guard.status(),
+            GuardStatus::Pass,
+            "burst_outlier should keep PASS"
+        );
 
         // Post-burst EWMA decay: predicted still elevated, actual back to baseline.
         // These are NOT burst outliers (actual rate is low). With the old symmetric
@@ -1228,11 +1230,11 @@ mod tests {
         // With directional rate_danger_ratio, these are "good" (overestimation is safe).
         for _ in 0..20 {
             guard.observe(CalibrationObservation {
-                predicted_rate: 5000.0,  // EWMA still elevated
-                actual_rate: 10.0,       // reality: disk idle
-                predicted_tte: 60.0,     // EWMA predicts filling
+                predicted_rate: 5000.0,    // EWMA still elevated
+                actual_rate: 10.0,         // reality: disk idle
+                predicted_tte: 60.0,       // EWMA predicts filling
                 actual_tte: f64::INFINITY, // reality: not filling
-                burst_outlier: false,    // NOT a burst outlier (actual is low)
+                burst_outlier: false,      // NOT a burst outlier (actual is low)
             });
         }
 

@@ -427,9 +427,7 @@ impl LaunchdConfig {
     /// creating log directories under `/usr/local/var/log/`.
     pub fn from_env(user_scope: bool) -> Result<Self> {
         let effective_user_scope = if !user_scope && !is_running_as_root() {
-            eprintln!(
-                "[SBH] Not running as root — defaulting to user-scope launchd installation"
-            );
+            eprintln!("[SBH] Not running as root — defaulting to user-scope launchd installation");
             true
         } else {
             user_scope

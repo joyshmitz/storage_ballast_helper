@@ -541,7 +541,11 @@ fn overview_pane_styled<'a>(
 }
 
 #[allow(clippy::option_if_let_else)]
-fn styled_pressure_summary<'a>(model: &'a DashboardModel, theme: &'a Theme, pane_width: u16) -> Vec<Line<'a>> {
+fn styled_pressure_summary<'a>(
+    model: &'a DashboardModel,
+    theme: &'a Theme,
+    pane_width: u16,
+) -> Vec<Line<'a>> {
     if let Some(ref state) = model.daemon_state {
         let mut lines = Vec::new();
         let level_color = theme.palette.pressure_color(&state.pressure.overall);
@@ -779,7 +783,11 @@ fn styled_decision_pulse<'a>(model: &'a DashboardModel, theme: &'a Theme) -> Vec
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn styled_candidate_hotlist<'a>(model: &'a DashboardModel, theme: &'a Theme, pane_width: u16) -> Vec<Line<'a>> {
+fn styled_candidate_hotlist<'a>(
+    model: &'a DashboardModel,
+    theme: &'a Theme,
+    pane_width: u16,
+) -> Vec<Line<'a>> {
     if model.candidates_list.is_empty() {
         return vec![Line::from(Span::styled(
             "hotlist no candidate ranking loaded yet",
@@ -1328,7 +1336,11 @@ fn frame_timeline_list_text(model: &DashboardModel, theme: &Theme, rows: usize) 
     out
 }
 
-fn frame_timeline_list_styled<'a>(model: &'a DashboardModel, theme: &'a Theme, rows: usize) -> Text<'a> {
+fn frame_timeline_list_styled<'a>(
+    model: &'a DashboardModel,
+    theme: &'a Theme,
+    rows: usize,
+) -> Text<'a> {
     let accent = theme.palette.tab_active_bg(Screen::Timeline.number());
     let filtered = model.timeline_filtered_events();
     let total = model.timeline_events.len();
@@ -1749,7 +1761,11 @@ fn frame_explainability_header_styled<'a>(model: &'a DashboardModel, theme: &'a 
     Text::from_lines(lines)
 }
 
-fn frame_explainability_list_styled<'a>(model: &'a DashboardModel, theme: &'a Theme, rows: usize) -> Text<'a> {
+fn frame_explainability_list_styled<'a>(
+    model: &'a DashboardModel,
+    theme: &'a Theme,
+    rows: usize,
+) -> Text<'a> {
     let accent = theme.palette.tab_active_bg(Screen::Explainability.number());
     if model.explainability_decisions.is_empty() {
         return Text::from_lines(vec![Line::from(Span::styled(
@@ -1877,7 +1893,11 @@ fn frame_explainability_detail_styled<'a>(
     }
 }
 
-fn styled_decision_detail<'a>(decision: &'a DecisionEvidence, theme: &'a Theme, width: usize) -> Text<'a> {
+fn styled_decision_detail<'a>(
+    decision: &'a DecisionEvidence,
+    theme: &'a Theme,
+    width: usize,
+) -> Text<'a> {
     let muted = theme.palette.muted_color();
     let primary = theme.palette.text_primary();
     let secondary = theme.palette.text_secondary();
@@ -2226,7 +2246,11 @@ fn frame_candidates_summary_styled<'a>(model: &'a DashboardModel, theme: &'a The
     Text::from_lines(vec![Line::from_spans(row)])
 }
 
-fn frame_candidates_list_styled<'a>(model: &'a DashboardModel, theme: &'a Theme, rows: usize) -> Text<'a> {
+fn frame_candidates_list_styled<'a>(
+    model: &'a DashboardModel,
+    theme: &'a Theme,
+    rows: usize,
+) -> Text<'a> {
     let accent = theme.palette.tab_active_bg(Screen::Candidates.number());
     if model.candidates_list.is_empty() {
         return Text::from_lines(vec![Line::from(Span::styled(
@@ -2281,7 +2305,11 @@ fn frame_candidates_list_styled<'a>(model: &'a DashboardModel, theme: &'a Theme,
 }
 
 #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
-fn frame_candidates_detail_styled<'a>(model: &'a DashboardModel, theme: &'a Theme, pane_width: u16) -> Text<'a> {
+fn frame_candidates_detail_styled<'a>(
+    model: &'a DashboardModel,
+    theme: &'a Theme,
+    pane_width: u16,
+) -> Text<'a> {
     let muted = theme.palette.muted_color();
     let primary = theme.palette.text_primary();
     let secondary = theme.palette.text_secondary();
@@ -2438,7 +2466,11 @@ fn frame_ballast_detail_text(model: &DashboardModel, theme: &Theme) -> String {
     out
 }
 
-fn frame_ballast_list_styled<'a>(model: &'a DashboardModel, theme: &'a Theme, rows: usize) -> Text<'a> {
+fn frame_ballast_list_styled<'a>(
+    model: &'a DashboardModel,
+    theme: &'a Theme,
+    rows: usize,
+) -> Text<'a> {
     let accent = theme.palette.tab_active_bg(Screen::Ballast.number());
     if model.ballast_volumes.is_empty() {
         return Text::from_lines(vec![Line::from(Span::styled(
@@ -2751,7 +2783,11 @@ fn frame_log_search_header_styled<'a>(model: &'a DashboardModel, theme: &'a Them
     Text::from_lines(vec![Line::from_spans(row)])
 }
 
-fn frame_log_search_list_styled<'a>(model: &'a DashboardModel, theme: &'a Theme, rows: usize) -> Text<'a> {
+fn frame_log_search_list_styled<'a>(
+    model: &'a DashboardModel,
+    theme: &'a Theme,
+    rows: usize,
+) -> Text<'a> {
     let accent = theme.palette.tab_active_bg(Screen::LogSearch.number());
     let entries = frame_log_entries(model);
     if entries.is_empty() {

@@ -257,9 +257,7 @@ impl PredictiveActionPolicy {
         if bs.calibrated && bs.burst_probability > 0.5 {
             // Use median rate for time projection instead of burst-inflated EWMA.
             let median_minutes = if bs.median_rate > 0.0 {
-                estimate.seconds_to_exhaustion
-                    * (estimate.bytes_per_second / bs.median_rate)
-                    / 60.0
+                estimate.seconds_to_exhaustion * (estimate.bytes_per_second / bs.median_rate) / 60.0
             } else {
                 f64::INFINITY
             };
@@ -282,7 +280,10 @@ impl PredictiveActionPolicy {
 
             // Require higher confidence during bursts — use the configured burst
             // threshold, but never lower than the normal min_confidence.
-            let burst_min_confidence = self.config.min_confidence.max(self.config.burst_min_confidence);
+            let burst_min_confidence = self
+                .config
+                .min_confidence
+                .max(self.config.burst_min_confidence);
             if effective_confidence < burst_min_confidence {
                 return PredictiveAction::Clear;
             }
@@ -314,9 +315,7 @@ impl PredictiveActionPolicy {
         // Production evidence: vmi1264463 at 73% free predicted "disk full in
         // 53m" (86% conf, implied 1.4%/min), vmi1152480 at 35% free predicted
         // "disk full in 54m" (78% conf, implied 0.65%/min).
-        if current_free_pct > 20.0
-            && minutes_remaining > self.config.imminent_danger_minutes
-        {
+        if current_free_pct > 20.0 && minutes_remaining > self.config.imminent_danger_minutes {
             let implied_rate_pct_per_min = current_free_pct / minutes_remaining;
             // Two tiers:
             // 1. Moderate rate (>1%/min with >40% free): require 0.90+ confidence.
@@ -1096,8 +1095,11 @@ mod tests {
         // Implied rate = 31%/2min = 15.5%/min > 5.
         // severity = (15.5-5)/10 = 1.0 (clamped), required = 0.7+0.25 = 0.95.
         // Confidence 0.73 < 0.95 → gated.
-        assert_eq!(action, PredictiveAction::Clear,
-            "should suppress false alarm: 31% free in 2 min with 73% confidence");
+        assert_eq!(
+            action,
+            PredictiveAction::Clear,
+            "should suppress false alarm: 31% free in 2 min with 73% confidence"
+        );
     }
 
     #[test]
@@ -1114,8 +1116,10 @@ mod tests {
         };
         let action = policy.evaluate(&est, 25.0, PathBuf::from("/data"));
         // Implied rate = 25%/3min = 8.3%/min > 5, but confidence 0.98 > required.
-        assert!(action.severity() >= 3,
-            "high-confidence prediction should not be gated: got {action:?}");
+        assert!(
+            action.severity() >= 3,
+            "high-confidence prediction should not be gated: got {action:?}"
+        );
     }
 
     #[test]
@@ -1126,8 +1130,10 @@ mod tests {
         // Default BurstState has calibrated=false.
         let action = policy.evaluate(&est, 30.0, PathBuf::from("/data"));
         // Should use normal path without free-space gating.
-        assert!(action.severity() >= 1,
-            "uncalibrated burst detector should not trigger gate: got {action:?}");
+        assert!(
+            action.severity() >= 1,
+            "uncalibrated burst detector should not trigger gate: got {action:?}"
+        );
     }
 
     #[test]

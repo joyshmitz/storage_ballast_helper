@@ -461,9 +461,7 @@ impl PolicyEngine {
         // loop (100ms at Critical, 250ms at Orange) from flooding the guard.
         if self.config.observe_min_interval_secs > 0 {
             if let Some(last) = self.last_observe_time {
-                if last.elapsed()
-                    < Duration::from_secs(self.config.observe_min_interval_secs)
-                {
+                if last.elapsed() < Duration::from_secs(self.config.observe_min_interval_secs) {
                     return;
                 }
             }
@@ -493,8 +491,7 @@ impl PolicyEngine {
             if self.mode == ActiveMode::FallbackSafe
                 && self.consecutive_clean_windows >= self.config.recovery_clean_windows
                 && self.fallback_entered_at.is_none_or(|entered| {
-                    entered.elapsed()
-                        >= Duration::from_secs(self.config.min_fallback_secs)
+                    entered.elapsed() >= Duration::from_secs(self.config.min_fallback_secs)
                 })
             {
                 self.recover_from_fallback();
@@ -521,8 +518,7 @@ impl PolicyEngine {
                         eprintln!(
                             "[SBH-POLICY] recalibrating after {} consecutive breach windows — \
                              resetting breach counter (cycle {}, guard will re-learn from fresh data)",
-                            self.consecutive_breach_windows,
-                            self.recalibration_count,
+                            self.consecutive_breach_windows, self.recalibration_count,
                         );
                     }
                     self.consecutive_breach_windows = 0;
@@ -539,8 +535,7 @@ impl PolicyEngine {
                 // Not a Fail breach — decay by 1 instead of accumulating.
                 // This means 20 breach windows from a 10-min burst unwind in
                 // ~10 min of non-Fail status, preventing unbounded accumulation.
-                self.consecutive_breach_windows =
-                    self.consecutive_breach_windows.saturating_sub(1);
+                self.consecutive_breach_windows = self.consecutive_breach_windows.saturating_sub(1);
             }
         }
     }
@@ -646,7 +641,10 @@ impl PolicyEngine {
                         // Without this, the message fires 5-8 times per scan cycle
                         // (every observe_window call) across all machines with
                         // active grace periods, flooding systemd journal.
-                        if self.last_suppression_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(300)) {
+                        if self
+                            .last_suppression_log
+                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(300))
+                        {
                             eprintln!(
                                 "[SBH-POLICY] suppressing fallback ({reason}) — \
                                  emergency grace period active ({:.0}s remaining)",
@@ -666,11 +664,15 @@ impl PolicyEngine {
                 if matches!(reason, FallbackReason::CalibrationBreach { .. }) {
                     let startup_grace = Duration::from_secs(STARTUP_CALIBRATION_GRACE_SECS);
                     if self.started_at.elapsed() < startup_grace {
-                        if self.last_suppression_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(300)) {
+                        if self
+                            .last_suppression_log
+                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(300))
+                        {
                             eprintln!(
                                 "[SBH-POLICY] suppressing calibration breach fallback — \
                                  startup grace period ({:.0}s remaining)",
-                                startup_grace.as_secs_f64() - self.started_at.elapsed().as_secs_f64()
+                                startup_grace.as_secs_f64()
+                                    - self.started_at.elapsed().as_secs_f64()
                             );
                             self.last_suppression_log = Some(Instant::now());
                         }
@@ -694,9 +696,7 @@ impl PolicyEngine {
                 Some(reason_str.clone()),
             );
             self.mode = ActiveMode::FallbackSafe;
-            eprintln!(
-                "[SBH-POLICY] {from} → FallbackSafe (reason: {reason_str})"
-            );
+            eprintln!("[SBH-POLICY] {from} → FallbackSafe (reason: {reason_str})");
         }
     }
 
@@ -1563,7 +1563,10 @@ mod tests {
             engine.observe_window(&unknown_guard);
         }
         // Should recover because green pressure + non-Fail guard = clean.
-        assert_ne!(engine.mode(), ActiveMode::FallbackSafe,
-            "should recover from fallback during green pressure with Unknown guard");
+        assert_ne!(
+            engine.mode(),
+            ActiveMode::FallbackSafe,
+            "should recover from fallback during green pressure with Unknown guard"
+        );
     }
 }

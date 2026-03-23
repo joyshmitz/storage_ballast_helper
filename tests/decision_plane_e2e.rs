@@ -608,8 +608,10 @@ fn e2e_calibration_drift_stays_operational() {
             .collect(),
         assertions: Vec::new(),
     };
-    step.assertions
-        .push(format!("deletions still approved: {}", decision.approved_for_deletion.len()));
+    step.assertions.push(format!(
+        "deletions still approved: {}",
+        decision.approved_for_deletion.len()
+    ));
     trace.steps.push(step);
 
     eprintln!("{}", trace.emit_report());
