@@ -121,6 +121,7 @@ pub fn run_cli_case_with_env(
 
 // ──────────────────── E2E Artifact Helpers ────────────────────
 
+#[cfg(feature = "tui")]
 pub use storage_ballast_helper::tui::e2e_artifact;
 
 /// Convert a [`CmdResult`] into an e2e artifact [`TestCaseArtifact`] for structured reporting.
