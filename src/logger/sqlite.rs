@@ -283,8 +283,7 @@ impl SqliteLogger {
     pub fn is_wal_mode(&self) -> bool {
         self.conn
             .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
-            .map(|mode| mode.eq_ignore_ascii_case("wal"))
-            .unwrap_or(false)
+            .is_ok_and(|mode| mode.eq_ignore_ascii_case("wal"))
     }
 }
 

@@ -45,7 +45,9 @@ use crate::monitor::special_locations::SpecialLocationRegistry;
 use crate::monitor::voi_scheduler::VoiScheduler;
 use crate::platform::pal::{MemoryInfo, Platform, detect_platform};
 use crate::scanner::deletion::{DeletionConfig, DeletionExecutor};
-use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry};
+use crate::scanner::patterns::{
+    ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, StructuralSignals,
+};
 use crate::scanner::protection::ProtectionRegistry;
 use crate::scanner::scoring::{CandidacyScore, ScoringEngine};
 use crate::scanner::walker::{DirectoryWalker, WalkerConfig};
@@ -75,14 +77,14 @@ const SCAN_ENTRY_BUDGET: usize = 500_000;
 /// is preferred over this constant.
 const SCAN_TIME_BUDGET_SECS: u64 = 300;
 /// Cooldown between repeated swap-thrash warnings while pressure remains.
-const SWAP_THRASH_WARNING_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+const SWAP_THRASH_WARNING_COOLDOWN: Duration = Duration::from_mins(15);
 /// Swap usage threshold that indicates probable paging thrash.
 const SWAP_THRASH_USED_PCT_THRESHOLD: f64 = 70.0;
 /// Minimum free RAM for high swap use to indicate thrash (anomalous paging
 /// despite ample memory). Per README: "at least 8 GiB of RAM remains free".
 const SWAP_THRASH_MIN_AVAILABLE_RAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Even under high pressure, avoid deleting extremely fresh temp artifacts.
-const TEMP_FAST_TRACK_MIN_OBSERVED_AGE: Duration = Duration::from_secs(2 * 60);
+const TEMP_FAST_TRACK_MIN_OBSERVED_AGE: Duration = Duration::from_mins(2);
 
 // ──────────────────── shared executor config ────────────────────
 
@@ -134,7 +136,7 @@ impl SharedExecutorConfig {
 // ──────────────────── thread panic tracking ────────────────────
 
 const MAX_RESPAWNS: u32 = 3;
-const RESPAWN_WINDOW: Duration = Duration::from_secs(300);
+const RESPAWN_WINDOW: Duration = Duration::from_mins(5);
 const THREAD_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
 struct ThreadHealth {
@@ -446,7 +448,7 @@ fn read_rss_mb() -> Option<u64> {
             let trimmed = value
                 .trim()
                 .strip_suffix("kB")
-                .unwrap_or(value.trim())
+                .unwrap_or_else(|| value.trim())
                 .trim();
             return trimmed.parse::<u64>().ok().map(|kb| kb / 1024);
         }
@@ -915,7 +917,7 @@ impl MonitoringDaemon {
                 // - After Green→Red, repeated Green→Yellow→Green→Yellow cycling
                 let in_cooldown = self
                     .last_pressure_notify_time
-                    .is_some_and(|t| t.elapsed() < Duration::from_secs(300));
+                    .is_some_and(|t| t.elapsed() < Duration::from_mins(5));
                 let should_notify = if in_cooldown {
                     // Only notify if this level exceeds what we already notified about.
                     response.level > self.last_notified_pressure_level
@@ -1015,8 +1017,7 @@ impl MonitoringDaemon {
                 let free_pct = self
                     .fs_collector
                     .collect(state_path)
-                    .map(|s| s.free_pct())
-                    .unwrap_or(0.0);
+                    .map_or(0.0, |s| s.free_pct());
                 let mount_str = state_path.to_string_lossy().into_owned();
                 let ballast_available = self
                     .ballast_coordinator
@@ -1130,7 +1131,7 @@ impl MonitoringDaemon {
             }
 
             // 10. Periodic summary report (every 5 minutes).
-            if self.last_summary_report.elapsed() >= Duration::from_secs(300) {
+            if self.last_summary_report.elapsed() >= Duration::from_mins(5) {
                 let rss_mb = read_rss_mb().unwrap_or(0);
                 let guard_diag_snapshot = self.shared_guard_diagnostics.read().clone();
                 let guard_str = guard_diag_snapshot.as_ref().map_or_else(
@@ -1190,6 +1191,7 @@ impl MonitoringDaemon {
 
     // ──────────────────── pressure monitoring ────────────────────
 
+    #[allow(clippy::too_many_lines)]
     fn check_pressure(&mut self) -> Result<crate::monitor::pid::PressureResponse> {
         // Collect stats for all root paths.
         let default_paths;
@@ -1458,12 +1460,8 @@ impl MonitoringDaemon {
                         pool_info.files_available,
                         pool_info.files_total,
                     ) {
-                        let free_check = || {
-                            collector
-                                .collect(&mount_path)
-                                .map(|s| s.free_pct())
-                                .unwrap_or(0.0)
-                        };
+                        let free_check =
+                            || collector.collect(&mount_path).map_or(0.0, |s| s.free_pct());
 
                         // Try to replenish this pool.
                         if let Ok(Some(report)) = self
@@ -1626,7 +1624,7 @@ impl MonitoringDaemon {
                 let now = Instant::now();
                 let should_log = self
                     .last_scan_channel_warn
-                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(3600));
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_hours(1));
                 if should_log {
                     let suppressed = self.scan_channel_warn_suppressed;
                     self.scan_channel_warn_suppressed = 0;
@@ -1738,7 +1736,7 @@ impl MonitoringDaemon {
                 if current_level > last_level {
                     true
                 } else if let Some(last_time) = self.last_predictive_warning {
-                    now.duration_since(last_time) >= Duration::from_secs(300)
+                    now.duration_since(last_time) >= Duration::from_mins(5)
                 } else {
                     true
                 }
@@ -1804,6 +1802,7 @@ impl MonitoringDaemon {
 
     // ──────────────────── special locations ────────────────────
 
+    #[allow(clippy::too_many_lines)]
     fn check_special_locations(
         &mut self,
         scan_tx: &Sender<ScanRequest>,
@@ -2249,7 +2248,7 @@ impl ScanCursor {
     fn new() -> Self {
         Self {
             barren_dirs: HashMap::new(),
-            ttl: Duration::from_secs(30 * 60), // 30 minutes
+            ttl: Duration::from_mins(30), // 30 minutes
             max_entries: 50_000,
         }
     }
@@ -2329,6 +2328,8 @@ fn scanner_thread_main(
     heartbeat: &Arc<ThreadHeartbeat>,
     report_tx: &Sender<WorkerReport>,
 ) {
+    const DIR_SIZE_FLOOR: u64 = 100 * 1_048_576; // 100 MiB
+
     // Initialize pattern registry (default built-ins).
     let pattern_registry = ArtifactPatternRegistry::default();
 
@@ -2390,7 +2391,8 @@ fn scanner_thread_main(
                         if is_git_repo {
                             known_git_dirs.insert(path.clone());
                         }
-                        let classification = pattern_registry.classify(&path, Default::default());
+                        let classification =
+                            pattern_registry.classify(&path, StructuralSignals::default());
                         let depth1_is_artifact = !is_git_repo
                             && classification.category
                                 != crate::scanner::patterns::ArtifactCategory::Unknown;
@@ -2413,13 +2415,11 @@ fn scanner_thread_main(
                                         known_git_dirs.insert(sub_path);
                                         continue;
                                     }
-                                    let sub_class =
-                                        pattern_registry.classify(&sub_path, Default::default());
+                                    let sub_class = pattern_registry
+                                        .classify(&sub_path, StructuralSignals::default());
                                     if sub_class.category
-                                        != crate::scanner::patterns::ArtifactCategory::Unknown
+                                        == crate::scanner::patterns::ArtifactCategory::Unknown
                                     {
-                                        to_score.push(sub_path);
-                                    } else {
                                         // Depth 3: check children of Unknown depth-2 dirs
                                         // (catches workspace patterns like crates/foo/target).
                                         if let Ok(d3_entries) = std::fs::read_dir(&sub_path) {
@@ -2432,8 +2432,10 @@ fn scanner_thread_main(
                                                         known_git_dirs.insert(d3_path);
                                                         continue;
                                                     }
-                                                    let d3_class = pattern_registry
-                                                        .classify(&d3_path, Default::default());
+                                                    let d3_class = pattern_registry.classify(
+                                                        &d3_path,
+                                                        StructuralSignals::default(),
+                                                    );
                                                     if d3_class.category
                                                         != crate::scanner::patterns::ArtifactCategory::Unknown
                                                     {
@@ -2442,6 +2444,8 @@ fn scanner_thread_main(
                                                 }
                                             }
                                         }
+                                    } else {
+                                        to_score.push(sub_path);
                                     }
                                 }
                             }
@@ -2452,8 +2456,8 @@ fn scanner_thread_main(
                         }
 
                         for candidate_path in to_score {
-                            let candidate_class =
-                                pattern_registry.classify(&candidate_path, Default::default());
+                            let candidate_class = pattern_registry
+                                .classify(&candidate_path, StructuralSignals::default());
                             if candidate_class.category
                                 == crate::scanner::patterns::ArtifactCategory::Unknown
                             {
@@ -2472,8 +2476,7 @@ fn scanner_thread_main(
                             // prevents the size factor from penalizing them.
                             // The general walker will compute precise recursive
                             // sizes if these candidates survive to that stage.
-                            const DIR_SIZE_FLOOR: u64 = 100 * 1_048_576; // 100 MiB
-                            let raw_size = candidate_path.metadata().map(|m| m.len()).unwrap_or(0);
+                            let raw_size = candidate_path.metadata().map_or(0, |m| m.len());
                             let size = if candidate_path.is_dir() {
                                 raw_size.max(DIR_SIZE_FLOOR)
                             } else {
@@ -2491,7 +2494,7 @@ fn scanner_thread_main(
                                     &candidate_class,
                                 ),
                                 classification: candidate_class,
-                                signals: Default::default(),
+                                signals: StructuralSignals::default(),
                                 is_open: false,
                                 excluded: false,
                             };
@@ -2519,7 +2522,7 @@ fn scanner_thread_main(
                 *pattern_counts.entry(label).or_insert(0) += 1;
             }
             let mut breakdown: Vec<_> = pattern_counts.into_iter().collect();
-            breakdown.sort_by(|a, b| b.1.cmp(&a.1));
+            breakdown.sort_by_key(|e| std::cmp::Reverse(e.1));
             let breakdown_str: String = breakdown
                 .iter()
                 .map(|(label, n)| format!("{label}\u{00d7}{n}"))
@@ -3007,7 +3010,7 @@ fn executor_thread_main(
     let mut last_circuit_breaker_trip: Option<Instant> = None;
     let base_circuit_breaker_cooldown = DeletionConfig::default().circuit_breaker_cooldown;
     let mut circuit_breaker_cooldown = base_circuit_breaker_cooldown;
-    let max_circuit_breaker_cooldown = Duration::from_secs(300); // 5 minutes cap
+    let max_circuit_breaker_cooldown = Duration::from_mins(5); // 5 minutes cap
     let mut last_policy_reject_log: Option<Instant> = None;
     let mut last_cb_cooldown_log: Option<Instant> = None;
 
@@ -3021,7 +3024,7 @@ fn executor_thread_main(
             if trip_time.elapsed() < circuit_breaker_cooldown {
                 // Rate-limit this message: log once per 60s during cooldown
                 let should_log =
-                    last_cb_cooldown_log.map_or(true, |t| t.elapsed() >= Duration::from_secs(60));
+                    last_cb_cooldown_log.is_none_or(|t| t.elapsed() >= Duration::from_mins(1));
                 if should_log {
                     eprintln!(
                         "[SBH-EXECUTOR] circuit breaker cooldown active ({:.0}s remaining), skipping batches",
@@ -3071,7 +3074,7 @@ fn executor_thread_main(
             // the issue without flooding the journal.
             let now = Instant::now();
             let should_log = last_policy_reject_log
-                .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1800));
+                .is_none_or(|last| now.duration_since(last) >= Duration::from_mins(30));
             if should_log {
                 last_policy_reject_log = Some(now);
                 eprintln!(
@@ -3215,7 +3218,7 @@ mod tests {
             veto_reason: None,
             classification: ArtifactClassification::unknown(),
             size_bytes: 1,
-            age: Duration::from_secs(60),
+            age: Duration::from_mins(1),
             decision: DecisionOutcome {
                 action: DecisionAction::Delete,
                 posterior_abandoned: 0.9,
@@ -3520,13 +3523,13 @@ mod tests {
             combined_confidence: 0.84,
         };
         let adjusted = adjusted_candidate_age(
-            Duration::from_secs(5 * 60),
+            Duration::from_mins(5),
             30,
             PressureLevel::Red,
             Path::new("/tmp/green-ft"),
             &classification,
         );
-        assert_eq!(adjusted, Duration::from_secs(30 * 60));
+        assert_eq!(adjusted, Duration::from_mins(30));
     }
 
     #[test]
@@ -3538,7 +3541,7 @@ mod tests {
             structural_confidence: 0.70,
             combined_confidence: 0.84,
         };
-        let base_age = Duration::from_secs(120);
+        let base_age = Duration::from_mins(2);
 
         let low_pressure = adjusted_candidate_age(
             base_age,
@@ -3569,13 +3572,13 @@ mod tests {
             combined_confidence: 0.60,
         };
         let adjusted = adjusted_candidate_age(
-            Duration::from_secs(5 * 60),
+            Duration::from_mins(5),
             30,
             PressureLevel::Red,
             Path::new("/tmp/random-agent-build-cache"),
             &classification,
         );
-        assert_eq!(adjusted, Duration::from_secs(30 * 60));
+        assert_eq!(adjusted, Duration::from_mins(30));
     }
 
     #[test]
@@ -3614,7 +3617,7 @@ mod tests {
             structural_confidence: 0.75,
             combined_confidence: 0.89,
         };
-        let age = Duration::from_secs(5 * 60);
+        let age = Duration::from_mins(5);
 
         let adjusted_node = adjusted_candidate_age(
             age,
@@ -3665,8 +3668,7 @@ mod tests {
 
     #[test]
     fn repeat_dampening_new_path_no_dampening() {
-        let tracker =
-            RepeatDeletionTracker::new(Duration::from_secs(300), Duration::from_secs(3600));
+        let tracker = RepeatDeletionTracker::new(Duration::from_mins(5), Duration::from_hours(1));
         let candidates = vec![test_candidate("/tmp/target/debug", 0.9)];
         let (approved, dampened) = tracker.filter_candidates(candidates, PressureLevel::Orange);
         assert_eq!(approved.len(), 1);
@@ -3676,7 +3678,7 @@ mod tests {
     #[test]
     fn repeat_dampening_within_cooldown_dampened() {
         let mut tracker =
-            RepeatDeletionTracker::new(Duration::from_secs(300), Duration::from_secs(3600));
+            RepeatDeletionTracker::new(Duration::from_mins(5), Duration::from_hours(1));
         let path = PathBuf::from("/tmp/target/debug");
         tracker.record_deletions(std::slice::from_ref(&path));
 
@@ -3690,7 +3692,7 @@ mod tests {
     fn repeat_dampening_after_cooldown_allowed() {
         let mut tracker = RepeatDeletionTracker::new(
             Duration::from_secs(0), // zero cooldown for test
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
         );
         let path = PathBuf::from("/tmp/target/debug");
         tracker.record_deletions(std::slice::from_ref(&path));
@@ -3705,7 +3707,7 @@ mod tests {
     #[test]
     fn repeat_dampening_exponential_backoff_growth() {
         let mut tracker =
-            RepeatDeletionTracker::new(Duration::from_secs(300), Duration::from_secs(3600));
+            RepeatDeletionTracker::new(Duration::from_mins(5), Duration::from_hours(1));
         let path = PathBuf::from("/tmp/target/debug");
 
         // 1st deletion: cycle_count becomes 1, cooldown = 300s
@@ -3728,7 +3730,7 @@ mod tests {
     #[test]
     fn repeat_dampening_max_cooldown_cap() {
         let mut tracker =
-            RepeatDeletionTracker::new(Duration::from_secs(300), Duration::from_secs(3600));
+            RepeatDeletionTracker::new(Duration::from_mins(5), Duration::from_hours(1));
         let path = PathBuf::from("/tmp/target/debug");
 
         // Record many deletions to push past max.
@@ -3739,7 +3741,7 @@ mod tests {
         let cooldown = tracker.cooldown_for(&path).expect("should have cooldown");
         // Cooldown should not exceed max_cooldown (3600s).
         assert!(
-            cooldown <= Duration::from_secs(3600),
+            cooldown <= Duration::from_hours(1),
             "cooldown {cooldown:?} should be <= 3600s"
         );
     }
@@ -3747,7 +3749,7 @@ mod tests {
     #[test]
     fn repeat_dampening_red_pressure_bypasses() {
         let mut tracker =
-            RepeatDeletionTracker::new(Duration::from_secs(300), Duration::from_secs(3600));
+            RepeatDeletionTracker::new(Duration::from_mins(5), Duration::from_hours(1));
         let path = PathBuf::from("/tmp/target/debug");
         tracker.record_deletions(std::slice::from_ref(&path));
 
@@ -3760,7 +3762,7 @@ mod tests {
     #[test]
     fn repeat_dampening_critical_pressure_bypasses() {
         let mut tracker =
-            RepeatDeletionTracker::new(Duration::from_secs(300), Duration::from_secs(3600));
+            RepeatDeletionTracker::new(Duration::from_mins(5), Duration::from_hours(1));
         let path = PathBuf::from("/tmp/target/debug");
         tracker.record_deletions(std::slice::from_ref(&path));
 
@@ -3773,7 +3775,7 @@ mod tests {
     #[test]
     fn repeat_dampening_mixed_paths() {
         let mut tracker =
-            RepeatDeletionTracker::new(Duration::from_secs(300), Duration::from_secs(3600));
+            RepeatDeletionTracker::new(Duration::from_mins(5), Duration::from_hours(1));
         // Only record deletion for one path.
         tracker.record_deletions(&[PathBuf::from("/tmp/target/debug")]);
 
@@ -3791,7 +3793,7 @@ mod tests {
     #[test]
     fn repeat_dampening_prune_removes_expired() {
         let mut tracker = RepeatDeletionTracker::new(
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             Duration::from_secs(0), // max_cooldown=0 so everything is instantly expired
         );
         tracker.record_deletions(&[PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]);
@@ -3806,7 +3808,7 @@ mod tests {
     #[test]
     fn repeat_dampening_cycle_count_increments() {
         let mut tracker =
-            RepeatDeletionTracker::new(Duration::from_secs(300), Duration::from_secs(3600));
+            RepeatDeletionTracker::new(Duration::from_mins(5), Duration::from_hours(1));
         let path = PathBuf::from("/tmp/target/debug");
 
         tracker.record_deletions(std::slice::from_ref(&path));

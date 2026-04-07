@@ -646,7 +646,7 @@ mod tests {
                 combined_confidence: 0.92,
             },
             size_bytes: 3_500_000_000,
-            age: Duration::from_secs(5 * 3600),
+            age: Duration::from_hours(5),
             decision: DecisionOutcome {
                 action: DecisionAction::Delete,
                 posterior_abandoned: 0.87,
@@ -730,7 +730,7 @@ mod tests {
                 combined_confidence: 0.25,
             },
             size_bytes: 1024,
-            age: Duration::from_secs(3600),
+            age: Duration::from_hours(1),
             decision: DecisionOutcome {
                 action: DecisionAction::Keep,
                 posterior_abandoned: 0.0,
@@ -1051,7 +1051,7 @@ mod tests {
         let input = CandidateInput {
             path: PathBuf::from("/tmp/cargo-target-test"),
             size_bytes: 2_000_000_000,
-            age: Duration::from_secs(4 * 3600),
+            age: Duration::from_hours(4),
             classification: ArtifactClassification {
                 pattern_name: "cargo-target-*".into(),
                 category: ArtifactCategory::RustTarget,

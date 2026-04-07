@@ -18,13 +18,13 @@ use crate::logger::sqlite::SqliteLogger;
 
 /// The standard time windows used for aggregation.
 pub const STANDARD_WINDOWS: &[Duration] = &[
-    Duration::from_secs(10 * 60),          // 10 minutes
-    Duration::from_secs(30 * 60),          // 30 minutes
-    Duration::from_secs(60 * 60),          // 1 hour
-    Duration::from_secs(6 * 60 * 60),      // 6 hours
-    Duration::from_secs(24 * 60 * 60),     // 24 hours
-    Duration::from_secs(3 * 24 * 60 * 60), // 3 days
-    Duration::from_secs(7 * 24 * 60 * 60), // 7 days
+    Duration::from_mins(10),   // 10 minutes
+    Duration::from_mins(30),   // 30 minutes
+    Duration::from_hours(1),   // 1 hour
+    Duration::from_hours(6),   // 6 hours
+    Duration::from_hours(24),  // 24 hours
+    Duration::from_hours(72),  // 3 days
+    Duration::from_hours(168), // 7 days
 ];
 
 // ──────────────────── stat types ────────────────────
@@ -238,7 +238,7 @@ impl<'a> StatsEngine<'a> {
             .query_map(params![since, limit], |row| {
                 Ok(DeletionDetail {
                     path: row.get(0)?,
-                    size_bytes: row.get::<_, i64>(1).map(|v| v as u64).unwrap_or(0),
+                    size_bytes: row.get::<_, i64>(1).map_or(0, |v| v as u64),
                     score: row.get::<_, f64>(2).unwrap_or(0.0),
                     timestamp: row.get(3)?,
                 })
@@ -340,7 +340,7 @@ impl<'a> StatsEngine<'a> {
                 |row| {
                     Ok(PathInfo {
                         path: row.get(0)?,
-                        size_bytes: row.get::<_, i64>(1).map(|v| v as u64).unwrap_or(0),
+                        size_bytes: row.get::<_, i64>(1).map_or(0, |v| v as u64),
                     })
                 },
             )
@@ -659,7 +659,7 @@ mod tests {
         .unwrap();
 
         let engine = StatsEngine::new(&db);
-        let ws = engine.window_stats(Duration::from_secs(10 * 60)).unwrap();
+        let ws = engine.window_stats(Duration::from_mins(10)).unwrap();
 
         assert_eq!(ws.deletions.count, 5);
         assert_eq!(ws.deletions.total_bytes_freed, 15_000_000);
@@ -714,7 +714,7 @@ mod tests {
         .unwrap();
 
         let engine = StatsEngine::new(&db);
-        let ws = engine.window_stats(Duration::from_secs(60 * 60)).unwrap();
+        let ws = engine.window_stats(Duration::from_hours(1)).unwrap();
 
         assert_eq!(ws.ballast.files_released, 1);
         assert_eq!(ws.ballast.current_inventory, 2);
@@ -746,7 +746,7 @@ mod tests {
         }
 
         let engine = StatsEngine::new(&db);
-        let ws = engine.window_stats(Duration::from_secs(10 * 60)).unwrap();
+        let ws = engine.window_stats(Duration::from_mins(10)).unwrap();
 
         // 2 transitions: green->orange, orange->green.
         assert_eq!(ws.pressure.transitions, 2);
@@ -795,9 +795,7 @@ mod tests {
         }
 
         let engine = StatsEngine::new(&db);
-        let patterns = engine
-            .top_patterns(3, Duration::from_secs(60 * 60))
-            .unwrap();
+        let patterns = engine.top_patterns(3, Duration::from_hours(1)).unwrap();
 
         assert_eq!(patterns.len(), 3);
         assert_eq!(patterns[0].pattern, ".target*");
@@ -832,9 +830,7 @@ mod tests {
         }
 
         let engine = StatsEngine::new(&db);
-        let top = engine
-            .top_deletions(3, Duration::from_secs(60 * 60))
-            .unwrap();
+        let top = engine.top_deletions(3, Duration::from_hours(1)).unwrap();
 
         assert_eq!(top.len(), 3);
         assert_eq!(top[0].size_bytes, 5_000_000);
@@ -860,13 +856,13 @@ mod tests {
 
     #[test]
     fn window_label_formatting() {
-        assert_eq!(window_label(Duration::from_secs(600)), "10 min");
-        assert_eq!(window_label(Duration::from_secs(1800)), "30 min");
-        assert_eq!(window_label(Duration::from_secs(3600)), "1 hour");
-        assert_eq!(window_label(Duration::from_secs(21600)), "6 hours");
-        assert_eq!(window_label(Duration::from_secs(86400)), "1 day");
-        assert_eq!(window_label(Duration::from_secs(259_200)), "3 days");
-        assert_eq!(window_label(Duration::from_secs(604_800)), "7 days");
+        assert_eq!(window_label(Duration::from_mins(10)), "10 min");
+        assert_eq!(window_label(Duration::from_mins(30)), "30 min");
+        assert_eq!(window_label(Duration::from_hours(1)), "1 hour");
+        assert_eq!(window_label(Duration::from_hours(6)), "6 hours");
+        assert_eq!(window_label(Duration::from_hours(24)), "1 day");
+        assert_eq!(window_label(Duration::from_hours(72)), "3 days");
+        assert_eq!(window_label(Duration::from_hours(168)), "7 days");
     }
 
     #[test]

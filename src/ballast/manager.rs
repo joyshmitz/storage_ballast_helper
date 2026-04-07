@@ -250,9 +250,8 @@ impl BallastManager {
             match self.create_ballast_file(index) {
                 Ok(()) => {
                     report.files_created += 1;
-                    let actual_size = fs::metadata(&path)
-                        .map(|m| m.len())
-                        .unwrap_or(self.config.file_size_bytes);
+                    let actual_size =
+                        fs::metadata(&path).map_or(self.config.file_size_bytes, |m| m.len());
                     report.total_bytes += actual_size;
                 }
                 Err(e) => {
@@ -282,7 +281,7 @@ impl BallastManager {
 
         for &index in available.iter().take(count) {
             let path = self.file_path(index);
-            let actual_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let actual_size = fs::metadata(&path).map_or(0, |m| m.len());
             match fs::remove_file(&path) {
                 Ok(()) => {
                     report.files_released += 1;
@@ -388,9 +387,8 @@ impl BallastManager {
             match self.create_ballast_file(index) {
                 Ok(()) => {
                     report.files_created += 1;
-                    let actual_size = fs::metadata(&path)
-                        .map(|m| m.len())
-                        .unwrap_or(self.config.file_size_bytes);
+                    let actual_size =
+                        fs::metadata(&path).map_or(self.config.file_size_bytes, |m| m.len());
                     report.total_bytes += actual_size;
                     // Only create one file per call.
                     break;
@@ -464,7 +462,7 @@ impl BallastManager {
             let path = self.file_path(index);
             if path.exists() {
                 let integrity_ok = self.verify_single_file(&path, index).is_ok();
-                let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let size = fs::metadata(&path).map_or(0, |m| m.len());
                 let created_at = fs::metadata(&path)
                     .ok()
                     .and_then(|m| m.created().ok())

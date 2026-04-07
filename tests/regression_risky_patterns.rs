@@ -36,7 +36,7 @@ mod tests {
         let input = CandidateInput {
             path,
             size_bytes: 4096,
-            age: Duration::from_secs(24 * 3600), // Old
+            age: Duration::from_hours(24), // Old
             classification,
             signals,
             is_open: false,
@@ -71,7 +71,7 @@ mod tests {
         let input = CandidateInput {
             path,
             size_bytes: 4096,
-            age: Duration::from_secs(24 * 3600),
+            age: Duration::from_hours(24),
             classification,
             signals,
             is_open: false,

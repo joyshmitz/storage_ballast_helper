@@ -256,7 +256,7 @@ impl MerkleScanIndex {
             .map(|e| (&e.path, e.path.components().count().saturating_sub(1)))
             .collect();
         // Process deepest first so children are hashed before parents.
-        entries_by_depth.sort_by(|a, b| b.1.cmp(&a.1));
+        entries_by_depth.sort_by_key(|e| std::cmp::Reverse(e.1));
 
         for (path, depth) in entries_by_depth {
             let metadata_hash = self

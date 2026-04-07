@@ -511,7 +511,7 @@ fn epistemic_uncertainty(posterior_abandoned: f64, calibration: f64) -> f64 {
     // - `calibration_penalty`: Adds uncertainty if the model is known to be poorly calibrated.
     // - Mix: 65% entropy, 35% calibration penalty.
     let p = posterior_abandoned.clamp(1e-6, 1.0 - 1e-6);
-    let entropy = -(p * p.ln() + (1.0 - p) * (1.0 - p).ln()) / std::f64::consts::LN_2;
+    let entropy = -(1.0 - p).mul_add((1.0 - p).ln(), p * p.ln()) / std::f64::consts::LN_2;
     let calibration_penalty = 1.0 - calibration.clamp(0.0, 1.0);
     0.65f64
         .mul_add(entropy, 0.35 * calibration_penalty)
@@ -689,7 +689,7 @@ mod tests {
             &CandidateInput {
                 path: PathBuf::from("/data/projects/repo/.git/objects"),
                 size_bytes: 1024,
-                age: Duration::from_secs(3600),
+                age: Duration::from_hours(1),
                 classification: classification(0.9, ArtifactCategory::RustTarget),
                 signals: StructuralSignals::default(),
                 is_open: false,
@@ -718,7 +718,7 @@ mod tests {
                 &CandidateInput {
                     path: PathBuf::from(system_dir),
                     size_bytes: 1_073_741_824,
-                    age: Duration::from_secs(6 * 3600),
+                    age: Duration::from_hours(6),
                     classification: classification(0.95, ArtifactCategory::RustTarget),
                     signals: StructuralSignals::default(),
                     is_open: false,
@@ -740,7 +740,7 @@ mod tests {
             &CandidateInput {
                 path: PathBuf::from("/var/tmp"),
                 size_bytes: 4096,
-                age: Duration::from_secs(24 * 3600 * 30), // Old
+                age: Duration::from_hours(720), // Old
                 classification: classification(0.0, ArtifactCategory::Unknown), // No pattern
                 signals: StructuralSignals::default(),
                 is_open: false,
@@ -766,7 +766,7 @@ mod tests {
                 &CandidateInput {
                     path: PathBuf::from(user_dir),
                     size_bytes: 1_073_741_824,
-                    age: Duration::from_secs(6 * 3600),
+                    age: Duration::from_hours(6),
                     classification: classification(0.95, ArtifactCategory::RustTarget),
                     signals: StructuralSignals::default(),
                     is_open: false,
@@ -788,7 +788,7 @@ mod tests {
             &CandidateInput {
                 path: PathBuf::from("/tmp/cargo-target-quietwillow"),
                 size_bytes: 5 * 1_073_741_824,
-                age: Duration::from_secs(6 * 3600),
+                age: Duration::from_hours(6),
                 classification: classification(0.95, ArtifactCategory::RustTarget),
                 signals: StructuralSignals {
                     has_incremental: true,
@@ -821,7 +821,7 @@ mod tests {
         let input = CandidateInput {
             path: PathBuf::from("/tmp/cargo-target-same"),
             size_bytes: 2 * 1_073_741_824,
-            age: Duration::from_secs(5 * 3600),
+            age: Duration::from_hours(5),
             classification: classification(0.9, ArtifactCategory::RustTarget),
             signals: StructuralSignals {
                 has_incremental: true,
@@ -848,7 +848,7 @@ mod tests {
         let input = CandidateInput {
             path: PathBuf::from("/tmp/cargo-target-pressure"),
             size_bytes: 1_073_741_824,
-            age: Duration::from_secs(4 * 3600),
+            age: Duration::from_hours(4),
             classification: classification(0.9, ArtifactCategory::RustTarget),
             signals: StructuralSignals {
                 has_incremental: true,
@@ -946,7 +946,7 @@ mod tests {
         let input = CandidateInput {
             path: PathBuf::from("/data/projects/myapp/target"),
             size_bytes: 2 * 1_073_741_824,
-            age: Duration::from_secs(4 * 3600),
+            age: Duration::from_hours(4),
             classification: classification(0.85, ArtifactCategory::RustTarget),
             signals: StructuralSignals {
                 has_incremental: true,

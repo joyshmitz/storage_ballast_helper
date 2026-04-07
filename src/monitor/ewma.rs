@@ -197,7 +197,7 @@ impl DiskRateEstimator {
         // Damp alpha during bursts: high burstiness → lower alpha → stickier EWMA.
         // burstiness=0 (steady): alpha=base_alpha (~0.30).
         // burstiness=5 (burst):  alpha≈base_alpha/11 → clamped to min_alpha (~0.10).
-        let damping = 1.0 / (1.0 + 2.0 * burstiness);
+        let damping = 1.0 / 2.0f64.mul_add(burstiness, 1.0);
         let alpha = (self.base_alpha * damping).clamp(self.min_alpha, self.max_alpha);
 
         // Compute residual BEFORE updating ewma_rate so it measures
@@ -287,8 +287,13 @@ impl DiskRateEstimator {
         let residual_term = 1.0 / (1.0 + self.residual_ewma / (self.ewma_rate.abs() + 1.0));
         // Prediction stability: 1.0 when predictions are consistent, drops toward
         // 0.0 when predictions swing wildly between ticks (e.g. 47m → 2m).
-        let stability_term = 1.0 / (1.0 + 3.0 * self.prediction_jitter_ewma);
-        (0.5 * sample_term + 0.2 * residual_term + 0.3 * stability_term).clamp(0.0, 1.0)
+        let stability_term = 1.0 / 3.0f64.mul_add(self.prediction_jitter_ewma, 1.0);
+        0.3f64
+            .mul_add(
+                stability_term,
+                0.2f64.mul_add(residual_term, 0.5 * sample_term),
+            )
+            .clamp(0.0, 1.0)
     }
 
     fn fallback_estimate(&self, free_bytes: u64, threshold_free_bytes: u64) -> RateEstimate {
@@ -326,7 +331,7 @@ impl DiskRateEstimator {
         // Compute median of absolute rates in history.
         let mut sorted: Vec<f64> = self.rate_history.iter().map(|r| r.abs()).collect();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median_rate = if sorted.len() % 2 == 0 {
+        let median_rate = if sorted.len().is_multiple_of(2) {
             let mid = sorted.len() / 2;
             f64::midpoint(sorted[mid - 1], sorted[mid])
         } else {
@@ -338,7 +343,7 @@ impl DiskRateEstimator {
         // does not inflate MAD because it only affects one deviation from the median.
         let mut deviations: Vec<f64> = sorted.iter().map(|r| (r - median_rate).abs()).collect();
         deviations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let mad_raw = if deviations.len() % 2 == 0 {
+        let mad_raw = if deviations.len().is_multiple_of(2) {
             let mid = deviations.len() / 2;
             f64::midpoint(deviations[mid - 1], deviations[mid])
         } else {
@@ -347,7 +352,7 @@ impl DiskRateEstimator {
         // 1.4826 is the consistency factor for the normal distribution:
         // MAD * 1.4826 ≈ standard deviation when data is Gaussian.
         let mad_rate = mad_raw * 1.4826;
-        let robust_upper_bound = median_rate + 3.0 * mad_rate;
+        let robust_upper_bound = 3.0f64.mul_add(mad_rate, median_rate);
 
         // Count consecutive recent samples above 3× median.
         // Guard: when median_rate is negligible (< 0.33 bytes/sec), threshold is
@@ -374,7 +379,7 @@ impl DiskRateEstimator {
         let magnitude_weight = (deviation_factor / 10.0).clamp(0.0, 1.0);
         // 2. Duration: moderate bursts need sustained consecutive samples.
         //    1 sample → 0.2, 3 samples → 0.6, 5+ → 1.0.
-        let duration_weight = (self.burst_duration_samples as f64 / 5.0).min(1.0);
+        let duration_weight = (f64::from(self.burst_duration_samples) / 5.0).min(1.0);
         // Combined: either strong magnitude OR sustained duration triggers detection.
         let combined_weight = magnitude_weight.max(duration_weight);
         let burst_probability =
@@ -660,8 +665,7 @@ mod tests {
 
         // Now inject a massive burst: 500_000 bytes consumed in 30 seconds (50x spike).
         let burst_free = total_free - 41 * 100 - 500_000;
-        let burst_estimate =
-            estimator.update(burst_free, t0 + Duration::from_secs(42 * 30), threshold);
+        let burst_estimate = estimator.update(burst_free, t0 + Duration::from_mins(21), threshold);
 
         // The instantaneous burst rate is ~16667 bytes/sec, ~5000x the steady rate.
         // With alpha damping (alpha clamped low during bursts), the EWMA should
@@ -810,7 +814,7 @@ mod tests {
 
         // Inject a massive burst: 500_000 bytes consumed in 30 seconds.
         let burst_free = total_free - 41 * 100 - 500_000;
-        let burst = estimator.update(burst_free, t0 + Duration::from_secs(42 * 30), threshold);
+        let burst = estimator.update(burst_free, t0 + Duration::from_mins(21), threshold);
         // MAD should not be wildly inflated by a single outlier.
         // With 42 samples where 41 are ~3.33 and 1 is ~16667, the median barely
         // moves and the MAD barely moves (the outlier is just 1/42 of deviations).

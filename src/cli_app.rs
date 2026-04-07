@@ -1232,7 +1232,7 @@ fn run_stats(cli: &Cli, args: &StatsArgs) -> Result<(), CliError> {
 
     // Top patterns.
     if args.top_patterns > 0 {
-        let window = specific_window.unwrap_or(std::time::Duration::from_secs(24 * 3600));
+        let window = specific_window.unwrap_or(std::time::Duration::from_hours(24));
         let patterns = engine
             .top_patterns(args.top_patterns, window)
             .map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -1261,7 +1261,7 @@ fn run_stats(cli: &Cli, args: &StatsArgs) -> Result<(), CliError> {
 
     // Top deletions.
     if args.top_deletions > 0 {
-        let window = specific_window.unwrap_or(std::time::Duration::from_secs(24 * 3600));
+        let window = specific_window.unwrap_or(std::time::Duration::from_hours(24));
         let deletions = engine
             .top_deletions(args.top_deletions, window)
             .map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -1291,7 +1291,7 @@ fn run_stats(cli: &Cli, args: &StatsArgs) -> Result<(), CliError> {
 
     // Pressure history.
     if args.pressure_history {
-        let window = specific_window.unwrap_or(std::time::Duration::from_secs(24 * 3600));
+        let window = specific_window.unwrap_or(std::time::Duration::from_hours(24));
         let ws = engine
             .window_stats(window)
             .map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -1382,7 +1382,7 @@ fn run_stats_json(
 
     // Attach top_patterns if requested.
     if args.top_patterns > 0 {
-        let window = specific_window.unwrap_or(std::time::Duration::from_secs(24 * 3600));
+        let window = specific_window.unwrap_or(std::time::Duration::from_hours(24));
         let patterns = engine
             .top_patterns(args.top_patterns, window)
             .map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -1397,7 +1397,7 @@ fn run_stats_json(
 
     // Attach top_deletions if requested.
     if args.top_deletions > 0 {
-        let window = specific_window.unwrap_or(std::time::Duration::from_secs(24 * 3600));
+        let window = specific_window.unwrap_or(std::time::Duration::from_hours(24));
         let deletions = engine
             .top_deletions(args.top_deletions, window)
             .map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -1642,7 +1642,7 @@ fn run_blame(cli: &Cli, args: &BlameArgs) -> Result<(), CliError> {
 
     // Sort groups by total size descending.
     let mut sorted_groups: Vec<BlameGroup> = groups.into_values().collect();
-    sorted_groups.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+    sorted_groups.sort_by_key(|g| std::cmp::Reverse(g.total_bytes));
     sorted_groups.truncate(args.top);
 
     let total_dirs: usize = sorted_groups.iter().map(|g| g.build_dirs.len()).sum();
@@ -2559,16 +2559,13 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
             let ballast_dir = config.paths.ballast_dir.clone();
             #[allow(clippy::cast_precision_loss)]
             let free_check = move || -> f64 {
-                collector
-                    .collect(&ballast_dir)
-                    .map(|s| {
-                        if s.total_bytes == 0 {
-                            0.0
-                        } else {
-                            s.available_bytes as f64 / s.total_bytes as f64 * 100.0
-                        }
-                    })
-                    .unwrap_or(0.0)
+                collector.collect(&ballast_dir).map_or(0.0, |s| {
+                    if s.total_bytes == 0 {
+                        0.0
+                    } else {
+                        s.available_bytes as f64 / s.total_bytes as f64 * 100.0
+                    }
+                })
             };
             let report = manager
                 .provision(Some(&free_check))
@@ -2673,16 +2670,13 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
             let ballast_dir = config.paths.ballast_dir.clone();
             #[allow(clippy::cast_precision_loss)]
             let free_check = move || -> f64 {
-                collector
-                    .collect(&ballast_dir)
-                    .map(|s| {
-                        if s.total_bytes == 0 {
-                            0.0
-                        } else {
-                            s.available_bytes as f64 / s.total_bytes as f64 * 100.0
-                        }
-                    })
-                    .unwrap_or(0.0)
+                collector.collect(&ballast_dir).map_or(0.0, |s| {
+                    if s.total_bytes == 0 {
+                        0.0
+                    } else {
+                        s.available_bytes as f64 / s.total_bytes as f64 * 100.0
+                    }
+                })
             };
             let report = manager
                 .replenish(Some(&free_check))
@@ -2854,6 +2848,7 @@ impl std::fmt::Display for DashboardSelectionReason {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct DashboardRuntimeRequest {
     refresh_ms: u64,
     state_file: PathBuf,
@@ -3061,9 +3056,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
             .ok()
             .and_then(|db| {
                 let engine = StatsEngine::new(&db);
-                engine
-                    .window_stats(std::time::Duration::from_secs(3600))
-                    .ok()
+                engine.window_stats(std::time::Duration::from_hours(1)).ok()
             })
     } else {
         None
@@ -3073,7 +3066,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
     match output_mode(cli) {
         OutputMode::Human => {
             println!("Storage Ballast Helper v{version}");
-            println!("  Config: {}", config.paths.config_file.display(),);
+            println!("  Config: {}", config.paths.config_file.display());
             if daemon_running {
                 println!("  Daemon: running");
             } else {
@@ -3296,6 +3289,8 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
 }
 
 fn run_log(cli: &Cli, args: &LogArgs) -> Result<(), CliError> {
+    use io::{BufRead, Seek};
+
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
     let log_path = &config.paths.jsonl_log;
@@ -3307,16 +3302,14 @@ fn run_log(cli: &Cli, args: &LogArgs) -> Result<(), CliError> {
         )));
     }
 
-    if args.follow {
-        // Follow mode: tail the file then watch for new lines.
-        // Print the last `tail` lines first, then follow.
-        print_tail_lines(log_path, args.tail, args.r#type.as_deref())?;
+    // Always print the tail first, whether following or not.
+    print_tail_lines(log_path, args.tail, args.r#type.as_deref())?;
 
+    if args.follow {
+        // Follow mode: watch for new lines after the initial tail.
         let file = std::fs::File::open(log_path)
             .map_err(|e| CliError::Runtime(format!("failed to open log: {e}")))?;
         let mut reader = io::BufReader::new(file);
-
-        use io::{BufRead, Seek};
 
         // Seek to end.
         reader
@@ -3341,8 +3334,6 @@ fn run_log(cli: &Cli, args: &LogArgs) -> Result<(), CliError> {
                 }
             }
         }
-    } else {
-        print_tail_lines(log_path, args.tail, args.r#type.as_deref())?;
     }
 
     Ok(())
@@ -3373,11 +3364,11 @@ fn matches_type_filter(line: &str, type_filter: Option<&str>) -> bool {
     // Match against the "event" field in the JSONL line.
     // Common event types: "deletion", "scan_started", "scan_completed",
     // "pressure_changed", "error", "ballast_released", etc.
-    if let Ok(v) = serde_json::from_str::<Value>(line) {
-        if let Some(event) = v.get("event").and_then(|e| e.as_str()) {
-            let event_lower = event.to_lowercase();
-            return event_lower.contains(&filter_lower);
-        }
+    if let Ok(v) = serde_json::from_str::<Value>(line)
+        && let Some(event) = v.get("event").and_then(|e| e.as_str())
+    {
+        let event_lower = event.to_lowercase();
+        return event_lower.contains(&filter_lower);
     }
     // Fallback: substring match on the raw line.
     line.to_lowercase().contains(&filter_lower)
@@ -3385,32 +3376,31 @@ fn matches_type_filter(line: &str, type_filter: Option<&str>) -> bool {
 
 fn format_log_line(line: &str) -> String {
     // Try to parse as JSON and format nicely; fall back to raw output.
-    if let Ok(v) = serde_json::from_str::<Value>(line) {
-        let ts = v
-            .get("timestamp")
-            .or_else(|| v.get("ts"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("?");
-        let event = v.get("event").and_then(|e| e.as_str()).unwrap_or("?");
+    serde_json::from_str::<Value>(line).map_or_else(
+        |_| line.to_string(),
+        |v| {
+            let ts = v
+                .get("timestamp")
+                .or_else(|| v.get("ts"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("?");
+            let event = v.get("event").and_then(|e| e.as_str()).unwrap_or("?");
 
-        // Build a compact summary from common fields.
-        let mut detail = String::new();
-        if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
-            detail = msg.to_string();
-        } else if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
-            detail = path.to_string();
-        } else if let Some(mount) = v.get("mount").and_then(|m| m.as_str()) {
-            detail = mount.to_string();
-        }
+            // Build a compact summary from common fields.
+            let detail = v
+                .get("message")
+                .and_then(|m| m.as_str())
+                .or_else(|| v.get("path").and_then(|p| p.as_str()))
+                .or_else(|| v.get("mount").and_then(|m| m.as_str()))
+                .unwrap_or("");
 
-        if detail.is_empty() {
-            format!("{ts}  {event}")
-        } else {
-            format!("{ts}  {event:<20}  {detail}")
-        }
-    } else {
-        line.to_string()
-    }
+            if detail.is_empty() {
+                format!("{ts}  {event}")
+            } else {
+                format!("{ts}  {event:<20}  {detail}")
+            }
+        },
+    )
 }
 
 /// Cross-user daemon detection fallback: check systemd service and /proc.
@@ -4165,8 +4155,7 @@ fn build_pressure_check(
     Some(Box::new(move |path: &Path| {
         collector
             .collect(path)
-            .map(|stats| stats.free_pct() >= target)
-            .unwrap_or(false)
+            .is_ok_and(|stats| stats.free_pct() >= target)
     }))
 }
 
@@ -5974,7 +5963,7 @@ mod tests {
 
         let config = Config::default();
         let ws = WindowStats {
-            window: std::time::Duration::from_secs(86400),
+            window: std::time::Duration::from_hours(24),
             deletions: DeletionStats::default(),
             ballast: BallastStats {
                 files_released: 10,
@@ -6000,7 +5989,7 @@ mod tests {
 
         let config = Config::default();
         let ws = WindowStats {
-            window: std::time::Duration::from_secs(86400),
+            window: std::time::Duration::from_hours(24),
             deletions: DeletionStats::default(),
             ballast: BallastStats::default(),
             pressure: PressureStats {
@@ -6032,7 +6021,7 @@ mod tests {
         config.scanner.min_file_age_minutes = 15; // Low value to trigger recommendation.
 
         let ws = WindowStats {
-            window: std::time::Duration::from_secs(3600),
+            window: std::time::Duration::from_hours(1),
             deletions: DeletionStats {
                 count: 10,
                 total_bytes_freed: 1_000_000,

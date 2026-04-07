@@ -460,10 +460,10 @@ impl PolicyEngine {
         // Rate-limit observations to prevent the high-frequency pressure tick
         // loop (100ms at Critical, 250ms at Orange) from flooding the guard.
         if self.config.observe_min_interval_secs > 0 {
-            if let Some(last) = self.last_observe_time {
-                if last.elapsed() < Duration::from_secs(self.config.observe_min_interval_secs) {
-                    return;
-                }
+            if let Some(last) = self.last_observe_time
+                && last.elapsed() < Duration::from_secs(self.config.observe_min_interval_secs)
+            {
+                return;
             }
             self.last_observe_time = Some(Instant::now());
         }
@@ -643,7 +643,7 @@ impl PolicyEngine {
                         // active grace periods, flooding systemd journal.
                         if self
                             .last_suppression_log
-                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(300))
+                            .is_none_or(|t| t.elapsed() >= Duration::from_mins(5))
                         {
                             eprintln!(
                                 "[SBH-POLICY] suppressing fallback ({reason}) — \
@@ -666,7 +666,7 @@ impl PolicyEngine {
                     if self.started_at.elapsed() < startup_grace {
                         if self
                             .last_suppression_log
-                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(300))
+                            .is_none_or(|t| t.elapsed() >= Duration::from_mins(5))
                         {
                             eprintln!(
                                 "[SBH-POLICY] suppressing calibration breach fallback — \
@@ -785,21 +785,21 @@ impl PolicyEngine {
         //   on 3 production machines (vmi1156319/1227854/1149989 in v0.3.5-6).
         // At Orange: guard penalty × 0.10 (urgency high, strong candidates pass).
         // At Red/Critical: guard penalty = 0 (bypass guard, survival mode).
-        if self.pressure_level >= PressureLevel::Yellow {
-            if let Some(diag) = guard
-                && !diag.status.adaptive_allowed()
-            {
-                let penalty_scale = match self.pressure_level {
-                    PressureLevel::Green => 0.0, // unreachable due to outer if
-                    PressureLevel::Yellow => 0.25,
-                    PressureLevel::Orange => 0.10,
-                    PressureLevel::Red | PressureLevel::Critical => 0.0,
-                };
-                let penalized_delete_loss = candidate.decision.expected_loss_delete
-                    + self.config.guard_penalty * penalty_scale;
-                if penalized_delete_loss >= candidate.decision.expected_loss_keep {
-                    return DecisionAction::Keep;
-                }
+        if self.pressure_level >= PressureLevel::Yellow
+            && let Some(diag) = guard
+            && !diag.status.adaptive_allowed()
+        {
+            let penalty_scale = match self.pressure_level {
+                PressureLevel::Green | PressureLevel::Red | PressureLevel::Critical => 0.0,
+                PressureLevel::Yellow => 0.25,
+                PressureLevel::Orange => 0.10,
+            };
+            let penalized_delete_loss = self
+                .config
+                .guard_penalty
+                .mul_add(penalty_scale, candidate.decision.expected_loss_delete);
+            if penalized_delete_loss >= candidate.decision.expected_loss_keep {
+                return DecisionAction::Keep;
             }
         }
 
@@ -855,7 +855,9 @@ impl PolicyEngine {
     /// Expire the startup calibration grace period immediately.
     /// Used by tests to verify calibration breach behavior without waiting.
     pub fn bypass_startup_grace(&mut self) {
-        self.started_at = Instant::now() - Duration::from_secs(STARTUP_CALIBRATION_GRACE_SECS + 1);
+        self.started_at = Instant::now()
+            .checked_sub(Duration::from_secs(STARTUP_CALIBRATION_GRACE_SECS + 1))
+            .unwrap();
     }
 
     fn recover_from_fallback(&mut self) {
@@ -899,7 +901,7 @@ impl PolicyEngine {
     }
 
     fn rotate_canary_hour(&mut self) {
-        if self.canary_hour_start.elapsed() >= std::time::Duration::from_secs(3600) {
+        if self.canary_hour_start.elapsed() >= std::time::Duration::from_hours(1) {
             self.canary_deletes_this_hour = 0;
             self.canary_hour_start = Instant::now();
         }
@@ -977,7 +979,7 @@ mod tests {
                 combined_confidence: 0.92,
             },
             size_bytes: 3_000_000_000,
-            age: Duration::from_secs(5 * 3600),
+            age: Duration::from_hours(5),
             decision: DecisionOutcome {
                 action,
                 posterior_abandoned: 0.87,
@@ -1545,8 +1547,11 @@ mod tests {
         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
 
         // Fast-forward past min_fallback_secs.
-        engine.fallback_entered_at =
-            Some(Instant::now() - Duration::from_secs(engine.config.min_fallback_secs + 1));
+        engine.fallback_entered_at = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(engine.config.min_fallback_secs + 1))
+                .unwrap(),
+        );
 
         // Simulate enough "clean" windows during green pressure with Unknown guard.
         let unknown_guard = GuardDiagnostics {

@@ -615,7 +615,7 @@ mod tests {
             );
         }
 
-        let plan = s.schedule(now + Duration::from_secs(60));
+        let plan = s.schedule(now + Duration::from_mins(1));
         let exploration: Vec<_> = plan.paths.iter().filter(|e| e.is_exploration).collect();
         // With 50% exploration and budget=4, at least 2 should be exploration picks.
         assert!(
@@ -795,7 +795,7 @@ mod tests {
             );
         }
 
-        let plan = s.schedule(now + Duration::from_secs(60));
+        let plan = s.schedule(now + Duration::from_mins(1));
         let exploitation: Vec<_> = plan.paths.iter().filter(|e| !e.is_exploration).collect();
         if exploitation.len() >= 2 {
             // /clean should rank higher than /fp_heavy.

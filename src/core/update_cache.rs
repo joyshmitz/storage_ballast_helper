@@ -131,7 +131,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = UpdateMetadataCache::new(
             dir.path().join("update-metadata.json"),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         );
         let got = cache.load_fresh(ts(100)).expect("load should succeed");
         assert!(got.is_none());
@@ -142,7 +142,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = UpdateMetadataCache::new(
             dir.path().join("update-metadata.json"),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         );
         let entry = sample_entry(1_000);
         cache.store(&entry).expect("store should succeed");
@@ -191,7 +191,7 @@ mod tests {
             .join("nested")
             .join("cache")
             .join("update-metadata.json");
-        let cache = UpdateMetadataCache::new(cache_path.clone(), Duration::from_secs(60));
+        let cache = UpdateMetadataCache::new(cache_path.clone(), Duration::from_mins(1));
         cache
             .store(&sample_entry(123))
             .expect("store should create parent directories");
@@ -202,7 +202,7 @@ mod tests {
     fn clear_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("update-metadata.json");
-        let cache = UpdateMetadataCache::new(path.clone(), Duration::from_secs(60));
+        let cache = UpdateMetadataCache::new(path.clone(), Duration::from_mins(1));
         cache
             .store(&sample_entry(42))
             .expect("store should succeed");
@@ -217,7 +217,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("update-metadata.json");
         fs::write(&path, "{not-json").expect("write corrupt cache");
-        let cache = UpdateMetadataCache::new(path, Duration::from_secs(60));
+        let cache = UpdateMetadataCache::new(path, Duration::from_mins(1));
         let err = cache.load_fresh(ts(200)).expect_err("load should fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }

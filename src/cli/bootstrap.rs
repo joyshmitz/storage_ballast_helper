@@ -951,20 +951,19 @@ fn plan_actions(footprints: &[Footprint], opts: &MigrateOptions) -> Vec<Migratio
                     error: None,
                 });
             }
-            (FootprintKind::BackupFile, Some(MigrationReason::StaleBackupFile)) => {
+            (FootprintKind::BackupFile, Some(MigrationReason::StaleBackupFile))
                 if opts.cleanup_backups_older_than > 0
-                    && is_older_than(&fp.path, opts.cleanup_backups_older_than)
-                {
-                    actions.push(MigrationAction {
-                        kind: ActionKind::CleanupBackup,
-                        reason: MigrationReason::StaleBackupFile,
-                        target: fp.path.clone(),
-                        description: format!("remove stale backup {}", fp.path.display()),
-                        applied: false,
-                        backup_path: None,
-                        error: None,
-                    });
-                }
+                    && is_older_than(&fp.path, opts.cleanup_backups_older_than) =>
+            {
+                actions.push(MigrationAction {
+                    kind: ActionKind::CleanupBackup,
+                    reason: MigrationReason::StaleBackupFile,
+                    target: fp.path.clone(),
+                    description: format!("remove stale backup {}", fp.path.display()),
+                    applied: false,
+                    backup_path: None,
+                    error: None,
+                });
             }
             _ => {}
         }

@@ -213,6 +213,7 @@ impl DirectoryWalker {
 
 /// Worker thread function: pulls directories from work channel, processes them,
 /// sends results and new subdirectories back.
+#[allow(clippy::too_many_arguments)]
 fn walker_thread(
     work_rx: &channel::Receiver<WorkItem>,
     work_tx: &channel::Sender<WorkItem>,
@@ -341,7 +342,7 @@ fn process_directory(
         }
 
         // Keep the daemon heartbeat alive while iterating a huge directory.
-        if total_count % 256 == 0
+        if total_count.is_multiple_of(256)
             && let Some(hb) = heartbeat
         {
             hb();
@@ -411,9 +412,7 @@ fn process_directory(
         // Determine if we should recurse.
         // If following symlinks, we must stat to see if the target is a dir.
         let is_dir = if config.follow_symlinks && ft.is_symlink() {
-            metadata_for_path(&child_path, true)
-                .map(|m| m.is_dir())
-                .unwrap_or(false)
+            metadata_for_path(&child_path, true).is_ok_and(|m| m.is_dir())
         } else {
             ft.is_dir()
         };
@@ -1150,7 +1149,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
 
-        let dir_clone = dir.clone();
+        let dir_clone = dir;
         let start = Instant::now();
         let join = thread::spawn(move || {
             process_directory(

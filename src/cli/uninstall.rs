@@ -327,9 +327,7 @@ fn discover_profile_entries() -> Vec<PathBuf> {
         .map(|p| home.join(p))
         .filter(|p| {
             p.exists()
-                && fs::read_to_string(p)
-                    .map(|c| c.contains("sbh") && c.contains("PATH"))
-                    .unwrap_or(false)
+                && fs::read_to_string(p).is_ok_and(|c| c.contains("sbh") && c.contains("PATH"))
         })
         .collect()
 }
@@ -644,7 +642,7 @@ fn file_or_dir_size(path: &Path) -> u64 {
     if path.is_dir() {
         dir_size(path)
     } else {
-        fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+        fs::metadata(path).map_or(0, |m| m.len())
     }
 }
 
@@ -658,7 +656,7 @@ fn dir_size(path: &Path) -> u64 {
             if e.path().is_dir() {
                 dir_size(&e.path())
             } else {
-                e.metadata().map(|m| m.len()).unwrap_or(0)
+                e.metadata().map_or(0, |m| m.len())
             }
         })
         .sum()

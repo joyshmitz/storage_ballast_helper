@@ -245,7 +245,7 @@ impl AdaptiveGuard {
                 / (1.0 - self.config.max_rate_error))
                 .clamp(0.0, 1.0);
             // Scale: severity 0.0 → 30% of base penalty, severity 1.0 → 100%.
-            let scale = 0.3 + 0.7 * severity;
+            let scale = 0.7f64.mul_add(severity, 0.3);
             self.config.e_process_penalty.ln() * scale
         };
         self.e_process_log += lr;

@@ -145,7 +145,7 @@ impl AssetCache {
             let partial = self.partial_path(entry);
             if partial.exists() {
                 return CacheStatus::Partial {
-                    bytes_downloaded: fs::metadata(&partial).map(|m| m.len()).unwrap_or(0),
+                    bytes_downloaded: fs::metadata(&partial).map_or(0, |m| m.len()),
                 };
             }
             return CacheStatus::Missing;
@@ -270,7 +270,7 @@ fn dir_size(path: &Path) -> u64 {
             if e.path().is_dir() {
                 dir_size(&e.path())
             } else {
-                e.metadata().map(|m| m.len()).unwrap_or(0)
+                e.metadata().map_or(0, |m| m.len())
             }
         })
         .sum()

@@ -218,7 +218,7 @@ impl BackupStore {
         std::fs::copy(install_path, &dest)
             .map_err(|e| format!("failed to copy binary for backup: {e}"))?;
 
-        let binary_size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        let binary_size = std::fs::metadata(&dest).map_or(0, |m| m.len());
 
         let meta = serde_json::json!({
             "version": version,
@@ -290,9 +290,7 @@ impl BackupStore {
             }
 
             // Fallback: no valid metadata file.
-            let binary_size = std::fs::metadata(&binary_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let binary_size = std::fs::metadata(&binary_path).map_or(0, |m| m.len());
             entries.push(BackupSnapshot {
                 id: id.clone(),
                 version: "unknown".to_string(),
@@ -302,7 +300,7 @@ impl BackupStore {
             });
         }
 
-        entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
         entries
     }
 
@@ -1427,7 +1425,7 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
         let cache = UpdateMetadataCache::new(
             cache_dir.path().join("update-metadata.json"),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
         );
         let now = UNIX_EPOCH + Duration::from_secs(2_000);
         let cached = CachedUpdateMetadata {
@@ -1460,7 +1458,7 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
         let cache = UpdateMetadataCache::new(
             cache_dir.path().join("update-metadata.json"),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
         );
         let now = UNIX_EPOCH + Duration::from_secs(5_000);
         cache
@@ -1520,7 +1518,7 @@ mod tests {
             dry_run: false,
             max_backups: 5,
             metadata_cache_file: tmp.path().join("update-cache.json"),
-            metadata_cache_ttl: Duration::from_secs(60),
+            metadata_cache_ttl: Duration::from_mins(1),
             refresh_cache: false,
             notices_enabled: true,
             offline_bundle_manifest: Some(manifest_path),
@@ -1572,7 +1570,7 @@ mod tests {
             dry_run: false,
             max_backups: 5,
             metadata_cache_file: tmp.path().join("update-cache.json"),
-            metadata_cache_ttl: Duration::from_secs(60),
+            metadata_cache_ttl: Duration::from_mins(1),
             refresh_cache: false,
             notices_enabled: true,
             offline_bundle_manifest: Some(manifest_path),
@@ -1619,7 +1617,7 @@ mod tests {
             dry_run: false,
             max_backups: 5,
             metadata_cache_file: tmp.path().join("update-cache.json"),
-            metadata_cache_ttl: Duration::from_secs(60),
+            metadata_cache_ttl: Duration::from_mins(1),
             refresh_cache: false,
             notices_enabled: true,
             offline_bundle_manifest: Some(manifest_path),
@@ -1665,7 +1663,7 @@ mod tests {
             dry_run: false,
             max_backups: 5,
             metadata_cache_file: tmp.path().join("update-cache.json"),
-            metadata_cache_ttl: Duration::from_secs(60),
+            metadata_cache_ttl: Duration::from_mins(1),
             refresh_cache: false,
             notices_enabled: true,
             offline_bundle_manifest: Some(manifest_path),
@@ -1711,7 +1709,7 @@ mod tests {
             dry_run: true,
             max_backups: 5,
             metadata_cache_file: tmp.path().join("update-cache.json"),
-            metadata_cache_ttl: Duration::from_secs(60),
+            metadata_cache_ttl: Duration::from_mins(1),
             refresh_cache: true,
             notices_enabled: false,
             offline_bundle_manifest: Some(manifest_path),
@@ -1763,7 +1761,7 @@ mod tests {
             dry_run: false,
             max_backups: 5,
             metadata_cache_file: tmp.path().join("update-cache.json"),
-            metadata_cache_ttl: Duration::from_secs(60),
+            metadata_cache_ttl: Duration::from_mins(1),
             refresh_cache: false,
             notices_enabled: true,
             offline_bundle_manifest: Some(manifest_path),

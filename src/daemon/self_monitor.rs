@@ -797,7 +797,7 @@ mod tests {
         let hb = ThreadHeartbeat::new("test-thread");
 
         // Fresh heartbeat should be healthy.
-        let status = hb.status(Duration::from_secs(60));
+        let status = hb.status(Duration::from_mins(1));
         assert!(status.is_healthy());
         assert_eq!(status.name(), "test-thread");
 
@@ -816,7 +816,7 @@ mod tests {
         hb.beat();
 
         // Should still be healthy with reasonable threshold.
-        let status = hb.status(Duration::from_secs(60));
+        let status = hb.status(Duration::from_mins(1));
         assert!(status.is_healthy());
     }
 
@@ -841,7 +841,7 @@ mod tests {
 
         let health = monitor.health_snapshot(
             &[Arc::clone(&hb1), Arc::clone(&hb2)],
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             PressureLevel::Green,
         );
 
@@ -883,7 +883,7 @@ mod tests {
                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         );
 
-        let health = monitor.health_snapshot(&[], Duration::from_secs(60), PressureLevel::Green);
+        let health = monitor.health_snapshot(&[], Duration::from_mins(1), PressureLevel::Green);
         let elapsed = health
             .last_scan_at
             .expect("last_scan_at should parse")

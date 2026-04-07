@@ -515,7 +515,7 @@ fn open_append(path: &Path) -> Result<(File, u64)> {
         opts.open(path)
             .map_err(|source| SbhError::io(path, source))?
     };
-    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let size = file.metadata().map_or(0, |m| m.len());
     Ok((file, size))
 }
 

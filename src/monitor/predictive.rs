@@ -203,6 +203,7 @@ impl PredictiveActionPolicy {
 
     /// Evaluate with an explicit sample count for min_samples gating.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn evaluate_with_samples(
         &self,
         estimate: &RateEstimate,
@@ -276,7 +277,8 @@ impl PredictiveActionPolicy {
             }
 
             // Apply confidence penalty during bursts.
-            let effective_confidence = estimate.confidence * (1.0 - 0.3 * bs.burst_probability);
+            let effective_confidence =
+                estimate.confidence * 0.3f64.mul_add(-bs.burst_probability, 1.0);
 
             // Require higher confidence during bursts — use the configured burst
             // threshold, but never lower than the normal min_confidence.
@@ -322,10 +324,11 @@ impl PredictiveActionPolicy {
             //    Catches most false alarms from burst EWMA spikes.
             // 2. Extreme rate (>5%/min): require confidence proportional to severity.
             //    Catches remaining extreme cases even at lower free space.
-            if implied_rate_pct_per_min > 1.0 && current_free_pct > 40.0 {
-                if estimate.confidence < 0.90 {
-                    return PredictiveAction::Clear;
-                }
+            if implied_rate_pct_per_min > 1.0
+                && current_free_pct > 40.0
+                && estimate.confidence < 0.90
+            {
+                return PredictiveAction::Clear;
             }
             if implied_rate_pct_per_min > 5.0 {
                 let severity = ((implied_rate_pct_per_min - 5.0) / 10.0).clamp(0.0, 1.0);

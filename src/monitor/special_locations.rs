@@ -277,7 +277,7 @@ mod tests {
             path: PathBuf::from("/tmp"),
             kind: SpecialKind::Tmpfs,
             buffer_pct: 15,
-            scan_interval: Duration::from_secs(60),
+            scan_interval: Duration::from_mins(1),
             priority: 200,
         };
         assert!(loc.scan_due(None, Instant::now()));
@@ -292,7 +292,7 @@ mod tests {
             path: PathBuf::from("/tmp"),
             kind: SpecialKind::Tmpfs,
             buffer_pct: 15,
-            scan_interval: Duration::from_secs(60),
+            scan_interval: Duration::from_mins(1),
             priority: 200,
         };
         let now = Instant::now();

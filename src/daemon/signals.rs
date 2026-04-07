@@ -364,7 +364,7 @@ mod tests {
     fn watchdog_respects_interval() {
         // Construct directly with enabled=true — no env var mutation needed.
         let mut wd = WatchdogHeartbeat {
-            interval: Duration::from_secs(60),
+            interval: Duration::from_mins(1),
             last_beat: Instant::now(),
             enabled: true,
             socket_path: Some("/tmp/test.sock".to_string()),

@@ -45,6 +45,10 @@ jobs:
             archive: tar.xz
     steps:
       - uses: actions/checkout@v4
+      - name: Strip local-only TUI path deps
+        run: |
+          sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
+          sed -i '/^tui = \["dep:ftui/d' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

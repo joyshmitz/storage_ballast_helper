@@ -335,7 +335,7 @@ fn render_frame(
         SetForegroundColor(Color::Cyan),
         SetAttribute(Attribute::Bold),
     )?;
-    write!(stdout, "┌─{header}{:─<pad$}{right}─┐", "", pad = pad,)?;
+    write!(stdout, "┌─{header}{:─<pad$}{right}─┐", "", pad = pad)?;
     queue!(stdout, SetAttribute(Attribute::Reset))?;
     row += 1;
 

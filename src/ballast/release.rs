@@ -54,7 +54,7 @@ impl BallastReleaseController {
         Self {
             states: HashMap::new(),
             replenish_cooldown: Duration::from_secs(replenish_cooldown_minutes * 60),
-            replenish_interval: Duration::from_secs(5 * 60), // 5 min between files
+            replenish_interval: Duration::from_mins(5), // 5 min between files
         }
     }
 
@@ -273,7 +273,7 @@ mod tests {
 
     fn one_hour_ago() -> Instant {
         Instant::now()
-            .checked_sub(Duration::from_secs(3_600))
+            .checked_sub(Duration::from_hours(1))
             .expect("current instant must support one-hour subtraction in tests")
     }
 

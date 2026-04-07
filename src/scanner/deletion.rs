@@ -490,7 +490,7 @@ mod tests {
                 combined_confidence: 0.92,
             },
             size_bytes: size,
-            age: Duration::from_secs(3600),
+            age: Duration::from_hours(1),
             decision: DecisionOutcome {
                 action: DecisionAction::Delete,
                 posterior_abandoned: 0.92,

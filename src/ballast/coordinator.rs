@@ -278,8 +278,7 @@ impl BallastPoolCoordinator {
             let free_check = move || -> f64 {
                 platform_ref
                     .fs_stats(&mount_path_clone)
-                    .map(|s| s.free_pct())
-                    .unwrap_or(0.0)
+                    .map_or(0.0, |s| s.free_pct())
             };
 
             if free_pct < 20.0 {
