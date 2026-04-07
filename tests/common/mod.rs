@@ -128,6 +128,7 @@ pub use storage_ballast_helper::tui::e2e_artifact;
 ///
 /// Automatically populates trace ID, captured output, exit code, and status.
 /// Tag with `"cli"` for CLI-spawned tests.
+#[cfg(feature = "tui")]
 pub fn cmd_result_to_artifact(name: &str, result: &CmdResult) -> e2e_artifact::TestCaseArtifact {
     let status = if result.status.success() {
         e2e_artifact::CaseStatus::Pass
