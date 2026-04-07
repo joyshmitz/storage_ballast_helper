@@ -26,6 +26,7 @@ jobs:
           # ftui crates use /dp/frankentui/ paths unavailable in CI; strip them
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i '/^tui = \["dep:ftui/d' Cargo.toml
+          sed -i 's/, "tui"//g' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -45,6 +46,7 @@ jobs:
         run: |
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i '/^tui = \["dep:ftui/d' Cargo.toml
+          sed -i 's/, "tui"//g' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run unit tests
@@ -71,6 +73,7 @@ jobs:
         run: |
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i '/^tui = \["dep:ftui/d' Cargo.toml
+          sed -i 's/, "tui"//g' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run integration tests
@@ -93,6 +96,7 @@ jobs:
         run: |
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i '/^tui = \["dep:ftui/d' Cargo.toml
+          sed -i 's/, "tui"//g' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run proof harness
@@ -119,6 +123,7 @@ jobs:
         run: |
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i '/^tui = \["dep:ftui/d' Cargo.toml
+          sed -i 's/, "tui"//g' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # TUI tests skipped — tui feature requires local-path frankentui crates
@@ -147,6 +152,7 @@ jobs:
         run: |
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i '/^tui = \["dep:ftui/d' Cargo.toml
+          sed -i 's/, "tui"//g' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
@@ -178,6 +184,7 @@ jobs:
         run: |
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i '/^tui = \["dep:ftui/d' Cargo.toml
+          sed -i 's/, "tui"//g' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run stress tests
@@ -200,6 +207,7 @@ jobs:
         run: |
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i '/^tui = \["dep:ftui/d' Cargo.toml
+          sed -i 's/, "tui"//g' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run artifact contract tests
@@ -231,6 +239,7 @@ jobs:
         run: |
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i '/^tui = \["dep:ftui/d' Cargo.toml
+          sed -i 's/, "tui"//g' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
       - name: Collect provenance
         run: |
