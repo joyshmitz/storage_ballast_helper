@@ -48,8 +48,9 @@ jobs:
       - name: Strip local-only TUI path deps
         run: |
           # ftui crates use /dp/frankentui/ paths unavailable in CI
-          sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
+          # Use perl for cross-platform compat (macOS sed -i requires different syntax)
+          perl -i -ne 'print unless /^ftui.*=.*\{.*path.*=.*"\/dp\//' Cargo.toml
+          perl -i -pe 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
