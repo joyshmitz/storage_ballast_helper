@@ -661,7 +661,8 @@ mod tests {
             t0 + Duration::from_secs(41 * 30),
             threshold,
         );
-        let _steady_rate = steady_estimate.bytes_per_second;
+        // Verify steady state was computed (used as baseline for burst comparison below).
+        assert!(steady_estimate.bytes_per_second.abs() < 100.0);
 
         // Now inject a massive burst: 500_000 bytes consumed in 30 seconds (50x spike).
         let burst_free = total_free - 41 * 100 - 500_000;

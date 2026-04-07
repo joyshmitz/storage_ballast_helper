@@ -24,9 +24,9 @@ jobs:
       - name: Strip local-only TUI path deps
         run: |
           # ftui crates use /dp/frankentui/ paths unavailable in CI; strip them
+          # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i '/^tui = \["dep:ftui/d' Cargo.toml
-          sed -i 's/, "tui"//g' Cargo.toml
+          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -44,9 +44,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Strip local-only TUI path deps
         run: |
+          # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i '/^tui = \["dep:ftui/d' Cargo.toml
-          sed -i 's/, "tui"//g' Cargo.toml
+          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run unit tests
@@ -71,9 +71,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Strip local-only TUI path deps
         run: |
+          # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i '/^tui = \["dep:ftui/d' Cargo.toml
-          sed -i 's/, "tui"//g' Cargo.toml
+          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run integration tests
@@ -94,9 +94,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Strip local-only TUI path deps
         run: |
+          # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i '/^tui = \["dep:ftui/d' Cargo.toml
-          sed -i 's/, "tui"//g' Cargo.toml
+          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run proof harness
@@ -121,9 +121,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Strip local-only TUI path deps
         run: |
+          # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i '/^tui = \["dep:ftui/d' Cargo.toml
-          sed -i 's/, "tui"//g' Cargo.toml
+          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # TUI tests skipped — tui feature requires local-path frankentui crates
@@ -150,9 +150,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Strip local-only TUI path deps
         run: |
+          # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i '/^tui = \["dep:ftui/d' Cargo.toml
-          sed -i 's/, "tui"//g' Cargo.toml
+          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
@@ -182,9 +182,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Strip local-only TUI path deps
         run: |
+          # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i '/^tui = \["dep:ftui/d' Cargo.toml
-          sed -i 's/, "tui"//g' Cargo.toml
+          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run stress tests
@@ -205,9 +205,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Strip local-only TUI path deps
         run: |
+          # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i '/^tui = \["dep:ftui/d' Cargo.toml
-          sed -i 's/, "tui"//g' Cargo.toml
+          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run artifact contract tests
@@ -237,9 +237,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Strip local-only TUI path deps
         run: |
+          # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i '/^tui = \["dep:ftui/d' Cargo.toml
-          sed -i 's/, "tui"//g' Cargo.toml
+          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
       - name: Collect provenance
         run: |
