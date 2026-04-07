@@ -766,7 +766,7 @@ main() {
       log_header "sbh installer (dry-run)"
       if [[ "$ASSET_FORMAT" == "none" ]]; then
         log_info "No pre-built binary found for ${TARGET_TRIPLE}"
-        log_info "Would fall back to: cargo install storage_ballast_helper"
+        log_info "Would fall back to: cargo install --git https://github.com/${REPO}.git"
       else
         log_info "Asset format: ${ASSET_FORMAT}"
         log_info "Would download: ${ASSET_URL}"
@@ -797,9 +797,9 @@ main() {
     if ! command -v cargo >/dev/null 2>&1; then
       die "No release binary for ${TARGET_TRIPLE} and cargo is not installed. Install Rust via https://rustup.rs and retry, or manually download from https://github.com/${REPO}/releases"
     fi
-    log_info "Running: cargo install storage_ballast_helper"
-    if ! cargo install storage_ballast_helper 2>&1; then
-      die "cargo install storage_ballast_helper failed"
+    log_info "Running: cargo install --git https://github.com/${REPO}.git"
+    if ! cargo install --git "https://github.com/${REPO}.git" 2>&1; then
+      die "cargo install from git (https://github.com/${REPO}.git) failed"
     fi
     finish_phase "built and installed via cargo"
     INSTALL_CHANGED=true
