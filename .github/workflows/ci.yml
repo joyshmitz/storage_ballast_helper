@@ -23,7 +23,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Strip local-only TUI path deps
         run: |
-          # ftui crates use /dp/frankentui/ paths unavailable in CI; strip them
           # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
