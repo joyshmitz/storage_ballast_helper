@@ -50,3 +50,4 @@ test_meminfo
 
 # Accidental shell output
 /test
+test_cast
