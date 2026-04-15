@@ -42,6 +42,7 @@ perf.data.*
 --graph-format.svg
 target-codex*/
 target_*/
+target-local/
 
 # Ephemeral files (agent-generated, build artifacts, test detritus)
 ci-artifacts/
