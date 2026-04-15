@@ -390,7 +390,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "ftui"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-a11y"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "ahash",
  "ftui-core",
@@ -410,7 +410,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-backend"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "ftui-core",
  "ftui-render",
@@ -418,11 +418,12 @@ dependencies = [
 
 [[package]]
 name = "ftui-core"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "ahash",
  "arc-swap",
  "bitflags",
+ "libc",
  "signal-hook 0.4.3",
  "unicode-display-width",
  "unicode-segmentation",
@@ -432,11 +433,11 @@ dependencies = [
 
 [[package]]
 name = "ftui-i18n"
-version = "0.2.1"
+version = "0.3.1"
 
 [[package]]
 name = "ftui-layout"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "ftui-core",
  "rustc-hash",
@@ -446,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-render"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "ahash",
  "bitflags",
@@ -460,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-runtime"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "arc-swap",
  "ftui-backend",
@@ -478,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-style"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -488,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-text"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -505,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-tty"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "ftui-backend",
  "ftui-core",
@@ -517,7 +518,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-widgets"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "ahash",
  "bitflags",

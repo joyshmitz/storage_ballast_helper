@@ -169,15 +169,24 @@ impl ArtifactPatternRegistry {
         }
 
         // Structural rescue path: name is ambiguous but layout screams "Rust target".
+        // Graduated confidence based on how many cargo-specific markers are present:
+        // only cargo build output directories have .fingerprint + deps + incremental +
+        // build together, so 3+ markers is definitive and warrants higher confidence.
         if best.category == ArtifactCategory::Unknown
             && (signals.has_fingerprint || (signals.has_incremental && signals.has_deps))
         {
+            let marker_count = u8::from(signals.has_fingerprint)
+                + u8::from(signals.has_incremental)
+                + u8::from(signals.has_deps)
+                + u8::from(signals.has_build);
+            let rescue_confidence = if marker_count >= 3 { 0.75 } else { 0.55 };
+
             best = ArtifactClassification {
                 pattern_name: Cow::Borrowed("structural-rust-target"),
                 category: ArtifactCategory::RustTarget,
-                name_confidence: 0.55,
+                name_confidence: rescue_confidence,
                 structural_confidence: 0.0,
-                combined_confidence: 0.55,
+                combined_confidence: rescue_confidence,
             };
         }
 
@@ -470,6 +479,12 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
             confidence: 0.92,
             category: ArtifactCategory::RustTarget,
         },
+        ArtifactPattern {
+            name: "dot-rch-target-hyphen",
+            kind: MatchKind::Prefix(".rch-target-"),
+            confidence: 0.92,
+            category: ArtifactCategory::RustTarget,
+        },
         // codex agent build artifacts.
         ArtifactPattern {
             name: "target-codex",
@@ -524,6 +539,7 @@ pub fn extract_pattern_label(path: &str) -> String {
     if lower.starts_with("rch_target_")
         || lower.starts_with(".rch_target_")
         || lower.starts_with("rch-target-")
+        || lower.starts_with(".rch-target-")
     {
         return "rch_target_*".to_string();
     }
@@ -626,6 +642,92 @@ mod tests {
             "score {} was not penalized enough",
             classification.combined_confidence
         );
+    }
+
+    #[test]
+    fn structural_rescue_with_few_markers_gets_base_confidence() {
+        let registry = ArtifactPatternRegistry::default();
+        // Only fingerprint present (1 marker) — should get base rescue confidence.
+        let classification = registry.classify(
+            Path::new("debug"),
+            StructuralSignals {
+                has_fingerprint: true,
+                ..StructuralSignals::default()
+            },
+        );
+        assert_eq!(classification.category, ArtifactCategory::RustTarget);
+        assert_eq!(classification.pattern_name, "structural-rust-target");
+        // combined = 0.70 * 0.55 + 0.30 * structural ≈ 0.68
+        assert!(
+            classification.combined_confidence < 0.72,
+            "few markers should yield moderate confidence, got {:.3}",
+            classification.combined_confidence
+        );
+    }
+
+    #[test]
+    fn structural_rescue_with_many_markers_gets_boosted_confidence() {
+        let registry = ArtifactPatternRegistry::default();
+        // Three cargo markers present — should get boosted rescue confidence.
+        let classification = registry.classify(
+            Path::new("debug"),
+            StructuralSignals {
+                has_fingerprint: true,
+                has_incremental: true,
+                has_deps: true,
+                ..StructuralSignals::default()
+            },
+        );
+        assert_eq!(classification.category, ArtifactCategory::RustTarget);
+        assert_eq!(classification.pattern_name, "structural-rust-target");
+        // combined = 0.70 * 0.75 + 0.30 * 0.98 ≈ 0.82
+        assert!(
+            classification.combined_confidence > 0.80,
+            "3+ markers should yield high confidence, got {:.3}",
+            classification.combined_confidence
+        );
+    }
+
+    #[test]
+    fn structural_rescue_with_all_markers_gets_boosted_confidence() {
+        let registry = ArtifactPatternRegistry::default();
+        // All four cargo markers — definitive evidence.
+        let classification = registry.classify(
+            Path::new("release"),
+            StructuralSignals {
+                has_fingerprint: true,
+                has_incremental: true,
+                has_deps: true,
+                has_build: true,
+                ..StructuralSignals::default()
+            },
+        );
+        assert_eq!(classification.category, ArtifactCategory::RustTarget);
+        assert!(
+            classification.combined_confidence > 0.80,
+            "all markers should yield high confidence, got {:.3}",
+            classification.combined_confidence
+        );
+    }
+
+    #[test]
+    fn structural_rescue_does_not_fire_without_markers() {
+        let registry = ArtifactPatternRegistry::default();
+        // A directory named "debug" with NO cargo markers — should NOT be rescued.
+        let classification =
+            registry.classify(Path::new("debug"), StructuralSignals::default());
+        assert_eq!(classification.category, ArtifactCategory::Unknown);
+    }
+
+    #[test]
+    fn dot_rch_target_hyphen_is_classified() {
+        let registry = ArtifactPatternRegistry::default();
+        let classification = registry.classify(
+            Path::new(".rch-target-quietwillow"),
+            StructuralSignals::default(),
+        );
+        assert_eq!(classification.category, ArtifactCategory::RustTarget);
+        assert!(classification.combined_confidence > 0.60);
     }
 
     #[test]
