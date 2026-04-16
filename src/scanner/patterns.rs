@@ -714,8 +714,7 @@ mod tests {
     fn structural_rescue_does_not_fire_without_markers() {
         let registry = ArtifactPatternRegistry::default();
         // A directory named "debug" with NO cargo markers — should NOT be rescued.
-        let classification =
-            registry.classify(Path::new("debug"), StructuralSignals::default());
+        let classification = registry.classify(Path::new("debug"), StructuralSignals::default());
         assert_eq!(classification.category, ArtifactCategory::Unknown);
     }
 
