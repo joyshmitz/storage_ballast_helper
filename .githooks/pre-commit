@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Pre-commit hook: run rustfmt check on staged Rust files.
+# Catches formatting issues before they reach CI.
+#
+# Install: git config core.hooksPath .githooks
+
+set -euo pipefail
+
+# Only check if there are staged .rs files
+if ! git diff --cached --name-only --diff-filter=ACM | grep -q '\.rs$'; then
+  exit 0
+fi
+
+# Run cargo fmt --check. If it fails, the commit is blocked with
+# a helpful message showing exactly what needs formatting.
+if ! cargo fmt --check 2>/dev/null; then
+  printf '\n\033[1;31mPre-commit: cargo fmt --check failed.\033[0m\n'
+  printf 'Run \033[1mcargo fmt\033[0m to fix, then re-stage and commit.\n\n'
+  exit 1
+fi

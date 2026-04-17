@@ -718,6 +718,108 @@ SKILL_EOF
   finish_phase "inline skill created (tarball unavailable)"
 }
 
+sync_system_service() {
+  # After installing the binary to the primary destination, check if a systemd
+  # service exists whose ExecStart points to a DIFFERENT path. If so, update
+  # that binary and restart the service so the running daemon picks up the new
+  # version. Handles the common case where `--user` installs to ~/.local/bin
+  # but the daemon runs from /usr/local/bin via a system unit.
+
+  [[ "$(uname -s)" == "Linux" ]] || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+
+  local target_path="${DEST_DIR}/${PROGRAM}"
+  local service_binary=""
+  local unit_scope=""
+
+  # Check system-level service
+  local sys_unit="/etc/systemd/system/sbh.service"
+  if [[ -f "$sys_unit" ]]; then
+    service_binary=$(grep '^ExecStart=' "$sys_unit" | head -1 | sed 's/^ExecStart=\([^ ]*\).*/\1/')
+    unit_scope="system"
+  fi
+
+  # Fallback: check user-level service
+  if [[ -z "$service_binary" ]]; then
+    local user_unit="${HOME}/.config/systemd/user/sbh.service"
+    if [[ -f "$user_unit" ]]; then
+      service_binary=$(grep '^ExecStart=' "$user_unit" | head -1 | sed 's/^ExecStart=\([^ ]*\).*/\1/')
+      unit_scope="user"
+    fi
+  fi
+
+  # No service found or can't determine binary path
+  [[ -n "$service_binary" ]] || return 0
+
+  # If the service already points to where we installed, nothing to sync
+  [[ "$service_binary" != "$target_path" ]] || return 0
+
+  # If the service binary is already identical, skip
+  if [[ -f "$service_binary" ]] && cmp -s "$target_path" "$service_binary" 2>/dev/null; then
+    return 0
+  fi
+
+  start_phase "sync_service" "syncing systemd service binary"
+  log_header "Syncing systemd service binary"
+  log_info "Service (${unit_scope}) ExecStart: ${service_binary}"
+  log_info "Installer installed to: ${target_path}"
+
+  if [[ "$unit_scope" == "system" ]]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+      log_warn "Cannot update ${service_binary} without sudo — restart the daemon manually"
+      finish_phase "skipped: sudo not available"
+      return 0
+    fi
+
+    local was_active=false
+    if systemctl is-active sbh.service >/dev/null 2>&1; then
+      was_active=true
+      log_info "Stopping sbh.service for binary update..."
+      sudo systemctl stop sbh.service 2>/dev/null || true
+    fi
+
+    if sudo install -m 0755 "$target_path" "$service_binary" 2>/dev/null; then
+      log_info "Updated ${service_binary}"
+    else
+      log_warn "Failed to update ${service_binary} — restart the daemon manually"
+      if $was_active; then
+        sudo systemctl start sbh.service 2>/dev/null || true
+      fi
+      finish_phase "failed to update service binary"
+      return 0
+    fi
+
+    if $was_active; then
+      log_info "Restarting sbh.service..."
+      if sudo systemctl start sbh.service 2>/dev/null; then
+        log_info "Service restarted with updated binary"
+      else
+        log_warn "Service restart failed — may need manual intervention"
+      fi
+    fi
+  else
+    # User-scope service — no sudo needed
+    local was_active=false
+    if systemctl --user is-active sbh.service >/dev/null 2>&1; then
+      was_active=true
+      systemctl --user stop sbh.service 2>/dev/null || true
+    fi
+
+    if install -m 0755 "$target_path" "$service_binary" 2>/dev/null; then
+      log_info "Updated ${service_binary}"
+    else
+      log_warn "Failed to update ${service_binary}"
+    fi
+
+    if $was_active; then
+      systemctl --user start sbh.service 2>/dev/null || true
+      log_info "User service restarted"
+    fi
+  fi
+
+  finish_phase "service binary synced and daemon restarted"
+}
+
 print_summary() {
   local message="$1"
   local changed="$2"
@@ -808,6 +910,7 @@ main() {
     DEST_DIR="$(dirname "$(command -v sbh 2>/dev/null || echo "${HOME}/.cargo/bin/sbh")")"
     ASSET_URL="(cargo install)"
     install_skill
+    sync_system_service
     print_summary "installed ${PROGRAM} via cargo to ${DEST_DIR}/${PROGRAM}" true
     emit_event "complete" "success" "installer completed via cargo install" 0
     return 0
@@ -907,6 +1010,7 @@ main() {
   fi
 
   install_skill
+  sync_system_service
 
   if [[ "$INSTALL_CHANGED" == "true" ]]; then
     print_summary "installed ${PROGRAM} to ${target_path}" true
