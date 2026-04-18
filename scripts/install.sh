@@ -735,7 +735,9 @@ sync_system_service() {
   # Check system-level service
   local sys_unit="/etc/systemd/system/sbh.service"
   if [[ -f "$sys_unit" ]]; then
-    service_binary=$(grep '^ExecStart=' "$sys_unit" | head -1 | sed 's/^ExecStart=\([^ ]*\).*/\1/')
+    # Strip ExecStart= prefix and optional - (systemd ignore-error marker),
+    # then take the first whitespace-delimited token (the binary path).
+    service_binary=$(grep '^ExecStart=' "$sys_unit" | head -1 | sed 's/^ExecStart=-\{0,1\}//' | awk '{print $1}')
     unit_scope="system"
   fi
 
@@ -743,7 +745,7 @@ sync_system_service() {
   if [[ -z "$service_binary" ]]; then
     local user_unit="${HOME}/.config/systemd/user/sbh.service"
     if [[ -f "$user_unit" ]]; then
-      service_binary=$(grep '^ExecStart=' "$user_unit" | head -1 | sed 's/^ExecStart=\([^ ]*\).*/\1/')
+      service_binary=$(grep '^ExecStart=' "$user_unit" | head -1 | sed 's/^ExecStart=-\{0,1\}//' | awk '{print $1}')
       unit_scope="user"
     fi
   fi
@@ -809,6 +811,11 @@ sync_system_service() {
       log_info "Updated ${service_binary}"
     else
       log_warn "Failed to update ${service_binary}"
+      if $was_active; then
+        systemctl --user start sbh.service 2>/dev/null || true
+      fi
+      finish_phase "failed to update user service binary"
+      return 0
     fi
 
     if $was_active; then
@@ -817,7 +824,7 @@ sync_system_service() {
     fi
   fi
 
-  finish_phase "service binary synced and daemon restarted"
+  finish_phase "service binary synced"
 }
 
 print_summary() {

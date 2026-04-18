@@ -13,7 +13,7 @@ fi
 
 # Run cargo fmt --check. If it fails, the commit is blocked with
 # a helpful message showing exactly what needs formatting.
-if ! cargo fmt --check 2>/dev/null; then
+if ! cargo fmt --check; then
   printf '\n\033[1;31mPre-commit: cargo fmt --check failed.\033[0m\n'
   printf 'Run \033[1mcargo fmt\033[0m to fix, then re-stage and commit.\n\n'
   exit 1
