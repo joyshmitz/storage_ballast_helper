@@ -574,7 +574,7 @@ install_skill() {
   fi
 
   # ── Fallback: create minimal inline skill ──────────────────────────────────
-  log_info "Skill tarball unavailable — creating inline skill"
+  log_info "Installing bundled inline skill"
 
   local skill_content
   skill_content=$(cat << 'SKILL_EOF'
@@ -715,7 +715,7 @@ SKILL_EOF
 
   log_info "Skill created: $claude_dest/SKILL.md"
   log_info "Skill created: $codex_dest/SKILL.md"
-  finish_phase "inline skill created (tarball unavailable)"
+  finish_phase "inline skill installed"
 }
 
 sync_system_service() {
