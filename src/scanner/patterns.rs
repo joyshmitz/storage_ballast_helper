@@ -499,6 +499,56 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
             confidence: 0.88,
             category: ArtifactCategory::CacheDir,
         },
+        // cass (Cross-Agent Session Search) bench/profile/scratch dirs.
+        // Observed in the wild filling /tmp with 100+ GB of `cass_*_target`
+        // (cargo target dirs), `cass_*_bench`, `cass_*_profile`, plus many
+        // small per-mode `cass_*.txt`/`.log` artifacts. Both underscore
+        // (canonical) and hyphen forms.
+        ArtifactPattern {
+            name: "cass-prefix-underscore",
+            kind: MatchKind::Prefix("cass_"),
+            confidence: 0.86,
+            category: ArtifactCategory::AgentWorkspace,
+        },
+        ArtifactPattern {
+            name: "cass-prefix-hyphen",
+            kind: MatchKind::Prefix("cass-"),
+            confidence: 0.86,
+            category: ArtifactCategory::AgentWorkspace,
+        },
+        // Underscore-`_target` cargo build dirs — a sibling shape to the
+        // existing `-target` suffix pattern. cass_*_target, pi_*_target,
+        // and similar agent-prefixed patterns produce these.
+        //
+        // Confidence intentionally above the cass-/frankentui- workspace
+        // prefixes (0.86, 0.90) so a name like `cass_append_baseline_target`
+        // — which matches BOTH `cass_` (workspace) and `_target` (RustTarget)
+        // — classifies as the more specific RustTarget. Both lead to the
+        // same cleanup outcome; the distinction matters for stats and for
+        // the structural-score boost RustTarget gets when cargo markers
+        // are present.
+        ArtifactPattern {
+            name: "underscore-target-suffix",
+            kind: MatchKind::Suffix("_target"),
+            confidence: 0.92,
+            category: ArtifactCategory::RustTarget,
+        },
+        // FrankenTUI (sibling project to FrankenTerm) — codex bead
+        // workspace dirs `frankentui-codex-bd-<id>-*`, profile/sweep
+        // outputs `frankentui_profile_*`. Observed in the wild at
+        // multiple GB per workspace.
+        ArtifactPattern {
+            name: "frankentui-prefix-hyphen",
+            kind: MatchKind::Prefix("frankentui-"),
+            confidence: 0.90,
+            category: ArtifactCategory::AgentWorkspace,
+        },
+        ArtifactPattern {
+            name: "frankentui-prefix-underscore",
+            kind: MatchKind::Prefix("frankentui_"),
+            confidence: 0.90,
+            category: ArtifactCategory::AgentWorkspace,
+        },
     ]
 }
 
@@ -563,6 +613,20 @@ pub fn extract_pattern_label(path: &str) -> String {
     }
     if lower.starts_with("claude-") {
         return "claude-*".to_string();
+    }
+    // `*_target` checked BEFORE `cass_*` so `cass_append_baseline_target`
+    // groups under the more-specific RustTarget label, not the generic
+    // cass workspace label. Mirrors the confidence ordering in
+    // `builtin_patterns()` (underscore-target-suffix at 0.92 above
+    // cass-prefix at 0.86).
+    if lower.ends_with("_target") {
+        return "*_target".to_string();
+    }
+    if lower.starts_with("cass_") || lower.starts_with("cass-") {
+        return "cass_*".to_string();
+    }
+    if lower.starts_with("frankentui-") || lower.starts_with("frankentui_") {
+        return "frankentui-*".to_string();
     }
     if lower == "node_modules" {
         return "node_modules/".to_string();
@@ -752,5 +816,131 @@ mod tests {
                 classification.combined_confidence
             );
         }
+    }
+
+    #[test]
+    fn cass_workspace_patterns_real_world_dirs() {
+        // Real /tmp dir names observed during a recent agent session that
+        // filled the tmpfs with 100+ GB of leftover cass dirs.
+        let registry = ArtifactPatternRegistry::default();
+        let cases = [
+            "cass_next_profile",          // 1.4 GB profile dir
+            "cass_batch20_bench",         // 4 GB cargo target
+            "cass_append_sqlcache_bench", // 4 GB cargo target
+            "cass_swarm",                 // small scratch
+            "cass_orchestrator",          // small scratch
+            "cass_marching_orders.txt",   // small text artifact
+            "cass-target-thatlilac",      // hyphen variant — already covered by cass-target
+        ];
+
+        for name in cases {
+            let classification = registry.classify(Path::new(name), StructuralSignals::default());
+            assert_ne!(
+                classification.category,
+                ArtifactCategory::Unknown,
+                "{name} should be classified, not Unknown"
+            );
+            assert!(
+                classification.combined_confidence > 0.55,
+                "low confidence {:.2} for {name}",
+                classification.combined_confidence
+            );
+        }
+    }
+
+    #[test]
+    fn underscore_target_suffix_classifies_as_rust_target() {
+        // `cass_append_baseline_target`, `pi_agent_rust_target`, and any
+        // future agent-prefixed `..._target` cargo dir.
+        let registry = ArtifactPatternRegistry::default();
+        for name in [
+            "cass_append_baseline_target",
+            "cass_append_patch_target",
+            "build_target",
+            "release_target",
+        ] {
+            let classification = registry.classify(Path::new(name), StructuralSignals::default());
+            assert_eq!(
+                classification.category,
+                ArtifactCategory::RustTarget,
+                "{name} should classify as RustTarget"
+            );
+        }
+    }
+
+    #[test]
+    fn frankentui_workspace_patterns_real_world_dirs() {
+        // Codex bead workspace dirs: 3.7 GB each, observed in /tmp.
+        let registry = ArtifactPatternRegistry::default();
+        let cases = [
+            "frankentui-codex-bd-2vr05-10-2-workspace",
+            "frankentui-codex-bd-2vr05-10-3-workspace",
+            "frankentui-codex-bd-2vr05-10-4-workspace",
+            "frankentui-codex-bd-2vr05-6-text-corpus",
+            "frankentui-bd-2vr05-10-4-fuzz-pass3",
+            "frankentui_profile_sweep_view.data",
+            "frankentui_git_clone_stderr",
+        ];
+
+        for name in cases {
+            let classification = registry.classify(Path::new(name), StructuralSignals::default());
+            assert_eq!(
+                classification.category,
+                ArtifactCategory::AgentWorkspace,
+                "{name} should classify as AgentWorkspace"
+            );
+            assert!(
+                classification.combined_confidence > 0.55,
+                "low confidence {:.2} for {name}",
+                classification.combined_confidence
+            );
+        }
+    }
+
+    #[test]
+    fn frankentui_does_not_collide_with_frankenterm() {
+        // The pre-existing `frankenterm-` pattern still wins for its own
+        // names; the new `frankentui-` does not steal them.
+        let registry = ArtifactPatternRegistry::default();
+        let frankenterm = registry.classify(
+            Path::new("frankenterm-build-1234"),
+            StructuralSignals::default(),
+        );
+        assert_eq!(frankenterm.category, ArtifactCategory::AgentWorkspace);
+        let frankentui = registry.classify(
+            Path::new("frankentui-codex-bd-2vr05-4"),
+            StructuralSignals::default(),
+        );
+        assert_eq!(frankentui.category, ArtifactCategory::AgentWorkspace);
+    }
+
+    #[test]
+    fn extract_pattern_label_groups_new_families() {
+        use super::extract_pattern_label;
+        // cass family (NOT cass-target — that has its own pre-existing
+        // `cass-target*` label which is more specific and should win).
+        assert_eq!(extract_pattern_label("/tmp/cass_next_profile"), "cass_*");
+        assert_eq!(extract_pattern_label("/tmp/cass_swarm"), "cass_*");
+        assert_eq!(extract_pattern_label("/tmp/cass-orchestrator"), "cass_*");
+        // The pre-existing cass-target family is unchanged.
+        assert_eq!(
+            extract_pattern_label("/tmp/cass-target-thatlilac"),
+            "cass-target*"
+        );
+        // _target suffix family.
+        assert_eq!(
+            extract_pattern_label("/tmp/cass_append_baseline_target"),
+            "*_target"
+        );
+        assert_eq!(extract_pattern_label("/tmp/build_target"), "*_target");
+        // frankentui family — both forms collapse.
+        assert_eq!(
+            extract_pattern_label("/tmp/frankentui-codex-bd-2vr05-10-2-workspace"),
+            "frankentui-*"
+        );
+        assert_eq!(
+            extract_pattern_label("/tmp/frankentui_profile_sweep_view.data"),
+            "frankentui-*"
+        );
     }
 }
