@@ -379,7 +379,11 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
         ArtifactPattern {
             name: "cass-target",
             kind: MatchKind::Prefix("cass-target"),
-            confidence: 0.82,
+            // Must stay above `cass-prefix-hyphen` (0.86) below so a name
+            // like `cass-target-thatlilac` keeps its RustTarget label and
+            // the cargo-marker structural boost (0.92–0.98) instead of
+            // collapsing to the flat 0.78 AgentWorkspace score.
+            confidence: 0.94,
             category: ArtifactCategory::RustTarget,
         },
         ArtifactPattern {
@@ -821,7 +825,10 @@ mod tests {
     #[test]
     fn cass_workspace_patterns_real_world_dirs() {
         // Real /tmp dir names observed during a recent agent session that
-        // filled the tmpfs with 100+ GB of leftover cass dirs.
+        // filled the tmpfs with 100+ GB of leftover cass dirs. Only the
+        // `cass_*`/`cass-*` workspace shape — the cargo-target sibling
+        // `cass-target-*` is asserted separately below since it has its
+        // own (more specific) pattern that must keep winning.
         let registry = ArtifactPatternRegistry::default();
         let cases = [
             "cass_next_profile",          // 1.4 GB profile dir
@@ -830,7 +837,6 @@ mod tests {
             "cass_swarm",                 // small scratch
             "cass_orchestrator",          // small scratch
             "cass_marching_orders.txt",   // small text artifact
-            "cass-target-thatlilac",      // hyphen variant — already covered by cass-target
         ];
 
         for name in cases {
@@ -844,6 +850,33 @@ mod tests {
                 classification.combined_confidence > 0.55,
                 "low confidence {:.2} for {name}",
                 classification.combined_confidence
+            );
+        }
+    }
+
+    #[test]
+    fn cass_target_prefix_not_shadowed_by_cass_workspace_prefix() {
+        // Regression guard: `cass-target-*` names match BOTH the pre-existing
+        // `cass-target` Prefix pattern (RustTarget) and the broader new
+        // `cass-prefix-hyphen` Prefix pattern (AgentWorkspace). The more
+        // specific one must win — otherwise these dirs lose the cargo-marker
+        // structural boost (0.92–0.98) and collapse to the flat 0.78
+        // AgentWorkspace score, which can drop them below the deletion
+        // confidence floor on machines without populated cargo signals.
+        let registry = ArtifactPatternRegistry::default();
+        for name in ["cass-target-thatlilac", "cass-target", "cass-target-foo"] {
+            let classification = registry.classify(Path::new(name), StructuralSignals::default());
+            assert_eq!(
+                classification.category,
+                ArtifactCategory::RustTarget,
+                "{name} should classify as RustTarget, got {:?}",
+                classification.category
+            );
+            assert_eq!(
+                classification.pattern_name.as_ref(),
+                "cass-target",
+                "{name} should match the cass-target pattern, got {}",
+                classification.pattern_name
             );
         }
     }
