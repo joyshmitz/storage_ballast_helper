@@ -8,11 +8,35 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
-Compare: [`v0.3.16...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.3.16...HEAD)
+Compare: [`v0.4.5...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.5...HEAD)
 
-### Installer
+---
 
+## [v0.4.5] -- 2026-04-30
+
+Tag: [`v0.4.5`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.5) | Compare: [`v0.4.4...v0.4.5`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.4...v0.4.5)
+
+Three independent bugs combined to let `ts1` (a 1.9 TB build host) silently hit 100% disk on 2026-04-30. SBH's daemon was running, scanning, and finding candidates — but every delete was failing with `NotWritable`, the scanner was timing out before enumerating the giant directories, the dampener refused to retry recently-deleted paths even as pressure climbed, and pressure tracking missed the root mount entirely. This release fixes all four root causes, surfaces the misconfiguration as an actionable warning, and ships safer defaults.
+
+### Daemon
+
+- **Surface `NotWritable` skips as a single actionable `[SBH-CONFIG-WARNING]`** instead of one log line per candidate. When the systemd unit's `ProtectSystem=strict` + `ReadWritePaths=` whitelist excludes a scanner root, every delete fails silently. The warning is rate-limited to once per hour per executor and includes concrete remediation (re-run `sbh service install` or strip `ProtectSystem=strict`). Adds `not_writable_paths` to `DeletionReport`.
+- **Repeat-deletion dampener now also bypasses on imminent danger** (urgency ≥ 0.85), not just at Red pressure. On TBs of disk under high build throughput, free space can drop from Yellow (14% free) to Critical (~0%) in a single poll interval, skipping Red entirely. The predictive controller's high-urgency signal now triggers the bypass — the dampener no longer sits idle while disk fills.
+- **`check_pressure()` always includes `/` alongside configured `scanner.root_paths`**. When a user configured `root_paths = ["/tmp", "/data/tmp", "/data/projects"]`, the daemon stopped monitoring `/` directly. If those subdirs don't drive pressure (e.g. `/tmp` is tmpfs), the root mount could fill silently. Per-mount dedup makes this free when `/` is already implied.
+
+### Scanner
+
+- **Default `scan_time_budget_secs` raised from 300 → 900**. On agent-swarm hosts, `/data/tmp` can hold 10K–48K stale test artifacts (frankenlibc/fr_live_oracle fixtures, beads_mem temp DBs, etc). 300s let the scanner enumerate ~3% of such directories before aborting, so the actual disk hogs were never identified as candidates.
+
+### Installer / Service
+
+- **`default_read_write_paths` now probes for `/data` and `/data/tmp`** (only adds them if the directory exists, so unit doesn't break on hosts without `/data`). Universal on the agent-fleet machines this tool was built for.
 - Auto-detect release asset format (raw binary vs tar.xz) so the installer works regardless of how the release was packaged ([`9a5782a`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/9a5782adeb50cbe268863e6076e92dd753f6db07))
+
+### Tests
+
+- Two new dampener tests: `repeat_dampening_high_urgency_bypasses_at_yellow` (regression) and `repeat_dampening_low_urgency_at_yellow_still_dampens` (sanity).
+- New `deletion_report_tracks_not_writable_paths` test verifies the new bucket on Unix hosts (uses `chmod 555` on a tempdir parent).
 
 ---
 
