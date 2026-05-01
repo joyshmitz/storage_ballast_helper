@@ -380,7 +380,11 @@ impl Default for ScannerConfig {
             max_delete_batch: 20,
             repeat_deletion_base_cooldown_secs: 300,
             repeat_deletion_max_cooldown_secs: 3600,
-            scan_time_budget_secs: 300,
+            // 300s is too short for /data/tmp on agent-swarm machines where
+            // a single directory can hold tens of thousands of test artifact
+            // entries. Scans timing out before identifying candidates was the
+            // failure mode behind the 2026-04-30 100%-disk incident on ts1.
+            scan_time_budget_secs: 900,
         }
     }
 }
