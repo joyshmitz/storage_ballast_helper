@@ -1193,19 +1193,21 @@ impl MonitoringDaemon {
 
     #[allow(clippy::too_many_lines)]
     fn check_pressure(&mut self) -> Result<crate::monitor::pid::PressureResponse> {
-        // Collect stats for all root paths.
-        let default_paths;
-        let paths = if self.config.scanner.root_paths.is_empty() {
-            default_paths = [PathBuf::from("/")];
-            &default_paths[..]
-        } else {
-            &self.config.scanner.root_paths
-        };
+        // Collect stats for all root paths PLUS "/". Always monitoring "/"
+        // is defensive: if a user configures scanner.root_paths to specific
+        // subdirs, the root mount may still fill from non-monitored sources
+        // (logs, packages, agent worktrees) and we'd miss the pressure
+        // entirely. Per-mount dedup below means this is essentially free
+        // when "/" is already implied by the configured paths.
+        let mut paths: Vec<PathBuf> = self.config.scanner.root_paths.clone();
+        if !paths.iter().any(|p| p == Path::new("/")) {
+            paths.push(PathBuf::from("/"));
+        }
 
         // Group paths by mount point to avoid redundant updates.
         let mut stats_by_mount: HashMap<PathBuf, crate::platform::pal::FsStats> = HashMap::new();
 
-        for path in paths {
+        for path in &paths {
             if let Ok(stats) = self.fs_collector.collect(path) {
                 // If multiple paths share a mount, we just need one valid reading.
                 stats_by_mount
@@ -2954,13 +2956,23 @@ impl RepeatDeletionTracker {
     }
 
     /// Split candidates into (approved, dampened).
-    /// Red/Critical pressure bypasses all dampening.
+    ///
+    /// Bypass conditions (no dampening applied):
+    /// - Pressure is Red or Critical (disk safety always wins).
+    /// - Urgency >= 0.85 even at lower pressure levels — the predictive
+    ///   controller has flagged that Red is imminent within the action
+    ///   horizon. On high-throughput build machines disk can drop from
+    ///   Yellow (14% free) to Critical (~0%) in a single poll interval,
+    ///   which is faster than the dampener's per-path cooldown can
+    ///   sensibly resolve. Without this bypass, sbh sits idle at Yellow
+    ///   while disk fills (the failure mode that hit ts1 on 2026-04-30).
     fn filter_candidates(
         &self,
         candidates: Vec<CandidacyScore>,
         pressure: PressureLevel,
+        urgency: f64,
     ) -> (Vec<CandidacyScore>, Vec<CandidacyScore>) {
-        if pressure >= PressureLevel::Red {
+        if pressure >= PressureLevel::Red || urgency >= 0.85 {
             return (candidates, Vec::new());
         }
         let mut approved = Vec::with_capacity(candidates.len());
@@ -3013,6 +3025,10 @@ fn executor_thread_main(
     let max_circuit_breaker_cooldown = Duration::from_mins(5); // 5 minutes cap
     let mut last_policy_reject_log: Option<Instant> = None;
     let mut last_cb_cooldown_log: Option<Instant> = None;
+    // Rate-limit the NotWritable systemd-misconfig warning to once per hour
+    // per executor thread. The condition is persistent until the operator
+    // fixes the unit file, so logging on every batch would flood journals.
+    let mut last_not_writable_warning: Option<Instant> = None;
 
     while let Ok(batch) = del_rx.recv() {
         heartbeat.beat();
@@ -3087,9 +3103,9 @@ fn executor_thread_main(
             continue;
         }
 
-        // Apply repeat-deletion dampening (Red/Critical bypasses).
+        // Apply repeat-deletion dampening (Red/Critical or high-urgency bypasses).
         let (approved_candidates, dampened) =
-            tracker.filter_candidates(approved_candidates, batch.pressure_level);
+            tracker.filter_candidates(approved_candidates, batch.pressure_level, batch.urgency);
 
         if !dampened.is_empty() {
             eprintln!(
@@ -3138,6 +3154,44 @@ fn executor_thread_main(
         }
 
         let report = executor.execute(&plan, None);
+
+        // If preflight failed any candidates with NotWritable, the daemon's
+        // sandbox doesn't include those paths. This is almost always a
+        // misconfigured systemd unit (ProtectSystem=strict + a stale
+        // ReadWritePaths whitelist). Surface a single actionable warning
+        // per hour rather than silently piling up [SBH-EXECUTOR] skip lines
+        // that the operator has no way to interpret. Without this signal,
+        // sbh appears to "do nothing" while disks fill — exactly the
+        // failure mode that hit ts1 on 2026-04-30.
+        if !report.not_writable_paths.is_empty() {
+            let should_warn =
+                last_not_writable_warning.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600));
+            if should_warn {
+                last_not_writable_warning = Some(Instant::now());
+                let example = report
+                    .not_writable_paths
+                    .first()
+                    .map_or_else(String::new, |p| p.display().to_string());
+                eprintln!(
+                    "[SBH-CONFIG-WARNING] {} candidate(s) skipped this batch \
+                     because the daemon cannot write to their parent directory \
+                     (e.g. {example}). This usually means the systemd unit's \
+                     ReadWritePaths= list does not include the parent mount. \
+                     Run `sbh service install` to regenerate the unit from \
+                     the current scanner.root_paths config, or remove \
+                     ProtectSystem=strict from /etc/systemd/system/sbh.service \
+                     and `systemctl daemon-reload && systemctl restart sbh`.",
+                    report.not_writable_paths.len(),
+                );
+                logger.send(ActivityEvent::Error {
+                    code: "SBH-CONFIG-NOTWRITABLE".to_string(),
+                    message: format!(
+                        "{} skip(s) due to ReadWritePaths sandbox; first={example}",
+                        report.not_writable_paths.len(),
+                    ),
+                });
+            }
+        }
 
         // Record deletions for repeat-deletion dampening.
         tracker.record_deletions(&report.deleted_paths);
@@ -3670,7 +3724,8 @@ mod tests {
     fn repeat_dampening_new_path_no_dampening() {
         let tracker = RepeatDeletionTracker::new(Duration::from_mins(5), Duration::from_hours(1));
         let candidates = vec![test_candidate("/tmp/target/debug", 0.9)];
-        let (approved, dampened) = tracker.filter_candidates(candidates, PressureLevel::Orange);
+        let (approved, dampened) =
+            tracker.filter_candidates(candidates, PressureLevel::Orange, 0.0);
         assert_eq!(approved.len(), 1);
         assert!(dampened.is_empty());
     }
@@ -3683,7 +3738,8 @@ mod tests {
         tracker.record_deletions(std::slice::from_ref(&path));
 
         let candidates = vec![test_candidate("/tmp/target/debug", 0.9)];
-        let (approved, dampened) = tracker.filter_candidates(candidates, PressureLevel::Orange);
+        let (approved, dampened) =
+            tracker.filter_candidates(candidates, PressureLevel::Orange, 0.0);
         assert!(approved.is_empty());
         assert_eq!(dampened.len(), 1);
     }
@@ -3699,7 +3755,8 @@ mod tests {
 
         // With base_cooldown=0, the cooldown should already be expired.
         let candidates = vec![test_candidate("/tmp/target/debug", 0.9)];
-        let (approved, dampened) = tracker.filter_candidates(candidates, PressureLevel::Orange);
+        let (approved, dampened) =
+            tracker.filter_candidates(candidates, PressureLevel::Orange, 0.0);
         assert_eq!(approved.len(), 1);
         assert!(dampened.is_empty());
     }
@@ -3754,7 +3811,7 @@ mod tests {
         tracker.record_deletions(std::slice::from_ref(&path));
 
         let candidates = vec![test_candidate("/tmp/target/debug", 0.9)];
-        let (approved, dampened) = tracker.filter_candidates(candidates, PressureLevel::Red);
+        let (approved, dampened) = tracker.filter_candidates(candidates, PressureLevel::Red, 0.0);
         assert_eq!(approved.len(), 1);
         assert!(dampened.is_empty());
     }
@@ -3767,9 +3824,43 @@ mod tests {
         tracker.record_deletions(std::slice::from_ref(&path));
 
         let candidates = vec![test_candidate("/tmp/target/debug", 0.9)];
-        let (approved, dampened) = tracker.filter_candidates(candidates, PressureLevel::Critical);
+        let (approved, dampened) =
+            tracker.filter_candidates(candidates, PressureLevel::Critical, 0.0);
         assert_eq!(approved.len(), 1);
         assert!(dampened.is_empty());
+    }
+
+    #[test]
+    fn repeat_dampening_high_urgency_bypasses_at_yellow() {
+        // Regression: ts1 sat at Yellow while disk filled because the
+        // dampener had cooldowns on the same paths from previous attempts
+        // and bypass only triggered at Red. High urgency means the
+        // predictor expects Red imminently; we should act now.
+        let mut tracker =
+            RepeatDeletionTracker::new(Duration::from_mins(5), Duration::from_hours(1));
+        let path = PathBuf::from("/tmp/target/debug");
+        tracker.record_deletions(std::slice::from_ref(&path));
+
+        let candidates = vec![test_candidate("/tmp/target/debug", 0.9)];
+        let (approved, dampened) =
+            tracker.filter_candidates(candidates, PressureLevel::Yellow, 0.95);
+        assert_eq!(approved.len(), 1, "high urgency should bypass dampener");
+        assert!(dampened.is_empty());
+    }
+
+    #[test]
+    fn repeat_dampening_low_urgency_at_yellow_still_dampens() {
+        // Sanity: without urgency boost, Yellow still respects dampening.
+        let mut tracker =
+            RepeatDeletionTracker::new(Duration::from_mins(5), Duration::from_hours(1));
+        let path = PathBuf::from("/tmp/target/debug");
+        tracker.record_deletions(std::slice::from_ref(&path));
+
+        let candidates = vec![test_candidate("/tmp/target/debug", 0.9)];
+        let (approved, dampened) =
+            tracker.filter_candidates(candidates, PressureLevel::Yellow, 0.5);
+        assert!(approved.is_empty());
+        assert_eq!(dampened.len(), 1);
     }
 
     #[test]
@@ -3784,7 +3875,8 @@ mod tests {
             test_candidate("/tmp/node_modules", 0.8),
             test_candidate("/data/projects/build", 0.7),
         ];
-        let (approved, dampened) = tracker.filter_candidates(candidates, PressureLevel::Orange);
+        let (approved, dampened) =
+            tracker.filter_candidates(candidates, PressureLevel::Orange, 0.0);
         assert_eq!(approved.len(), 2);
         assert_eq!(dampened.len(), 1);
         assert_eq!(dampened[0].path, Path::new("/tmp/target/debug"));

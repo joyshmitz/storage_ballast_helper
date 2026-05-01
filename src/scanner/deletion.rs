@@ -79,6 +79,12 @@ pub struct DeletionReport {
     pub dry_run: bool,
     pub circuit_breaker_tripped: bool,
     pub deleted_paths: Vec<PathBuf>,
+    /// Paths skipped specifically because the executor cannot write to the
+    /// parent directory. Almost always indicates a misconfigured systemd
+    /// unit (`ProtectSystem=strict` + `ReadWritePaths=` whitelist that
+    /// excludes the path). The daemon uses this list to emit a single
+    /// actionable warning per batch instead of per-skip log noise.
+    pub not_writable_paths: Vec<PathBuf>,
 }
 
 /// A single deletion failure record.
@@ -166,6 +172,7 @@ impl DeletionExecutor {
             dry_run: self.config.dry_run,
             circuit_breaker_tripped: false,
             deleted_paths: Vec::new(),
+            not_writable_paths: Vec::new(),
         };
 
         let mut consecutive_failures: u32 = 0;
@@ -242,6 +249,12 @@ impl DeletionExecutor {
                     // across different path prefixes (e.g. FUSE mount failures shouldn't
                     // trip the breaker for normal /tmp deletions).
                     consecutive_failures = 0;
+                    // NotWritable goes into a dedicated bucket so the daemon can
+                    // emit one actionable warning per batch (systemd unit fix)
+                    // instead of one log line per candidate.
+                    if matches!(skip, SkipReason::NotWritable) {
+                        report.not_writable_paths.push(candidate.path.clone());
+                    }
                     // Only log unexpected skip reasons. PathGone (parent deleted) and
                     // ContainsGit (project root) are normal conditions that produce
                     // excessive log noise when logged as errors.
@@ -862,5 +875,45 @@ mod tests {
         assert!(report.deleted_paths.contains(&file1));
         assert!(report.deleted_paths.contains(&file2));
         assert!(report.deleted_paths.contains(&file3));
+    }
+
+    #[test]
+    fn deletion_report_tracks_not_writable_paths() {
+        // Regression: when systemd ProtectSystem=strict + ReadWritePaths
+        // omits a path, preflight returns NotWritable. The daemon needs
+        // these paths separately so it can emit a single actionable
+        // warning per batch instead of one log line per skip.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let readonly_parent = dir.path().join("readonly");
+            fs::create_dir(&readonly_parent).unwrap();
+            let target = readonly_parent.join("artifact");
+            fs::write(&target, "data").unwrap();
+
+            // Strip write permission from the parent so preflight returns
+            // NotWritable. (Unix-only; Windows ACLs differ.)
+            fs::set_permissions(&readonly_parent, fs::Permissions::from_mode(0o555)).unwrap();
+
+            let cand = make_candidate(&target, 4, 0.9);
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    check_open_files: false,
+                    ..DeletionConfig::default()
+                },
+                None,
+            );
+            let plan = executor.plan(vec![cand]);
+            let report = executor.execute(&plan, None);
+
+            // Restore perms so tempdir cleanup can proceed.
+            fs::set_permissions(&readonly_parent, fs::Permissions::from_mode(0o755)).ok();
+
+            assert_eq!(report.items_deleted, 0);
+            assert_eq!(report.items_skipped, 1);
+            assert_eq!(report.not_writable_paths.len(), 1);
+            assert_eq!(report.not_writable_paths[0], target);
+        }
     }
 }

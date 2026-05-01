@@ -385,10 +385,26 @@ fn resolve_sbh_binary() -> Result<PathBuf> {
 }
 
 /// Default paths that sbh needs write access to under `ProtectSystem=strict`.
+///
+/// Includes common cleanup targets (/tmp, /var/tmp) and sbh's own state dirs.
+/// Also probes for `/data` and `/data/tmp` since these are universal on the
+/// agent-fleet machines this tool was built for (Contabo VPS layout) and
+/// omitting them produces silent NotWritable skips that defeat the daemon's
+/// purpose. Callers (cli_app::install) further extend this list with the
+/// scanner.root_paths from the user's config.
 fn default_read_write_paths(user_scope: bool) -> Vec<PathBuf> {
     let mut paths = vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")];
     if !user_scope {
         paths.push(PathBuf::from("/var/lib/sbh"));
+    }
+    // Probe for /data layouts common on agent-fleet machines. Only add them
+    // if the directory exists so we don't pollute ReadWritePaths on hosts
+    // without /data (which would make systemd refuse to start the unit).
+    for candidate in ["/data", "/data/tmp"] {
+        let p = PathBuf::from(candidate);
+        if p.is_dir() {
+            paths.push(p);
+        }
     }
     // Add user-local data dir.
     if let Some(home) = env::var_os("HOME") {
