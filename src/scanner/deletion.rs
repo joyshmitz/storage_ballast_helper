@@ -877,43 +877,52 @@ mod tests {
         assert!(report.deleted_paths.contains(&file3));
     }
 
+    #[cfg(unix)]
     #[test]
     fn deletion_report_tracks_not_writable_paths() {
         // Regression: when systemd ProtectSystem=strict + ReadWritePaths
         // omits a path, preflight returns NotWritable. The daemon needs
         // these paths separately so it can emit a single actionable
         // warning per batch instead of one log line per skip.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let dir = tempfile::tempdir().unwrap();
-            let readonly_parent = dir.path().join("readonly");
-            fs::create_dir(&readonly_parent).unwrap();
-            let target = readonly_parent.join("artifact");
-            fs::write(&target, "data").unwrap();
+        use std::os::unix::fs::PermissionsExt;
 
-            // Strip write permission from the parent so preflight returns
-            // NotWritable. (Unix-only; Windows ACLs differ.)
-            fs::set_permissions(&readonly_parent, fs::Permissions::from_mode(0o555)).unwrap();
-
-            let cand = make_candidate(&target, 4, 0.9);
-            let executor = DeletionExecutor::new(
-                DeletionConfig {
-                    check_open_files: false,
-                    ..DeletionConfig::default()
-                },
-                None,
-            );
-            let plan = executor.plan(vec![cand]);
-            let report = executor.execute(&plan, None);
-
-            // Restore perms so tempdir cleanup can proceed.
-            fs::set_permissions(&readonly_parent, fs::Permissions::from_mode(0o755)).ok();
-
-            assert_eq!(report.items_deleted, 0);
-            assert_eq!(report.items_skipped, 1);
-            assert_eq!(report.not_writable_paths.len(), 1);
-            assert_eq!(report.not_writable_paths[0], target);
+        // Skip when running as root: root bypasses unix mode bits, so
+        // chmod 555 doesn't actually deny write and the preflight check
+        // would succeed unexpectedly. CI runs as non-root so this still
+        // exercises the path; on dev hosts and root-owned shells we just
+        // skip cleanly to avoid a false-positive failure.
+        if nix::unistd::Uid::effective().is_root() {
+            eprintln!("skipping deletion_report_tracks_not_writable_paths: running as root");
+            return;
         }
+
+        let dir = tempfile::tempdir().unwrap();
+        let readonly_parent = dir.path().join("readonly");
+        fs::create_dir(&readonly_parent).unwrap();
+        let target = readonly_parent.join("artifact");
+        fs::write(&target, "data").unwrap();
+
+        // Strip write permission from the parent so preflight returns
+        // NotWritable. (Unix-only; Windows ACLs differ.)
+        fs::set_permissions(&readonly_parent, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let cand = make_candidate(&target, 4, 0.9);
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                ..DeletionConfig::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![cand]);
+        let report = executor.execute(&plan, None);
+
+        // Restore perms so tempdir cleanup can proceed.
+        fs::set_permissions(&readonly_parent, fs::Permissions::from_mode(0o755)).ok();
+
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert_eq!(report.not_writable_paths.len(), 1);
+        assert_eq!(report.not_writable_paths[0], target);
     }
 }

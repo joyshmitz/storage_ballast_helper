@@ -8,7 +8,23 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
-Compare: [`v0.4.5...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.5...HEAD)
+Compare: [`v0.4.6...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.6...HEAD)
+
+---
+
+## [v0.4.6] -- 2026-04-30
+
+Tag: [`v0.4.6`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.6) | Compare: [`v0.4.5...v0.4.6`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.5...v0.4.6)
+
+Fresh-eyes review of the v0.4.5 incident-fix commit caught two bugs:
+
+### Daemon
+
+- **Fix wrong remediation command in `[SBH-CONFIG-WARNING]` text**. The v0.4.5 message instructed operators to "Run `sbh service install`" — but no such subcommand exists. The actual command is `sudo sbh install --systemd --auto`. Anyone hitting the warning would have been sent on a wild goose chase. Updated to reference the real subcommand for both system- and user-scope installs.
+
+### Tests
+
+- **`deletion_report_tracks_not_writable_paths` skips when running as root**. POSIX `access(W_OK)` always succeeds for root regardless of mode bits, so `chmod 555` doesn't actually deny write — the assertion `report.items_skipped == 1` would fail. CI runs as non-root so the test still exercises the path; on root-owned shells it skips cleanly.
 
 ---
 
@@ -20,7 +36,7 @@ Three independent bugs combined to let `ts1` (a 1.9 TB build host) silently hit 
 
 ### Daemon
 
-- **Surface `NotWritable` skips as a single actionable `[SBH-CONFIG-WARNING]`** instead of one log line per candidate. When the systemd unit's `ProtectSystem=strict` + `ReadWritePaths=` whitelist excludes a scanner root, every delete fails silently. The warning is rate-limited to once per hour per executor and includes concrete remediation (re-run `sbh service install` or strip `ProtectSystem=strict`). Adds `not_writable_paths` to `DeletionReport`.
+- **Surface `NotWritable` skips as a single actionable `[SBH-CONFIG-WARNING]`** instead of one log line per candidate. When the systemd unit's `ProtectSystem=strict` + `ReadWritePaths=` whitelist excludes a scanner root, every delete fails silently. The warning is rate-limited to once per hour per executor and includes concrete remediation (re-run `sudo sbh install --systemd --auto` or strip `ProtectSystem=strict`). Adds `not_writable_paths` to `DeletionReport`.
 - **Repeat-deletion dampener now also bypasses on imminent danger** (urgency ≥ 0.85), not just at Red pressure. On TBs of disk under high build throughput, free space can drop from Yellow (14% free) to Critical (~0%) in a single poll interval, skipping Red entirely. The predictive controller's high-urgency signal now triggers the bypass — the dampener no longer sits idle while disk fills.
 - **`check_pressure()` always includes `/` alongside configured `scanner.root_paths`**. When a user configured `root_paths = ["/tmp", "/data/tmp", "/data/projects"]`, the daemon stopped monitoring `/` directly. If those subdirs don't drive pressure (e.g. `/tmp` is tmpfs), the root mount could fill silently. Per-mount dedup makes this free when `/` is already implied.
 

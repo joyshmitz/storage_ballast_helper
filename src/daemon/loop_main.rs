@@ -3177,10 +3177,11 @@ fn executor_thread_main(
                      because the daemon cannot write to their parent directory \
                      (e.g. {example}). This usually means the systemd unit's \
                      ReadWritePaths= list does not include the parent mount. \
-                     Run `sbh service install` to regenerate the unit from \
-                     the current scanner.root_paths config, or remove \
-                     ProtectSystem=strict from /etc/systemd/system/sbh.service \
-                     and `systemctl daemon-reload && systemctl restart sbh`.",
+                     Re-run `sudo sbh install --systemd --auto` to regenerate \
+                     the unit from the current scanner.root_paths config (or \
+                     `sbh install --systemd --user --auto` for user scope), \
+                     or edit the unit and remove ProtectSystem=strict, then \
+                     `systemctl daemon-reload && systemctl restart sbh`.",
                     report.not_writable_paths.len(),
                 );
                 logger.send(ActivityEvent::Error {
