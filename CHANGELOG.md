@@ -12,7 +12,7 @@ Compare: [`v0.4.6...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_
 
 ---
 
-## [v0.4.6] -- 2026-04-30
+## [v0.4.6] -- 2026-05-02
 
 Tag: [`v0.4.6`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.6) | Compare: [`v0.4.5...v0.4.6`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.5...v0.4.6)
 
