@@ -489,6 +489,45 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
             confidence: 0.92,
             category: ArtifactCategory::RustTarget,
         },
+        // Bare in-tree shared rch target dirs. rch creates a directory
+        // literally named `.rch-target/` (no trailing identifier) in the
+        // project root as the default `CARGO_TARGET_DIR` when no per-job
+        // override is supplied; on a heavily used worker this can grow
+        // to 100+ GB. Without these exact matches the bare names only
+        // hit the generic suffix rules — `target-suffix` (0.88) for the
+        // hyphen variants and `underscore-target-suffix` (0.92) for the
+        // underscore variants — and the dir's mtime gets bumped
+        // continuously by active builds, so the age veto fires forever
+        // and the disk runs out. Explicit, high-confidence patterns
+        // both stabilize classification and unlock the in-tree
+        // pressure-based age fast-track in `daemon/loop_main.rs`.
+        // Confidences are set above BOTH conflicting suffix matchers
+        // (0.88 and 0.92) so `classify()` deterministically picks the
+        // specific rch pattern over the generic suffix fallback.
+        ArtifactPattern {
+            name: "rch-target-bare-dot",
+            kind: MatchKind::Exact(".rch-target"),
+            confidence: 0.95,
+            category: ArtifactCategory::RustTarget,
+        },
+        ArtifactPattern {
+            name: "rch-target-bare-dot-underscore",
+            kind: MatchKind::Exact(".rch_target"),
+            confidence: 0.94,
+            category: ArtifactCategory::RustTarget,
+        },
+        ArtifactPattern {
+            name: "rch-target-bare-hyphen",
+            kind: MatchKind::Exact("rch-target"),
+            confidence: 0.93,
+            category: ArtifactCategory::RustTarget,
+        },
+        ArtifactPattern {
+            name: "rch-target-bare-underscore",
+            kind: MatchKind::Exact("rch_target"),
+            confidence: 0.93,
+            category: ArtifactCategory::RustTarget,
+        },
         // codex agent build artifacts.
         ArtifactPattern {
             name: "target-codex",
@@ -568,6 +607,18 @@ pub fn extract_pattern_label(path: &str) -> String {
     let lower = name.to_ascii_lowercase();
     if lower == "target" || lower.starts_with("target-") {
         return "target/".to_string();
+    }
+    // rch's bare in-tree targets (`.rch-target`, `.rch_target`,
+    // `rch-target`, `rch_target`) are checked here — before the
+    // generic `*-target` suffix branch — so they group with their
+    // per-job siblings (`rch_target_*`) in stats output instead of
+    // being lumped under the generic `*-target` bucket.
+    if lower == "rch_target"
+        || lower == ".rch_target"
+        || lower == "rch-target"
+        || lower == ".rch-target"
+    {
+        return "rch_target_*".to_string();
     }
     if lower.ends_with("-target") {
         return "*-target".to_string();
@@ -795,6 +846,46 @@ mod tests {
         );
         assert_eq!(classification.category, ArtifactCategory::RustTarget);
         assert!(classification.combined_confidence > 0.60);
+    }
+
+    #[test]
+    fn dot_rch_target_bare_is_classified() {
+        let registry = ArtifactPatternRegistry::default();
+        let classification =
+            registry.classify(Path::new(".rch-target"), StructuralSignals::default());
+        assert_eq!(classification.category, ArtifactCategory::RustTarget);
+        assert_eq!(classification.pattern_name, "rch-target-bare-dot");
+        assert!(classification.combined_confidence > 0.60);
+    }
+
+    #[test]
+    fn rch_target_bare_variants_all_classify_as_rust_target() {
+        let registry = ArtifactPatternRegistry::default();
+        for (name, expected_pattern) in [
+            (".rch-target", "rch-target-bare-dot"),
+            (".rch_target", "rch-target-bare-dot-underscore"),
+            ("rch-target", "rch-target-bare-hyphen"),
+            ("rch_target", "rch-target-bare-underscore"),
+        ] {
+            let classification = registry.classify(Path::new(name), StructuralSignals::default());
+            assert_eq!(
+                classification.category,
+                ArtifactCategory::RustTarget,
+                "{name} should classify as RustTarget"
+            );
+            assert_eq!(
+                classification.pattern_name, expected_pattern,
+                "{name} should match {expected_pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn rch_target_bare_label_groups_with_other_rch_variants() {
+        use super::extract_pattern_label;
+        for name in [".rch-target", "rch-target", ".rch_target", "rch_target"] {
+            assert_eq!(extract_pattern_label(name), "rch_target_*");
+        }
     }
 
     #[test]

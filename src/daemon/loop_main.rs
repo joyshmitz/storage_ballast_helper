@@ -540,6 +540,22 @@ fn is_tmp_like_path(path: &Path) -> bool {
         || text.starts_with("/private/tmp/")
 }
 
+/// rch's bare in-tree target dirs (`.rch-target/`, `rch-target/`, plus
+/// underscore variants) are reliably reclaimable build caches that rch
+/// regenerates from scratch on the next dispatch. Under Orange/Red
+/// pressure they should bypass the tmp-only path gate so a 100%-full
+/// project mount can self-heal — the open-file check in the executor
+/// remains the real safety net for in-flight builds.
+fn is_named_in_tree_rch_target(classification: &ArtifactClassification) -> bool {
+    matches!(
+        classification.pattern_name.as_ref(),
+        "rch-target-bare-dot"
+            | "rch-target-bare-dot-underscore"
+            | "rch-target-bare-hyphen"
+            | "rch-target-bare-underscore"
+    )
+}
+
 fn should_fast_track_temp_age(
     pressure_level: PressureLevel,
     path: &Path,
@@ -548,7 +564,12 @@ fn should_fast_track_temp_age(
     if pressure_level < PressureLevel::Orange {
         return false;
     }
-    if classification.category == ArtifactCategory::Unknown || !is_tmp_like_path(path) {
+    if classification.category == ArtifactCategory::Unknown {
+        return false;
+    }
+    // Restrict fast-track to tmp-like roots, with one carved-out exception:
+    // explicit bare in-tree rch target dirs (see `is_named_in_tree_rch_target`).
+    if !is_tmp_like_path(path) && !is_named_in_tree_rch_target(classification) {
         return false;
     }
 
@@ -602,6 +623,10 @@ fn should_fast_track_temp_age(
             | "rch-target-underscore"
             | "rch-target-dot"
             | "rch-target-hyphen"
+            | "rch-target-bare-dot"
+            | "rch-target-bare-dot-underscore"
+            | "rch-target-bare-hyphen"
+            | "rch-target-bare-underscore"
             | "target-codex"
     )
 }
@@ -3615,6 +3640,78 @@ mod tests {
             &classification,
         );
         assert_eq!(non_tmp, base_age);
+    }
+
+    #[test]
+    fn rch_in_tree_target_fast_tracks_outside_tmp_under_red_pressure() {
+        // The bare in-tree `.rch-target/` sitting under /data/projects/...
+        // is the case that left vmi1167313 stuck at 100% disk: not under
+        // /tmp, mtime bumped continuously by active builds. With its
+        // explicit pattern in the in-tree allowlist it should now have
+        // its age veto bypassed under Red pressure.
+        let classification = ArtifactClassification {
+            pattern_name: "rch-target-bare-dot".into(),
+            category: ArtifactCategory::RustTarget,
+            name_confidence: 0.95,
+            structural_confidence: 0.70,
+            combined_confidence: 0.88,
+        };
+        let adjusted = adjusted_candidate_age(
+            Duration::from_mins(5),
+            30,
+            PressureLevel::Red,
+            Path::new("/data/projects/franken_engine/crates/franken-engine/.rch-target"),
+            &classification,
+        );
+        assert_eq!(adjusted, Duration::from_mins(30));
+    }
+
+    #[test]
+    fn rch_in_tree_target_does_not_fast_track_below_orange_pressure() {
+        // Same in-tree path, but under Yellow (low) pressure: respect the
+        // observed age. We only relax the gate when disk is genuinely tight.
+        // `observed` is well above TEMP_FAST_TRACK_MIN_OBSERVED_AGE (2 min)
+        // so the assertion isolates the pressure gate from the
+        // observed-age threshold.
+        let classification = ArtifactClassification {
+            pattern_name: "rch-target-bare-dot".into(),
+            category: ArtifactCategory::RustTarget,
+            name_confidence: 0.95,
+            structural_confidence: 0.70,
+            combined_confidence: 0.88,
+        };
+        let observed = Duration::from_mins(5);
+        let adjusted = adjusted_candidate_age(
+            observed,
+            30,
+            PressureLevel::Yellow,
+            Path::new("/data/projects/franken_engine/crates/franken-engine/.rch-target"),
+            &classification,
+        );
+        assert_eq!(adjusted, observed);
+    }
+
+    #[test]
+    fn unrelated_in_tree_target_still_blocked_outside_tmp() {
+        // Belt-and-suspenders: a generic `target-suffix` match on an
+        // in-tree path must not get fast-tracked — only the bare rch
+        // patterns are special-cased.
+        let classification = ArtifactClassification {
+            pattern_name: "target-suffix".into(),
+            category: ArtifactCategory::RustTarget,
+            name_confidence: 0.88,
+            structural_confidence: 0.70,
+            combined_confidence: 0.83,
+        };
+        let observed = Duration::from_mins(2);
+        let adjusted = adjusted_candidate_age(
+            observed,
+            30,
+            PressureLevel::Red,
+            Path::new("/data/projects/some_repo/cargo-target"),
+            &classification,
+        );
+        assert_eq!(adjusted, observed);
     }
 
     #[test]

@@ -10,6 +10,18 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.4.6...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.6...HEAD)
 
+### Scanner
+
+- **Recognize bare in-tree `.rch-target/` as a first-class rch artifact pattern.** Previously the bare directory names (without a per-job suffix) only hit the generic suffix rules — `target-suffix` (`Suffix("-target")`, 0.88) for the hyphen variants and `underscore-target-suffix` (`Suffix("_target")`, 0.92) for the underscore variants — so they inherited moderate confidence. Stats grouping in `extract_pattern_label` was also lossy: `.rch-target`/`rch-target` landed in the generic `*-target` bucket while `.rch_target`/`rch_target` fell through to the catch-all `unknown` bucket (the existing `*-target` and prefix-based rch checks didn't cover them). Adds four explicit `Exact` patterns — `.rch-target` (0.95), `.rch_target` (0.94), `rch-target` (0.93), `rch_target` (0.93) — with confidences set above BOTH conflicting suffix matchers so `classify()` picks them deterministically. Updates `extract_pattern_label` to group all four with their per-job siblings under `rch_target_*`.
+
+### Daemon
+
+- **In-tree `.rch-target/` dirs now bypass the tmp-only path gate during Orange/Red pressure.** A 117 GB `.rch-target/` under `/data/projects/franken_engine/...` left vmi1167313 stuck at 100% disk because (a) the directory wasn't under `/tmp`/`/data/tmp`, and (b) its mtime was bumped continuously by active rch builds — so the age veto fired forever. `should_fast_track_temp_age` now consults a new `is_named_in_tree_rch_target()` helper that whitelists the four bare rch patterns added above, letting the age fast-track apply to in-tree project mounts as well. The open-file check in the executor remains the real safety net for in-flight builds.
+
+### Tests
+
+- Adds 7 tests covering the new behavior end-to-end: classification of all 4 bare variants, pattern-label grouping, fast-track under Red pressure outside `/tmp`, no fast-track below Orange, and the negative case (a generic `target-suffix` match in-tree must NOT fast-track).
+
 ---
 
 ## [v0.4.6] -- 2026-05-02
