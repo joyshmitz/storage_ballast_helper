@@ -203,6 +203,7 @@ Use `--local` to skip rch. CI workflows run locally (no rch available).
 | e2e | `e2e-output.txt`, per-case logs | 14 days |
 | macos-platform | `macos-*-output.txt`, `macos-runner-info.txt`, `macos-toolchain-output.txt`, `macos-codesign-output.txt`, `sbh-completions.zsh` | 14 days |
 | macos-coverage | `current-coverage.json`, `current-lcov.info`, `coverage-summary.json`, optional PR `base-coverage.json` | 30 days |
+| macos-benchmarks | `current-summary.json`, `current-output.txt`, `benchmark-summary.json`, optional PR `base-summary.json` | 30 days |
 | stress | `stress-output.txt` | 14 days |
 | dashboard | TUI test stage outputs | 14 days |
 | provenance | `ci-metadata.json`, `dependency-tree.txt` | 90 days |
@@ -221,6 +222,22 @@ and `integration_tests` targets. On pull requests it also checks out the base
 SHA, computes the same macOS line-coverage summary, and fails if current
 coverage is more than 2.0 percentage points below the base branch. The rendered
 step summary and `coverage-summary.json` show current, base, and delta values.
+
+**macOS performance budgets:** The `macos-benchmarks` job runs on
+`macos-latest` and executes the Criterion bench target
+`macos_performance`. The bench records two hard budget summaries:
+
+- `daemon_poll_tick_avg_ms` must stay at or below 200 ms for a representative
+  synthetic monitoring tick.
+- `pal_surface_avg_ms` must stay at or below 5 ms for the PAL filesystem and
+  memory calls exercised by a tick.
+
+On pull requests, CI also runs the same bench target at the base SHA when that
+target exists there. `benchmark-summary.json` reports current, base, and delta
+values, and the job fails if either metric regresses by more than 20 percent.
+The harness uses the native PAL when platform detection is available and falls
+back to a deterministic synthetic PAL while a platform implementation is still
+being wired in.
 
 ## Log Artifact Naming Conventions
 
@@ -298,6 +315,7 @@ Stable event IDs follow `<component>.<action>` pattern:
 | Benchmark threshold exceeded | Workflow takes too many keystrokes | Review command palette or shortcut changes |
 | E2E timeout | Hung process or slow binary | Check `SBH_E2E_CASE_TIMEOUT`, look for blocking I/O |
 | Stress test OOM | Unbounded growth in model/adapter | Profile with sustained load, check Vec/HashMap bounds |
+| macOS benchmark regression | Daemon tick or PAL surface cost exceeded budget/delta | Inspect `macos-benchmarks/benchmark-summary.json`, then profile the touched monitor or PAL path |
 | Decision plane proof fails | Scoring/ranking invariant violated | Check scoring weights, RRF fusion, or veto logic |
 | Clippy lint | New lint in toolchain update | Add targeted `#[allow]` with justification, or fix |
 | Feature gate error | Missing `--features tui` | TUI tests require explicit feature flag |

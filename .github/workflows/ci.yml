@@ -423,6 +423,160 @@ jobs:
           path: coverage/
           retention-days: 30
 
+  macos-benchmarks:
+    name: macOS Performance Budgets
+    runs-on: macos-latest
+    needs: check
+    timeout-minutes: 45
+    env:
+      BENCH_REGRESSION_LIMIT: "20.0"
+    steps:
+      - name: Checkout current ref
+        uses: actions/checkout@v4
+        with:
+          path: current
+      - name: Checkout PR base ref
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Strip local-only TUI path deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          sanitize_ci_cargo() {
+            local dir="$1"
+            perl -0pi -e 's/^ftui.*=.*\{.*path.*=.*"\/dp\/.*\n//mg; s/^tui = \["dep:ftui.*\]/tui = []/m' "${dir}/Cargo.toml"
+            grep -q '^tui = \[\]' "${dir}/Cargo.toml"
+          }
+          sanitize_ci_cargo current
+          if [ -d base ]; then
+            sanitize_ci_cargo base
+          fi
+      - name: Generate current macOS benchmark summary
+        shell: bash
+        working-directory: current
+        run: |
+          set -euo pipefail
+          mkdir -p ../bench
+          SBH_BENCH_SUMMARY=../bench/current-summary.json \
+            cargo bench $CI_FEATURES --bench macos_performance -- --sample-size 10 --warm-up-time 1 --measurement-time 2 \
+            2>&1 | tee ../bench/current-output.txt
+      - name: Generate base macOS benchmark summary
+        if: github.event_name == 'pull_request'
+        shell: bash
+        working-directory: base
+        run: |
+          set -euo pipefail
+          if [ ! -f benches/macos_performance.rs ]; then
+            echo "Base ref has no macos_performance bench; skipping base comparison." | tee ../bench/base-output.txt
+            exit 0
+          fi
+          SBH_BENCH_SUMMARY=../bench/base-summary.json \
+            cargo bench $CI_FEATURES --bench macos_performance -- --sample-size 10 --warm-up-time 1 --measurement-time 2 \
+            2>&1 | tee ../bench/base-output.txt
+      - name: Enforce benchmark budgets and PR regression limit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          metrics = [
+              ("daemon_poll_tick_avg_ms", "daemon poll tick", "daemon_poll_tick_budget_ms"),
+              ("pal_surface_avg_ms", "PAL surface pass", "pal_surface_budget_ms"),
+          ]
+
+          def load_summary(path: str) -> dict:
+              with open(path, "r", encoding="utf-8") as handle:
+                  return json.load(handle)
+
+          current = load_summary("bench/current-summary.json")
+          regression_limit = float(os.environ["BENCH_REGRESSION_LIMIT"])
+          output = {
+              "regression_limit_percent": regression_limit,
+              "current": current,
+              "comparisons": [],
+          }
+          failed = False
+
+          for key, label, budget_key in metrics:
+              actual = float(current[key])
+              budget = float(current[budget_key])
+              print(f"{label}: current={actual:.3f} ms budget={budget:.3f} ms")
+              if actual > budget:
+                  print(f"::error::{label} exceeded budget: {actual:.3f} ms > {budget:.3f} ms")
+                  failed = True
+
+          base_path = pathlib.Path("bench/base-summary.json")
+          if base_path.exists():
+              base = load_summary(str(base_path))
+              output["base"] = base
+              for key, label, _budget_key in metrics:
+                  current_value = float(current[key])
+                  base_value = float(base[key])
+                  if base_value <= 0.0:
+                      print(f"::warning::{label} base value is non-positive; skipping regression comparison")
+                      continue
+                  delta_percent = ((current_value - base_value) / base_value) * 100.0
+                  comparison = {
+                      "metric": key,
+                      "label": label,
+                      "current_ms": current_value,
+                      "base_ms": base_value,
+                      "delta_percent": delta_percent,
+                  }
+                  output["comparisons"].append(comparison)
+                  print(
+                      f"{label}: base={base_value:.3f} ms current={current_value:.3f} ms "
+                      f"delta={delta_percent:.2f}%"
+                  )
+                  if delta_percent > regression_limit:
+                      print(
+                          f"::error::{label} regressed by {delta_percent:.2f}% "
+                          f"(limit {regression_limit:.2f}%)"
+                      )
+                      failed = True
+          else:
+              print("No base benchmark summary available; enforcing hard budgets only.")
+
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary:
+              with open(step_summary, "a", encoding="utf-8") as handle:
+                  handle.write("### macOS performance budgets\n\n")
+                  for key, label, budget_key in metrics:
+                      handle.write(
+                          f"- {label}: {float(current[key]):.3f} ms "
+                          f"(budget {float(current[budget_key]):.3f} ms)\n"
+                      )
+                  if output["comparisons"]:
+                      handle.write(f"- Regression limit: {regression_limit:.2f}%\n")
+                      for comparison in output["comparisons"]:
+                          handle.write(
+                              f"- {comparison['label']} delta: "
+                              f"{comparison['delta_percent']:.2f}%\n"
+                          )
+
+          pathlib.Path("bench/benchmark-summary.json").write_text(
+              json.dumps(output, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          if failed:
+              sys.exit(1)
+          PY
+      - name: Upload macOS benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-benchmarks
+          path: bench/
+          retention-days: 30
+
   stress:
     name: Stress Tests
     runs-on: ubuntu-latest
@@ -482,7 +636,7 @@ jobs:
   provenance:
     name: Provenance Metadata
     runs-on: ubuntu-latest
-    needs: [unit, integration, decision-plane, dashboard, e2e, macos-platform, macos-coverage, stress, artifact-contract]
+    needs: [unit, integration, decision-plane, dashboard, e2e, macos-platform, macos-coverage, macos-benchmarks, stress, artifact-contract]
     steps:
       - uses: actions/checkout@v4
       - name: Strip local-only TUI path deps
