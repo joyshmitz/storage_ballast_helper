@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell as CompletionShell, generate};
@@ -28,10 +28,13 @@ use storage_ballast_helper::platform::pal::{MemoryInfo, ServiceManager, detect_p
 use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionPlan};
 use storage_ballast_helper::scanner::patterns::ArtifactPatternRegistry;
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
-use storage_ballast_helper::scanner::scoring::{CandidacyScore, CandidateInput, ScoringEngine};
+use storage_ballast_helper::scanner::scoring::{
+    ActiveReferenceSummary, CandidacyScore, CandidateInput, ScoringEngine,
+};
 use storage_ballast_helper::scanner::walker::{
-    ActiveReferenceIndex, DirectoryWalker, WalkerConfig, collect_active_reference_index,
-    collect_open_path_ancestors, is_path_open_by_ancestor,
+    ActiveReferenceIndex, ActiveReferenceScanConfig, DirectoryWalker, WalkerConfig,
+    collect_active_reference_index_cached, collect_open_path_ancestors,
+    collect_open_path_ancestors_cached, is_path_open_by_ancestor,
 };
 
 const LIVE_REFRESH_MIN_MS: u64 = 100;
@@ -3683,6 +3686,7 @@ fn build_scan_trace(
     input: &CandidateInput,
     score: &CandidacyScore,
     min_file_age_seconds: u64,
+    active_reference_checked: bool,
 ) -> ScanTrace {
     let open_fd_count = input
         .active_references
@@ -3719,19 +3723,25 @@ fn build_scan_trace(
                 min_file_age_seconds
             )
         },
-        fd_check: if open_fd_count > 0 {
+        fd_check: if !active_reference_checked {
+            "skipped below active-reference size threshold".to_string()
+        } else if open_fd_count > 0 {
             format!("{open_fd_count} open file descriptor(s)")
         } else if input.is_open {
             "open file detected by fallback scanner".to_string()
         } else {
             "clear".to_string()
         },
-        exec_check: if running_exec_count > 0 {
+        exec_check: if !active_reference_checked {
+            "skipped below active-reference size threshold".to_string()
+        } else if running_exec_count > 0 {
             format!("{running_exec_count} running executable(s)")
         } else {
             "clear".to_string()
         },
-        mmap_check: if mmap_region_count > 0 {
+        mmap_check: if !active_reference_checked {
+            "skipped below active-reference size threshold".to_string()
+        } else if mmap_region_count > 0 {
             format!("{mmap_region_count} mmap region(s)")
         } else {
             "clear".to_string()
@@ -3851,8 +3861,9 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     let registry = ArtifactPatternRegistry::default();
     let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
     let now = SystemTime::now();
-    let (open_paths, _) = collect_open_path_ancestors(&scan_roots);
-    let active_reference_index = collect_active_reference_index_best_effort(&scan_roots);
+    let active_reference_scan = active_reference_scan_config(&config);
+    let mut open_paths = None;
+    let mut active_reference_index = None;
     let min_file_age_seconds = config.scanner.min_file_age_minutes.saturating_mul(60);
 
     let scored_entries = entries
@@ -3862,18 +3873,37 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
             let age = now
                 .duration_since(entry.metadata.effective_age_timestamp())
                 .unwrap_or_default();
+            let is_open = open_status_for_candidate(
+                &mut open_paths,
+                &scan_roots,
+                active_reference_scan,
+                &entry.path,
+                entry.metadata.content_size_bytes,
+            );
+            let (active_references, active_reference_checked) = active_references_for_candidate(
+                &mut active_reference_index,
+                &scan_roots,
+                active_reference_scan,
+                &entry.path,
+                entry.metadata.content_size_bytes,
+            );
             let candidate = CandidateInput {
                 path: entry.path.clone(),
                 size_bytes: entry.metadata.content_size_bytes,
                 age,
                 classification,
                 signals: entry.structural_signals,
-                active_references: active_reference_index.summary_for(&entry.path),
-                is_open: is_path_open_by_ancestor(&entry.path, &open_paths),
+                active_references,
+                is_open,
                 excluded: false,
             };
             let score = engine.score_candidate(&candidate, 0.0); // No pressure urgency for manual scan.
-            let trace = build_scan_trace(&candidate, &score, min_file_age_seconds);
+            let trace = build_scan_trace(
+                &candidate,
+                &score,
+                min_file_age_seconds,
+                active_reference_checked,
+            );
             ScoredScanEntry { score, trace }
         })
         .collect::<Vec<_>>();
@@ -4142,8 +4172,9 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     scoring_config.min_score = args.min_score;
     let engine = ScoringEngine::from_config(&scoring_config, config.scanner.min_file_age_minutes);
     let now = SystemTime::now();
-    let (open_paths, _) = collect_open_path_ancestors(&root_paths);
-    let active_reference_index = collect_active_reference_index_best_effort(&root_paths);
+    let active_reference_scan = active_reference_scan_config(&config);
+    let mut open_paths = None;
+    let mut active_reference_index = None;
 
     let scored: Vec<CandidacyScore> = entries
         .iter()
@@ -4152,14 +4183,28 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
             let age = now
                 .duration_since(entry.metadata.effective_age_timestamp())
                 .unwrap_or_default();
+            let is_open = open_status_for_candidate(
+                &mut open_paths,
+                &root_paths,
+                active_reference_scan,
+                &entry.path,
+                entry.metadata.content_size_bytes,
+            );
+            let (active_references, _) = active_references_for_candidate(
+                &mut active_reference_index,
+                &root_paths,
+                active_reference_scan,
+                &entry.path,
+                entry.metadata.content_size_bytes,
+            );
             let candidate = CandidateInput {
                 path: entry.path.clone(),
                 size_bytes: entry.metadata.content_size_bytes,
                 age,
                 classification,
                 signals: entry.structural_signals,
-                active_references: active_reference_index.summary_for(&entry.path),
-                is_open: is_path_open_by_ancestor(&entry.path, &open_paths),
+                active_references,
+                is_open,
                 excluded: false,
             };
             engine.score_candidate(&candidate, 0.0)
@@ -4333,12 +4378,56 @@ fn build_pressure_check(
     }))
 }
 
-fn collect_active_reference_index_best_effort(root_paths: &[PathBuf]) -> ActiveReferenceIndex {
+fn active_reference_scan_config(config: &Config) -> ActiveReferenceScanConfig {
+    ActiveReferenceScanConfig::new(
+        Duration::from_secs(config.scanner.active_reference_cache_ttl_secs),
+        config.scanner.active_reference_min_size_bytes,
+    )
+}
+
+fn collect_active_reference_index_best_effort(
+    root_paths: &[PathBuf],
+    cache_ttl: Duration,
+) -> ActiveReferenceIndex {
     detect_platform()
         .ok()
         .map_or_else(ActiveReferenceIndex::empty, |platform| {
-            collect_active_reference_index(platform.as_ref(), root_paths)
+            collect_active_reference_index_cached(platform.as_ref(), root_paths, cache_ttl)
         })
+}
+
+fn active_references_for_candidate(
+    active_reference_index: &mut Option<ActiveReferenceIndex>,
+    root_paths: &[PathBuf],
+    scan_config: ActiveReferenceScanConfig,
+    path: &Path,
+    size_bytes: u64,
+) -> (ActiveReferenceSummary, bool) {
+    if !scan_config.should_probe(size_bytes) {
+        return (ActiveReferenceSummary::default(), false);
+    }
+
+    let index = active_reference_index.get_or_insert_with(|| {
+        collect_active_reference_index_best_effort(root_paths, scan_config.cache_ttl)
+    });
+    (index.summary_for(path), true)
+}
+
+fn open_status_for_candidate(
+    open_paths: &mut Option<HashSet<PathBuf>>,
+    root_paths: &[PathBuf],
+    scan_config: ActiveReferenceScanConfig,
+    path: &Path,
+    size_bytes: u64,
+) -> bool {
+    if !scan_config.should_probe(size_bytes) {
+        return false;
+    }
+
+    let open_paths = open_paths.get_or_insert_with(|| {
+        collect_open_path_ancestors_cached(root_paths, scan_config.cache_ttl).0
+    });
+    is_path_open_by_ancestor(path, open_paths)
 }
 
 /// Interactive clean: prompt user for each candidate.
@@ -4803,9 +4892,11 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         .map_err(|e| CliError::Runtime(e.to_string()))?;
     let dir_count = entries.len();
 
-    // Collect open path ancestors under emergency roots (single /proc scan).
-    let (open_paths, _) = collect_open_path_ancestors(&root_paths);
-    let active_reference_index = collect_active_reference_index_best_effort(&root_paths);
+    // Collect active-reference evidence lazily so tiny emergency candidates do
+    // not force a global process/fd/mmap probe.
+    let active_reference_scan = active_reference_scan_config(&config);
+    let mut open_paths = None;
+    let mut active_reference_index = None;
 
     // Classify and score using default weights.
     let registry = ArtifactPatternRegistry::default();
@@ -4819,14 +4910,28 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
             let age = now
                 .duration_since(entry.metadata.effective_age_timestamp())
                 .unwrap_or_default();
+            let is_open = open_status_for_candidate(
+                &mut open_paths,
+                &root_paths,
+                active_reference_scan,
+                &entry.path,
+                entry.metadata.content_size_bytes,
+            );
+            let (active_references, _) = active_references_for_candidate(
+                &mut active_reference_index,
+                &root_paths,
+                active_reference_scan,
+                &entry.path,
+                entry.metadata.content_size_bytes,
+            );
             let candidate = CandidateInput {
                 path: entry.path.clone(),
                 size_bytes: entry.metadata.content_size_bytes,
                 age,
                 classification,
                 signals: entry.structural_signals,
-                active_references: active_reference_index.summary_for(&entry.path),
-                is_open: is_path_open_by_ancestor(&entry.path, &open_paths),
+                active_references,
+                is_open,
                 excluded: false,
             };
             // High urgency (0.8) for emergency mode — aggressive scoring.
@@ -5875,7 +5980,7 @@ mod tests {
             30,
         );
         let score = engine.score_candidate(&input, 0.0);
-        let trace = build_scan_trace(&input, &score, 1_800);
+        let trace = build_scan_trace(&input, &score, 1_800, true);
 
         assert_eq!(trace.fd_check, "1 open file descriptor(s)");
         assert_eq!(trace.exec_check, "1 running executable(s)");
@@ -5883,6 +5988,44 @@ mod tests {
         assert!(trace.veto_reason.as_deref().is_some_and(|reason| {
             reason.contains("Cannot reclaim safely") && reason.contains("pid 42 (rustc)")
         }));
+    }
+
+    #[test]
+    fn scan_trace_reports_skipped_active_reference_probe() {
+        let path = PathBuf::from("/tmp/small-cache");
+        let input = CandidateInput {
+            path: path.clone(),
+            size_bytes: 4096,
+            age: std::time::Duration::from_hours(2),
+            classification: ArtifactPatternRegistry::default().classify(
+                &path,
+                storage_ballast_helper::scanner::patterns::StructuralSignals::default(),
+            ),
+            signals: storage_ballast_helper::scanner::patterns::StructuralSignals::default(),
+            active_references:
+                storage_ballast_helper::scanner::scoring::ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        };
+        let engine = ScoringEngine::from_config(
+            &storage_ballast_helper::core::config::ScoringConfig::default(),
+            30,
+        );
+        let score = engine.score_candidate(&input, 0.0);
+        let trace = build_scan_trace(&input, &score, 1_800, false);
+
+        assert_eq!(
+            trace.fd_check,
+            "skipped below active-reference size threshold"
+        );
+        assert_eq!(
+            trace.exec_check,
+            "skipped below active-reference size threshold"
+        );
+        assert_eq!(
+            trace.mmap_check,
+            "skipped below active-reference size threshold"
+        );
     }
 
     #[test]

@@ -11,10 +11,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel as channel;
 
@@ -23,6 +23,9 @@ use crate::platform::pal::Platform;
 use crate::scanner::patterns::StructuralSignals;
 use crate::scanner::protection::ProtectionRegistry;
 use crate::scanner::scoring::ActiveReferenceSummary;
+
+pub const DEFAULT_ACTIVE_REFERENCE_CACHE_TTL_SECS: u64 = 30;
+pub const DEFAULT_ACTIVE_REFERENCE_MIN_SIZE_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Walker configuration derived from `ScannerConfig`.
 #[derive(Debug, Clone)]
@@ -33,6 +36,36 @@ pub struct WalkerConfig {
     pub cross_devices: bool,
     pub parallelism: usize,
     pub excluded_paths: HashSet<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveReferenceScanConfig {
+    pub cache_ttl: Duration,
+    pub min_candidate_size_bytes: u64,
+}
+
+impl ActiveReferenceScanConfig {
+    #[must_use]
+    pub fn new(cache_ttl: Duration, min_candidate_size_bytes: u64) -> Self {
+        Self {
+            cache_ttl,
+            min_candidate_size_bytes,
+        }
+    }
+
+    #[must_use]
+    pub fn should_probe(self, candidate_size_bytes: u64) -> bool {
+        self.min_candidate_size_bytes == 0 || candidate_size_bytes >= self.min_candidate_size_bytes
+    }
+}
+
+impl Default for ActiveReferenceScanConfig {
+    fn default() -> Self {
+        Self {
+            cache_ttl: Duration::from_secs(DEFAULT_ACTIVE_REFERENCE_CACHE_TTL_SECS),
+            min_candidate_size_bytes: DEFAULT_ACTIVE_REFERENCE_MIN_SIZE_BYTES,
+        }
+    }
 }
 
 /// Metadata collected for each filesystem entry.
@@ -698,6 +731,47 @@ pub fn collect_open_path_ancestors(root_paths: &[PathBuf]) -> (HashSet<PathBuf>,
     }
 }
 
+#[derive(Debug, Clone)]
+struct CachedOpenPathAncestors {
+    roots: Vec<PathBuf>,
+    collected_at: Instant,
+    paths: HashSet<PathBuf>,
+    complete: bool,
+}
+
+static OPEN_PATH_ANCESTOR_CACHE: OnceLock<parking_lot::Mutex<Option<CachedOpenPathAncestors>>> =
+    OnceLock::new();
+
+#[must_use]
+pub fn collect_open_path_ancestors_cached(
+    root_paths: &[PathBuf],
+    cache_ttl: Duration,
+) -> (HashSet<PathBuf>, bool) {
+    if cache_ttl.is_zero() {
+        return collect_open_path_ancestors(root_paths);
+    }
+
+    let roots = normalized_root_cache_key(root_paths);
+    let now = Instant::now();
+    let cache = OPEN_PATH_ANCESTOR_CACHE.get_or_init(|| parking_lot::Mutex::new(None));
+
+    if let Some(cached) = cache.lock().as_ref()
+        && cached.roots == roots
+        && now.duration_since(cached.collected_at) <= cache_ttl
+    {
+        return (cached.paths.clone(), cached.complete);
+    }
+
+    let (paths, complete) = collect_open_path_ancestors(&roots);
+    *cache.lock() = Some(CachedOpenPathAncestors {
+        roots,
+        collected_at: now,
+        paths: paths.clone(),
+        complete,
+    });
+    (paths, complete)
+}
+
 #[cfg(target_os = "linux")]
 fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> (HashSet<PathBuf>, bool) {
     use std::os::unix::ffi::OsStrExt;
@@ -787,6 +861,28 @@ fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> (HashSet<PathBuf
     }
 
     (ancestors, !incomplete)
+}
+
+#[derive(Debug, Clone)]
+struct CachedActiveReferenceIndex {
+    platform_name: &'static str,
+    roots: Vec<PathBuf>,
+    collected_at: Instant,
+    index: ActiveReferenceIndex,
+}
+
+static ACTIVE_REFERENCE_INDEX_CACHE: OnceLock<
+    parking_lot::Mutex<Option<CachedActiveReferenceIndex>>,
+> = OnceLock::new();
+
+fn normalized_root_cache_key(root_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = root_paths
+        .iter()
+        .map(|path| crate::core::paths::resolve_absolute_path(path))
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 #[derive(Debug, Clone)]
@@ -932,6 +1028,43 @@ pub fn collect_active_reference_index(
     index
 }
 
+#[must_use]
+pub fn collect_active_reference_index_cached(
+    platform: &dyn Platform,
+    root_paths: &[PathBuf],
+    cache_ttl: Duration,
+) -> ActiveReferenceIndex {
+    if cache_ttl.is_zero() {
+        return collect_active_reference_index(platform, root_paths);
+    }
+
+    let roots = normalized_root_cache_key(root_paths);
+    if roots.is_empty() {
+        return ActiveReferenceIndex::empty();
+    }
+
+    let now = Instant::now();
+    let platform_name = platform.name();
+    let cache = ACTIVE_REFERENCE_INDEX_CACHE.get_or_init(|| parking_lot::Mutex::new(None));
+
+    if let Some(cached) = cache.lock().as_ref()
+        && cached.platform_name == platform_name
+        && cached.roots == roots
+        && now.duration_since(cached.collected_at) <= cache_ttl
+    {
+        return cached.index.clone();
+    }
+
+    let index = collect_active_reference_index(platform, &roots);
+    *cache.lock() = Some(CachedActiveReferenceIndex {
+        platform_name,
+        roots,
+        collected_at: now,
+        index: index.clone(),
+    });
+    index
+}
+
 /// Check if `path` is present in the open-ancestor index.
 #[must_use]
 pub fn is_path_open_by_ancestor<S: std::hash::BuildHasher>(
@@ -1062,9 +1195,14 @@ mod tests {
         open_files: Vec<crate::platform::types::OpenFile>,
         executables: Vec<crate::platform::types::ProcessInfo>,
         mmap_regions: Vec<crate::platform::types::MappedRegion>,
+        probe_calls: AtomicUsize,
     }
 
     impl Platform for TestActiveRefPlatform {
+        fn name(&self) -> &'static str {
+            "test-active-ref"
+        }
+
         fn fs_stats(&self, path: &Path) -> Result<crate::platform::pal::FsStats> {
             Ok(crate::platform::pal::FsStats {
                 total_bytes: 1,
@@ -1102,6 +1240,7 @@ mod tests {
         }
 
         fn process_list(&self) -> Result<Vec<crate::platform::types::ProcessInfo>> {
+            self.probe_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.processes.clone())
         }
 
@@ -1187,6 +1326,7 @@ mod tests {
                 end_address: Some(0x2000),
                 protection: Some("r--".to_string()),
             }],
+            ..Default::default()
         };
 
         let index = collect_active_reference_index(&platform, std::slice::from_ref(&root));
@@ -1209,6 +1349,52 @@ mod tests {
         assert!(reason.contains("open file descriptor"));
         assert!(reason.contains("running executable"));
         assert!(reason.contains("mmap region"));
+    }
+
+    #[test]
+    fn active_reference_scan_config_gates_small_candidates() {
+        let config = ActiveReferenceScanConfig::new(Duration::from_secs(30), 100 * 1024 * 1024);
+
+        assert!(!config.should_probe(100 * 1024 * 1024 - 1));
+        assert!(config.should_probe(100 * 1024 * 1024));
+        assert!(ActiveReferenceScanConfig::new(Duration::ZERO, 0).should_probe(1));
+    }
+
+    #[test]
+    fn cached_active_reference_collection_reuses_snapshot_within_ttl() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let candidate = root.join("target");
+        let open_file_path = candidate.join("debug").join("object.o");
+        fs::create_dir_all(open_file_path.parent().unwrap()).unwrap();
+        fs::write(&open_file_path, b"object").unwrap();
+
+        let platform = TestActiveRefPlatform {
+            processes: vec![process(42, "rustc", None)],
+            open_files: vec![crate::platform::types::OpenFile {
+                pid: 42,
+                path: open_file_path,
+                fd: Some(9),
+                kind: crate::platform::types::OpenFileKind::Regular,
+                mode: crate::platform::types::OpenFileMode::ReadWrite,
+            }],
+            ..Default::default()
+        };
+
+        let first = collect_active_reference_index_cached(
+            &platform,
+            std::slice::from_ref(&root),
+            Duration::from_secs(30),
+        );
+        let second = collect_active_reference_index_cached(
+            &platform,
+            std::slice::from_ref(&root),
+            Duration::from_secs(30),
+        );
+
+        assert!(!first.summary_for(&candidate).is_empty());
+        assert!(!second.summary_for(&candidate).is_empty());
+        assert_eq!(platform.probe_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

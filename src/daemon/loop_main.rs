@@ -49,9 +49,10 @@ use crate::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, StructuralSignals,
 };
 use crate::scanner::protection::ProtectionRegistry;
-use crate::scanner::scoring::{CandidacyScore, ScoringEngine};
+use crate::scanner::scoring::{ActiveReferenceSummary, CandidacyScore, ScoringEngine};
 use crate::scanner::walker::{
-    ActiveReferenceIndex, DirectoryWalker, WalkerConfig, collect_active_reference_index,
+    ActiveReferenceIndex, ActiveReferenceScanConfig, DirectoryWalker, WalkerConfig,
+    collect_active_reference_index_cached, collect_open_path_ancestors_cached,
 };
 
 // ──────────────────── channel capacities ────────────────────
@@ -2396,25 +2397,10 @@ fn scanner_thread_main(
         // Track total candidates found (priority pre-scan + general walker).
         let mut candidates_found = 0;
 
-        // Snapshot active references in background so process/fd/mmap scans
-        // overlap with the cheap priority pre-scan and walker startup.
-        let open_files_paths = request.paths.clone();
-        let mut open_files_handle: Option<std::thread::JoinHandle<_>> = std::thread::Builder::new()
-            .name("sbh-open-files".into())
-            .spawn(move || crate::scanner::walker::collect_open_path_ancestors(&open_files_paths).0)
-            .ok();
-        let active_reference_paths = request.paths.clone();
-        let active_reference_platform = Arc::clone(platform);
-        let mut active_reference_handle: Option<std::thread::JoinHandle<_>> =
-            std::thread::Builder::new()
-                .name("sbh-active-refs".into())
-                .spawn(move || {
-                    collect_active_reference_index(
-                        active_reference_platform.as_ref(),
-                        &active_reference_paths,
-                    )
-                })
-                .ok();
+        let active_reference_scan = ActiveReferenceScanConfig::new(
+            Duration::from_secs(current_scanner_config.active_reference_cache_ttl_secs),
+            current_scanner_config.active_reference_min_size_bytes,
+        );
         let mut open_files_joined: Option<std::collections::HashSet<std::path::PathBuf>> = None;
         let mut active_reference_joined: Option<ActiveReferenceIndex> = None;
 
@@ -2536,19 +2522,33 @@ fn scanner_thread_main(
                             } else {
                                 raw_size
                             };
-                            let open_files = open_files_joined.get_or_insert_with(|| {
-                                open_files_handle
-                                    .take()
-                                    .and_then(|h| h.join().ok())
-                                    .unwrap_or_default()
-                            });
-                            let active_references =
-                                active_reference_joined.get_or_insert_with(|| {
-                                    active_reference_handle
-                                        .take()
-                                        .and_then(|h| h.join().ok())
-                                        .unwrap_or_else(ActiveReferenceIndex::empty)
-                                });
+                            let (active_references, is_open) =
+                                if active_reference_scan.should_probe(size) {
+                                    let open_files = open_files_joined.get_or_insert_with(|| {
+                                        collect_open_path_ancestors_cached(
+                                            &request.paths,
+                                            active_reference_scan.cache_ttl,
+                                        )
+                                        .0
+                                    });
+                                    let active_references = active_reference_joined
+                                        .get_or_insert_with(|| {
+                                            collect_active_reference_index_cached(
+                                                platform.as_ref(),
+                                                &request.paths,
+                                                active_reference_scan.cache_ttl,
+                                            )
+                                        });
+                                    (
+                                        active_references.summary_for(&candidate_path),
+                                        crate::scanner::walker::is_path_open_by_ancestor(
+                                            &candidate_path,
+                                            open_files,
+                                        ),
+                                    )
+                                } else {
+                                    (ActiveReferenceSummary::default(), false)
+                                };
 
                             let input = crate::scanner::scoring::CandidateInput {
                                 path: candidate_path.clone(),
@@ -2562,11 +2562,8 @@ fn scanner_thread_main(
                                 ),
                                 classification: candidate_class,
                                 signals: StructuralSignals::default(),
-                                active_references: active_references.summary_for(&candidate_path),
-                                is_open: crate::scanner::walker::is_path_open_by_ancestor(
-                                    &candidate_path,
-                                    open_files,
-                                ),
+                                active_references,
+                                is_open,
                                 excluded: false,
                             };
                             let score = prescan_engine.score_candidate(&input, request.urgency);
@@ -2801,22 +2798,29 @@ fn scanner_thread_main(
                 dirs_with_candidates.insert(parent.to_path_buf());
             }
 
-            // Lazy-join active-reference snapshots on first classified entry.
-            // This gives process/fd/mmap scans the walker startup period to run
-            // in parallel instead of blocking the scanner up front.
-            let open_files = open_files_joined.get_or_insert_with(|| {
-                open_files_handle
-                    .take()
-                    .and_then(|h| h.join().ok())
-                    .unwrap_or_default()
-            });
-            let active_references = active_reference_joined.get_or_insert_with(|| {
-                active_reference_handle
-                    .take()
-                    .and_then(|h| h.join().ok())
-                    .unwrap_or_else(ActiveReferenceIndex::empty)
-            });
-            let is_open = crate::scanner::walker::is_path_open_by_ancestor(&entry.path, open_files);
+            let (active_references, is_open) =
+                if active_reference_scan.should_probe(entry.metadata.content_size_bytes) {
+                    let open_files = open_files_joined.get_or_insert_with(|| {
+                        collect_open_path_ancestors_cached(
+                            &request.paths,
+                            active_reference_scan.cache_ttl,
+                        )
+                        .0
+                    });
+                    let active_references = active_reference_joined.get_or_insert_with(|| {
+                        collect_active_reference_index_cached(
+                            platform.as_ref(),
+                            &request.paths,
+                            active_reference_scan.cache_ttl,
+                        )
+                    });
+                    (
+                        active_references.summary_for(&entry.path),
+                        crate::scanner::walker::is_path_open_by_ancestor(&entry.path, open_files),
+                    )
+                } else {
+                    (ActiveReferenceSummary::default(), false)
+                };
 
             let input = crate::scanner::scoring::CandidateInput {
                 path: entry.path.clone(), // Clone needed for input
@@ -2830,7 +2834,7 @@ fn scanner_thread_main(
                 ),
                 classification,
                 signals: entry.structural_signals,
-                active_references: active_references.summary_for(&entry.path),
+                active_references,
                 is_open,
                 excluded: false, // Walker already filters excluded paths.
             };

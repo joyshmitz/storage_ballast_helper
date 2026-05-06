@@ -84,6 +84,12 @@ pub struct ScannerConfig {
     pub repeat_deletion_max_cooldown_secs: u64,
     /// Maximum wall-clock seconds for a single scan pass. 0 = use built-in default.
     pub scan_time_budget_secs: u64,
+    /// Seconds to reuse active file/process/mmap evidence before refreshing.
+    /// 0 disables caching and forces a fresh probe on demand.
+    pub active_reference_cache_ttl_secs: u64,
+    /// Minimum candidate size before running expensive active-reference probes.
+    /// 0 checks every candidate.
+    pub active_reference_min_size_bytes: u64,
 }
 
 /// Multi-factor score weights and decision-theoretic losses.
@@ -385,6 +391,8 @@ impl Default for ScannerConfig {
             // entries. Scans timing out before identifying candidates was the
             // failure mode behind the 2026-04-30 100%-disk incident on ts1.
             scan_time_budget_secs: 900,
+            active_reference_cache_ttl_secs: 30,
+            active_reference_min_size_bytes: 100 * 1024 * 1024,
         }
     }
 }
@@ -647,6 +655,14 @@ impl Config {
         set_env_u64(
             "SBH_SCANNER_REPEAT_DELETION_MAX_COOLDOWN_SECS",
             &mut self.scanner.repeat_deletion_max_cooldown_secs,
+        )?;
+        set_env_u64(
+            "SBH_SCANNER_ACTIVE_REFERENCE_CACHE_TTL_SECS",
+            &mut self.scanner.active_reference_cache_ttl_secs,
+        )?;
+        set_env_u64(
+            "SBH_SCANNER_ACTIVE_REFERENCE_MIN_SIZE_BYTES",
+            &mut self.scanner.active_reference_min_size_bytes,
         )?;
 
         // scoring
@@ -1154,6 +1170,16 @@ mod tests {
     fn default_config_is_valid() {
         let cfg = Config::default();
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn scanner_active_reference_defaults_bound_expensive_probes() {
+        let cfg = Config::default();
+        assert_eq!(cfg.scanner.active_reference_cache_ttl_secs, 30);
+        assert_eq!(
+            cfg.scanner.active_reference_min_size_bytes,
+            100 * 1024 * 1024
+        );
     }
 
     #[test]
