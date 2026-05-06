@@ -36,7 +36,9 @@ use storage_ballast_helper::scanner::merkle::{IndexHealth, MerkleScanIndex, Scan
 use storage_ballast_helper::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, StructuralSignals,
 };
-use storage_ballast_helper::scanner::scoring::{CandidateInput, ScoringEngine};
+use storage_ballast_helper::scanner::scoring::{
+    ActiveReferenceSummary, CandidateInput, ScoringEngine,
+};
 use storage_ballast_helper::scanner::walker::{EntryMetadata, WalkEntry};
 
 use common::SyntheticTimeSeries;
@@ -269,6 +271,7 @@ fn make_candidate(path: &str, size: u64, age_secs: u64) -> CandidateInput {
             has_fingerprint: true,
             ..StructuralSignals::default()
         },
+        active_references: ActiveReferenceSummary::default(),
         is_open: false,
         excluded: false,
     }

@@ -618,8 +618,8 @@ mod tests {
     use crate::monitor::guardrails::{GuardDiagnostics, GuardStatus};
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
     use crate::scanner::scoring::{
-        CandidacyScore, CandidateInput, DecisionAction, DecisionOutcome, EvidenceLedger,
-        EvidenceTerm, ScoreFactors, ScoringEngine,
+        ActiveReferenceSummary, CandidacyScore, CandidateInput, DecisionAction, DecisionOutcome,
+        EvidenceLedger, EvidenceTerm, ScoreFactors, ScoringEngine,
     };
     use std::path::PathBuf;
     use std::time::Duration;
@@ -1068,6 +1068,7 @@ mod tests {
                 has_cargo_toml: false,
                 mostly_object_files: true,
             },
+            active_references: ActiveReferenceSummary::default(),
             is_open: false,
             excluded: false,
         };

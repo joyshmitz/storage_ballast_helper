@@ -28,8 +28,8 @@ use storage_ballast_helper::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, StructuralSignals,
 };
 use storage_ballast_helper::scanner::scoring::{
-    CandidacyScore, CandidateInput, DecisionAction, DecisionOutcome, EvidenceLedger, EvidenceTerm,
-    ScoreFactors, ScoringEngine,
+    ActiveReferenceSummary, CandidacyScore, CandidateInput, DecisionAction, DecisionOutcome,
+    EvidenceLedger, EvidenceTerm, ScoreFactors, ScoringEngine,
 };
 
 // ════════════════════════════════════════════════════════════
@@ -119,6 +119,7 @@ fn make_candidate_input(
             has_cargo_toml: false,
             mostly_object_files: rng.next_bool(0.6),
         },
+        active_references: ActiveReferenceSummary::default(),
         is_open: false,
         excluded: false,
     }

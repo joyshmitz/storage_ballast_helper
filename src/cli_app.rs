@@ -30,7 +30,8 @@ use storage_ballast_helper::scanner::patterns::ArtifactPatternRegistry;
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
 use storage_ballast_helper::scanner::scoring::{CandidacyScore, CandidateInput, ScoringEngine};
 use storage_ballast_helper::scanner::walker::{
-    DirectoryWalker, WalkerConfig, collect_open_path_ancestors, is_path_open_by_ancestor,
+    ActiveReferenceIndex, DirectoryWalker, WalkerConfig, collect_active_reference_index,
+    collect_open_path_ancestors, is_path_open_by_ancestor,
 };
 
 const LIVE_REFRESH_MIN_MS: u64 = 100;
@@ -3723,8 +3724,10 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     let registry = ArtifactPatternRegistry::default();
     let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
     let now = SystemTime::now();
+    let (open_paths, _) = collect_open_path_ancestors(&scan_roots);
+    let active_reference_index = collect_active_reference_index_best_effort(&scan_roots);
 
-    let mut preliminary: Vec<_> = entries
+    let mut candidates: Vec<_> = entries
         .iter()
         .map(|entry| {
             let classification = registry.classify(&entry.path, entry.structural_signals);
@@ -3737,7 +3740,8 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 age,
                 classification,
                 signals: entry.structural_signals,
-                is_open: false,
+                active_references: active_reference_index.summary_for(&entry.path),
+                is_open: is_path_open_by_ancestor(&entry.path, &open_paths),
                 excluded: false,
             };
             engine.score_candidate(&candidate, 0.0) // No pressure urgency for manual scan.
@@ -3745,26 +3749,13 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
         .filter(|score| !score.vetoed && score.total_score >= args.min_score)
         .collect();
 
-    preliminary.sort_by(|a, b| {
+    candidates.sort_by(|a, b| {
         b.total_score
             .partial_cmp(&a.total_score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-
-    // Open-file checks can only veto candidates, never improve scores.
-    // Evaluate in rank order and stop once we have enough results.
-    let mut candidates: Vec<_> = Vec::with_capacity(args.top.min(preliminary.len()));
-    if args.top > 0 && !preliminary.is_empty() {
-        let (open_paths, _) = collect_open_path_ancestors(&scan_roots);
-        for score in preliminary {
-            if is_path_open_by_ancestor(&score.path, &open_paths) {
-                continue;
-            }
-            candidates.push(score);
-            if candidates.len() >= args.top {
-                break;
-            }
-        }
+    if candidates.len() > args.top {
+        candidates.truncate(args.top);
     }
 
     let elapsed = start.elapsed();
@@ -3957,16 +3948,18 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     // Count protected directories encountered.
     let protected_count = walker.protection().read().list_protections().len();
 
-    // Classify and score each entry.
-    // Optimize: Score first with is_open=false, then filter, then check open files on survivors.
+    // Classify and score each entry with active-reference evidence already
+    // attached, so in-use artifacts are vetoed before the deletion plan.
     // Also apply CLI min_score override to the engine config.
     let registry = ArtifactPatternRegistry::default();
     let mut scoring_config = config.scoring.clone();
     scoring_config.min_score = args.min_score;
     let engine = ScoringEngine::from_config(&scoring_config, config.scanner.min_file_age_minutes);
     let now = SystemTime::now();
+    let (open_paths, _) = collect_open_path_ancestors(&root_paths);
+    let active_reference_index = collect_active_reference_index_best_effort(&root_paths);
 
-    let mut scored: Vec<CandidacyScore> = entries
+    let scored: Vec<CandidacyScore> = entries
         .iter()
         .map(|entry| {
             let classification = registry.classify(&entry.path, entry.structural_signals);
@@ -3979,19 +3972,14 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                 age,
                 classification,
                 signals: entry.structural_signals,
-                is_open: false, // Deferred check
+                active_references: active_reference_index.summary_for(&entry.path),
+                is_open: is_path_open_by_ancestor(&entry.path, &open_paths),
                 excluded: false,
             };
             engine.score_candidate(&candidate, 0.0)
         })
         .filter(|score| !score.vetoed && score.total_score >= args.min_score)
         .collect();
-
-    // Filter open files from survivors.
-    if !scored.is_empty() {
-        let (open_paths, _) = collect_open_path_ancestors(&root_paths);
-        scored.retain(|candidate| !is_path_open_by_ancestor(&candidate.path, &open_paths));
-    }
 
     let scan_elapsed = start.elapsed();
 
@@ -4157,6 +4145,14 @@ fn build_pressure_check(
             .collect(path)
             .is_ok_and(|stats| stats.free_pct() >= target)
     }))
+}
+
+fn collect_active_reference_index_best_effort(root_paths: &[PathBuf]) -> ActiveReferenceIndex {
+    detect_platform()
+        .ok()
+        .map_or_else(ActiveReferenceIndex::empty, |platform| {
+            collect_active_reference_index(platform.as_ref(), root_paths)
+        })
 }
 
 /// Interactive clean: prompt user for each candidate.
@@ -4623,6 +4619,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
 
     // Collect open path ancestors under emergency roots (single /proc scan).
     let (open_paths, _) = collect_open_path_ancestors(&root_paths);
+    let active_reference_index = collect_active_reference_index_best_effort(&root_paths);
 
     // Classify and score using default weights.
     let registry = ArtifactPatternRegistry::default();
@@ -4642,6 +4639,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
                 age,
                 classification,
                 signals: entry.structural_signals,
+                active_references: active_reference_index.summary_for(&entry.path),
                 is_open: is_path_open_by_ancestor(&entry.path, &open_paths),
                 excluded: false,
             };

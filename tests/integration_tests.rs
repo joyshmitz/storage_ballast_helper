@@ -36,8 +36,8 @@ use storage_ballast_helper::scanner::patterns::{
 };
 use storage_ballast_helper::scanner::protection::ProtectionRegistry;
 use storage_ballast_helper::scanner::scoring::{
-    CandidacyScore, CandidateInput, DecisionAction, DecisionOutcome, EvidenceLedger, EvidenceTerm,
-    ScoreFactors, ScoringEngine,
+    ActiveReferenceSummary, CandidacyScore, CandidateInput, DecisionAction, DecisionOutcome,
+    EvidenceLedger, EvidenceTerm, ScoreFactors, ScoringEngine,
 };
 use storage_ballast_helper::scanner::walker::{DirectoryWalker, WalkerConfig};
 
@@ -224,6 +224,7 @@ proptest! {
                 age: Duration::from_hours(age_hours),
                 classification: registry.classify(&logical_path, StructuralSignals::default()),
                 signals: StructuralSignals::default(),
+                active_references: ActiveReferenceSummary::default(),
                 is_open: false,
                 excluded: true,
             };
@@ -270,6 +271,7 @@ proptest! {
                 age: Duration::from_hours(age_hours),
                 classification,
                 signals,
+                active_references: ActiveReferenceSummary::default(),
                 is_open: false,
                 excluded: false,
             },
@@ -934,6 +936,7 @@ fn green_pressure_no_deletions() {
         age: Duration::from_hours(1),
         classification: ArtifactClassification::unknown(),
         signals: StructuralSignals::default(),
+        active_references: ActiveReferenceSummary::default(),
         is_open: false,
         excluded: false,
     };
@@ -1095,6 +1098,7 @@ fn scoring_pipeline_ranks_artifacts_above_source() {
             has_fingerprint: true,
             ..Default::default()
         },
+        active_references: ActiveReferenceSummary::default(),
         is_open: false,
         excluded: false,
     };
@@ -1106,6 +1110,7 @@ fn scoring_pipeline_ranks_artifacts_above_source() {
         age: Duration::from_hours(1), // 1 hour
         classification: ArtifactClassification::unknown(),
         signals: StructuralSignals::default(),
+        active_references: ActiveReferenceSummary::default(),
         is_open: false,
         excluded: false,
     };
@@ -1164,6 +1169,7 @@ fn dry_run_deletes_nothing() {
             has_deps: true,
             ..Default::default()
         },
+        active_references: ActiveReferenceSummary::default(),
         is_open: false,
         excluded: false,
     };
@@ -1381,6 +1387,7 @@ fn batch_scoring_ranks_correctly() {
                 has_fingerprint: true,
                 ..Default::default()
             },
+            active_references: ActiveReferenceSummary::default(),
             is_open: false,
             excluded: false,
         },
@@ -1390,6 +1397,7 @@ fn batch_scoring_ranks_correctly() {
             age: Duration::from_hours(2), // 2 hours
             classification: ArtifactClassification::unknown(),
             signals: StructuralSignals::default(),
+            active_references: ActiveReferenceSummary::default(),
             is_open: false,
             excluded: false,
         },
@@ -1450,6 +1458,7 @@ fn e2e_candidate(path: &str, size_gb: u64, age_hours: u64, confidence: f64) -> C
             has_cargo_toml: false,
             mostly_object_files: true,
         },
+        active_references: ActiveReferenceSummary::default(),
         is_open: false,
         excluded: false,
     }

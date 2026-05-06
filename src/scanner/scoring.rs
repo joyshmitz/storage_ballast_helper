@@ -52,6 +52,123 @@ pub struct EvidenceLedger {
     pub summary: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ActiveReferenceSummary {
+    pub processes: Vec<ActiveReferenceProcess>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveReferenceProcess {
+    pub pid: i32,
+    pub name: Option<String>,
+    pub open_file_descriptors: usize,
+    pub running_executable: bool,
+    pub mmap_regions: usize,
+}
+
+impl ActiveReferenceSummary {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.processes.iter().all(ActiveReferenceProcess::is_empty)
+    }
+
+    pub fn add_open_file_descriptor(&mut self, pid: i32, name: Option<String>) {
+        self.process_mut(pid, name).open_file_descriptors += 1;
+    }
+
+    pub fn add_running_executable(&mut self, pid: i32, name: Option<String>) {
+        self.process_mut(pid, name).running_executable = true;
+    }
+
+    pub fn add_mmap_region(&mut self, pid: i32, name: Option<String>) {
+        self.process_mut(pid, name).mmap_regions += 1;
+    }
+
+    #[must_use]
+    pub fn safe_reclaim_reason(&self) -> Option<Cow<'static, str>> {
+        let active = self
+            .processes
+            .iter()
+            .filter(|process| !process.is_empty())
+            .collect::<Vec<_>>();
+        if active.is_empty() {
+            return None;
+        }
+
+        let mut process_reasons = active
+            .iter()
+            .take(3)
+            .map(|process| process.safe_reclaim_reason())
+            .collect::<Vec<_>>();
+        let remaining = active.len().saturating_sub(process_reasons.len());
+        if remaining > 0 {
+            process_reasons.push(format!("and {remaining} more processes"));
+        }
+
+        Some(Cow::Owned(format!(
+            "Cannot reclaim safely: {}",
+            process_reasons.join("; ")
+        )))
+    }
+
+    fn process_mut(&mut self, pid: i32, name: Option<String>) -> &mut ActiveReferenceProcess {
+        let index = if let Some(index) = self.processes.iter().position(|p| p.pid == pid) {
+            index
+        } else {
+            self.processes.push(ActiveReferenceProcess {
+                pid,
+                name: None,
+                open_file_descriptors: 0,
+                running_executable: false,
+                mmap_regions: 0,
+            });
+            self.processes.sort_by_key(|p| p.pid);
+            self.processes
+                .iter()
+                .position(|p| p.pid == pid)
+                .expect("inserted active-reference process must be present")
+        };
+
+        let process = &mut self.processes[index];
+        if process.name.is_none()
+            && let Some(name) = name.filter(|value| !value.is_empty())
+        {
+            process.name = Some(name);
+        }
+        process
+    }
+}
+
+impl ActiveReferenceProcess {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.open_file_descriptors == 0 && !self.running_executable && self.mmap_regions == 0
+    }
+
+    fn safe_reclaim_reason(&self) -> String {
+        let name = self.name.as_deref().filter(|name| !name.is_empty());
+        let label = name.map_or_else(
+            || format!("pid {}", self.pid),
+            |name| format!("pid {} ({name})", self.pid),
+        );
+        let mut evidence = Vec::new();
+        if self.open_file_descriptors > 0 {
+            evidence.push(pluralize(
+                self.open_file_descriptors,
+                "open file descriptor",
+                "open file descriptors",
+            ));
+        }
+        if self.running_executable {
+            evidence.push("1 running executable".to_string());
+        }
+        if self.mmap_regions > 0 {
+            evidence.push(pluralize(self.mmap_regions, "mmap region", "mmap regions"));
+        }
+        format!("{label} has {}", evidence.join(", "))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DecisionOutcome {
     pub action: DecisionAction,
@@ -83,6 +200,7 @@ pub struct CandidateInput {
     pub age: Duration,
     pub classification: ArtifactClassification,
     pub signals: StructuralSignals,
+    pub active_references: ActiveReferenceSummary,
     pub is_open: bool,
     pub excluded: bool,
 }
@@ -243,6 +361,9 @@ impl ScoringEngine {
         if input.excluded {
             return Some(Cow::Borrowed("matched user exclusion"));
         }
+        if let Some(reason) = input.active_references.safe_reclaim_reason() {
+            return Some(reason);
+        }
         if input.is_open {
             return Some(Cow::Borrowed("currently open by another process"));
         }
@@ -386,6 +507,11 @@ fn factor_structure(signals: StructuralSignals) -> f64 {
         return 0.90;
     }
     0.40
+}
+
+fn pluralize(count: usize, singular: &str, plural: &str) -> String {
+    let label = if count == 1 { singular } else { plural };
+    format!("{count} {label}")
 }
 
 fn pressure_multiplier(urgency: f64) -> f64 {
@@ -661,7 +787,7 @@ fn is_system_path(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CandidateInput, DecisionAction, ScoringEngine};
+    use super::{ActiveReferenceSummary, CandidateInput, DecisionAction, ScoringEngine};
     use crate::core::config::ScoringConfig;
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
     use std::borrow::Cow;
@@ -692,6 +818,7 @@ mod tests {
                 age: Duration::from_hours(1),
                 classification: classification(0.9, ArtifactCategory::RustTarget),
                 signals: StructuralSignals::default(),
+                active_references: ActiveReferenceSummary::default(),
                 is_open: false,
                 excluded: false,
             },
@@ -721,6 +848,7 @@ mod tests {
                     age: Duration::from_hours(6),
                     classification: classification(0.95, ArtifactCategory::RustTarget),
                     signals: StructuralSignals::default(),
+                    active_references: ActiveReferenceSummary::default(),
                     is_open: false,
                     excluded: false,
                 },
@@ -743,6 +871,7 @@ mod tests {
                 age: Duration::from_hours(720), // Old
                 classification: classification(0.0, ArtifactCategory::Unknown), // No pattern
                 signals: StructuralSignals::default(),
+                active_references: ActiveReferenceSummary::default(),
                 is_open: false,
                 excluded: false,
             },
@@ -769,6 +898,7 @@ mod tests {
                     age: Duration::from_hours(6),
                     classification: classification(0.95, ArtifactCategory::RustTarget),
                     signals: StructuralSignals::default(),
+                    active_references: ActiveReferenceSummary::default(),
                     is_open: false,
                     excluded: false,
                 },
@@ -779,6 +909,39 @@ mod tests {
                 "user path {user_dir} should NOT be hard-vetoed"
             );
         }
+    }
+
+    #[test]
+    fn active_references_are_hard_vetoed_with_structured_reason() {
+        let engine = default_engine();
+        let mut active_references = ActiveReferenceSummary::default();
+        active_references.add_open_file_descriptor(12345, Some("rustc".to_string()));
+        active_references.add_open_file_descriptor(12345, Some("rustc".to_string()));
+        active_references.add_running_executable(12345, Some("rustc".to_string()));
+        active_references.add_mmap_region(12345, Some("rustc".to_string()));
+
+        let score = engine.score_candidate(
+            &CandidateInput {
+                path: PathBuf::from("/tmp/cargo-target-active"),
+                size_bytes: 1_073_741_824,
+                age: Duration::from_hours(6),
+                classification: classification(0.95, ArtifactCategory::RustTarget),
+                signals: StructuralSignals::default(),
+                active_references,
+                is_open: false,
+                excluded: false,
+            },
+            0.9,
+        );
+
+        assert!(score.vetoed);
+        assert_eq!(score.decision.action, DecisionAction::Keep);
+        assert_eq!(
+            score.veto_reason.as_deref(),
+            Some(
+                "Cannot reclaim safely: pid 12345 (rustc) has 2 open file descriptors, 1 running executable, 1 mmap region"
+            )
+        );
     }
 
     #[test]
@@ -799,6 +962,7 @@ mod tests {
                     has_cargo_toml: false,
                     mostly_object_files: true,
                 },
+                active_references: ActiveReferenceSummary::default(),
                 is_open: false,
                 excluded: false,
             },
@@ -832,6 +996,7 @@ mod tests {
                 has_cargo_toml: false,
                 mostly_object_files: true,
             },
+            active_references: ActiveReferenceSummary::default(),
             is_open: false,
             excluded: false,
         };
@@ -859,6 +1024,7 @@ mod tests {
                 has_cargo_toml: false,
                 mostly_object_files: false,
             },
+            active_references: ActiveReferenceSummary::default(),
             is_open: false,
             excluded: false,
         };
@@ -957,6 +1123,7 @@ mod tests {
                 has_cargo_toml: false,
                 mostly_object_files: false,
             },
+            active_references: ActiveReferenceSummary::default(),
             is_open: false,
             excluded: false,
         };
@@ -1039,6 +1206,7 @@ mod tests {
                     has_cargo_toml: false,
                     mostly_object_files: false,
                 },
+                active_references: ActiveReferenceSummary::default(),
                 is_open: false,
                 excluded: false,
             };

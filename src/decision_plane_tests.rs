@@ -22,8 +22,8 @@ use crate::scanner::decision_record::{
 };
 use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
 use crate::scanner::scoring::{
-    CandidacyScore, CandidateInput, DecisionAction, DecisionOutcome, EvidenceLedger, EvidenceTerm,
-    ScoreFactors, ScoringEngine,
+    ActiveReferenceSummary, CandidacyScore, CandidateInput, DecisionAction, DecisionOutcome,
+    EvidenceLedger, EvidenceTerm, ScoreFactors, ScoringEngine,
 };
 
 /// Returns a PolicyConfig starting in Observe mode (for lifecycle tests).
@@ -104,6 +104,7 @@ fn make_candidate(
             has_cargo_toml: false,
             mostly_object_files: rng.next_f64() > 0.4,
         },
+        active_references: ActiveReferenceSummary::default(),
         is_open: false,
         excluded: false,
     }

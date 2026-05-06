@@ -19,8 +19,10 @@ use std::time::{Duration, SystemTime};
 use crossbeam_channel as channel;
 
 use crate::core::errors::{Result, SbhError};
+use crate::platform::pal::Platform;
 use crate::scanner::patterns::StructuralSignals;
 use crate::scanner::protection::ProtectionRegistry;
+use crate::scanner::scoring::ActiveReferenceSummary;
 
 /// Walker configuration derived from `ScannerConfig`.
 #[derive(Debug, Clone)]
@@ -785,6 +787,149 @@ fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> (HashSet<PathBuf
     }
 
     (ancestors, !incomplete)
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveReferenceIndex {
+    references: HashMap<PathBuf, ActiveReferenceSummary>,
+    complete: bool,
+}
+
+impl Default for ActiveReferenceIndex {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl ActiveReferenceIndex {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            references: HashMap::new(),
+            complete: true,
+        }
+    }
+
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    #[must_use]
+    pub fn summary_for(&self, path: &Path) -> ActiveReferenceSummary {
+        self.references
+            .get(path)
+            .cloned()
+            .or_else(|| {
+                let normalized = crate::core::paths::resolve_absolute_path(path);
+                self.references.get(&normalized).cloned()
+            })
+            .unwrap_or_default()
+    }
+
+    fn add_reference<F>(&mut self, roots: &[PathBuf], reference_path: &Path, mut add: F)
+    where
+        F: FnMut(&mut ActiveReferenceSummary),
+    {
+        let normalized = crate::core::paths::resolve_absolute_path(reference_path);
+        let stop_at = roots
+            .iter()
+            .filter(|root| normalized.starts_with(root))
+            .min_by_key(|root| root.components().count())
+            .map(PathBuf::as_path);
+        let Some(stop_at) = stop_at else {
+            return;
+        };
+
+        let mut current = Some(normalized.as_path());
+        while let Some(path) = current {
+            add(self.references.entry(path.to_path_buf()).or_default());
+            if path == stop_at {
+                break;
+            }
+            let Some(parent) = path.parent() else {
+                break;
+            };
+            if parent == path {
+                break;
+            }
+            current = Some(parent);
+        }
+    }
+}
+
+/// Collect structured active-reference evidence under scan roots using the PAL.
+///
+/// Unsupported PAL methods are treated as incomplete evidence rather than scan
+/// failures; callers should keep any cheaper platform-specific fallback checks.
+#[must_use]
+pub fn collect_active_reference_index(
+    platform: &dyn Platform,
+    root_paths: &[PathBuf],
+) -> ActiveReferenceIndex {
+    let roots = root_paths
+        .iter()
+        .map(|path| crate::core::paths::resolve_absolute_path(path))
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        return ActiveReferenceIndex::empty();
+    }
+
+    let mut index = ActiveReferenceIndex {
+        references: HashMap::new(),
+        complete: true,
+    };
+    let mut process_names = HashMap::new();
+    match platform.process_list() {
+        Ok(processes) => {
+            for process in processes {
+                process_names.insert(process.pid, process.name);
+            }
+        }
+        Err(_) => index.complete = false,
+    }
+
+    for root in &roots {
+        match platform.open_files_under(root) {
+            Ok(open_files) => {
+                for open_file in open_files {
+                    let name = process_names.get(&open_file.pid).cloned();
+                    index.add_reference(&roots, &open_file.path, |summary| {
+                        summary.add_open_file_descriptor(open_file.pid, name.clone());
+                    });
+                }
+            }
+            Err(_) => index.complete = false,
+        }
+
+        match platform.executables_under(root) {
+            Ok(processes) => {
+                for process in processes {
+                    if let Some(executable) = process.executable.as_deref() {
+                        let name = Some(process.name.clone());
+                        index.add_reference(&roots, executable, |summary| {
+                            summary.add_running_executable(process.pid, name.clone());
+                        });
+                    }
+                }
+            }
+            Err(_) => index.complete = false,
+        }
+
+        match platform.mmap_regions_under(root) {
+            Ok(regions) => {
+                for region in regions {
+                    let name = process_names.get(&region.pid).cloned();
+                    index.add_reference(&roots, &region.path, |summary| {
+                        summary.add_mmap_region(region.pid, name.clone());
+                    });
+                }
+            }
+            Err(_) => index.complete = false,
+        }
+    }
+
+    index
 }
 
 /// Check if `path` is present in the open-ancestor index.

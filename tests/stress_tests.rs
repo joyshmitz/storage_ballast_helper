@@ -25,7 +25,9 @@ use storage_ballast_helper::scanner::decision_record::ActionRecord;
 use storage_ballast_helper::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, StructuralSignals,
 };
-use storage_ballast_helper::scanner::scoring::{CandidateInput, ScoringEngine};
+use storage_ballast_helper::scanner::scoring::{
+    ActiveReferenceSummary, CandidateInput, ScoringEngine,
+};
 
 // ════════════════════════════════════════════════════════════════
 // INFRASTRUCTURE
@@ -104,6 +106,7 @@ fn make_candidate(idx: usize, age_hours: u64, size_gib: u64) -> CandidateInput {
             has_cargo_toml: false,
             mostly_object_files: true,
         },
+        active_references: ActiveReferenceSummary::default(),
         is_open: false,
         excluded: false,
     }

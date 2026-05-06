@@ -12,7 +12,9 @@ use std::time::SystemTime;
 use storage_ballast_helper::core::config::Config;
 use storage_ballast_helper::scanner::patterns::ArtifactPatternRegistry;
 use storage_ballast_helper::scanner::protection::ProtectionRegistry;
-use storage_ballast_helper::scanner::scoring::{CandidateInput, ScoringEngine};
+use storage_ballast_helper::scanner::scoring::{
+    ActiveReferenceSummary, CandidateInput, ScoringEngine,
+};
 use storage_ballast_helper::scanner::walker::{DirectoryWalker, WalkerConfig};
 
 fn main() {
@@ -55,6 +57,7 @@ fn main() {
                 age,
                 classification,
                 signals: entry.structural_signals,
+                active_references: ActiveReferenceSummary::default(),
                 is_open: entry.is_open,
                 excluded: false,
             });

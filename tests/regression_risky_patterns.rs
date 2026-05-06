@@ -6,7 +6,9 @@ mod tests {
     use std::time::Duration;
     use storage_ballast_helper::core::config::ScoringConfig;
     use storage_ballast_helper::scanner::patterns::{ArtifactPatternRegistry, StructuralSignals};
-    use storage_ballast_helper::scanner::scoring::{CandidateInput, DecisionAction, ScoringEngine};
+    use storage_ballast_helper::scanner::scoring::{
+        ActiveReferenceSummary, CandidateInput, DecisionAction, ScoringEngine,
+    };
 
     fn default_engine() -> ScoringEngine {
         ScoringEngine::from_config(&ScoringConfig::default(), 4) // 4 hours min age
@@ -39,6 +41,7 @@ mod tests {
             age: Duration::from_hours(24), // Old
             classification,
             signals,
+            active_references: ActiveReferenceSummary::default(),
             is_open: false,
             excluded: false,
         };
@@ -74,6 +77,7 @@ mod tests {
             age: Duration::from_hours(24),
             classification,
             signals,
+            active_references: ActiveReferenceSummary::default(),
             is_open: false,
             excluded: false,
         };

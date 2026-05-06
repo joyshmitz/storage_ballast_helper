@@ -50,7 +50,9 @@ use crate::scanner::patterns::{
 };
 use crate::scanner::protection::ProtectionRegistry;
 use crate::scanner::scoring::{CandidacyScore, ScoringEngine};
-use crate::scanner::walker::{DirectoryWalker, WalkerConfig};
+use crate::scanner::walker::{
+    ActiveReferenceIndex, DirectoryWalker, WalkerConfig, collect_active_reference_index,
+};
 
 // ──────────────────── channel capacities ────────────────────
 
@@ -2115,6 +2117,7 @@ impl MonitoringDaemon {
     ) -> Result<thread::JoinHandle<()>> {
         let scoring_config = Arc::clone(&self.shared_scoring_config);
         let scanner_config = Arc::clone(&self.shared_scanner_config);
+        let platform = Arc::clone(&self.platform);
         thread::Builder::new()
             .name("sbh-scanner".to_string())
             .spawn(move || {
@@ -2124,6 +2127,7 @@ impl MonitoringDaemon {
                     &logger,
                     &scoring_config,
                     &scanner_config,
+                    &platform,
                     &heartbeat,
                     &report_tx,
                 );
@@ -2345,13 +2349,14 @@ impl ScanCursor {
 ///
 /// Uses `DirectoryWalker` to perform parallel, depth-limited, safe traversals
 /// and `ScoringEngine` to rank candidates.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn scanner_thread_main(
     scan_rx: &Receiver<ScanRequest>,
     del_tx: &Sender<DeletionBatch>,
     logger: &ActivityLoggerHandle,
     shared_scoring_config: &Arc<RwLock<crate::core::config::ScoringConfig>>,
     shared_scanner_config: &Arc<RwLock<crate::core::config::ScannerConfig>>,
+    platform: &Arc<dyn Platform>,
     heartbeat: &Arc<ThreadHeartbeat>,
     report_tx: &Sender<WorkerReport>,
 ) {
@@ -2390,6 +2395,28 @@ fn scanner_thread_main(
 
         // Track total candidates found (priority pre-scan + general walker).
         let mut candidates_found = 0;
+
+        // Snapshot active references in background so process/fd/mmap scans
+        // overlap with the cheap priority pre-scan and walker startup.
+        let open_files_paths = request.paths.clone();
+        let mut open_files_handle: Option<std::thread::JoinHandle<_>> = std::thread::Builder::new()
+            .name("sbh-open-files".into())
+            .spawn(move || crate::scanner::walker::collect_open_path_ancestors(&open_files_paths).0)
+            .ok();
+        let active_reference_paths = request.paths.clone();
+        let active_reference_platform = Arc::clone(platform);
+        let mut active_reference_handle: Option<std::thread::JoinHandle<_>> =
+            std::thread::Builder::new()
+                .name("sbh-active-refs".into())
+                .spawn(move || {
+                    collect_active_reference_index(
+                        active_reference_platform.as_ref(),
+                        &active_reference_paths,
+                    )
+                })
+                .ok();
+        let mut open_files_joined: Option<std::collections::HashSet<std::path::PathBuf>> = None;
+        let mut active_reference_joined: Option<ActiveReferenceIndex> = None;
 
         // ── Priority pre-scan pass ──
         // Before the general walker, do a shallow (depth 1-2) scan of each root
@@ -2509,6 +2536,19 @@ fn scanner_thread_main(
                             } else {
                                 raw_size
                             };
+                            let open_files = open_files_joined.get_or_insert_with(|| {
+                                open_files_handle
+                                    .take()
+                                    .and_then(|h| h.join().ok())
+                                    .unwrap_or_default()
+                            });
+                            let active_references =
+                                active_reference_joined.get_or_insert_with(|| {
+                                    active_reference_handle
+                                        .take()
+                                        .and_then(|h| h.join().ok())
+                                        .unwrap_or_else(ActiveReferenceIndex::empty)
+                                });
 
                             let input = crate::scanner::scoring::CandidateInput {
                                 path: candidate_path.clone(),
@@ -2522,7 +2562,11 @@ fn scanner_thread_main(
                                 ),
                                 classification: candidate_class,
                                 signals: StructuralSignals::default(),
-                                is_open: false,
+                                active_references: active_references.summary_for(&candidate_path),
+                                is_open: crate::scanner::walker::is_path_open_by_ancestor(
+                                    &candidate_path,
+                                    open_files,
+                                ),
                                 excluded: false,
                             };
                             let score = prescan_engine.score_candidate(&input, request.urgency);
@@ -2648,17 +2692,6 @@ fn scanner_thread_main(
             .saturating_mul(EARLY_DISPATCH_MULTIPLIER);
         let mut next_dispatch_deadline = scan_start + EARLY_DISPATCH_MAX_WAIT;
 
-        // Snapshot open files in a background thread so the ~5s /proc scan
-        // overlaps with the walker's initial directory reads instead of
-        // blocking the scanner thread.
-        let open_files_paths = request.paths.clone();
-        let mut open_files_handle: Option<std::thread::JoinHandle<_>> = std::thread::Builder::new()
-            .name("sbh-open-files".into())
-            .spawn(move || crate::scanner::walker::collect_open_path_ancestors(&open_files_paths).0)
-            .ok();
-        // Join lazily — we only need results when classifying candidates.
-        let mut open_files_joined: Option<std::collections::HashSet<std::path::PathBuf>> = None;
-
         // Initialize per-root stats.
         let mut root_stats_map: HashMap<PathBuf, RootScanResult> = HashMap::new();
         for root in &request.paths {
@@ -2768,14 +2801,20 @@ fn scanner_thread_main(
                 dirs_with_candidates.insert(parent.to_path_buf());
             }
 
-            // Lazy-join the /proc scan thread on first classified entry.
-            // This gives the /proc scan the full walker startup period to run
+            // Lazy-join active-reference snapshots on first classified entry.
+            // This gives process/fd/mmap scans the walker startup period to run
             // in parallel instead of blocking the scanner up front.
             let open_files = open_files_joined.get_or_insert_with(|| {
                 open_files_handle
                     .take()
                     .and_then(|h| h.join().ok())
                     .unwrap_or_default()
+            });
+            let active_references = active_reference_joined.get_or_insert_with(|| {
+                active_reference_handle
+                    .take()
+                    .and_then(|h| h.join().ok())
+                    .unwrap_or_else(ActiveReferenceIndex::empty)
             });
             let is_open = crate::scanner::walker::is_path_open_by_ancestor(&entry.path, open_files);
 
@@ -2791,6 +2830,7 @@ fn scanner_thread_main(
                 ),
                 classification,
                 signals: entry.structural_signals,
+                active_references: active_references.summary_for(&entry.path),
                 is_open,
                 excluded: false, // Walker already filters excluded paths.
             };
