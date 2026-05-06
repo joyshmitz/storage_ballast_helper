@@ -217,6 +217,27 @@ jobs:
             cargo --version
           } | tee macos-runner-info.txt
           test "$(uname -m)" = "${{ matrix.expected_arch }}"
+      - name: Verify macOS developer tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "xcode_select_path=$(xcode-select -p)"
+            cc_path="$(xcrun --find cc)"
+            ar_path="$(xcrun --find ar)"
+            echo "cc_path=${cc_path}"
+            echo "ar_path=${ar_path}"
+            echo "cc_version:"
+            "${cc_path}" --version
+            echo "ar_identity:"
+            if "${ar_path}" -V; then
+              :
+            elif "${ar_path}" --version; then
+              :
+            else
+              echo "ar responded to neither -V nor --version; xcrun path lookup succeeded"
+            fi
+          } 2>&1 | tee macos-toolchain-output.txt
       - name: Run unit tests
         shell: bash
         run: |
@@ -256,6 +277,7 @@ jobs:
           name: macos-platform-logs-${{ matrix.os }}
           path: |
             macos-runner-info.txt
+            macos-toolchain-output.txt
             macos-unit-lib-output.txt
             macos-unit-bin-output.txt
             macos-integration-output.txt
