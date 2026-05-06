@@ -313,6 +313,116 @@ jobs:
             sbh-completions.zsh
           retention-days: 14
 
+  macos-coverage:
+    name: macOS Coverage
+    runs-on: macos-latest
+    needs: check
+    timeout-minutes: 45
+    env:
+      COVERAGE_DELTA_FLOOR: "-2.0"
+    steps:
+      - name: Checkout current ref
+        uses: actions/checkout@v4
+        with:
+          path: current
+      - name: Checkout PR base ref
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Strip local-only TUI path deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          sanitize_ci_cargo() {
+            local dir="$1"
+            perl -0pi -e 's/^ftui.*=.*\{.*path.*=.*"\/dp\/.*\n//mg; s/^tui = \["dep:ftui.*\]/tui = []/m' "${dir}/Cargo.toml"
+            grep -q '^tui = \[\]' "${dir}/Cargo.toml"
+          }
+          sanitize_ci_cargo current
+          if [ -d base ]; then
+            sanitize_ci_cargo base
+          fi
+      - name: Generate current macOS coverage
+        shell: bash
+        working-directory: current
+        run: |
+          set -euo pipefail
+          mkdir -p ../coverage
+          cargo llvm-cov $CI_FEATURES --lib --bin sbh --test integration_tests --json --output-path ../coverage/current-coverage.json 2>&1 | tee ../coverage/current-output.txt
+          cargo llvm-cov report --lcov --output-path ../coverage/current-lcov.info
+      - name: Generate base macOS coverage
+        if: github.event_name == 'pull_request'
+        shell: bash
+        working-directory: base
+        run: |
+          set -euo pipefail
+          cargo llvm-cov $CI_FEATURES --lib --bin sbh --test integration_tests --json --output-path ../coverage/base-coverage.json 2>&1 | tee ../coverage/base-output.txt
+      - name: Enforce PR coverage delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          def line_percent(path: str) -> float:
+              with open(path, "r", encoding="utf-8") as handle:
+                  report = json.load(handle)
+              return float(report["data"][0]["totals"]["lines"]["percent"])
+
+          current = line_percent("coverage/current-coverage.json")
+          summary = {
+              "current_lines_percent": current,
+              "delta_floor_percent": float(os.environ["COVERAGE_DELTA_FLOOR"]),
+          }
+          failed = False
+          base_path = pathlib.Path("coverage/base-coverage.json")
+          if base_path.exists():
+              base = line_percent(str(base_path))
+              delta = current - base
+              summary["base_lines_percent"] = base
+              summary["delta_lines_percent"] = delta
+              print(f"macOS coverage current={current:.2f}% base={base:.2f}% delta={delta:.2f}%")
+              if delta < summary["delta_floor_percent"]:
+                  print(
+                      f"::error::macOS line coverage dropped by {delta:.2f} percentage points "
+                      f"(allowed floor {summary['delta_floor_percent']:.2f})"
+                  )
+                  failed = True
+          else:
+              print(f"macOS coverage current={current:.2f}%; no PR base coverage available")
+
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary:
+              with open(step_summary, "a", encoding="utf-8") as handle:
+                  handle.write("### macOS coverage\n\n")
+                  handle.write(f"- Current line coverage: {current:.2f}%\n")
+                  if "base_lines_percent" in summary:
+                      handle.write(f"- Base line coverage: {summary['base_lines_percent']:.2f}%\n")
+                      handle.write(f"- Delta: {summary['delta_lines_percent']:.2f} percentage points\n")
+                      handle.write(f"- Allowed floor: {summary['delta_floor_percent']:.2f} percentage points\n")
+
+          pathlib.Path("coverage/coverage-summary.json").write_text(
+              json.dumps(summary, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          if failed:
+              sys.exit(1)
+          PY
+      - name: Upload macOS coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-coverage
+          path: coverage/
+          retention-days: 30
+
   stress:
     name: Stress Tests
     runs-on: ubuntu-latest
@@ -372,7 +482,7 @@ jobs:
   provenance:
     name: Provenance Metadata
     runs-on: ubuntu-latest
-    needs: [unit, integration, decision-plane, dashboard, e2e, macos-platform, stress, artifact-contract]
+    needs: [unit, integration, decision-plane, dashboard, e2e, macos-platform, macos-coverage, stress, artifact-contract]
     steps:
       - uses: actions/checkout@v4
       - name: Strip local-only TUI path deps

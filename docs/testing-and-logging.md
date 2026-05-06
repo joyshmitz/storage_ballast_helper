@@ -202,6 +202,7 @@ Use `--local` to skip rch. CI workflows run locally (no rch available).
 | decision-plane | `proof-harness-output.txt`, `decision-plane-e2e-output.txt` | 30 days |
 | e2e | `e2e-output.txt`, per-case logs | 14 days |
 | macos-platform | `macos-*-output.txt`, `macos-runner-info.txt`, `macos-toolchain-output.txt`, `macos-codesign-output.txt`, `sbh-completions.zsh` | 14 days |
+| macos-coverage | `current-coverage.json`, `current-lcov.info`, `coverage-summary.json`, optional PR `base-coverage.json` | 30 days |
 | stress | `stress-output.txt` | 14 days |
 | dashboard | TUI test stage outputs | 14 days |
 | provenance | `ci-metadata.json`, `dependency-tree.txt` | 90 days |
@@ -211,6 +212,15 @@ for this project are `macos-latest` for Apple Silicon (`arm64`) and
 `macos-15-intel` for Intel (`x86_64`). The retired `macos-13` label is not used
 in active workflows. The `macos-platform` job asserts `uname -m` so runner-label
 drift is caught before release artifacts are trusted.
+
+**macOS coverage tracking:** The `macos-coverage` job runs on `macos-latest`
+and installs `cargo-llvm-cov` with `taiki-e/install-action@cargo-llvm-cov`, the
+upstream GitHub Actions install path for prebuilt cargo-llvm-cov binaries. It
+generates JSON and LCOV coverage for the CI-supported non-TUI library, binary,
+and `integration_tests` targets. On pull requests it also checks out the base
+SHA, computes the same macOS line-coverage summary, and fails if current
+coverage is more than 2.0 percentage points below the base branch. The rendered
+step summary and `coverage-summary.json` show current, base, and delta values.
 
 ## Log Artifact Naming Conventions
 
