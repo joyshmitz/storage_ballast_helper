@@ -85,6 +85,9 @@ pub enum ActivityEvent {
     ConfigReloaded {
         details: String,
     },
+    Info {
+        message: String,
+    },
     Error {
         code: String,
         message: String,
@@ -440,6 +443,12 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
             e.ok = Some(true);
             e
         }
+        ActivityEvent::Info { message } => {
+            let mut e = LogEntry::new(EventType::Info, Severity::Info);
+            e.details = Some(message.clone());
+            e.ok = Some(true);
+            e
+        }
         ActivityEvent::Error { code, message } => {
             let mut e = LogEntry::new(EventType::Error, Severity::Critical);
             e.error_code = Some(code.clone());
@@ -587,6 +596,22 @@ fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
             error_code: Some(code.clone()),
             error_message: Some(message.clone()),
             details: None,
+        }),
+        ActivityEvent::Info { message } => Some(ActivityRow {
+            timestamp: ts,
+            event_type: "info".to_string(),
+            severity: "info".to_string(),
+            path: None,
+            size_bytes: None,
+            score: None,
+            score_factors: None,
+            pressure_level: None,
+            free_pct: None,
+            duration_ms: None,
+            success: 1,
+            error_code: None,
+            error_message: None,
+            details: Some(message.clone()),
         }),
         ActivityEvent::BallastReplenished { path, size_bytes } => Some(ActivityRow {
             timestamp: ts,
@@ -776,6 +801,23 @@ mod tests {
 
         let contents = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
         assert_eq!(contents.lines().count(), 2);
+    }
+
+    #[test]
+    fn info_event_is_logged_at_info_severity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join) = spawn_logger(test_config(dir.path())).unwrap();
+
+        handle.send(ActivityEvent::Info {
+            message: "active-reference visibility incomplete".to_string(),
+        });
+        handle.shutdown();
+        join.join().unwrap();
+
+        let contents = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
+        assert!(contents.contains("\"event\":\"info\""));
+        assert!(contents.contains("\"severity\":\"info\""));
+        assert!(contents.contains("active-reference visibility incomplete"));
     }
 
     #[test]

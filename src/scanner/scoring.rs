@@ -55,6 +55,7 @@ pub struct EvidenceLedger {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ActiveReferenceSummary {
     pub processes: Vec<ActiveReferenceProcess>,
+    pub incomplete_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +70,8 @@ pub struct ActiveReferenceProcess {
 impl ActiveReferenceSummary {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.processes.iter().all(ActiveReferenceProcess::is_empty)
+        self.incomplete_reason.is_none()
+            && self.processes.iter().all(ActiveReferenceProcess::is_empty)
     }
 
     pub fn add_open_file_descriptor(&mut self, pid: i32, name: Option<String>) {
@@ -84,6 +86,10 @@ impl ActiveReferenceSummary {
         self.process_mut(pid, name).mmap_regions += 1;
     }
 
+    pub fn mark_incomplete(&mut self, reason: impl Into<String>) {
+        self.incomplete_reason = Some(reason.into());
+    }
+
     #[must_use]
     pub fn safe_reclaim_reason(&self) -> Option<Cow<'static, str>> {
         let active = self
@@ -91,7 +97,7 @@ impl ActiveReferenceSummary {
             .iter()
             .filter(|process| !process.is_empty())
             .collect::<Vec<_>>();
-        if active.is_empty() {
+        if active.is_empty() && self.incomplete_reason.is_none() {
             return None;
         }
 
@@ -103,6 +109,13 @@ impl ActiveReferenceSummary {
         let remaining = active.len().saturating_sub(process_reasons.len());
         if remaining > 0 {
             process_reasons.push(format!("and {remaining} more processes"));
+        }
+        if let Some(reason) = &self.incomplete_reason {
+            process_reasons.push(reason.clone());
+        }
+
+        if active.is_empty() {
+            return self.incomplete_reason.clone().map(Cow::Owned);
         }
 
         Some(Cow::Owned(format!(
@@ -941,6 +954,34 @@ mod tests {
             Some(
                 "Cannot reclaim safely: pid 12345 (rustc) has 2 open file descriptors, 1 running executable, 1 mmap region"
             )
+        );
+    }
+
+    #[test]
+    fn incomplete_active_reference_visibility_is_reported_as_safety_reason() {
+        let engine = default_engine();
+        let mut active_references = ActiveReferenceSummary::default();
+        active_references.mark_incomplete("fd check incomplete: other-user processes not visible");
+
+        let score = engine.score_candidate(
+            &CandidateInput {
+                path: PathBuf::from("/tmp/cargo-target-active"),
+                size_bytes: 1_073_741_824,
+                age: Duration::from_hours(6),
+                classification: classification(0.95, ArtifactCategory::RustTarget),
+                signals: StructuralSignals::default(),
+                active_references,
+                is_open: false,
+                excluded: false,
+            },
+            0.9,
+        );
+
+        assert!(score.vetoed);
+        assert_eq!(score.decision.action, DecisionAction::Keep);
+        assert_eq!(
+            score.veto_reason.as_deref(),
+            Some("fd check incomplete: other-user processes not visible")
         );
     }
 

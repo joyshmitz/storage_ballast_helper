@@ -1091,6 +1091,7 @@ fn parse_event_type(input: &str) -> Option<crate::logger::jsonl::EventType> {
         "daemon_start" => Some(crate::logger::jsonl::EventType::DaemonStart),
         "daemon_stop" => Some(crate::logger::jsonl::EventType::DaemonStop),
         "config_reload" => Some(crate::logger::jsonl::EventType::ConfigReload),
+        "info" => Some(crate::logger::jsonl::EventType::Info),
         "error" => Some(crate::logger::jsonl::EventType::Error),
         "emergency" => Some(crate::logger::jsonl::EventType::Emergency),
         _ => match compact.as_str() {
@@ -1103,6 +1104,7 @@ fn parse_event_type(input: &str) -> Option<crate::logger::jsonl::EventType> {
             "daemonstart" => Some(crate::logger::jsonl::EventType::DaemonStart),
             "daemonstop" => Some(crate::logger::jsonl::EventType::DaemonStop),
             "configreload" => Some(crate::logger::jsonl::EventType::ConfigReload),
+            "info" => Some(crate::logger::jsonl::EventType::Info),
             _ => None,
         },
     }

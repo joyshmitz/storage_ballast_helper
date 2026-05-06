@@ -43,6 +43,7 @@ pub enum EventType {
     DaemonStart,
     DaemonStop,
     ConfigReload,
+    Info,
     Error,
     Emergency,
 }
@@ -966,6 +967,7 @@ mod tests {
             EventType::DaemonStart,
             EventType::DaemonStop,
             EventType::ConfigReload,
+            EventType::Info,
             EventType::Error,
             EventType::Emergency,
         ];

@@ -26,6 +26,8 @@ use crate::scanner::scoring::ActiveReferenceSummary;
 
 pub const DEFAULT_ACTIVE_REFERENCE_CACHE_TTL_SECS: u64 = 30;
 pub const DEFAULT_ACTIVE_REFERENCE_MIN_SIZE_BYTES: u64 = 100 * 1024 * 1024;
+pub const MACOS_USER_SCOPE_ACTIVE_REFERENCE_WARNING: &str =
+    "fd check incomplete: other-user processes not visible";
 
 /// Walker configuration derived from `ScannerConfig`.
 #[derive(Debug, Clone)]
@@ -889,6 +891,7 @@ fn normalized_root_cache_key(root_paths: &[PathBuf]) -> Vec<PathBuf> {
 pub struct ActiveReferenceIndex {
     references: HashMap<PathBuf, ActiveReferenceSummary>,
     complete: bool,
+    incomplete_reason: Option<String>,
 }
 
 impl Default for ActiveReferenceIndex {
@@ -903,6 +906,16 @@ impl ActiveReferenceIndex {
         Self {
             references: HashMap::new(),
             complete: true,
+            incomplete_reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn incomplete(reason: impl Into<String>) -> Self {
+        Self {
+            references: HashMap::new(),
+            complete: false,
+            incomplete_reason: Some(reason.into()),
         }
     }
 
@@ -912,15 +925,25 @@ impl ActiveReferenceIndex {
     }
 
     #[must_use]
+    pub fn incomplete_reason(&self) -> Option<&str> {
+        self.incomplete_reason.as_deref()
+    }
+
+    #[must_use]
     pub fn summary_for(&self, path: &Path) -> ActiveReferenceSummary {
-        self.references
+        let mut summary = self
+            .references
             .get(path)
             .cloned()
             .or_else(|| {
                 let normalized = crate::core::paths::resolve_absolute_path(path);
                 self.references.get(&normalized).cloned()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Some(reason) = &self.incomplete_reason {
+            summary.mark_incomplete(reason.clone());
+        }
+        summary
     }
 
     fn add_reference<F>(&mut self, roots: &[PathBuf], reference_path: &Path, mut add: F)
@@ -974,7 +997,11 @@ pub fn collect_active_reference_index(
     let mut index = ActiveReferenceIndex {
         references: HashMap::new(),
         complete: true,
+        incomplete_reason: active_reference_visibility_warning(platform).map(str::to_string),
     };
+    if index.incomplete_reason.is_some() {
+        index.complete = false;
+    }
     let mut process_names = HashMap::new();
     match platform.process_list() {
         Ok(processes) => {
@@ -1026,6 +1053,26 @@ pub fn collect_active_reference_index(
     }
 
     index
+}
+
+fn active_reference_visibility_warning(platform: &dyn Platform) -> Option<&'static str> {
+    if platform.name() == "macos" && !process_can_inspect_all_users() {
+        Some(MACOS_USER_SCOPE_ACTIVE_REFERENCE_WARNING)
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn process_can_inspect_all_users() -> bool {
+    // A root-scoped LaunchDaemon can inspect system-wide process state; a
+    // user-scoped LaunchAgent generally cannot see other users' file handles.
+    nix::unistd::Uid::effective().is_root()
+}
+
+#[cfg(not(unix))]
+fn process_can_inspect_all_users() -> bool {
+    true
 }
 
 #[must_use]
@@ -1349,6 +1396,22 @@ mod tests {
         assert!(reason.contains("open file descriptor"));
         assert!(reason.contains("running executable"));
         assert!(reason.contains("mmap region"));
+    }
+
+    #[test]
+    fn incomplete_active_reference_index_marks_candidate_summaries() {
+        let index = ActiveReferenceIndex::incomplete(MACOS_USER_SCOPE_ACTIVE_REFERENCE_WARNING);
+        let summary = index.summary_for(Path::new("/tmp/cargo-target-active"));
+
+        assert!(!index.is_complete());
+        assert_eq!(
+            index.incomplete_reason(),
+            Some(MACOS_USER_SCOPE_ACTIVE_REFERENCE_WARNING)
+        );
+        assert_eq!(
+            summary.safe_reclaim_reason().as_deref(),
+            Some(MACOS_USER_SCOPE_ACTIVE_REFERENCE_WARNING)
+        );
     }
 
     #[test]

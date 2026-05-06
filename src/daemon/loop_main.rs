@@ -2257,6 +2257,21 @@ fn dispatch_top_candidates(
     }
 }
 
+fn collect_active_references_for_scan(
+    platform: &dyn Platform,
+    paths: &[PathBuf],
+    scan_config: ActiveReferenceScanConfig,
+    logger: &ActivityLoggerHandle,
+) -> ActiveReferenceIndex {
+    let index = collect_active_reference_index_cached(platform, paths, scan_config.cache_ttl);
+    if let Some(reason) = index.incomplete_reason() {
+        let message = format!("active-reference visibility incomplete: {reason}");
+        eprintln!("[SBH-SCANNER] info: {message}");
+        logger.send(ActivityEvent::Info { message });
+    }
+    index
+}
+
 /// Incremental scan cursor — persists across scan iterations within the scanner
 /// thread to avoid re-walking large directory subtrees that contained zero
 /// cleanup candidates on the previous pass.
@@ -2533,10 +2548,11 @@ fn scanner_thread_main(
                                     });
                                     let active_references = active_reference_joined
                                         .get_or_insert_with(|| {
-                                            collect_active_reference_index_cached(
+                                            collect_active_references_for_scan(
                                                 platform.as_ref(),
                                                 &request.paths,
-                                                active_reference_scan.cache_ttl,
+                                                active_reference_scan,
+                                                logger,
                                             )
                                         });
                                     (
@@ -2808,10 +2824,11 @@ fn scanner_thread_main(
                         .0
                     });
                     let active_references = active_reference_joined.get_or_insert_with(|| {
-                        collect_active_reference_index_cached(
+                        collect_active_references_for_scan(
                             platform.as_ref(),
                             &request.paths,
-                            active_reference_scan.cache_ttl,
+                            active_reference_scan,
+                            logger,
                         )
                     });
                     (

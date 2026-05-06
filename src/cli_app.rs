@@ -3706,6 +3706,7 @@ fn build_scan_trace(
         .iter()
         .map(|process| process.mmap_regions)
         .sum::<usize>();
+    let active_reference_incomplete = input.active_references.incomplete_reason.as_deref();
 
     ScanTrace {
         pattern_name: input.classification.pattern_name.to_string(),
@@ -3729,6 +3730,8 @@ fn build_scan_trace(
             format!("{open_fd_count} open file descriptor(s)")
         } else if input.is_open {
             "open file detected by fallback scanner".to_string()
+        } else if let Some(reason) = active_reference_incomplete {
+            reason.to_string()
         } else {
             "clear".to_string()
         },
@@ -6025,6 +6028,42 @@ mod tests {
         assert_eq!(
             trace.mmap_check,
             "skipped below active-reference size threshold"
+        );
+    }
+
+    #[test]
+    fn scan_trace_reports_incomplete_active_reference_visibility() {
+        let path = PathBuf::from("/tmp/cargo-target-active");
+        let mut active_references =
+            storage_ballast_helper::scanner::scoring::ActiveReferenceSummary::default();
+        active_references.mark_incomplete("fd check incomplete: other-user processes not visible");
+        let input = CandidateInput {
+            path: path.clone(),
+            size_bytes: 1_073_741_824,
+            age: std::time::Duration::from_hours(2),
+            classification: ArtifactPatternRegistry::default().classify(
+                &path,
+                storage_ballast_helper::scanner::patterns::StructuralSignals::default(),
+            ),
+            signals: storage_ballast_helper::scanner::patterns::StructuralSignals::default(),
+            active_references,
+            is_open: false,
+            excluded: false,
+        };
+        let engine = ScoringEngine::from_config(
+            &storage_ballast_helper::core::config::ScoringConfig::default(),
+            30,
+        );
+        let score = engine.score_candidate(&input, 0.0);
+        let trace = build_scan_trace(&input, &score, 1_800, true);
+
+        assert_eq!(
+            trace.fd_check,
+            "fd check incomplete: other-user processes not visible"
+        );
+        assert_eq!(
+            trace.veto_reason.as_deref(),
+            Some("fd check incomplete: other-user processes not visible")
         );
     }
 
