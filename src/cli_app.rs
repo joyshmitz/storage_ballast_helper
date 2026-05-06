@@ -24,7 +24,9 @@ use storage_ballast_helper::daemon::service::{
 use storage_ballast_helper::logger::sqlite::SqliteLogger;
 use storage_ballast_helper::logger::stats::{StatsEngine, window_label};
 use storage_ballast_helper::monitor::fs_stats::FsStatsCollector;
-use storage_ballast_helper::platform::pal::{MemoryInfo, ServiceManager, detect_platform};
+use storage_ballast_helper::platform::pal::{
+    MemoryInfo, Platform, ServiceManager, detect_platform,
+};
 use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionPlan};
 use storage_ballast_helper::scanner::patterns::ArtifactPatternRegistry;
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
@@ -109,6 +111,8 @@ enum Command {
     Blame(BlameArgs),
     /// Live TUI-style dashboard.
     Dashboard(DashboardArgs),
+    /// Run diagnostics.
+    Doctor(DoctorArgs),
     /// Generate shell completions.
     Completions(CompletionsArgs),
     /// Check for and apply updates.
@@ -195,6 +199,13 @@ struct StatusArgs {
     /// Continuously refresh status output.
     #[arg(long)]
     watch: bool,
+}
+
+#[derive(Debug, Clone, Args, Serialize, Default)]
+struct DoctorArgs {
+    /// Probe the Platform Abstraction Layer implementation.
+    #[arg(long)]
+    pal: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -619,6 +630,7 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Check(args) => run_check(cli, args),
         Command::Blame(args) => run_blame(cli, args),
         Command::Dashboard(args) => run_dashboard(cli, args),
+        Command::Doctor(args) => run_doctor(cli, args),
         Command::Completions(args) => {
             let mut command = Cli::command();
             let binary_name = command.get_name().to_string();
@@ -3005,6 +3017,187 @@ fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
     };
 
     run_dashboard_runtime(cli, &request)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PalDoctorReport {
+    platform: String,
+    implemented: usize,
+    not_implemented: usize,
+    failed: usize,
+    skipped: usize,
+    methods: Vec<PalDoctorProbe>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PalDoctorProbe {
+    method: &'static str,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bead: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
+    if !args.pal {
+        return Err(CliError::User(
+            "specify a diagnostic target, for example: sbh doctor --pal".to_string(),
+        ));
+    }
+
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+    let report = pal_doctor_report(platform.as_ref());
+
+    match output_mode(cli) {
+        OutputMode::Json => {
+            let payload = serde_json::to_value(&report)?;
+            write_json_line(&payload)?;
+        }
+        OutputMode::Human => {
+            println!("PAL doctor: {}", report.platform);
+            println!(
+                "  implemented={} not_implemented={} failed={} skipped={}",
+                report.implemented, report.not_implemented, report.failed, report.skipped
+            );
+            for method in &report.methods {
+                match (&method.bead, &method.message) {
+                    (Some(bead), Some(message)) => {
+                        println!(
+                            "  {:<28} {:<16} {:<12} {}",
+                            method.method, method.status, bead, message
+                        );
+                    }
+                    (Some(bead), None) => {
+                        println!("  {:<28} {:<16} {bead}", method.method, method.status);
+                    }
+                    (None, Some(message)) => {
+                        println!("  {:<28} {:<16} {}", method.method, method.status, message);
+                    }
+                    (None, None) => {
+                        println!("  {:<28} {}", method.method, method.status);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn pal_doctor_report(platform: &dyn Platform) -> PalDoctorReport {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let current_pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
+    let current_exe = std::env::current_exe().unwrap_or_else(|_| cwd.clone());
+    let callback = || -> storage_ballast_helper::core::errors::Result<_> {
+        platform.subscribe_memory_pressure(Box::new(|_| {}))
+    };
+
+    let mut methods = vec![
+        pal_probe_result("fs_stats", platform.fs_stats(&cwd)),
+        pal_probe_result("mount_points", platform.mount_points()),
+        pal_probe_result("is_ram_backed", platform.is_ram_backed(&cwd)),
+        pal_probe_value("default_paths", platform.default_paths()),
+        pal_probe_result("memory_info", platform.memory_info()),
+        pal_probe_result(
+            "service_manager.status",
+            platform.service_manager().status(),
+        ),
+        pal_probe_result("capacity", platform.capacity(&cwd)),
+        pal_probe_result("mounts", platform.mounts()),
+        pal_probe_result("memory_pressure", platform.memory_pressure()),
+        pal_probe_result("subscribe_memory_pressure", callback()),
+        pal_probe_result("process_list", platform.process_list()),
+        pal_probe_result("process_io", platform.process_io(current_pid)),
+        pal_probe_result("open_files_under", platform.open_files_under(&cwd)),
+        pal_probe_result("executables_under", platform.executables_under(&cwd)),
+        pal_probe_result("mmap_regions_under", platform.mmap_regions_under(&cwd)),
+        pal_probe_result("self_stats", platform.self_stats()),
+        pal_probe_skipped(
+            "preallocate_file",
+            "requires an explicit writable target and is skipped by read-only doctor",
+        ),
+        pal_probe_result("file_block_count", platform.file_block_count(&current_exe)),
+        pal_probe_value("user_home", platform.user_home()),
+        pal_probe_value("temp_dirs", platform.temp_dirs()),
+        pal_probe_value("cache_roots", platform.cache_roots()),
+        pal_probe_value("sacred_paths", platform.sacred_paths()),
+        pal_probe_value("service_kind", platform.service_kind()),
+    ];
+    methods.sort_by_key(|probe| probe.method);
+
+    let implemented = methods
+        .iter()
+        .filter(|probe| probe.status == "implemented")
+        .count();
+    let not_implemented = methods
+        .iter()
+        .filter(|probe| probe.status == "not_implemented")
+        .count();
+    let failed = methods
+        .iter()
+        .filter(|probe| probe.status == "failed")
+        .count();
+    let skipped = methods
+        .iter()
+        .filter(|probe| probe.status == "skipped")
+        .count();
+
+    PalDoctorReport {
+        platform: platform.name().to_string(),
+        implemented,
+        not_implemented,
+        failed,
+        skipped,
+        methods,
+    }
+}
+
+fn pal_probe_value<T>(method: &'static str, _value: T) -> PalDoctorProbe {
+    PalDoctorProbe {
+        method,
+        status: "implemented",
+        bead: None,
+        message: None,
+    }
+}
+
+fn pal_probe_skipped(method: &'static str, message: impl Into<String>) -> PalDoctorProbe {
+    PalDoctorProbe {
+        method,
+        status: "skipped",
+        bead: None,
+        message: Some(message.into()),
+    }
+}
+
+fn pal_probe_result<T>(
+    method: &'static str,
+    result: storage_ballast_helper::core::errors::Result<T>,
+) -> PalDoctorProbe {
+    match result {
+        Ok(_) => pal_probe_value(method, ()),
+        Err(storage_ballast_helper::core::errors::SbhError::Pal { source }) => {
+            let status = match source {
+                storage_ballast_helper::platform::types::PalError::NotImplemented { .. } => {
+                    "not_implemented"
+                }
+                storage_ballast_helper::platform::types::PalError::MethodFailed { .. } => "failed",
+            };
+            PalDoctorProbe {
+                method,
+                status,
+                bead: source.bead().map(str::to_string),
+                message: Some(source.to_string()),
+            }
+        }
+        Err(error) => PalDoctorProbe {
+            method,
+            status: "failed",
+            bead: None,
+            message: Some(error.to_string()),
+        },
+    }
 }
 
 fn run_status(cli: &Cli, args: &StatusArgs) -> Result<(), CliError> {
@@ -5943,6 +6136,7 @@ mod tests {
             vec!["sbh", "dashboard", "--refresh-ms", "250"],
             vec!["sbh", "dashboard", "--new-dashboard"],
             vec!["sbh", "dashboard", "--legacy-dashboard"],
+            vec!["sbh", "doctor", "--pal"],
             vec!["sbh", "ballast", "status"],
             vec!["sbh", "ballast", "release", "2"],
             vec!["sbh", "config", "path"],
