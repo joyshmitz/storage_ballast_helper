@@ -6,15 +6,18 @@
 use std::path::{Path, PathBuf};
 
 use crate::core::errors::Result;
+use crate::core::paths::resolve_absolute_path;
 use crate::platform::macos::libproc::{
-    ProcTaskAllInfo, proc_listpids_safe, proc_pidinfo_task_all, proc_pidpath_safe,
+    ProcFdInfo, ProcFdType, ProcTaskAllInfo, VnodeFdInfoWithPath, proc_listpids_safe,
+    proc_pid_list_fds, proc_pidfdinfo_vnode_path, proc_pidinfo_task_all, proc_pidpath_safe,
 };
 use crate::platform::pal::{
     FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
 };
 use crate::platform::types::{
-    Capacity, MappedRegion, MemoryPressure, MemoryPressureCallback, MountInfo, OpenFile, PalError,
-    ProcessInfo, ProcessIo, SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
+    Capacity, MappedRegion, MemoryPressure, MemoryPressureCallback, MountInfo, OpenFile,
+    OpenFileKind, OpenFileMode, PalError, ProcessInfo, ProcessIo, SacredPath, SelfStats,
+    ServiceKind, SubscriptionHandle,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -90,8 +93,21 @@ impl Platform for MacOsPal {
         macos_placeholder("bd-ly4w.3", "process_io")
     }
 
-    fn open_files_under(&self, _path: &Path) -> Result<Vec<OpenFile>> {
-        macos_placeholder("bd-ezkk.1", "open_files_under")
+    fn open_files_under(&self, path: &Path) -> Result<Vec<OpenFile>> {
+        let root = resolve_absolute_path(path);
+        let mut open_files: Vec<OpenFile> = proc_listpids_safe()
+            .map_err(|error| macos_method_error("open_files_under", &error))?
+            .into_iter()
+            .filter(|pid| *pid > 0)
+            .flat_map(|pid| open_files_for_pid_under(pid, &root))
+            .collect();
+        open_files.sort_by(|left, right| {
+            left.pid
+                .cmp(&right.pid)
+                .then_with(|| left.fd.cmp(&right.fd))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        Ok(open_files)
     }
 
     fn executables_under(&self, _path: &Path) -> Result<Vec<ProcessInfo>> {
@@ -206,6 +222,57 @@ fn start_time_unix_ms(seconds: u64, micros: u64) -> Option<i64> {
     i64::try_from(millis).ok()
 }
 
+fn open_files_for_pid_under(pid: i32, root: &Path) -> Vec<OpenFile> {
+    let Ok(fds) = proc_pid_list_fds(pid) else {
+        return Vec::new();
+    };
+    fds.into_iter()
+        .filter_map(|fd| open_file_for_fd_under(pid, fd, root))
+        .collect()
+}
+
+fn open_file_for_fd_under(pid: i32, fd: ProcFdInfo, root: &Path) -> Option<OpenFile> {
+    if fd.fd_type().ok()? != ProcFdType::VNODE {
+        return None;
+    }
+    let info = proc_pidfdinfo_vnode_path(pid, fd.proc_fd.0)
+        .ok()
+        .flatten()?;
+    let path = resolve_absolute_path(info.path().ok()?);
+    if !path.starts_with(root) {
+        return None;
+    }
+    Some(OpenFile {
+        pid,
+        path,
+        fd: Some(fd.proc_fd.0),
+        kind: open_file_kind(&info),
+        mode: open_file_mode(info.pfi.fi_openflags),
+    })
+}
+
+fn open_file_kind(info: &VnodeFdInfoWithPath) -> OpenFileKind {
+    match info.pvip.vip_vi.vi_stat.vst_mode & libc::S_IFMT {
+        libc::S_IFREG => OpenFileKind::Regular,
+        libc::S_IFDIR => OpenFileKind::Directory,
+        libc::S_IFSOCK => OpenFileKind::Socket,
+        libc::S_IFIFO => OpenFileKind::Pipe,
+        libc::S_IFCHR | libc::S_IFBLK => OpenFileKind::Device,
+        _ => OpenFileKind::Unknown,
+    }
+}
+
+fn open_file_mode(open_flags: u32) -> OpenFileMode {
+    const FREAD: u32 = 0x1;
+    const FWRITE: u32 = 0x2;
+    match (open_flags & FREAD != 0, open_flags & FWRITE != 0) {
+        (true, true) => OpenFileMode::ReadWrite,
+        (true, false) => OpenFileMode::Read,
+        (false, true) => OpenFileMode::Write,
+        (false, false) => OpenFileMode::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::platform::pal::Platform;
@@ -240,5 +307,34 @@ mod tests {
                 .iter()
                 .any(|process| process.resident_memory_bytes.is_some())
         );
+    }
+
+    #[test]
+    fn open_files_under_returns_current_process_tempfile_fd() {
+        let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        let file_path = dir.path().join("open-file.txt");
+        let _file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&file_path)
+            .expect("temp file should stay open for fd scan");
+        let expected = std::fs::canonicalize(&file_path).expect("temp file should canonicalize");
+
+        let platform = MacOsPal::new();
+        let open_files = platform
+            .open_files_under(dir.path())
+            .expect("macOS open fd scan should be readable");
+
+        let actual = open_files
+            .iter()
+            .find(|open_file| {
+                open_file.pid == super::current_process_pid() && open_file.path == expected
+            })
+            .expect("current process open tempfile should be reported");
+        assert_eq!(actual.kind, crate::platform::types::OpenFileKind::Regular);
+        assert_eq!(actual.mode, crate::platform::types::OpenFileMode::ReadWrite);
+        assert!(actual.fd.is_some());
     }
 }
