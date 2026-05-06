@@ -119,8 +119,21 @@ impl Platform for MacOsPal {
         Ok(open_files)
     }
 
-    fn executables_under(&self, _path: &Path) -> Result<Vec<ProcessInfo>> {
-        macos_placeholder("bd-ezkk.2", "executables_under")
+    fn executables_under(&self, path: &Path) -> Result<Vec<ProcessInfo>> {
+        let root = resolve_absolute_path(path);
+        let mut processes: Vec<ProcessInfo> = proc_listpids_safe()
+            .map_err(|error| macos_method_error("executables_under", &error))?
+            .into_iter()
+            .filter(|pid| *pid > 0)
+            .filter_map(process_info_for_pid)
+            .filter(|process| executable_is_under(process, &root))
+            .collect();
+        processes.sort_by(|left, right| {
+            left.pid
+                .cmp(&right.pid)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        Ok(processes)
     }
 
     fn mmap_regions_under(&self, _path: &Path) -> Result<Vec<MappedRegion>> {
@@ -229,6 +242,13 @@ fn start_time_unix_ms(seconds: u64, micros: u64) -> Option<i64> {
         .checked_mul(1000)?
         .checked_add(micros.checked_div(1000)?)?;
     i64::try_from(millis).ok()
+}
+
+fn executable_is_under(process: &ProcessInfo, root: &Path) -> bool {
+    process
+        .executable
+        .as_deref()
+        .is_some_and(|path| resolve_absolute_path(path).starts_with(root))
 }
 
 fn open_files_for_pid_under(pid: i32, root: &Path) -> Vec<OpenFile> {
@@ -362,5 +382,25 @@ mod tests {
         assert_eq!(actual.kind, crate::platform::types::OpenFileKind::Regular);
         assert_eq!(actual.mode, crate::platform::types::OpenFileMode::ReadWrite);
         assert!(actual.fd.is_some());
+    }
+
+    #[test]
+    fn executables_under_returns_current_process_executable() {
+        let current_exe = std::env::current_exe().expect("current executable should be known");
+        let root = current_exe
+            .parent()
+            .expect("current executable should have parent");
+        let expected =
+            std::fs::canonicalize(&current_exe).expect("current executable should canonicalize");
+
+        let platform = MacOsPal::new();
+        let processes = platform
+            .executables_under(root)
+            .expect("macOS executable scan should be readable");
+
+        assert!(processes.iter().any(|process| {
+            process.pid == super::current_process_pid()
+                && process.executable.as_deref() == Some(expected.as_path())
+        }));
     }
 }
