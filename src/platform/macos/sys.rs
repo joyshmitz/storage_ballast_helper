@@ -5,10 +5,16 @@
 
 use std::ffi::OsStr;
 use std::io;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 use nix::mount::MntFlags;
 use nix::sys::statfs::{Statfs, statfs as nix_statfs};
+use parking_lot::RwLock;
+use plist::Value;
+use std::sync::OnceLock;
 
 const STATFS_STRUCT_SIZE_BYTES: usize = core::mem::size_of::<libc::statfs>();
 const STATFS_MOUNT_NAME_BYTES: usize = core::mem::size_of::<[libc::c_char; 1024]>();
@@ -17,6 +23,10 @@ const STATFS_TYPE_NAME_BYTES: usize = core::mem::size_of::<[libc::c_char; 16]>()
 const _: [(); 2168] = [(); STATFS_STRUCT_SIZE_BYTES];
 const _: [(); 1024] = [(); STATFS_MOUNT_NAME_BYTES];
 const _: [(); 16] = [(); STATFS_TYPE_NAME_BYTES];
+
+const APFS_CACHE_TTL_SECS: u64 = 5 * 60;
+const APFS_CACHE_TTL: Duration = Duration::from_secs(APFS_CACHE_TTL_SECS);
+static APFS_INVENTORY_CACHE: OnceLock<RwLock<Option<(Instant, ApfsInventory)>>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatfsSnapshot {
@@ -52,6 +62,67 @@ impl StatfsSnapshot {
             self.fs_type.to_ascii_lowercase().as_str(),
             "devfs" | "mfs" | "ramfs" | "tmpfs"
         )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApfsInventory {
+    pub containers: Vec<ApfsContainer>,
+    pub volumes: Vec<ApfsVolume>,
+}
+
+impl ApfsInventory {
+    #[must_use]
+    pub fn volume_for_device(&self, device_id: &str) -> Option<&ApfsVolume> {
+        let normalized = normalize_device_id(device_id);
+        self.volumes
+            .iter()
+            .find(|volume| volume.device_id == normalized)
+            .or_else(|| {
+                parent_apfs_volume_device(&normalized).and_then(|parent| {
+                    self.volumes
+                        .iter()
+                        .find(|volume| volume.device_id == parent)
+                })
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApfsContainer {
+    pub container_id: String,
+    pub uuid: Option<String>,
+    pub capacity_total_bytes: Option<u64>,
+    pub capacity_available_bytes: Option<u64>,
+    pub physical_stores: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApfsVolume {
+    pub device_id: String,
+    pub container_id: String,
+    pub name: Option<String>,
+    pub roles: Vec<ApfsVolumeRole>,
+    pub capacity_in_use_bytes: Option<u64>,
+    pub container_total_bytes: Option<u64>,
+    pub container_available_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApfsVolumeRole {
+    Data,
+    System,
+    Preboot,
+    Vm,
+    Update,
+    Recovery,
+    Other(String),
+}
+
+impl ApfsVolume {
+    #[must_use]
+    pub fn has_role(&self, role: &ApfsVolumeRole) -> bool {
+        self.roles.iter().any(|candidate| candidate == role)
     }
 }
 
@@ -91,6 +162,112 @@ pub fn mounted_filesystems() -> io::Result<Vec<StatfsSnapshot>> {
     Ok(filesystems)
 }
 
+pub fn apfs_inventory() -> io::Result<ApfsInventory> {
+    let cache = APFS_INVENTORY_CACHE.get_or_init(|| RwLock::new(None));
+    {
+        let cached = cache.read();
+        if let Some((collected_at, inventory)) = &*cached
+            && collected_at.elapsed() < APFS_CACHE_TTL
+        {
+            return Ok(inventory.clone());
+        }
+    }
+
+    let output = Command::new("/usr/sbin/diskutil")
+        .args(["apfs", "list", "-plist"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "diskutil apfs list -plist failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    let inventory = parse_apfs_inventory(&output.stdout)?;
+    *cache.write() = Some((Instant::now(), inventory.clone()));
+    Ok(inventory)
+}
+
+pub fn parse_apfs_inventory(raw: &[u8]) -> io::Result<ApfsInventory> {
+    let value = Value::from_reader(Cursor::new(raw)).map_err(io::Error::other)?;
+    let root = value.as_dictionary().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "APFS plist root is not a dictionary",
+        )
+    })?;
+    let containers = root
+        .get("Containers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "APFS plist has no Containers array",
+            )
+        })?;
+
+    let mut parsed_containers = Vec::new();
+    let mut parsed_volumes = Vec::new();
+    for container_value in containers {
+        let container = container_value.as_dictionary().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "APFS container is not a dictionary",
+            )
+        })?;
+        let container_id = required_device_id(container, "ContainerReference")?;
+        let capacity_total_bytes = optional_u64(container, "CapacityCeiling");
+        let capacity_available_bytes = optional_u64(container, "CapacityFree");
+        let physical_stores = container
+            .get("PhysicalStores")
+            .and_then(Value::as_array)
+            .map(|stores| {
+                stores
+                    .iter()
+                    .filter_map(Value::as_dictionary)
+                    .filter_map(|store| optional_device_id(store, "DeviceIdentifier"))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        parsed_containers.push(ApfsContainer {
+            container_id: container_id.clone(),
+            uuid: optional_string(container, "APFSContainerUUID"),
+            capacity_total_bytes,
+            capacity_available_bytes,
+            physical_stores,
+        });
+
+        if let Some(volumes) = container.get("Volumes").and_then(Value::as_array) {
+            for volume_value in volumes {
+                let volume = volume_value.as_dictionary().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "APFS volume is not a dictionary",
+                    )
+                })?;
+                let device_id = required_device_id(volume, "DeviceIdentifier")?;
+                let roles = volume_roles(volume);
+                parsed_volumes.push(ApfsVolume {
+                    device_id,
+                    container_id: container_id.clone(),
+                    name: optional_string(volume, "Name"),
+                    roles,
+                    capacity_in_use_bytes: optional_u64(volume, "CapacityInUse"),
+                    container_total_bytes: capacity_total_bytes,
+                    container_available_bytes: capacity_available_bytes,
+                });
+            }
+        }
+    }
+
+    Ok(ApfsInventory {
+        containers: parsed_containers,
+        volumes: parsed_volumes,
+    })
+}
+
 fn statfs_for_mount(mount_point: &Path, device: &OsStr) -> io::Result<StatfsSnapshot> {
     let raw = nix_statfs(mount_point).map_err(nix_error)?;
     Ok(snapshot_from_statfs(
@@ -121,11 +298,125 @@ fn nix_error(error: nix::errno::Errno) -> io::Error {
     io::Error::from_raw_os_error(error as i32)
 }
 
+fn required_device_id(dict: &plist::Dictionary, key: &'static str) -> io::Result<String> {
+    optional_device_id(dict, key).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("APFS plist entry missing {key}"),
+        )
+    })
+}
+
+fn optional_device_id(dict: &plist::Dictionary, key: &str) -> Option<String> {
+    optional_string(dict, key).map(|device_id| with_dev_prefix(&device_id))
+}
+
+fn optional_string(dict: &plist::Dictionary, key: &str) -> Option<String> {
+    dict.get(key)
+        .and_then(Value::as_string)
+        .map(ToOwned::to_owned)
+}
+
+fn optional_u64(dict: &plist::Dictionary, key: &str) -> Option<u64> {
+    dict.get(key).and_then(Value::as_unsigned_integer)
+}
+
+fn volume_roles(dict: &plist::Dictionary) -> Vec<ApfsVolumeRole> {
+    let mut roles: Vec<ApfsVolumeRole> = dict
+        .get("Roles")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_string)
+        .map(ApfsVolumeRole::from)
+        .collect();
+    roles.sort();
+    roles.dedup();
+    roles
+}
+
+fn normalize_device_id(device_id: &str) -> String {
+    with_dev_prefix(device_id.trim())
+}
+
+fn with_dev_prefix(device_id: &str) -> String {
+    if device_id.starts_with("/dev/") {
+        device_id.to_string()
+    } else {
+        format!("/dev/{device_id}")
+    }
+}
+
+fn parent_apfs_volume_device(device_id: &str) -> Option<String> {
+    let device_name = device_id.rsplit('/').next().unwrap_or(device_id);
+    let after_disk = device_name.strip_prefix("disk")?;
+    let disk_number_len = after_disk.find('s')?;
+    if disk_number_len == 0
+        || !after_disk[..disk_number_len]
+            .chars()
+            .all(|candidate| candidate.is_ascii_digit())
+        || after_disk.matches('s').count() < 2
+    {
+        return None;
+    }
+
+    let suffix_start = device_id.rfind('s')?;
+    Some(device_id[..suffix_start].to_string())
+}
+
+impl From<&str> for ApfsVolumeRole {
+    fn from(value: &str) -> Self {
+        match value {
+            "Data" => Self::Data,
+            "System" => Self::System,
+            "Preboot" => Self::Preboot,
+            "VM" => Self::Vm,
+            "Update" => Self::Update,
+            "Recovery" => Self::Recovery,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+impl Ord for ApfsVolumeRole {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.sort_key()
+            .cmp(&other.sort_key())
+            .then_with(|| match (self, other) {
+                (Self::Other(left), Self::Other(right)) => left.cmp(right),
+                _ => std::cmp::Ordering::Equal,
+            })
+    }
+}
+
+impl PartialOrd for ApfsVolumeRole {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl ApfsVolumeRole {
+    fn sort_key(&self) -> u8 {
+        match self {
+            Self::System => 0,
+            Self::Data => 1,
+            Self::Preboot => 2,
+            Self::Vm => 3,
+            Self::Update => 4,
+            Self::Recovery => 5,
+            Self::Other(_) => 6,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use super::{mounted_filesystems, statfs};
+    use super::{
+        ApfsVolumeRole, mounted_filesystems, parent_apfs_volume_device, parse_apfs_inventory,
+        statfs,
+    };
 
     #[test]
     fn statfs_tmp_reports_plausible_values() {
@@ -147,5 +438,75 @@ mod tests {
                 .iter()
                 .any(|mount| mount.mount_point == Path::new("/"))
         );
+    }
+
+    #[test]
+    fn parses_diskutil_apfs_inventory() {
+        let sample = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Containers</key>
+  <array>
+    <dict>
+      <key>ContainerReference</key><string>disk3</string>
+      <key>APFSContainerUUID</key><string>container-uuid</string>
+      <key>CapacityCeiling</key><integer>1995218165760</integer>
+      <key>CapacityFree</key><integer>667402285056</integer>
+      <key>PhysicalStores</key>
+      <array>
+        <dict><key>DeviceIdentifier</key><string>disk0s2</string></dict>
+      </array>
+      <key>Volumes</key>
+      <array>
+        <dict>
+          <key>DeviceIdentifier</key><string>disk3s1</string>
+          <key>Name</key><string>Macintosh HD</string>
+          <key>Roles</key><array><string>System</string></array>
+          <key>CapacityInUse</key><integer>12269772800</integer>
+        </dict>
+        <dict>
+          <key>DeviceIdentifier</key><string>disk3s5</string>
+          <key>Name</key><string>Data</string>
+          <key>Roles</key><array><string>Data</string></array>
+          <key>CapacityInUse</key><integer>1290235314176</integer>
+        </dict>
+        <dict>
+          <key>DeviceIdentifier</key><string>disk3s6</string>
+          <key>Name</key><string>VM</string>
+          <key>Roles</key><array><string>VM</string></array>
+        </dict>
+      </array>
+    </dict>
+  </array>
+</dict>
+</plist>"#;
+
+        let inventory = parse_apfs_inventory(sample).expect("sample should parse");
+        assert_eq!(inventory.containers.len(), 1);
+        assert_eq!(inventory.volumes.len(), 3);
+
+        let data = inventory
+            .volume_for_device("/dev/disk3s5")
+            .expect("data volume should be indexed");
+        assert_eq!(data.container_id, "/dev/disk3");
+        assert!(data.has_role(&ApfsVolumeRole::Data));
+        assert_eq!(data.container_total_bytes, Some(1_995_218_165_760));
+        assert_eq!(data.container_available_bytes, Some(667_402_285_056));
+
+        let system_snapshot = inventory
+            .volume_for_device("/dev/disk3s1s1")
+            .expect("system snapshot should map to its parent volume");
+        assert!(system_snapshot.has_role(&ApfsVolumeRole::System));
+    }
+
+    #[test]
+    fn parent_apfs_volume_strips_snapshot_suffix() {
+        assert_eq!(
+            parent_apfs_volume_device("/dev/disk3s1s1").as_deref(),
+            Some("/dev/disk3s1")
+        );
+        assert_eq!(parent_apfs_volume_device("/dev/disk3s1"), None);
     }
 }

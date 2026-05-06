@@ -13,7 +13,7 @@ use crate::platform::macos::libproc::{
     proc_pidfdinfo_vnode_path, proc_pidinfo_task_all, proc_pidpath_safe,
 };
 use crate::platform::macos::sacred_catalog::macos_sacred_paths;
-use crate::platform::macos::sys::{self, StatfsSnapshot};
+use crate::platform::macos::sys::{self, ApfsInventory, ApfsVolumeRole, StatfsSnapshot};
 use crate::platform::pal::{
     FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
 };
@@ -69,12 +69,20 @@ impl Platform for MacOsPal {
     }
 
     fn capacity(&self, mount: &Path) -> Result<Capacity> {
-        self.fs_stats(mount).map(Into::into)
+        let stats = sys::statfs(mount).map_err(|error| macos_method_error("capacity", &error))?;
+        let inventory = sys::apfs_inventory().ok();
+        Ok(statfs_to_capacity(stats, inventory.as_ref()))
     }
 
     fn mounts(&self) -> Result<Vec<MountInfo>> {
+        let inventory = sys::apfs_inventory().ok();
         sys::mounted_filesystems()
-            .map(|mounts| mounts.into_iter().map(statfs_to_mount_info).collect())
+            .map(|mounts| {
+                mounts
+                    .into_iter()
+                    .map(|stats| statfs_to_mount_info(stats, inventory.as_ref()))
+                    .collect()
+            })
             .map_err(|error| macos_method_error("mounts", &error))
     }
 
@@ -229,26 +237,60 @@ fn statfs_to_mount_point(stats: StatfsSnapshot) -> MountPoint {
     }
 }
 
-fn statfs_to_mount_info(stats: StatfsSnapshot) -> MountInfo {
+fn statfs_to_capacity(stats: StatfsSnapshot, inventory: Option<&ApfsInventory>) -> Capacity {
+    let total_bytes = stats.total_bytes();
+    let free_bytes = stats.free_bytes();
+    let available_bytes = stats.available_bytes();
+    let volume = inventory.and_then(|inventory| inventory.volume_for_device(&stats.device));
+    Capacity {
+        mount_point: stats.mount_point,
+        fs_type: stats.fs_type,
+        total_bytes,
+        free_bytes,
+        available_bytes,
+        is_readonly: stats.is_readonly,
+        container_id: volume.map(|volume| volume.container_id.clone()),
+        container_total_bytes: volume.and_then(|volume| volume.container_total_bytes),
+        container_available_bytes: volume.and_then(|volume| volume.container_available_bytes),
+        volume_total_bytes: Some(total_bytes),
+        volume_available_bytes: Some(available_bytes),
+        purgeable_bytes: None,
+        local_snapshot_bytes: None,
+    }
+}
+
+fn statfs_to_mount_info(stats: StatfsSnapshot, inventory: Option<&ApfsInventory>) -> MountInfo {
     let is_apfs = stats.fs_type.eq_ignore_ascii_case("apfs");
     let total_bytes = stats.total_bytes();
     let available_bytes = stats.available_bytes();
     let is_ram_backed = stats.is_ram_backed();
+    let volume = inventory.and_then(|inventory| inventory.volume_for_device(&stats.device));
+    let is_apfs_data_volume = volume.is_some_and(|volume| volume.has_role(&ApfsVolumeRole::Data))
+        || (is_apfs && stats.mount_point == Path::new("/System/Volumes/Data"));
+    let is_apfs_system_snapshot = volume
+        .is_some_and(|volume| volume.has_role(&ApfsVolumeRole::System))
+        || (is_apfs && stats.mount_point == Path::new("/") && stats.is_readonly);
+    let is_apfs_vm_volume = volume.is_some_and(|volume| volume.has_role(&ApfsVolumeRole::Vm))
+        || (is_apfs && stats.mount_point == Path::new("/System/Volumes/VM"));
     let mount_point = stats.mount_point;
     MountInfo {
         device: stats.device,
-        mount_point: mount_point.clone(),
+        mount_point,
         fs_type: stats.fs_type,
-        container_id: None,
-        total_bytes: Some(total_bytes),
-        available_bytes: Some(available_bytes),
+        container_id: volume.map(|volume| volume.container_id.clone()),
+        total_bytes: volume
+            .and_then(|volume| volume.container_total_bytes)
+            .or(Some(total_bytes)),
+        available_bytes: volume
+            .and_then(|volume| volume.container_available_bytes)
+            .or(Some(available_bytes)),
         purgeable_bytes: None,
         local_snapshot_bytes: None,
         is_readonly: stats.is_readonly,
         is_ram_backed,
-        is_apfs_data_volume: is_apfs && mount_point == Path::new("/System/Volumes/Data"),
-        is_apfs_system_snapshot: is_apfs && mount_point == Path::new("/") && stats.is_readonly,
-        is_apfs_vm_volume: is_apfs && mount_point == Path::new("/System/Volumes/VM"),
+        is_apfs_data_volume,
+        is_apfs_system_snapshot,
+        is_apfs_vm_volume,
     }
 }
 

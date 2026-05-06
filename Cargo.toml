@@ -65,6 +65,7 @@ libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libproc = "0.14.11"
+plist = "1.9.0"
 proc_pidinfo = "0.1.4"
 whichdisk = "0.4.0"
 [dev-dependencies]
