@@ -5,6 +5,7 @@
 //! - `MockPlatform` — configurable platform mock for unit tests
 //! - `TestEnvironment` — realistic directory tree builder
 //! - `create_fake_rust_target()` — builds a realistic `target/` directory
+//! - `SyntheticMacTree` — APFS-style macOS artifact and sacred-path fixture
 //! - `SyntheticTimeSeries` — generates pressure patterns for EWMA/PID testing
 
 // Not every test binary uses every item; suppress dead-code warnings for the shared module.
@@ -383,6 +384,177 @@ pub fn create_fake_rust_target(root: &Path, age: Duration) -> PathBuf {
     }
 
     target
+}
+
+// ──────────────────── SyntheticMacTree ────────────────────
+
+/// Synthetic macOS directory tree for scanner/protection tests.
+///
+/// The tree lives under a temp directory and mirrors path shapes that matter to
+/// the macOS port without touching real user locations:
+/// `Users/<user>/Library/Caches`, Xcode `DerivedData`, iOS Simulator caches,
+/// `/private/tmp` build targets, and protected personal-data locations.
+pub struct SyntheticMacTree {
+    root: tempfile::TempDir,
+    pub user_home: PathBuf,
+    pub library_caches: PathBuf,
+    pub xcode_derived_data: PathBuf,
+    pub simulator_device_cache: PathBuf,
+    pub private_tmp: PathBuf,
+    pub rust_target: PathBuf,
+    pub frankenterm_trash: PathBuf,
+    pub reclaimable_paths: Vec<PathBuf>,
+    pub sacred_paths: Vec<PathBuf>,
+}
+
+impl SyntheticMacTree {
+    /// Create a populated synthetic Mac tree with deterministic path names.
+    pub fn new() -> Self {
+        let root = tempfile::tempdir().expect("create synthetic mac tempdir");
+        let user_home = root.path().join("Users").join("operator");
+        let library = user_home.join("Library");
+        let library_caches = library.join("Caches");
+        let xcode_derived_data = library
+            .join("Developer")
+            .join("Xcode")
+            .join("DerivedData")
+            .join("sbh-demo-abc123");
+        let simulator_device_cache = library
+            .join("Developer")
+            .join("CoreSimulator")
+            .join("Devices")
+            .join("DEADBEEF-DEAD-BEEF-DEAD-BEEFDEADBEEF")
+            .join("data")
+            .join("Library")
+            .join("Caches")
+            .join("com.example.demo");
+        let private_tmp = root.path().join("private").join("tmp");
+        let rust_target = private_tmp.join("ft-cod7-target");
+        let frankenterm_trash = private_tmp.join("frankenterm-trash-20260503-092725");
+
+        let mut tree = Self {
+            root,
+            user_home,
+            library_caches,
+            xcode_derived_data,
+            simulator_device_cache,
+            private_tmp,
+            rust_target,
+            frankenterm_trash,
+            reclaimable_paths: Vec::new(),
+            sacred_paths: Vec::new(),
+        };
+        tree.populate();
+        tree
+    }
+
+    /// Root directory path for the synthetic filesystem.
+    pub fn root(&self) -> &Path {
+        self.root.path()
+    }
+
+    fn populate(&mut self) {
+        let old = Duration::from_hours(12);
+        let newer = Duration::from_hours(2);
+
+        Self::create_file(
+            self.library_caches
+                .join("com.anthropic.claude")
+                .join("Cache")
+                .join("data_0"),
+            b"synthetic electron cache",
+            old,
+        );
+        Self::create_file(
+            self.xcode_derived_data
+                .join("Build")
+                .join("Intermediates.noindex")
+                .join("sbh-demo.build")
+                .join("object.o"),
+            b"synthetic xcode object",
+            old,
+        );
+        Self::create_file(
+            self.simulator_device_cache.join("Cache.db"),
+            b"synthetic simulator cache",
+            old,
+        );
+        Self::create_file(
+            self.rust_target
+                .join("debug")
+                .join("incremental")
+                .join("sbh-abc")
+                .join("dep-graph.bin"),
+            b"synthetic incremental state",
+            newer,
+        );
+        Self::create_file(
+            self.frankenterm_trash
+                .join(".cargo-rch-goldenplateau")
+                .join("debug")
+                .join("deps")
+                .join("libsbh.rlib"),
+            b"synthetic cargo artifact",
+            old,
+        );
+
+        self.reclaimable_paths = vec![
+            self.library_caches.join("com.anthropic.claude"),
+            self.xcode_derived_data.clone(),
+            self.simulator_device_cache.clone(),
+            self.rust_target.clone(),
+            self.frankenterm_trash.clone(),
+        ];
+
+        self.sacred_paths = vec![
+            Self::create_file(
+                self.user_home
+                    .join("Pictures")
+                    .join("Photos Library.photoslibrary")
+                    .join("database")
+                    .join("Photos.sqlite"),
+                b"synthetic photos database",
+                old,
+            ),
+            Self::create_file(
+                self.user_home
+                    .join("Library")
+                    .join("Messages")
+                    .join("chat.db"),
+                b"synthetic messages database",
+                old,
+            ),
+            Self::create_file(
+                self.user_home
+                    .join("Library")
+                    .join("Mail")
+                    .join("V10")
+                    .join("MailData")
+                    .join("Envelope Index"),
+                b"synthetic mail index",
+                old,
+            ),
+            Self::create_file(
+                self.user_home
+                    .join("Library")
+                    .join("Mobile Documents")
+                    .join("com~apple~CloudDocs")
+                    .join("Important.txt"),
+                b"synthetic icloud document",
+                old,
+            ),
+        ];
+    }
+
+    fn create_file(path: PathBuf, content: &[u8], age: Duration) -> PathBuf {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create synthetic mac parent");
+        }
+        fs::write(&path, content).expect("write synthetic mac file");
+        let mtime = SystemTime::now() - age;
+        let _ = filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(mtime));
+        path
+    }
 }
 
 // ──────────────────── SyntheticTimeSeries ────────────────────

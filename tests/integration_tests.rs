@@ -141,6 +141,61 @@ fn completions_command_generates_shell_script() {
     );
 }
 
+#[test]
+fn synthetic_mac_tree_fixture_has_expected_shape() {
+    let tree = common::SyntheticMacTree::new();
+
+    assert!(tree.root().join("Users").join("operator").is_dir());
+    assert!(tree.private_tmp.ends_with(Path::new("private/tmp")));
+    assert_eq!(tree.reclaimable_paths.len(), 5);
+    assert_eq!(tree.sacred_paths.len(), 4);
+
+    for path in &tree.reclaimable_paths {
+        assert!(
+            path.exists(),
+            "reclaimable fixture path should exist: {}",
+            path.display()
+        );
+        assert!(
+            path.starts_with(tree.root()),
+            "reclaimable fixture path must stay under temp root: {}",
+            path.display()
+        );
+    }
+
+    for path in &tree.sacred_paths {
+        assert!(
+            path.exists(),
+            "sacred fixture path should exist: {}",
+            path.display()
+        );
+        assert!(
+            path.starts_with(&tree.user_home),
+            "sacred fixture path must stay under synthetic home: {}",
+            path.display()
+        );
+    }
+
+    assert!(
+        tree.library_caches
+            .join("com.anthropic.claude")
+            .join("Cache")
+            .join("data_0")
+            .is_file()
+    );
+    assert!(
+        tree.xcode_derived_data
+            .join("Build")
+            .join("Intermediates.noindex")
+            .is_dir()
+    );
+    assert!(
+        tree.frankenterm_trash
+            .join(".cargo-rch-goldenplateau")
+            .is_dir()
+    );
+}
+
 fn create_offline_update_bundle(bundle_root: &Path, release_tag: &str) -> (PathBuf, String) {
     let host = HostSpecifier::detect().expect("detect host");
     let contract =
