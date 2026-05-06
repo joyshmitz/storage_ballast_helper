@@ -3190,7 +3190,7 @@ fn executor_thread_main(
         // failure mode that hit ts1 on 2026-04-30.
         if !report.not_writable_paths.is_empty() {
             let should_warn =
-                last_not_writable_warning.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600));
+                last_not_writable_warning.is_none_or(|t| t.elapsed() >= Duration::from_hours(1));
             if should_warn {
                 last_not_writable_warning = Some(Instant::now());
                 let example = report

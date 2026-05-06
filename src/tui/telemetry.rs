@@ -637,7 +637,7 @@ impl JsonlTelemetryAdapter {
             return TailEntries::default();
         };
 
-        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let len = file.metadata().map_or(0, |m| m.len());
         let chunk_size = 256 * 1024; // 256KB buffer
         let start_pos = len.saturating_sub(chunk_size);
 

@@ -5087,7 +5087,7 @@ fn render_diagnostics(model: &DashboardModel, theme: &Theme, out: &mut String) {
         |t| format!("{}ms ago", t.elapsed().as_millis()),
     );
     let _ = writeln!(out, "  last-fetch:    {fetch_label}");
-    let _ = writeln!(out, "  notifications: {} active", model.notifications.len(),);
+    let _ = writeln!(out, "  notifications: {} active", model.notifications.len());
 
     // ── Dropped log events ──
     if let Some(ref state) = model.daemon_state {
@@ -5219,7 +5219,7 @@ fn render_diagnostics(model: &DashboardModel, theme: &Theme, out: &mut String) {
         if let Some(ref state) = model.daemon_state {
             let _ = writeln!(out, "  version: {}", state.version);
             let _ = writeln!(out, "  pid:     {}", state.pid);
-            let _ = writeln!(out, "  uptime:  {}", human_duration(state.uptime_seconds),);
+            let _ = writeln!(out, "  uptime:  {}", human_duration(state.uptime_seconds));
             let _ = writeln!(out, "  rss:     {}", human_bytes(state.memory_rss_bytes));
             let _ = writeln!(
                 out,
@@ -5237,8 +5237,8 @@ fn render_diagnostics(model: &DashboardModel, theme: &Theme, out: &mut String) {
         let _ = writeln!(out);
         let _ = writeln!(out, "{}", section_header("Screen State", width));
         let _ = writeln!(out, "  active:      {}", screen_label(model.screen));
-        let _ = writeln!(out, "  history:     {} entries", model.screen_history.len(),);
-        let _ = writeln!(out, "  rate-mounts: {} tracked", model.rate_histories.len(),);
+        let _ = writeln!(out, "  history:     {} entries", model.screen_history.len());
+        let _ = writeln!(out, "  rate-mounts: {} tracked", model.rate_histories.len());
         let _ = writeln!(
             out,
             "  timeline:    {} events (filter={})",

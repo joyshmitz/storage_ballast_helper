@@ -143,7 +143,8 @@ impl PredictiveAction {
     }
 }
 
-/// Construct a [`PredictiveConfig`] from the core config's [`PredictionConfig`].
+/// Construct a [`PredictiveConfig`] from the core config's
+/// [`PredictionConfig`](crate::core::config::PredictionConfig).
 impl From<crate::core::config::PredictionConfig> for PredictiveConfig {
     fn from(cfg: crate::core::config::PredictionConfig) -> Self {
         Self {

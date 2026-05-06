@@ -767,13 +767,9 @@ fn green_pressure_no_deletions() {
     env.create_file(
         "project/src/main.rs",
         b"fn main() {}",
-        Duration::from_secs(3600),
+        Duration::from_hours(1),
     );
-    env.create_file(
-        "project/Cargo.toml",
-        b"[package]",
-        Duration::from_secs(3600),
-    );
+    env.create_file("project/Cargo.toml", b"[package]", Duration::from_hours(1));
 
     let cfg = Config::default();
     let scoring = ScoringEngine::from_config(&cfg.scoring, cfg.scanner.min_file_age_minutes);
@@ -781,7 +777,7 @@ fn green_pressure_no_deletions() {
     let input = CandidateInput {
         path: env.root().join("project/src/main.rs"),
         size_bytes: 12,
-        age: Duration::from_secs(3600),
+        age: Duration::from_hours(1),
         classification: ArtifactClassification::unknown(),
         signals: StructuralSignals::default(),
         is_open: false,
@@ -889,8 +885,8 @@ fn ballast_lifecycle() {
 #[test]
 fn walker_discovers_entries_in_tree() {
     let env = common::TestEnvironment::new();
-    env.create_file("a/file1.txt", b"hello", Duration::from_secs(3600));
-    env.create_file("a/b/file2.txt", b"world", Duration::from_secs(7200));
+    env.create_file("a/file1.txt", b"hello", Duration::from_hours(1));
+    env.create_file("a/b/file2.txt", b"world", Duration::from_hours(2));
     env.create_dir("empty_dir");
 
     let config = WalkerConfig {
@@ -929,8 +925,8 @@ fn scoring_pipeline_ranks_artifacts_above_source() {
     // High-confidence Rust target artifact with strong structural signals.
     let target_input = CandidateInput {
         path: PathBuf::from("/tmp/project/target"),
-        size_bytes: 500_000_000,            // 500 MB
-        age: Duration::from_secs(4 * 3600), // 4 hours
+        size_bytes: 500_000_000,      // 500 MB
+        age: Duration::from_hours(4), // 4 hours
         classification: ArtifactClassification {
             pattern_name: "cargo-target".into(),
             category: ArtifactCategory::RustTarget,
@@ -953,7 +949,7 @@ fn scoring_pipeline_ranks_artifacts_above_source() {
     let source_input = CandidateInput {
         path: PathBuf::from("/tmp/project/src/main.rs"),
         size_bytes: 500,
-        age: Duration::from_secs(3600), // 1 hour
+        age: Duration::from_hours(1), // 1 hour
         classification: ArtifactClassification::unknown(),
         signals: StructuralSignals::default(),
         is_open: false,
@@ -990,7 +986,7 @@ fn dry_run_deletes_nothing() {
     let artifact = env.create_file(
         "target/debug/deps/libfoo.rlib",
         &vec![0u8; 1024],
-        Duration::from_secs(86400),
+        Duration::from_hours(24),
     );
 
     let cfg = Config::default();
@@ -1008,7 +1004,7 @@ fn dry_run_deletes_nothing() {
     let candidate = CandidateInput {
         path: artifact.clone(),
         size_bytes: 1024,
-        age: Duration::from_secs(86400),
+        age: Duration::from_hours(24),
         classification: class,
         signals: StructuralSignals {
             has_deps: true,
@@ -1176,9 +1172,9 @@ fn pattern_registry_classifies_node_modules() {
 #[test]
 fn walker_skips_protected_directories() {
     let env = common::TestEnvironment::new();
-    env.create_file("unprotected/file.txt", b"data", Duration::from_secs(3600));
-    env.create_file("protected/.sbh-protect", b"{}", Duration::from_secs(3600));
-    env.create_file("protected/secret.txt", b"keep", Duration::from_secs(3600));
+    env.create_file("unprotected/file.txt", b"data", Duration::from_hours(1));
+    env.create_file("protected/.sbh-protect", b"{}", Duration::from_hours(1));
+    env.create_file("protected/secret.txt", b"keep", Duration::from_hours(1));
 
     let config = WalkerConfig {
         root_paths: vec![env.root().to_path_buf()],
@@ -1216,7 +1212,7 @@ fn batch_scoring_ranks_correctly() {
         CandidateInput {
             path: PathBuf::from("/tmp/project/target"),
             size_bytes: 500_000_000,
-            age: Duration::from_secs(4 * 3600), // 4 hours
+            age: Duration::from_hours(4), // 4 hours
             classification: ArtifactClassification {
                 pattern_name: "cargo-target".into(),
                 category: ArtifactCategory::RustTarget,
@@ -1237,7 +1233,7 @@ fn batch_scoring_ranks_correctly() {
         CandidateInput {
             path: PathBuf::from("/tmp/project/notes.txt"),
             size_bytes: 100,
-            age: Duration::from_secs(2 * 3600), // 2 hours
+            age: Duration::from_hours(2), // 2 hours
             classification: ArtifactClassification::unknown(),
             signals: StructuralSignals::default(),
             is_open: false,
@@ -1359,7 +1355,7 @@ fn e2e_scored_candidate(action: DecisionAction, score: f64) -> CandidacyScore {
             combined_confidence: 0.92,
         },
         size_bytes: 3_000_000_000,
-        age: Duration::from_secs(5 * 3600),
+        age: Duration::from_hours(5),
         decision: DecisionOutcome {
             action,
             posterior_abandoned: 0.87,

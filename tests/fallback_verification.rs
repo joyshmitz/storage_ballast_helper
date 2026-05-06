@@ -502,7 +502,7 @@ fn adapter_stale_state_snapshot_still_provides_daemon_data() {
 
     // Make state file stale by setting mtime to 1 hour ago.
     let stale_mtime = filetime::FileTime::from_system_time(
-        std::time::SystemTime::now() - Duration::from_secs(3600),
+        std::time::SystemTime::now() - Duration::from_hours(1),
     );
     filetime::set_file_mtime(&state_path, stale_mtime).expect("set stale mtime");
 
@@ -968,7 +968,7 @@ fn adapter_stale_plus_drift_snapshot_is_usable() {
 
     // Make it stale.
     let stale_mtime = filetime::FileTime::from_system_time(
-        std::time::SystemTime::now() - Duration::from_secs(3600),
+        std::time::SystemTime::now() - Duration::from_hours(1),
     );
     filetime::set_file_mtime(&state_path, stale_mtime).expect("set mtime");
 

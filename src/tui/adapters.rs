@@ -461,7 +461,7 @@ mod tests {
         let state_path = tmp.path().join("state.json");
         write_state_file(&state_path, &sample_daemon_state()).expect("write state");
 
-        let stale_mtime = FileTime::from_system_time(SystemTime::now() - Duration::from_secs(3600));
+        let stale_mtime = FileTime::from_system_time(SystemTime::now() - Duration::from_hours(1));
         set_file_mtime(&state_path, stale_mtime).expect("set stale mtime");
 
         let adapter = DashboardStateAdapter::new(
@@ -548,7 +548,7 @@ mod tests {
         )
         .expect("write state");
 
-        let stale_mtime = FileTime::from_system_time(SystemTime::now() - Duration::from_secs(3600));
+        let stale_mtime = FileTime::from_system_time(SystemTime::now() - Duration::from_hours(1));
         set_file_mtime(&state_path, stale_mtime).expect("set stale mtime");
 
         let adapter = DashboardStateAdapter::new(
@@ -630,7 +630,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(1),
         );
-        let stale_mtime = FileTime::from_system_time(SystemTime::now() - Duration::from_secs(300));
+        let stale_mtime = FileTime::from_system_time(SystemTime::now() - Duration::from_mins(5));
         set_file_mtime(&state_path, stale_mtime).expect("set stale mtime");
         assert!(stale_adapter.read_state(&state_path).is_none());
     }
@@ -986,7 +986,7 @@ mod tests {
         value["extra_metric"] = serde_json::json!("new");
         std::fs::write(&state_path, serde_json::to_string(&value).expect("json")).expect("write");
 
-        let stale_mtime = FileTime::from_system_time(SystemTime::now() - Duration::from_secs(3600));
+        let stale_mtime = FileTime::from_system_time(SystemTime::now() - Duration::from_hours(1));
         set_file_mtime(&state_path, stale_mtime).expect("set stale mtime");
 
         let adapter = DashboardStateAdapter::new(

@@ -498,7 +498,7 @@ pub struct DashboardModel {
     pub last_fetch: Option<Instant>,
     /// Whether the user has requested quit.
     pub quit: bool,
-    /// Active notification toasts (oldest first, max [`MAX_NOTIFICATIONS`]).
+    /// Active notification toasts (oldest first, max `MAX_NOTIFICATIONS`).
     pub notifications: Vec<Notification>,
     /// Monotonic counter for notification IDs.
     pub next_notification_id: u64,
@@ -845,11 +845,11 @@ impl DashboardModel {
             }
             CandidatesSortOrder::Size => {
                 self.candidates_list
-                    .sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+                    .sort_by_key(|candidate| std::cmp::Reverse(candidate.size_bytes));
             }
             CandidatesSortOrder::Age => {
                 self.candidates_list
-                    .sort_by(|a, b| b.age_secs.cmp(&a.age_secs));
+                    .sort_by_key(|candidate| std::cmp::Reverse(candidate.age_secs));
             }
             CandidatesSortOrder::Path => {
                 self.candidates_list.sort_by(|a, b| a.path.cmp(&b.path));

@@ -209,13 +209,11 @@ pub fn incident_hints(
 
     // Screen-specific hints.
     match screen {
-        Screen::Overview => {
-            if severity >= IncidentSeverity::High {
-                hints.push(IncidentHint {
-                    text: "[x] Quick-release ballast".to_string(),
-                    shortcut: "x",
-                });
-            }
+        Screen::Overview if severity >= IncidentSeverity::High => {
+            hints.push(IncidentHint {
+                text: "[x] Quick-release ballast".to_string(),
+                shortcut: "x",
+            });
         }
         Screen::Ballast => {
             hints.push(IncidentHint {

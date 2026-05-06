@@ -552,6 +552,7 @@ fn stress_thread_health_overload() {
 // should be approved. Tests the full pipeline under drift.
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn stress_decision_plane_drift() {
     let scoring = ScoringEngine::from_config(&ScoringConfig::default(), 30);
     let guard_config = GuardrailConfig {

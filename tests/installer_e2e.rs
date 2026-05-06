@@ -447,7 +447,7 @@ fn e2e_update_dry_run_no_side_effects() {
         max_backups: 5,
         notices_enabled: true,
         metadata_cache_file: tmp.path().join("cache.json"),
-        metadata_cache_ttl: std::time::Duration::from_secs(60),
+        metadata_cache_ttl: std::time::Duration::from_mins(1),
         refresh_cache: false,
         offline_bundle_manifest: None,
     };
@@ -468,7 +468,7 @@ fn e2e_update_check_only_reports_availability() {
         max_backups: 5,
         notices_enabled: true,
         metadata_cache_file: tmp.path().join("cache.json"),
-        metadata_cache_ttl: std::time::Duration::from_secs(60),
+        metadata_cache_ttl: std::time::Duration::from_mins(1),
         refresh_cache: false,
         offline_bundle_manifest: None,
     };
@@ -492,7 +492,7 @@ fn e2e_update_offline_bundle_bad_checksum_fails_without_network_download() {
         max_backups: 5,
         notices_enabled: true,
         metadata_cache_file: tmp.path().join("cache.json"),
-        metadata_cache_ttl: std::time::Duration::from_secs(60),
+        metadata_cache_ttl: std::time::Duration::from_mins(1),
         refresh_cache: false,
         offline_bundle_manifest: Some(manifest_path),
     };
@@ -548,7 +548,7 @@ fn e2e_update_offline_bundle_missing_manifest_fails_without_network_download() {
         max_backups: 5,
         notices_enabled: true,
         metadata_cache_file: tmp.path().join("cache.json"),
-        metadata_cache_ttl: std::time::Duration::from_secs(60),
+        metadata_cache_ttl: std::time::Duration::from_mins(1),
         refresh_cache: false,
         offline_bundle_manifest: Some(missing_manifest),
     };
@@ -599,7 +599,7 @@ fn e2e_update_offline_bundle_unsupported_target_fails_without_network_download()
         max_backups: 5,
         notices_enabled: true,
         metadata_cache_file: tmp.path().join("cache.json"),
-        metadata_cache_ttl: std::time::Duration::from_secs(60),
+        metadata_cache_ttl: std::time::Duration::from_mins(1),
         refresh_cache: false,
         offline_bundle_manifest: Some(manifest_path),
     };
@@ -645,7 +645,7 @@ fn e2e_update_offline_bundle_blocked_install_path_fails_deterministically() {
         max_backups: 5,
         notices_enabled: true,
         metadata_cache_file: tmp.path().join("cache.json"),
-        metadata_cache_ttl: std::time::Duration::from_secs(60),
+        metadata_cache_ttl: std::time::Duration::from_mins(1),
         refresh_cache: false,
         offline_bundle_manifest: Some(manifest_path),
     };

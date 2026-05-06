@@ -27,6 +27,12 @@ pub enum SbhError {
     #[error("[SBH-1101] unsupported platform: {details}")]
     UnsupportedPlatform { details: String },
 
+    #[error("[SBH-1102] platform abstraction failure: {source}")]
+    Pal {
+        #[from]
+        source: crate::platform::types::PalError,
+    },
+
     #[error("[SBH-2001] filesystem stats failure for {path}: {details}")]
     FsStats { path: PathBuf, details: String },
 
@@ -74,6 +80,7 @@ impl SbhError {
             Self::MissingConfig { .. } => "SBH-1002",
             Self::ConfigParse { .. } => "SBH-1003",
             Self::UnsupportedPlatform { .. } => "SBH-1101",
+            Self::Pal { .. } => "SBH-1102",
             Self::FsStats { .. } => "SBH-2001",
             Self::MountParse { .. } => "SBH-2002",
             Self::SafetyVeto { .. } => "SBH-2003",
@@ -156,6 +163,9 @@ mod tests {
             },
             SbhError::UnsupportedPlatform {
                 details: String::new(),
+            },
+            SbhError::Pal {
+                source: crate::platform::types::PalError::not_implemented("test", "method"),
             },
             SbhError::FsStats {
                 path: PathBuf::new(),

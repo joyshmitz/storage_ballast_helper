@@ -491,6 +491,7 @@ fn e2e_canary_bounded_impact() {
 // policy fallback.
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_calibration_drift_stays_operational() {
     let seed = 303;
     let mut rng = SeededRng::new(seed);

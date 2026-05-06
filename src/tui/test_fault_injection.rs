@@ -220,8 +220,7 @@ fn state_stale_falls_back_with_daemon_state_preserved() {
     write_state(&path, &sample_state());
 
     // Make file 2 hours old.
-    let stale =
-        FileTime::from_system_time(std::time::SystemTime::now() - Duration::from_secs(7200));
+    let stale = FileTime::from_system_time(std::time::SystemTime::now() - Duration::from_hours(2));
     set_file_mtime(&path, stale).unwrap();
 
     let adapter = make_adapter(90);
@@ -700,7 +699,7 @@ fn debounced_writer_immediate_first_write() {
 fn debounced_writer_suppresses_during_debounce_window() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("prefs.json");
-    let mut writer = DebouncedWriter::new(path).with_debounce(Duration::from_secs(60));
+    let mut writer = DebouncedWriter::new(path).with_debounce(Duration::from_mins(1));
 
     // First write goes through.
     writer.request_save();
@@ -716,7 +715,7 @@ fn debounced_writer_suppresses_during_debounce_window() {
 fn debounced_writer_force_flush_bypasses_debounce() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("prefs.json");
-    let mut writer = DebouncedWriter::new(path).with_debounce(Duration::from_secs(60));
+    let mut writer = DebouncedWriter::new(path).with_debounce(Duration::from_mins(1));
 
     // First write.
     writer.request_save();

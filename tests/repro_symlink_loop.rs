@@ -1,8 +1,12 @@
 #![allow(missing_docs)]
 
+#[cfg(target_os = "linux")]
 use std::collections::HashSet;
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
+#[cfg(target_os = "linux")]
 use tempfile::TempDir;
 
 #[cfg(target_os = "linux")]

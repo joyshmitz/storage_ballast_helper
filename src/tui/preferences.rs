@@ -874,7 +874,7 @@ mod tests {
     fn debounced_writer_respects_debounce() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prefs.json");
-        let mut writer = DebouncedWriter::new(path).with_debounce(Duration::from_secs(60));
+        let mut writer = DebouncedWriter::new(path).with_debounce(Duration::from_mins(1));
 
         // First write goes through.
         writer.request_save();
@@ -890,7 +890,7 @@ mod tests {
     fn debounced_writer_force_flush_bypasses_debounce() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prefs.json");
-        let mut writer = DebouncedWriter::new(path).with_debounce(Duration::from_secs(60));
+        let mut writer = DebouncedWriter::new(path).with_debounce(Duration::from_mins(1));
 
         // First write.
         writer.request_save();

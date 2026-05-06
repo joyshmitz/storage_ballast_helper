@@ -164,7 +164,7 @@ fn make_scored(action: DecisionAction, score: f64) -> CandidacyScore {
             combined_confidence: 0.92,
         },
         size_bytes: 3_000_000_000,
-        age: Duration::from_secs(5 * 3600),
+        age: Duration::from_hours(5),
         decision: DecisionOutcome {
             action,
             posterior_abandoned: 0.87,

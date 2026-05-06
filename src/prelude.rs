@@ -10,6 +10,10 @@ pub use crate::core::errors::{Result, SbhError};
 
 // Platform
 pub use crate::platform::pal::{FsStats, MountPoint, Platform, detect_platform};
+pub use crate::platform::types::{
+    Capacity, MemoryPressure, MountInfo, OpenFile, PalError, ProcessInfo, ProcessIo, SacredPath,
+    SelfStats, ServiceKind,
+};
 
 // Monitor
 pub use crate::monitor::ewma::{DiskRateEstimator, RateEstimate, Trend};

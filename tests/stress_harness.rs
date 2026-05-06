@@ -285,7 +285,7 @@ fn make_walk_entry(path: &str, size: u64, depth: usize) -> WalkEntry {
         metadata: EntryMetadata {
             size_bytes: size,
             content_size_bytes: size,
-            modified: SystemTime::now() - Duration::from_secs(3600),
+            modified: SystemTime::now() - Duration::from_hours(1),
             created: None,
             is_dir: true,
             inode: 1000 + u64_from_usize(depth),
