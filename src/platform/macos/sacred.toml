@@ -1,0 +1,149 @@
+[[paths]]
+pattern = "~/Pictures/*.photoslibrary"
+kind = "GlobMatch"
+reason = "Photos libraries contain irreplaceable originals, edits, and metadata."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Library/Mobile Documents/com~apple~CloudPhotos*"
+kind = "GlobMatch"
+reason = "iCloud Photos data is user media and destructive changes may sync."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Library/Mail/*"
+kind = "GlobMatch"
+reason = "Mail contains local and cached message data."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Library/Containers/com.apple.mail/*"
+kind = "GlobMatch"
+reason = "Mail container data belongs to the user."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Library/Messages/*"
+kind = "GlobMatch"
+reason = "Messages contains conversation history and attachments."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Library/Containers/com.apple.iChat/*"
+kind = "GlobMatch"
+reason = "Messages container data belongs to the user."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Library/Group Containers/group.com.apple.notes/*"
+kind = "GlobMatch"
+reason = "Notes can contain local-only user notes."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Library/Calendars/*"
+kind = "GlobMatch"
+reason = "Calendar data is user information and should never be cleaned as cache."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Library/Group Containers/group.com.apple.reminders/*"
+kind = "GlobMatch"
+reason = "Reminders data is user information and should never be cleaned as cache."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Library/Mobile Documents/com~apple~CloudDocs/*"
+kind = "GlobMatch"
+reason = "iCloud Drive changes propagate to cloud storage and other devices."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Movies/*.fcpbundle"
+kind = "GlobMatch"
+reason = "Final Cut Pro libraries are project data."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Movies/*.imovielibrary"
+kind = "GlobMatch"
+reason = "iMovie libraries are project data."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Music/Logic/*"
+kind = "GlobMatch"
+reason = "Logic projects and media are user creative work."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Music/GarageBand/*"
+kind = "GlobMatch"
+reason = "GarageBand projects and media are user creative work."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Pictures/Lightroom*"
+kind = "GlobMatch"
+reason = "Lightroom catalogs and libraries are photo project data."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Pictures/Capture One*"
+kind = "GlobMatch"
+reason = "Capture One catalogs and sessions are photo project data."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Library/Application Support/Firefox/Profiles/*"
+kind = "GlobMatch"
+reason = "Firefox profiles contain browsing data, extensions, and credentials."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Library/Application Support/Google/Chrome/*"
+kind = "GlobMatch"
+reason = "Chrome profiles contain browsing data, extensions, and credentials."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Library/Application Support/BraveSoftware/*"
+kind = "GlobMatch"
+reason = "Brave profiles contain browsing data, extensions, and credentials."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Documents/**/*tax*"
+kind = "GlobMatch"
+reason = "Tax documents are high-value user records."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Documents/**/*Tax*"
+kind = "GlobMatch"
+reason = "Tax documents are high-value user records."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Documents/**/*.tax"
+kind = "GlobMatch"
+reason = "Tax files are high-value user records."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Documents/**/*.qbo"
+kind = "GlobMatch"
+reason = "QuickBooks export files are finance records."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Documents/**/*.qbb"
+kind = "GlobMatch"
+reason = "QuickBooks backup files are finance records."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Documents/**/*cpa*"
+kind = "GlobMatch"
+reason = "CPA and accounting files are finance records."
+source = "Builtin"
