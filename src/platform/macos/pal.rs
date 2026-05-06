@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use crate::core::errors::Result;
 use crate::core::paths::resolve_absolute_path;
 use crate::platform::macos::libproc::{
-    ProcFdInfo, ProcFdType, ProcTaskAllInfo, VnodeFdInfoWithPath, proc_listpids_safe,
-    proc_pid_list_fds, proc_pid_rusage_v4_safe, proc_pidfdinfo_vnode_path, proc_pidinfo_task_all,
-    proc_pidpath_safe,
+    ProcFdInfo, ProcFdType, ProcRegionWithPathInfo, ProcTaskAllInfo, VnodeFdInfoWithPath,
+    proc_listpids_safe, proc_pid_list_fds, proc_pid_region_path, proc_pid_rusage_v4_safe,
+    proc_pidfdinfo_vnode_path, proc_pidinfo_task_all, proc_pidpath_safe,
 };
 use crate::platform::pal::{
     FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
@@ -136,8 +136,21 @@ impl Platform for MacOsPal {
         Ok(processes)
     }
 
-    fn mmap_regions_under(&self, _path: &Path) -> Result<Vec<MappedRegion>> {
-        macos_placeholder("bd-ezkk.3", "mmap_regions_under")
+    fn mmap_regions_under(&self, path: &Path) -> Result<Vec<MappedRegion>> {
+        let root = resolve_absolute_path(path);
+        let mut regions: Vec<MappedRegion> = proc_listpids_safe()
+            .map_err(|error| macos_method_error("mmap_regions_under", &error))?
+            .into_iter()
+            .filter(|pid| *pid > 0)
+            .flat_map(|pid| mapped_regions_for_pid_under(pid, &root))
+            .collect();
+        regions.sort_by(|left, right| {
+            left.pid
+                .cmp(&right.pid)
+                .then_with(|| left.start_address.cmp(&right.start_address))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        Ok(regions)
     }
 
     fn self_stats(&self) -> Result<SelfStats> {
@@ -298,6 +311,68 @@ fn open_file_mode(open_flags: u32) -> OpenFileMode {
     }
 }
 
+fn mapped_regions_for_pid_under(pid: i32, root: &Path) -> Vec<MappedRegion> {
+    const MAX_REGIONS_PER_PID: usize = 16_384;
+
+    let mut address = 0;
+    let mut regions = Vec::new();
+    for _ in 0..MAX_REGIONS_PER_PID {
+        let Ok(info) = proc_pid_region_path(pid, address) else {
+            break;
+        };
+        let start = info.prp_prinfo.pri_address;
+        let size = info.prp_prinfo.pri_size;
+        if size == 0 {
+            break;
+        }
+        if let Some(region) = mapped_region_under(pid, &info, root) {
+            regions.push(region);
+        }
+        let Some(next_address) = start.checked_add(size) else {
+            break;
+        };
+        if next_address <= address {
+            break;
+        }
+        address = next_address;
+    }
+    regions
+}
+
+fn mapped_region_under(
+    pid: i32,
+    info: &ProcRegionWithPathInfo,
+    root: &Path,
+) -> Option<MappedRegion> {
+    let path = resolve_absolute_path(info.prp_vip.path().ok()?);
+    if !path.starts_with(root) {
+        return None;
+    }
+    let start = info.prp_prinfo.pri_address;
+    let end = start.checked_add(info.prp_prinfo.pri_size);
+    Some(MappedRegion {
+        pid,
+        path,
+        start_address: Some(start),
+        end_address: end,
+        protection: Some(region_protection(info.prp_prinfo.pri_protection)),
+    })
+}
+
+fn region_protection(bits: u32) -> String {
+    const VM_PROT_READ: u32 = 0x01;
+    const VM_PROT_WRITE: u32 = 0x02;
+    const VM_PROT_EXECUTE: u32 = 0x04;
+    let read = if bits & VM_PROT_READ != 0 { 'r' } else { '-' };
+    let write = if bits & VM_PROT_WRITE != 0 { 'w' } else { '-' };
+    let execute = if bits & VM_PROT_EXECUTE != 0 {
+        'x'
+    } else {
+        '-'
+    };
+    format!("{read}{write}{execute}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -424,5 +499,28 @@ mod tests {
             .blocks();
         assert_eq!(blocks, metadata_blocks);
         assert!(blocks > 0);
+    }
+
+    #[test]
+    fn mmap_regions_under_reports_current_process_executable_mapping() {
+        let current_exe = std::env::current_exe().expect("current executable should be known");
+        let root = current_exe
+            .parent()
+            .expect("current executable should have parent");
+        let expected =
+            std::fs::canonicalize(&current_exe).expect("current executable should canonicalize");
+
+        let platform = MacOsPal::new();
+        let regions = platform
+            .mmap_regions_under(root)
+            .expect("macOS mapped region scan should be readable");
+
+        assert!(regions.iter().any(|region| {
+            region.pid == super::current_process_pid()
+                && region.path == expected
+                && region.start_address.is_some()
+                && region.end_address.is_some()
+                && region.protection.is_some()
+        }));
     }
 }
