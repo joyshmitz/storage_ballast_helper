@@ -208,24 +208,56 @@ pub struct SelfStats {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SacredPathKind {
+    /// Protect exactly one path.
+    ///
+    /// Example: `~/Pictures/Photos Library.photoslibrary` protects that bundle
+    /// path, but not a sibling renamed library unless another rule covers it.
     ExactMatch,
+    /// Protect paths matched by a shell-style glob.
+    ///
+    /// Example: `~/Movies/*.fcpbundle` protects Final Cut Pro library bundles.
     GlobMatch,
+    /// Protect cleanup candidates that contain a matching descendant.
+    ///
+    /// Example: `/private/tmp/*-trash-*` may be rejected when it contains a
+    /// descendant matching `.beads/` or `.git/`.
     ContainsAny,
+    /// Protect cleanup candidates by scanning for sacred marker names inside.
+    ///
+    /// Example: any candidate containing `beads.db`, `*.sqlite3`, or
+    /// `.sbh-protect` is downgraded or refused before deletion.
     StowawayMarker,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SacredPathSource {
+    /// Built into sbh for platform or cross-platform safety.
+    ///
+    /// Example: macOS Photos libraries and cross-platform `.git/` directories.
     Builtin,
+    /// Loaded from user or system configuration.
+    ///
+    /// Example: an operator-defined project archive path in `sacred.toml`.
     UserConfig,
+    /// Discovered from an on-disk protection marker.
+    ///
+    /// Example: a directory containing `.sbh-protect`.
     Marker,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SacredPath {
+    /// Exact path, glob, or marker pattern used by this protection rule.
+    ///
+    /// Example: `~/Library/Messages/*` or `*.sqlite3`.
     pub pattern: String,
+    /// How `pattern` is interpreted during overlap and stowaway checks.
     pub kind: SacredPathKind,
+    /// Operator-facing explanation for why this path is protected.
+    ///
+    /// Example: `Messages history is user data`.
     pub reason: String,
+    /// Origin of this protection rule.
     pub source: SacredPathSource,
 }
 
@@ -234,4 +266,66 @@ pub enum ServiceKind {
     Systemd,
     Launchd,
     None,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SacredPath, SacredPathKind, SacredPathSource};
+
+    #[test]
+    fn sacred_path_exact_match_example_round_trips() {
+        let path = SacredPath {
+            pattern: "~/Pictures/Photos Library.photoslibrary".to_string(),
+            kind: SacredPathKind::ExactMatch,
+            reason: "Photos libraries are irreplaceable user data".to_string(),
+            source: SacredPathSource::Builtin,
+        };
+
+        let encoded = serde_json::to_string(&path).expect("SacredPath should encode");
+        let decoded: SacredPath = serde_json::from_str(&encoded).expect("SacredPath should decode");
+        assert_eq!(decoded, path);
+        assert!(encoded.contains("ExactMatch"));
+        assert!(encoded.contains("Builtin"));
+    }
+
+    #[test]
+    fn sacred_path_variant_examples_cover_catalog_semantics() {
+        let examples = [
+            SacredPath {
+                pattern: "~/Movies/*.fcpbundle".to_string(),
+                kind: SacredPathKind::GlobMatch,
+                reason: "Final Cut Pro libraries are project data".to_string(),
+                source: SacredPathSource::Builtin,
+            },
+            SacredPath {
+                pattern: ".beads/".to_string(),
+                kind: SacredPathKind::ContainsAny,
+                reason: "Beads tracker state must not be removed from trash dirs".to_string(),
+                source: SacredPathSource::Builtin,
+            },
+            SacredPath {
+                pattern: "*.sqlite3".to_string(),
+                kind: SacredPathKind::StowawayMarker,
+                reason: "SQLite files commonly hold application state".to_string(),
+                source: SacredPathSource::Builtin,
+            },
+            SacredPath {
+                pattern: "/Volumes/archive".to_string(),
+                kind: SacredPathKind::ExactMatch,
+                reason: "Operator-configured archive".to_string(),
+                source: SacredPathSource::UserConfig,
+            },
+            SacredPath {
+                pattern: ".sbh-protect".to_string(),
+                kind: SacredPathKind::StowawayMarker,
+                reason: "Protection marker present".to_string(),
+                source: SacredPathSource::Marker,
+            },
+        ];
+
+        for example in examples {
+            assert!(!example.pattern.is_empty());
+            assert!(!example.reason.is_empty());
+        }
+    }
 }
