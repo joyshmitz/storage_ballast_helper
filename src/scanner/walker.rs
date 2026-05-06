@@ -1056,6 +1056,94 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    #[derive(Debug, Default)]
+    struct TestActiveRefPlatform {
+        processes: Vec<crate::platform::types::ProcessInfo>,
+        open_files: Vec<crate::platform::types::OpenFile>,
+        executables: Vec<crate::platform::types::ProcessInfo>,
+        mmap_regions: Vec<crate::platform::types::MappedRegion>,
+    }
+
+    impl Platform for TestActiveRefPlatform {
+        fn fs_stats(&self, path: &Path) -> Result<crate::platform::pal::FsStats> {
+            Ok(crate::platform::pal::FsStats {
+                total_bytes: 1,
+                free_bytes: 1,
+                available_bytes: 1,
+                fs_type: "test".to_string(),
+                mount_point: path.to_path_buf(),
+                is_readonly: false,
+            })
+        }
+
+        fn mount_points(&self) -> Result<Vec<crate::platform::pal::MountPoint>> {
+            Ok(Vec::new())
+        }
+
+        fn is_ram_backed(&self, _path: &Path) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn default_paths(&self) -> crate::platform::pal::PlatformPaths {
+            crate::platform::pal::PlatformPaths::default()
+        }
+
+        fn memory_info(&self) -> Result<crate::platform::pal::MemoryInfo> {
+            Ok(crate::platform::pal::MemoryInfo {
+                total_bytes: 1,
+                available_bytes: 1,
+                swap_total_bytes: 0,
+                swap_free_bytes: 0,
+            })
+        }
+
+        fn service_manager(&self) -> Box<dyn crate::platform::pal::ServiceManager> {
+            Box::<crate::platform::pal::NoopServiceManager>::default()
+        }
+
+        fn process_list(&self) -> Result<Vec<crate::platform::types::ProcessInfo>> {
+            Ok(self.processes.clone())
+        }
+
+        fn open_files_under(&self, _path: &Path) -> Result<Vec<crate::platform::types::OpenFile>> {
+            Ok(self.open_files.clone())
+        }
+
+        fn executables_under(
+            &self,
+            _path: &Path,
+        ) -> Result<Vec<crate::platform::types::ProcessInfo>> {
+            Ok(self.executables.clone())
+        }
+
+        fn mmap_regions_under(
+            &self,
+            _path: &Path,
+        ) -> Result<Vec<crate::platform::types::MappedRegion>> {
+            Ok(self.mmap_regions.clone())
+        }
+    }
+
+    fn process(
+        pid: i32,
+        name: &str,
+        executable: Option<PathBuf>,
+    ) -> crate::platform::types::ProcessInfo {
+        crate::platform::types::ProcessInfo {
+            pid,
+            parent_pid: None,
+            name: name.to_string(),
+            command_line: Vec::new(),
+            executable,
+            cwd: None,
+            start_time_unix_ms: None,
+            virtual_memory_bytes: None,
+            resident_memory_bytes: None,
+            cpu_user_micros: None,
+            cpu_system_micros: None,
+        }
+    }
+
     fn test_config(root: &Path) -> WalkerConfig {
         WalkerConfig {
             root_paths: vec![root.to_path_buf()],
@@ -1065,6 +1153,62 @@ mod tests {
             parallelism: 2,
             excluded_paths: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn active_reference_index_maps_fd_exec_and_mmap_to_ancestors() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let candidate = root.join("target");
+        let open_file_path = candidate.join("debug").join("object.o");
+        let executable_path = candidate.join("debug").join("tool");
+        let mmap_path = candidate.join("incremental").join("cache.bin");
+        fs::create_dir_all(open_file_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(executable_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(mmap_path.parent().unwrap()).unwrap();
+        fs::write(&open_file_path, b"object").unwrap();
+        fs::write(&executable_path, b"tool").unwrap();
+        fs::write(&mmap_path, b"cache").unwrap();
+
+        let platform = TestActiveRefPlatform {
+            processes: vec![process(42, "rustc", None)],
+            open_files: vec![crate::platform::types::OpenFile {
+                pid: 42,
+                path: open_file_path,
+                fd: Some(9),
+                kind: crate::platform::types::OpenFileKind::Regular,
+                mode: crate::platform::types::OpenFileMode::ReadWrite,
+            }],
+            executables: vec![process(42, "rustc", Some(executable_path))],
+            mmap_regions: vec![crate::platform::types::MappedRegion {
+                pid: 42,
+                path: mmap_path,
+                start_address: Some(0x1000),
+                end_address: Some(0x2000),
+                protection: Some("r--".to_string()),
+            }],
+        };
+
+        let index = collect_active_reference_index(&platform, std::slice::from_ref(&root));
+        assert!(index.is_complete());
+
+        let summary = index.summary_for(&candidate);
+        let process = summary
+            .processes
+            .iter()
+            .find(|process| process.pid == 42)
+            .expect("candidate should inherit active references from children");
+        assert_eq!(process.name.as_deref(), Some("rustc"));
+        assert_eq!(process.open_file_descriptors, 1);
+        assert!(process.running_executable);
+        assert_eq!(process.mmap_regions, 1);
+
+        let reason = summary
+            .safe_reclaim_reason()
+            .expect("active summary should explain safety veto");
+        assert!(reason.contains("open file descriptor"));
+        assert!(reason.contains("running executable"));
+        assert!(reason.contains("mmap region"));
     }
 
     #[test]

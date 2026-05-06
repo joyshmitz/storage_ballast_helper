@@ -945,6 +945,55 @@ mod tests {
     }
 
     #[test]
+    fn each_active_reference_kind_vetoes_reclaim() {
+        let engine = default_engine();
+        let cases = [
+            ("open file descriptor", {
+                let mut summary = ActiveReferenceSummary::default();
+                summary.add_open_file_descriptor(7, Some("rustc".to_string()));
+                summary
+            }),
+            ("running executable", {
+                let mut summary = ActiveReferenceSummary::default();
+                summary.add_running_executable(7, Some("rustc".to_string()));
+                summary
+            }),
+            ("mmap region", {
+                let mut summary = ActiveReferenceSummary::default();
+                summary.add_mmap_region(7, Some("rustc".to_string()));
+                summary
+            }),
+        ];
+
+        for (expected_reason, active_references) in cases {
+            let score = engine.score_candidate(
+                &CandidateInput {
+                    path: PathBuf::from("/tmp/cargo-target-active"),
+                    size_bytes: 1_073_741_824,
+                    age: Duration::from_hours(6),
+                    classification: classification(0.95, ArtifactCategory::RustTarget),
+                    signals: StructuralSignals::default(),
+                    active_references,
+                    is_open: false,
+                    excluded: false,
+                },
+                0.9,
+            );
+
+            assert!(score.vetoed, "{expected_reason} should veto reclaim");
+            assert_eq!(score.decision.action, DecisionAction::Keep);
+            assert!(
+                score
+                    .veto_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(expected_reason)),
+                "{expected_reason} missing from veto reason: {:?}",
+                score.veto_reason,
+            );
+        }
+    }
+
+    #[test]
     fn high_confidence_old_target_gets_actionable_recommendation() {
         let engine = default_engine();
         let score = engine.score_candidate(
