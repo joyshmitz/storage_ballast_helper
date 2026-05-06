@@ -13,6 +13,7 @@ use crate::platform::macos::libproc::{
     proc_pidfdinfo_vnode_path, proc_pidinfo_task_all, proc_pidpath_safe,
 };
 use crate::platform::macos::sacred_catalog::macos_sacred_paths;
+use crate::platform::macos::sys::{self, StatfsSnapshot};
 use crate::platform::pal::{
     FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
 };
@@ -37,16 +38,22 @@ impl Platform for MacOsPal {
         "macos"
     }
 
-    fn fs_stats(&self, _path: &Path) -> Result<FsStats> {
-        macos_not_implemented("bd-zlxb.7", "fs_stats")
+    fn fs_stats(&self, path: &Path) -> Result<FsStats> {
+        sys::statfs(path)
+            .map(statfs_to_fs_stats)
+            .map_err(|error| macos_method_error("fs_stats", &error))
     }
 
     fn mount_points(&self) -> Result<Vec<MountPoint>> {
-        macos_not_implemented("bd-zlxb.7", "mount_points")
+        sys::mounted_filesystems()
+            .map(|mounts| mounts.into_iter().map(statfs_to_mount_point).collect())
+            .map_err(|error| macos_method_error("mount_points", &error))
     }
 
-    fn is_ram_backed(&self, _path: &Path) -> Result<bool> {
-        macos_not_implemented("bd-zlxb.7", "is_ram_backed")
+    fn is_ram_backed(&self, path: &Path) -> Result<bool> {
+        sys::statfs(path)
+            .map(|stats| stats.is_ram_backed())
+            .map_err(|error| macos_method_error("is_ram_backed", &error))
     }
 
     fn default_paths(&self) -> PlatformPaths {
@@ -61,12 +68,14 @@ impl Platform for MacOsPal {
         crate::daemon::service::service_manager_for_kind(ServiceKind::Launchd, false)
     }
 
-    fn capacity(&self, _mount: &Path) -> Result<Capacity> {
-        macos_not_implemented("bd-zlxb.7", "capacity")
+    fn capacity(&self, mount: &Path) -> Result<Capacity> {
+        self.fs_stats(mount).map(Into::into)
     }
 
     fn mounts(&self) -> Result<Vec<MountInfo>> {
-        macos_not_implemented("bd-zlxb.7", "mounts")
+        sys::mounted_filesystems()
+            .map(|mounts| mounts.into_iter().map(statfs_to_mount_info).collect())
+            .map_err(|error| macos_method_error("mounts", &error))
     }
 
     fn memory_pressure(&self) -> Result<MemoryPressure> {
@@ -197,6 +206,50 @@ fn macos_method_error(
     error: &impl ToString,
 ) -> crate::core::errors::SbhError {
     PalError::method_failed("macos", method, error.to_string()).into()
+}
+
+fn statfs_to_fs_stats(stats: StatfsSnapshot) -> FsStats {
+    FsStats {
+        total_bytes: stats.total_bytes(),
+        free_bytes: stats.free_bytes(),
+        available_bytes: stats.available_bytes(),
+        fs_type: stats.fs_type,
+        mount_point: stats.mount_point,
+        is_readonly: stats.is_readonly,
+    }
+}
+
+fn statfs_to_mount_point(stats: StatfsSnapshot) -> MountPoint {
+    let is_ram_backed = stats.is_ram_backed();
+    MountPoint {
+        path: stats.mount_point,
+        device: stats.device,
+        fs_type: stats.fs_type,
+        is_ram_backed,
+    }
+}
+
+fn statfs_to_mount_info(stats: StatfsSnapshot) -> MountInfo {
+    let is_apfs = stats.fs_type.eq_ignore_ascii_case("apfs");
+    let total_bytes = stats.total_bytes();
+    let available_bytes = stats.available_bytes();
+    let is_ram_backed = stats.is_ram_backed();
+    let mount_point = stats.mount_point;
+    MountInfo {
+        device: stats.device,
+        mount_point: mount_point.clone(),
+        fs_type: stats.fs_type,
+        container_id: None,
+        total_bytes: Some(total_bytes),
+        available_bytes: Some(available_bytes),
+        purgeable_bytes: None,
+        local_snapshot_bytes: None,
+        is_readonly: stats.is_readonly,
+        is_ram_backed,
+        is_apfs_data_volume: is_apfs && mount_point == Path::new("/System/Volumes/Data"),
+        is_apfs_system_snapshot: is_apfs && mount_point == Path::new("/") && stats.is_readonly,
+        is_apfs_vm_volume: is_apfs && mount_point == Path::new("/System/Volumes/VM"),
+    }
 }
 
 fn current_process_pid() -> i32 {
