@@ -249,6 +249,17 @@ jobs:
       - name: Build release binary
         shell: bash
         run: cargo build $CI_FEATURES --release 2>&1 | tee macos-release-build-output.txt
+      - name: Ad-hoc sign and verify release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="./target/release/sbh"
+          test -x "${bin}"
+          {
+            codesign --force --sign - --timestamp=none "${bin}"
+            codesign --verify --strict --verbose=2 "${bin}"
+            codesign --display --verbose=4 "${bin}"
+          } 2>&1 | tee macos-codesign-output.txt
       - name: Run selected E2E smoke checks
         shell: bash
         run: |
@@ -282,6 +293,7 @@ jobs:
             macos-unit-bin-output.txt
             macos-integration-output.txt
             macos-release-build-output.txt
+            macos-codesign-output.txt
             macos-e2e-smoke-output.txt
             sbh-completions.zsh
           retention-days: 14
