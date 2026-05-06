@@ -9,7 +9,8 @@ use crate::core::errors::Result;
 use crate::core::paths::resolve_absolute_path;
 use crate::platform::macos::libproc::{
     ProcFdInfo, ProcFdType, ProcTaskAllInfo, VnodeFdInfoWithPath, proc_listpids_safe,
-    proc_pid_list_fds, proc_pidfdinfo_vnode_path, proc_pidinfo_task_all, proc_pidpath_safe,
+    proc_pid_list_fds, proc_pid_rusage_v4_safe, proc_pidfdinfo_vnode_path, proc_pidinfo_task_all,
+    proc_pidpath_safe,
 };
 use crate::platform::pal::{
     FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
@@ -89,8 +90,16 @@ impl Platform for MacOsPal {
         Ok(processes)
     }
 
-    fn process_io(&self, _pid: i32) -> Result<ProcessIo> {
-        macos_placeholder("bd-ly4w.3", "process_io")
+    fn process_io(&self, pid: i32) -> Result<ProcessIo> {
+        let usage = proc_pid_rusage_v4_safe(pid)
+            .map_err(|error| macos_method_error("process_io", &error))?;
+        Ok(ProcessIo {
+            pid,
+            bytes_read_total: usage.ri_diskio_bytesread,
+            bytes_written_total: usage.ri_diskio_byteswritten,
+            bytes_read_recent_15m: None,
+            bytes_written_recent_15m: None,
+        })
     }
 
     fn open_files_under(&self, path: &Path) -> Result<Vec<OpenFile>> {
@@ -307,6 +316,23 @@ mod tests {
                 .iter()
                 .any(|process| process.resident_memory_bytes.is_some())
         );
+    }
+
+    #[test]
+    fn process_io_returns_lifetime_rusage_counters_for_current_process() {
+        let current = super::current_process_pid();
+        let platform = MacOsPal::new();
+        let io = platform
+            .process_io(current)
+            .expect("current process rusage should be readable");
+        let raw = crate::platform::macos::libproc::proc_pid_rusage_v4_safe(current)
+            .expect("current process raw rusage should be readable");
+
+        assert_eq!(io.pid, current);
+        assert!(io.bytes_read_total <= raw.ri_diskio_bytesread);
+        assert!(io.bytes_written_total <= raw.ri_diskio_byteswritten);
+        assert_eq!(io.bytes_read_recent_15m, None);
+        assert_eq!(io.bytes_written_recent_15m, None);
     }
 
     #[test]
