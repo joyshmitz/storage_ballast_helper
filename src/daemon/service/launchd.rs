@@ -232,7 +232,7 @@ impl ServiceManager for LaunchdServiceManager {
     }
 
     fn restart(&self) -> Result<()> {
-        Err(PalError::not_implemented("launchd", "restart").into())
+        Err(PalError::not_implemented_with_bead("launchd", "restart", Some("bd-1y7j.3")).into())
     }
 
     fn logs_path(&self) -> Result<Option<PathBuf>> {

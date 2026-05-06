@@ -12,6 +12,7 @@ use crate::platform::macos::libproc::{
     proc_listpids_safe, proc_pid_list_fds, proc_pid_region_path, proc_pid_rusage_v4_safe,
     proc_pidfdinfo_vnode_path, proc_pidinfo_task_all, proc_pidpath_safe,
 };
+use crate::platform::macos::sacred_catalog::macos_sacred_paths;
 use crate::platform::pal::{
     FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
 };
@@ -37,23 +38,23 @@ impl Platform for MacOsPal {
     }
 
     fn fs_stats(&self, _path: &Path) -> Result<FsStats> {
-        macos_placeholder("bd-zlxb.7", "fs_stats")
+        macos_not_implemented("bd-zlxb.7", "fs_stats")
     }
 
     fn mount_points(&self) -> Result<Vec<MountPoint>> {
-        macos_placeholder("bd-zlxb.7", "mount_points")
+        macos_not_implemented("bd-zlxb.7", "mount_points")
     }
 
     fn is_ram_backed(&self, _path: &Path) -> Result<bool> {
-        macos_placeholder("bd-zlxb.7", "is_ram_backed")
+        macos_not_implemented("bd-zlxb.7", "is_ram_backed")
     }
 
     fn default_paths(&self) -> PlatformPaths {
-        macos_placeholder("bd-1y7j.4", "default_paths")
+        PlatformPaths::default()
     }
 
     fn memory_info(&self) -> Result<MemoryInfo> {
-        macos_placeholder("bd-hqu2.4", "memory_info")
+        macos_not_implemented("bd-hqu2.4", "memory_info")
     }
 
     fn service_manager(&self) -> Box<dyn ServiceManager> {
@@ -61,22 +62,22 @@ impl Platform for MacOsPal {
     }
 
     fn capacity(&self, _mount: &Path) -> Result<Capacity> {
-        macos_placeholder("bd-zlxb.7", "capacity")
+        macos_not_implemented("bd-zlxb.7", "capacity")
     }
 
     fn mounts(&self) -> Result<Vec<MountInfo>> {
-        macos_placeholder("bd-zlxb.7", "mounts")
+        macos_not_implemented("bd-zlxb.7", "mounts")
     }
 
     fn memory_pressure(&self) -> Result<MemoryPressure> {
-        macos_placeholder("bd-hqu2.4", "memory_pressure")
+        macos_not_implemented("bd-hqu2.4", "memory_pressure")
     }
 
     fn subscribe_memory_pressure(
         &self,
         _callback: MemoryPressureCallback,
     ) -> Result<SubscriptionHandle> {
-        macos_placeholder("bd-68ik.1", "subscribe_memory_pressure")
+        macos_not_implemented("bd-68ik.1", "subscribe_memory_pressure")
     }
 
     fn process_list(&self) -> Result<Vec<ProcessInfo>> {
@@ -154,27 +155,32 @@ impl Platform for MacOsPal {
     }
 
     fn self_stats(&self) -> Result<SelfStats> {
-        macos_placeholder("bd-wiqg.2", "self_stats")
+        macos_not_implemented("bd-wiqg.2", "self_stats")
     }
 
     fn preallocate_file(&self, _path: &Path, _size: u64) -> Result<()> {
-        macos_placeholder("bd-hnxg.1", "preallocate_file")
+        macos_not_implemented("bd-hnxg.1", "preallocate_file")
     }
 
     fn user_home(&self) -> PathBuf {
-        macos_placeholder("bd-1y7j.4", "user_home")
+        std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
     }
 
     fn temp_dirs(&self) -> Vec<PathBuf> {
-        macos_placeholder("bd-1y7j.4", "temp_dirs")
+        let mut dirs = vec![std::env::temp_dir(), PathBuf::from("/private/tmp")];
+        dirs.sort();
+        dirs.dedup();
+        dirs
     }
 
     fn cache_roots(&self) -> Vec<PathBuf> {
-        macos_placeholder("bd-1y7j.4", "cache_roots")
+        std::env::var_os("HOME").map_or_else(Vec::new, |home| {
+            vec![PathBuf::from(home).join("Library/Caches")]
+        })
     }
 
     fn sacred_paths(&self) -> Vec<SacredPath> {
-        macos_placeholder("bd-h13a.5", "sacred_paths")
+        macos_sacred_paths().to_vec()
     }
 
     fn service_kind(&self) -> ServiceKind {
@@ -182,8 +188,8 @@ impl Platform for MacOsPal {
     }
 }
 
-fn macos_placeholder<T>(bead: &'static str, method: &'static str) -> T {
-    unimplemented!("{bead}: MacOsPal::{method}")
+fn macos_not_implemented<T>(bead: &'static str, method: &'static str) -> Result<T> {
+    Err(PalError::not_implemented_with_bead("macos", method, Some(bead)).into())
 }
 
 fn macos_method_error(

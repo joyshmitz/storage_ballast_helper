@@ -2,19 +2,18 @@
 
 #![allow(missing_docs)]
 
+use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
-#[derive(Debug, Clone, Error, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PalError {
-    #[error("PAL method {method_name} is not implemented on {os_name}")]
     NotImplemented {
         os_name: String,
         method_name: String,
+        bead: Option<String>,
     },
-    #[error("PAL method {method_name} failed on {os_name}: {details}")]
     MethodFailed {
         os_name: String,
         method_name: String,
@@ -22,12 +21,55 @@ pub enum PalError {
     },
 }
 
+impl fmt::Display for PalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotImplemented {
+                os_name,
+                method_name,
+                bead,
+            } => {
+                write!(
+                    f,
+                    "PAL method '{method_name}' is not yet implemented on {os_name}"
+                )?;
+                if let Some(bead) = bead {
+                    write!(f, ". See bead {bead} for tracking")?;
+                }
+                Ok(())
+            }
+            Self::MethodFailed {
+                os_name,
+                method_name,
+                details,
+            } => {
+                write!(
+                    f,
+                    "PAL method '{method_name}' failed on {os_name}: {details}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PalError {}
+
 impl PalError {
     #[must_use]
     pub fn not_implemented(os_name: impl Into<String>, method_name: impl Into<String>) -> Self {
+        Self::not_implemented_with_bead(os_name, method_name, None::<String>)
+    }
+
+    #[must_use]
+    pub fn not_implemented_with_bead(
+        os_name: impl Into<String>,
+        method_name: impl Into<String>,
+        bead: Option<impl Into<String>>,
+    ) -> Self {
         Self::NotImplemented {
             os_name: os_name.into(),
             method_name: method_name.into(),
+            bead: bead.map(Into::into),
         }
     }
 
@@ -57,6 +99,14 @@ impl PalError {
             Self::NotImplemented { method_name, .. } | Self::MethodFailed { method_name, .. } => {
                 method_name
             }
+        }
+    }
+
+    #[must_use]
+    pub fn bead(&self) -> Option<&str> {
+        match self {
+            Self::NotImplemented { bead, .. } => bead.as_deref(),
+            Self::MethodFailed { .. } => None,
         }
     }
 }
@@ -270,7 +320,7 @@ pub enum ServiceKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{SacredPath, SacredPathKind, SacredPathSource};
+    use super::{PalError, SacredPath, SacredPathKind, SacredPathSource};
 
     #[test]
     fn sacred_path_exact_match_example_round_trips() {
@@ -286,6 +336,20 @@ mod tests {
         assert_eq!(decoded, path);
         assert!(encoded.contains("ExactMatch"));
         assert!(encoded.contains("Builtin"));
+    }
+
+    #[test]
+    fn pal_not_implemented_includes_optional_bead_hint() {
+        let error =
+            PalError::not_implemented_with_bead("macos", "memory_pressure", Some("bd-hqu2.4"));
+
+        assert_eq!(error.os_name(), "macos");
+        assert_eq!(error.method_name(), "memory_pressure");
+        assert_eq!(error.bead(), Some("bd-hqu2.4"));
+        assert_eq!(
+            error.to_string(),
+            "PAL method 'memory_pressure' is not yet implemented on macos. See bead bd-hqu2.4 for tracking"
+        );
     }
 
     #[test]
