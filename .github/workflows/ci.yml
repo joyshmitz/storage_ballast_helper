@@ -172,6 +172,98 @@ jobs:
             /tmp/sbh_e2e_*/
           retention-days: 14
 
+  macos-platform:
+    name: macOS Platform Tests (${{ matrix.runner }})
+    runs-on: ${{ matrix.os }}
+    needs: check
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-13 was retired by GitHub; macos-15-intel is the current
+          # standard Intel runner label. macos-latest is the arm64 runner.
+          - runner: apple-silicon
+            os: macos-latest
+            expected_arch: arm64
+          - runner: intel
+            os: macos-15-intel
+            expected_arch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Strip local-only TUI path deps
+        shell: bash
+        run: |
+          # ftui crates use /dp/frankentui/ paths unavailable in CI.
+          # Use perl instead of sed -i so this step is portable across
+          # macOS/BSD and GNU userlands.
+          perl -0pi -e 's/^ftui.*=.*\{.*path.*=.*"\/dp\/.*\n//mg; s/^tui = \["dep:ftui.*\]/tui = []/m' Cargo.toml
+          grep -q '^tui = \[\]' Cargo.toml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-platform-${{ matrix.os }}
+      - name: Verify runner identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "runner_os=${{ runner.os }}"
+            echo "matrix_os=${{ matrix.os }}"
+            echo "expected_arch=${{ matrix.expected_arch }}"
+            echo "uname_s=$(uname -s)"
+            echo "uname_m=$(uname -m)"
+            rustc -vV
+            cargo --version
+          } | tee macos-runner-info.txt
+          test "$(uname -m)" = "${{ matrix.expected_arch }}"
+      - name: Run unit tests
+        shell: bash
+        run: |
+          cargo test $CI_FEATURES --lib -- --nocapture 2>&1 | tee macos-unit-lib-output.txt
+          cargo test $CI_FEATURES --bin sbh -- --nocapture 2>&1 | tee macos-unit-bin-output.txt
+      - name: Run integration tests
+        shell: bash
+        run: cargo test $CI_FEATURES --test integration_tests -- --nocapture 2>&1 | tee macos-integration-output.txt
+      - name: Build release binary
+        shell: bash
+        run: cargo build $CI_FEATURES --release 2>&1 | tee macos-release-build-output.txt
+      - name: Run selected E2E smoke checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="./target/release/sbh"
+          test -x "${bin}"
+          {
+            echo "case=help"
+            "${bin}" --help
+            echo "case=version-verbose"
+            "${bin}" version --verbose
+            echo "case=json-version"
+            "${bin}" --json version
+            echo "case=config-validate"
+            "${bin}" config validate
+            echo "case=json-status"
+            "${bin}" --json status
+            echo "case=completions-zsh"
+            "${bin}" completions zsh > sbh-completions.zsh
+            test -s sbh-completions.zsh
+          } 2>&1 | tee macos-e2e-smoke-output.txt
+      - name: Upload macOS platform logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-platform-logs-${{ matrix.os }}
+          path: |
+            macos-runner-info.txt
+            macos-unit-lib-output.txt
+            macos-unit-bin-output.txt
+            macos-integration-output.txt
+            macos-release-build-output.txt
+            macos-e2e-smoke-output.txt
+            sbh-completions.zsh
+          retention-days: 14
+
   stress:
     name: Stress Tests
     runs-on: ubuntu-latest
@@ -231,7 +323,7 @@ jobs:
   provenance:
     name: Provenance Metadata
     runs-on: ubuntu-latest
-    needs: [unit, integration, decision-plane, dashboard, e2e, stress, artifact-contract]
+    needs: [unit, integration, decision-plane, dashboard, e2e, macos-platform, stress, artifact-contract]
     steps:
       - uses: actions/checkout@v4
       - name: Strip local-only TUI path deps
