@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use proptest::prelude::*;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use storage_ballast_helper::ballast::manager::BallastManager;
@@ -194,6 +195,104 @@ fn synthetic_mac_tree_fixture_has_expected_shape() {
             .join(".cargo-rch-goldenplateau")
             .is_dir()
     );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 32,
+        failure_persistence: None,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn mac_sacred_paths_are_vetoed_by_exclusion_overlap(
+        size_mib in 1_u64..4096,
+        age_hours in 1_u64..720,
+    ) {
+        let tree = common::SyntheticMacTree::new();
+        let registry = ArtifactPatternRegistry::default();
+        let engine = ScoringEngine::from_config(&ScoringConfig::default(), 30);
+
+        for path in &tree.sacred_paths {
+            let rel_path = path
+                .strip_prefix(&tree.user_home)
+                .expect("synthetic sacred path should be under home");
+            let logical_path = PathBuf::from("/Users/operator").join(rel_path);
+            let input = CandidateInput {
+                path: logical_path.clone(),
+                size_bytes: size_mib.saturating_mul(1_048_576),
+                age: Duration::from_hours(age_hours),
+                classification: registry.classify(&logical_path, StructuralSignals::default()),
+                signals: StructuralSignals::default(),
+                is_open: false,
+                excluded: true,
+            };
+
+            let score = engine.score_candidate(&input, 1.0);
+            prop_assert!(score.vetoed, "sacred path was not vetoed: {}", logical_path.display());
+            prop_assert!(
+                score.total_score.abs() <= f64::EPSILON,
+                "vetoed sacred path kept a non-zero score: {}",
+                score.total_score
+            );
+            prop_assert_eq!(score.decision.action, DecisionAction::Keep);
+            prop_assert_eq!(score.veto_reason.as_deref(), Some("matched user exclusion"));
+        }
+    }
+
+    #[test]
+    fn mac_artifact_structure_drives_confidence_factors(
+        has_fingerprint in any::<bool>(),
+        has_incremental in any::<bool>(),
+        has_deps in any::<bool>(),
+        has_build in any::<bool>(),
+        mostly_object_files in any::<bool>(),
+        size_mib in 1_u64..4096,
+        age_hours in 1_u64..720,
+    ) {
+        let path = PathBuf::from("/private/tmp/ft-cod7-target");
+        let signals = StructuralSignals {
+            has_incremental,
+            has_deps,
+            has_build,
+            has_fingerprint,
+            has_git: false,
+            has_cargo_toml: false,
+            mostly_object_files,
+        };
+        let registry = ArtifactPatternRegistry::default();
+        let engine = ScoringEngine::from_config(&ScoringConfig::default(), 30);
+        let classification = registry.classify(&path, signals);
+        let score = engine.score_candidate(
+            &CandidateInput {
+                path: path.clone(),
+                size_bytes: size_mib.saturating_mul(1_048_576),
+                age: Duration::from_hours(age_hours),
+                classification,
+                signals,
+                is_open: false,
+                excluded: false,
+            },
+            0.75,
+        );
+
+        prop_assert!(!score.vetoed, "non-open synthetic artifact was vetoed: {}", path.display());
+        if has_fingerprint || has_incremental {
+            prop_assert!(score.factors.structure >= 0.95);
+        } else if has_deps && has_build {
+            prop_assert!(score.factors.structure >= 0.85);
+        } else if mostly_object_files {
+            prop_assert!(score.factors.structure >= 0.90);
+        } else {
+            prop_assert!(
+                (score.factors.structure - 0.40).abs() <= f64::EPSILON,
+                "unexpected baseline structure factor: {}",
+                score.factors.structure
+            );
+        }
+        prop_assert!(score.classification.combined_confidence >= 0.0);
+        prop_assert!(score.classification.combined_confidence <= 1.0);
+    }
 }
 
 fn create_offline_update_bundle(bundle_root: &Path, release_tag: &str) -> (PathBuf, String) {

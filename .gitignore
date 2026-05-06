@@ -47,6 +47,7 @@ target-local/
 # Ephemeral files (agent-generated, build artifacts, test detritus)
 ci-artifacts/
 proptest-regressions/
+*.proptest-regressions
 test_meminfo
 
 # Accidental shell output
