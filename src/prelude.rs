@@ -9,10 +9,13 @@ pub use crate::core::config::Config;
 pub use crate::core::errors::{Result, SbhError};
 
 // Platform
-pub use crate::platform::pal::{FsStats, MountPoint, Platform, detect_platform};
 pub use crate::platform::types::{
     Capacity, MemoryPressure, MountInfo, OpenFile, PalError, ProcessInfo, ProcessIo, SacredPath,
     SelfStats, ServiceKind,
+};
+pub use crate::platform::{
+    current,
+    pal::{FsStats, MountPoint, Platform, detect_platform},
 };
 
 // Monitor

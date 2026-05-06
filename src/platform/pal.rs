@@ -627,14 +627,14 @@ fn default_mock_self_stats() -> SelfStats {
 
 /// Detect active platform implementation.
 pub fn detect_platform() -> Result<Arc<dyn Platform>> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        Ok(Arc::new(crate::platform::linux::LinuxPal::new()))
+        Ok(Arc::new(crate::platform::current()))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(SbhError::UnsupportedPlatform {
-            details: "only Linux is currently implemented".to_string(),
+            details: "sbh requires Linux or macOS".to_string(),
         })
     }
 }
