@@ -281,6 +281,21 @@ jobs:
             "${bin}" completions zsh > sbh-completions.zsh
             test -s sbh-completions.zsh
           } 2>&1 | tee macos-e2e-smoke-output.txt
+      - name: Fail on unsupported PAL placeholders
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          logs=(macos-*.txt)
+          if [ "${#logs[@]}" -eq 0 ]; then
+            echo "No macOS platform logs were produced."
+            exit 0
+          fi
+          if grep -E -n 'SBH-1101|unsupported platform|PAL method .* is not implemented|not implemented on|PalError::NotImplemented|only Linux is currently implemented' "${logs[@]}"; then
+            echo "::error::macOS platform logs contain unsupported-platform or PAL-not-implemented output"
+            exit 1
+          fi
       - name: Upload macOS platform logs
         if: always()
         uses: actions/upload-artifact@v4
