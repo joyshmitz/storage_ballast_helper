@@ -1,15 +1,19 @@
 //! macOS PAL skeleton.
 
+#![cfg(target_os = "macos")]
 #![allow(missing_docs)]
 
 use std::path::{Path, PathBuf};
 
 use crate::core::errors::Result;
+use crate::platform::macos::libproc::{
+    ProcTaskAllInfo, proc_listpids_safe, proc_pidinfo_task_all, proc_pidpath_safe,
+};
 use crate::platform::pal::{
     FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
 };
 use crate::platform::types::{
-    Capacity, MappedRegion, MemoryPressure, MemoryPressureCallback, MountInfo, OpenFile,
+    Capacity, MappedRegion, MemoryPressure, MemoryPressureCallback, MountInfo, OpenFile, PalError,
     ProcessInfo, ProcessIo, SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
 };
 
@@ -72,7 +76,14 @@ impl Platform for MacOsPal {
     }
 
     fn process_list(&self) -> Result<Vec<ProcessInfo>> {
-        macos_placeholder("bd-ly4w.2", "process_list")
+        let current_pid = current_process_pid();
+        let processes = proc_listpids_safe()
+            .map_err(|error| macos_method_error("process_list", &error))?
+            .into_iter()
+            .filter(|pid| *pid > 0 && *pid != current_pid)
+            .filter_map(process_info_for_pid)
+            .collect();
+        Ok(processes)
     }
 
     fn process_io(&self, _pid: i32) -> Result<ProcessIo> {
@@ -128,6 +139,73 @@ fn macos_placeholder<T>(bead: &'static str, method: &'static str) -> T {
     unimplemented!("{bead}: MacOsPal::{method}")
 }
 
+fn macos_method_error(
+    method: &'static str,
+    error: &impl ToString,
+) -> crate::core::errors::SbhError {
+    PalError::method_failed("macos", method, error.to_string()).into()
+}
+
+fn current_process_pid() -> i32 {
+    i32::try_from(std::process::id()).expect("current process id should fit in i32")
+}
+
+fn process_info_for_pid(pid: i32) -> Option<ProcessInfo> {
+    let raw = proc_pidinfo_task_all(pid).ok()?;
+    Some(process_info_from_task_all(pid, raw))
+}
+
+fn process_info_from_task_all(pid: i32, raw: ProcTaskAllInfo) -> ProcessInfo {
+    let name = process_name(&raw);
+    let executable = proc_pidpath_safe(pid).ok();
+    ProcessInfo {
+        pid,
+        parent_pid: positive_pid(raw.pbsd.pbi_ppid.0),
+        name,
+        command_line: Vec::new(),
+        executable,
+        cwd: None,
+        start_time_unix_ms: start_time_unix_ms(raw.pbsd.pbi_start_tvsec, raw.pbsd.pbi_start_tvusec),
+        virtual_memory_bytes: Some(raw.ptinfo.pti_virtual_size),
+        resident_memory_bytes: Some(raw.ptinfo.pti_resident_size),
+        cpu_user_micros: None,
+        cpu_system_micros: None,
+    }
+}
+
+fn process_name(raw: &ProcTaskAllInfo) -> String {
+    let name = c_char_array_to_string(&raw.pbsd.pbi_name);
+    if name.is_empty() {
+        c_char_array_to_string(&raw.pbsd.pbi_comm)
+    } else {
+        name
+    }
+}
+
+fn c_char_array_to_string(raw: &[libc::c_char]) -> String {
+    let bytes: Vec<u8> = raw
+        .iter()
+        .copied()
+        .take_while(|c| *c != 0)
+        .map(|c| c.to_ne_bytes()[0])
+        .collect();
+    String::from_utf8_lossy(&bytes).trim().to_string()
+}
+
+fn positive_pid(pid: u32) -> Option<i32> {
+    if pid == 0 {
+        return None;
+    }
+    i32::try_from(pid).ok()
+}
+
+fn start_time_unix_ms(seconds: u64, micros: u64) -> Option<i64> {
+    let millis = seconds
+        .checked_mul(1000)?
+        .checked_add(micros.checked_div(1000)?)?;
+    i64::try_from(millis).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::platform::pal::Platform;
@@ -141,5 +219,26 @@ mod tests {
         let platform = MacOsPal::new();
         assert_platform(&platform);
         assert_eq!(platform.name(), "macos");
+    }
+
+    #[test]
+    fn process_list_returns_visible_processes_except_self_and_pid_zero() {
+        let platform = MacOsPal::new();
+        let processes = platform
+            .process_list()
+            .expect("macOS process list should be readable");
+        assert!(!processes.is_empty());
+        assert!(!processes.iter().any(|process| process.pid == 0));
+        assert!(
+            !processes
+                .iter()
+                .any(|process| process.pid == super::current_process_pid())
+        );
+        assert!(processes.iter().all(|process| !process.name.is_empty()));
+        assert!(
+            processes
+                .iter()
+                .any(|process| process.resident_memory_bytes.is_some())
+        );
     }
 }
