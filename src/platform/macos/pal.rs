@@ -57,7 +57,7 @@ impl Platform for MacOsPal {
     }
 
     fn service_manager(&self) -> Box<dyn ServiceManager> {
-        macos_placeholder("bd-1y7j.1", "service_manager")
+        crate::daemon::service::service_manager_for_kind(ServiceKind::Launchd, false)
     }
 
     fn capacity(&self, _mount: &Path) -> Result<Capacity> {
@@ -178,7 +178,7 @@ impl Platform for MacOsPal {
     }
 
     fn service_kind(&self) -> ServiceKind {
-        macos_placeholder("bd-1y7j.1", "service_kind")
+        ServiceKind::Launchd
     }
 }
 

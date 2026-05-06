@@ -129,6 +129,19 @@ pub trait ServiceManager: Send + Sync {
     fn install(&self) -> Result<()>;
     fn uninstall(&self) -> Result<()>;
     fn status(&self) -> Result<String>;
+
+    fn restart(&self) -> Result<()> {
+        pal_not_implemented("service", "restart")
+    }
+
+    fn logs_path(&self) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
+
+    fn is_loaded(&self) -> Result<bool> {
+        let status = self.status()?;
+        Ok(matches!(status.as_str(), "active" | "loaded" | "running"))
+    }
 }
 
 /// OS abstraction used by monitoring and daemon orchestration.

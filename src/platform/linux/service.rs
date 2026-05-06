@@ -3,11 +3,9 @@
 #![cfg(target_os = "linux")]
 #![allow(missing_docs)]
 
-use crate::platform::pal::{NoopServiceManager, ServiceManager};
+use crate::platform::pal::ServiceManager;
+use crate::platform::types::ServiceKind;
 
 pub(super) fn service_manager() -> Box<dyn ServiceManager> {
-    match crate::daemon::service::SystemdServiceManager::from_env(false) {
-        Ok(mgr) => Box::new(mgr),
-        Err(_) => Box::<NoopServiceManager>::default(),
-    }
+    crate::daemon::service::service_manager_for_kind(ServiceKind::Systemd, false)
 }

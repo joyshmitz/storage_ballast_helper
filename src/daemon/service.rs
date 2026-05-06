@@ -1,346 +1,25 @@
-//! Service integration: systemd (Type=notify, watchdog) and launchd (plist generation).
+//! Service integration dispatcher and shared service lifecycle contracts.
 //!
-//! Generates unit files / plists from configuration, installs them in the correct
-//! system or user directory, and drives `systemctl` / `launchctl` for lifecycle.
+//! Platform-specific implementations live under `service/systemd.rs` and
+//! `service/launchd.rs`. This file remains the module root so the repo can split
+//! the code without deleting or moving `src/daemon/service.rs`.
 
-use std::env;
-use std::fmt::Write as _;
-use std::fs;
+mod launchd;
+mod systemd;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use crate::core::errors::{Result, SbhError};
-use crate::platform::pal::ServiceManager;
+use crate::core::errors::Result;
+use crate::platform::pal::{NoopServiceManager, Platform, ServiceManager};
+use crate::platform::types::ServiceKind;
+
+pub use launchd::{LaunchdConfig, LaunchdServiceManager};
+pub use systemd::{SystemdConfig, SystemdServiceManager};
 
 /// Unit name for the systemd service.
-const SYSTEMD_UNIT_NAME: &str = "sbh.service";
-
-// ---------------------------------------------------------------------------
-// Systemd configuration
-// ---------------------------------------------------------------------------
-
-/// Parameters controlling systemd unit file generation and lifecycle commands.
-#[derive(Debug, Clone)]
-pub struct SystemdConfig {
-    /// Whether to operate in user scope (`--user`).
-    pub user_scope: bool,
-    /// Absolute path to the sbh binary baked into the unit file.
-    pub binary_path: PathBuf,
-    /// Paths sbh needs read-write access to under `ProtectSystem=strict`.
-    pub read_write_paths: Vec<PathBuf>,
-}
-
-impl SystemdConfig {
-    /// Build a config from the current environment.
-    ///
-    /// `user_scope` controls system vs user service placement.
-    pub fn from_env(user_scope: bool) -> Result<Self> {
-        let binary_path = resolve_sbh_binary()?;
-        let read_write_paths = default_read_write_paths(user_scope);
-        Ok(Self {
-            user_scope,
-            binary_path,
-            read_write_paths,
-        })
-    }
-
-    /// Directory where the unit file is written.
-    #[must_use]
-    pub fn unit_dir(&self) -> PathBuf {
-        if self.user_scope {
-            let home = env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-            home.join(".config/systemd/user")
-        } else {
-            PathBuf::from("/etc/systemd/system")
-        }
-    }
-
-    /// Full path to the generated unit file.
-    #[must_use]
-    pub fn unit_path(&self) -> PathBuf {
-        self.unit_dir().join(SYSTEMD_UNIT_NAME)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Systemd service manager
-// ---------------------------------------------------------------------------
-
-/// [`ServiceManager`] implementation that drives `systemctl` and generates
-/// a hardened systemd unit file.
-#[derive(Debug, Clone)]
-pub struct SystemdServiceManager {
-    config: SystemdConfig,
-}
-
-impl SystemdServiceManager {
-    /// Create a new manager with the given config.
-    #[must_use]
-    pub fn new(config: SystemdConfig) -> Self {
-        Self { config }
-    }
-
-    /// Create a manager from the current environment.
-    pub fn from_env(user_scope: bool) -> Result<Self> {
-        Ok(Self::new(SystemdConfig::from_env(user_scope)?))
-    }
-
-    /// Access the underlying config (for reading unit path, etc.).
-    #[must_use]
-    pub fn config(&self) -> &SystemdConfig {
-        &self.config
-    }
-
-    /// Generate the full systemd unit file content.
-    #[must_use]
-    pub fn generate_unit_file(&self) -> String {
-        let binary = self.config.binary_path.display();
-        let rw_paths = self
-            .config
-            .read_write_paths
-            .iter()
-            .map(|p| {
-                let s = p.display().to_string();
-                if s.contains(' ') || s.contains('"') {
-                    // Systemd quote escaping: escape internal quotes and wrap in quotes.
-                    format!("\"{}\"", s.replace('"', "\\\""))
-                } else {
-                    s
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let mut unit = String::with_capacity(2048);
-
-        // -- [Unit] section ------------------------------------------------
-        writeln!(unit, "[Unit]").ok();
-        writeln!(
-            unit,
-            "Description=Storage Ballast Helper - Disk Space Guardian"
-        )
-        .ok();
-        writeln!(
-            unit,
-            "Documentation=https://github.com/Dicklesworthstone/storage_ballast_helper"
-        )
-        .ok();
-        writeln!(unit, "After=local-fs.target").ok();
-        writeln!(unit, "Wants=local-fs.target").ok();
-        writeln!(unit).ok();
-
-        // -- [Service] section ---------------------------------------------
-        writeln!(unit, "[Service]").ok();
-
-        if self.config.user_scope {
-            // User services cannot use Type=notify without a sd_notify capable
-            // supervisor; use simple for safety.
-            writeln!(unit, "Type=simple").ok();
-        } else {
-            writeln!(unit, "Type=notify").ok();
-            writeln!(unit, "WatchdogSec=60").ok();
-        }
-
-        writeln!(unit, "ExecStart={binary} daemon").ok();
-        writeln!(unit, "ExecReload=/bin/kill -HUP $MAINPID").ok();
-        writeln!(unit, "Restart=on-failure").ok();
-        writeln!(unit, "RestartSec=10").ok();
-        writeln!(unit, "TimeoutStopSec=30").ok();
-        writeln!(unit).ok();
-
-        // -- Scheduling: lowest priority -----------------------------------
-        writeln!(unit, "# Low priority — never compete with build workloads").ok();
-        writeln!(unit, "Nice=19").ok();
-        writeln!(unit, "IOSchedulingClass=idle").ok();
-        writeln!(unit, "IOSchedulingPriority=7").ok();
-        writeln!(unit).ok();
-
-        // -- Security hardening -------------------------------------------
-        writeln!(unit, "# Security hardening").ok();
-        writeln!(unit, "NoNewPrivileges=true").ok();
-
-        if !self.config.user_scope {
-            // System services get strict protection; user services inherit
-            // user-session sandboxing and cannot use ProtectSystem.
-            writeln!(unit, "ProtectSystem=strict").ok();
-            writeln!(unit, "ReadWritePaths={rw_paths}").ok();
-            writeln!(unit, "ProtectHome=false").ok();
-            writeln!(unit, "PrivateTmp=false").ok();
-            writeln!(unit, "ProtectKernelTunables=true").ok();
-            writeln!(unit, "ProtectControlGroups=true").ok();
-            writeln!(unit, "RestrictSUIDSGID=true").ok();
-            writeln!(unit, "LimitNOFILE=4096").ok();
-        }
-        writeln!(unit).ok();
-
-        // -- Resource limits -----------------------------------------------
-        writeln!(unit, "# Resource limits").ok();
-        writeln!(unit, "MemoryMax=256M").ok();
-        writeln!(unit, "CPUQuota=10%").ok();
-        writeln!(unit).ok();
-
-        // -- Logging -------------------------------------------------------
-        if !self.config.user_scope {
-            writeln!(unit, "# Logging").ok();
-            writeln!(unit, "StandardOutput=journal").ok();
-            writeln!(unit, "StandardError=journal").ok();
-            writeln!(unit, "SyslogIdentifier=sbh").ok();
-            writeln!(unit).ok();
-        }
-
-        // -- [Install] section ---------------------------------------------
-        writeln!(unit, "[Install]").ok();
-        if self.config.user_scope {
-            writeln!(unit, "WantedBy=default.target").ok();
-        } else {
-            writeln!(unit, "WantedBy=multi-user.target").ok();
-        }
-
-        unit
-    }
-
-    // -- systemctl helpers -------------------------------------------------
-
-    fn check_binary_ownership(&self) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if !self.config.user_scope
-                && let Ok(meta) = fs::metadata(&self.config.binary_path)
-                && meta.uid() != 0
-            {
-                eprintln!(
-                    "[SBH-WARN] SECURITY RISK: System service binary '{}' is NOT owned by root (uid={}).",
-                    self.config.binary_path.display(),
-                    meta.uid()
-                );
-                eprintln!(
-                    "[SBH-WARN] A non-root user could replace this binary and gain root privileges."
-                );
-                let group = if cfg!(target_os = "macos") {
-                    "wheel"
-                } else {
-                    "root"
-                };
-                eprintln!(
-                    "[SBH-WARN] Recommendation: 'sudo chown root:{group} {}'",
-                    self.config.binary_path.display()
-                );
-            }
-        }
-    }
-
-    fn systemctl_args(&self, args: &[&str]) -> Vec<String> {
-        let mut cmd_args: Vec<String> = Vec::with_capacity(args.len() + 1);
-        if self.config.user_scope {
-            cmd_args.push("--user".to_string());
-        }
-        cmd_args.extend(args.iter().map(|s| (*s).to_string()));
-        cmd_args
-    }
-
-    fn run_systemctl(&self, args: &[&str]) -> Result<String> {
-        let full_args = self.systemctl_args(args);
-        let output = Command::new("systemctl")
-            .args(&full_args)
-            .output()
-            .map_err(|source| SbhError::Io {
-                path: PathBuf::from("systemctl"),
-                source,
-            })?;
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        if output.status.success() {
-            Ok(stdout.trim().to_string())
-        } else {
-            Err(SbhError::Runtime {
-                details: format!(
-                    "systemctl {} failed (exit {}): {}",
-                    full_args.join(" "),
-                    output.status.code().unwrap_or(-1),
-                    stderr.trim()
-                ),
-            })
-        }
-    }
-
-    /// Run systemctl but don't error on non-zero exit (used for stop/disable
-    /// where the service may already be stopped/disabled).
-    fn run_systemctl_lenient(&self, args: &[&str]) -> String {
-        let full_args = self.systemctl_args(args);
-        let output = Command::new("systemctl").args(&full_args).output();
-        match output {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            Err(_) => String::new(),
-        }
-    }
-}
-
-impl ServiceManager for SystemdServiceManager {
-    fn install(&self) -> Result<()> {
-        self.check_binary_ownership();
-
-        let unit_dir = self.config.unit_dir();
-        let unit_path = self.config.unit_path();
-        let unit_content = self.generate_unit_file();
-
-        // 1. Ensure parent directory exists.
-        fs::create_dir_all(&unit_dir).map_err(|source| SbhError::Io {
-            path: unit_dir.clone(),
-            source,
-        })?;
-
-        // 2. Write unit file.
-        fs::write(&unit_path, &unit_content).map_err(|source| SbhError::Io {
-            path: unit_path.clone(),
-            source,
-        })?;
-
-        // 3. Reload systemd daemon.
-        self.run_systemctl(&["daemon-reload"])?;
-
-        // 4. Enable the service.
-        self.run_systemctl(&["enable", SYSTEMD_UNIT_NAME])?;
-
-        Ok(())
-    }
-
-    fn uninstall(&self) -> Result<()> {
-        let unit_path = self.config.unit_path();
-
-        // 1. Stop service (lenient — may already be stopped).
-        self.run_systemctl_lenient(&["stop", SYSTEMD_UNIT_NAME]);
-
-        // 2. Disable service (lenient — may not be enabled).
-        self.run_systemctl_lenient(&["disable", SYSTEMD_UNIT_NAME]);
-
-        // 3. Remove unit file if it exists.
-        if unit_path.exists() {
-            fs::remove_file(&unit_path).map_err(|source| SbhError::Io {
-                path: unit_path.clone(),
-                source,
-            })?;
-        }
-
-        // 4. Reload systemd daemon.
-        self.run_systemctl(&["daemon-reload"])?;
-
-        Ok(())
-    }
-
-    fn status(&self) -> Result<String> {
-        // is-active returns non-zero for inactive/failed, so use lenient.
-        let state = self.run_systemctl_lenient(&["is-active", SYSTEMD_UNIT_NAME]);
-        if state.is_empty() {
-            return Ok("unknown".to_string());
-        }
-        Ok(state)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Service installation result (for structured CLI output)
-// ---------------------------------------------------------------------------
+pub const SYSTEMD_UNIT_NAME: &str = "sbh.service";
+/// Plist label used for the launchd service.
+pub const LAUNCHD_LABEL: &str = "com.sbh.daemon";
 
 /// Structured result from an install or uninstall operation.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -360,161 +39,571 @@ pub struct ServiceActionResult {
     pub error: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+/// Build a service manager from a platform service kind.
+#[must_use]
+pub fn service_manager_for_kind(kind: ServiceKind, user_scope: bool) -> Box<dyn ServiceManager> {
+    try_service_manager_for_kind(kind, user_scope)
+        .unwrap_or_else(|_| Box::<NoopServiceManager>::default())
+}
+
+/// Build a service manager from a platform, using `Platform::service_kind()` as
+/// the dispatch key.
+#[must_use]
+pub fn service_manager_for_platform<P: Platform>(
+    platform: &P,
+    user_scope: bool,
+) -> Box<dyn ServiceManager> {
+    service_manager_for_kind(platform.service_kind(), user_scope)
+}
+
+/// Fallible service-manager dispatcher used by CLI flows that want setup errors.
+pub fn try_service_manager_for_kind(
+    kind: ServiceKind,
+    user_scope: bool,
+) -> Result<Box<dyn ServiceManager>> {
+    match kind {
+        ServiceKind::Systemd => Ok(Box::new(SystemdServiceManager::from_env(user_scope)?)),
+        ServiceKind::Launchd => Ok(Box::new(LaunchdServiceManager::from_env(user_scope)?)),
+        ServiceKind::None => Ok(Box::<NoopServiceManager>::default()),
+    }
+}
 
 /// Resolve the sbh binary path (prefers the running binary, falls back to PATH).
 fn resolve_sbh_binary() -> Result<PathBuf> {
-    // First try: the currently running executable.
-    if let Ok(exe) = env::current_exe()
+    if let Ok(exe) = std::env::current_exe()
         && exe.exists()
     {
         return Ok(exe);
     }
-    // Fallback: search PATH.
     for candidate in &["/usr/local/bin/sbh", "/usr/bin/sbh"] {
         let p = Path::new(candidate);
         if p.exists() {
             return Ok(p.to_path_buf());
         }
     }
-    Err(SbhError::Runtime {
+    Err(crate::core::errors::SbhError::Runtime {
         details: "could not locate sbh binary; install it to a PATH directory first".to_string(),
     })
 }
 
-/// Default paths that sbh needs write access to under `ProtectSystem=strict`.
-///
-/// Includes common cleanup targets (/tmp, /var/tmp) and sbh's own state dirs.
-/// Also probes for `/data` and `/data/tmp` since these are universal on the
-/// agent-fleet machines this tool was built for (Contabo VPS layout) and
-/// omitting them produces silent NotWritable skips that defeat the daemon's
-/// purpose. Callers (cli_app::install) further extend this list with the
-/// scanner.root_paths from the user's config.
-fn default_read_write_paths(user_scope: bool) -> Vec<PathBuf> {
-    let mut paths = vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")];
-    if !user_scope {
-        paths.push(PathBuf::from("/var/lib/sbh"));
+#[allow(dead_code)]
+mod legacy_inline {
+
+    use std::env;
+    use std::fmt::Write as _;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use crate::core::errors::{Result, SbhError};
+    use crate::platform::pal::ServiceManager;
+
+    /// Unit name for the systemd service.
+    const SYSTEMD_UNIT_NAME: &str = "sbh.service";
+
+    // ---------------------------------------------------------------------------
+    // Systemd configuration
+    // ---------------------------------------------------------------------------
+
+    /// Parameters controlling systemd unit file generation and lifecycle commands.
+    #[derive(Debug, Clone)]
+    pub struct SystemdConfig {
+        /// Whether to operate in user scope (`--user`).
+        pub user_scope: bool,
+        /// Absolute path to the sbh binary baked into the unit file.
+        pub binary_path: PathBuf,
+        /// Paths sbh needs read-write access to under `ProtectSystem=strict`.
+        pub read_write_paths: Vec<PathBuf>,
     }
-    // Probe for /data layouts common on agent-fleet machines. Only add them
-    // if the directory exists so we don't pollute ReadWritePaths on hosts
-    // without /data (which would make systemd refuse to start the unit).
-    for candidate in ["/data", "/data/tmp"] {
-        let p = PathBuf::from(candidate);
-        if p.is_dir() {
-            paths.push(p);
+
+    impl SystemdConfig {
+        /// Build a config from the current environment.
+        ///
+        /// `user_scope` controls system vs user service placement.
+        pub fn from_env(user_scope: bool) -> Result<Self> {
+            let binary_path = resolve_sbh_binary()?;
+            let read_write_paths = default_read_write_paths(user_scope);
+            Ok(Self {
+                user_scope,
+                binary_path,
+                read_write_paths,
+            })
+        }
+
+        /// Directory where the unit file is written.
+        #[must_use]
+        pub fn unit_dir(&self) -> PathBuf {
+            if self.user_scope {
+                let home = env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+                home.join(".config/systemd/user")
+            } else {
+                PathBuf::from("/etc/systemd/system")
+            }
+        }
+
+        /// Full path to the generated unit file.
+        #[must_use]
+        pub fn unit_path(&self) -> PathBuf {
+            self.unit_dir().join(SYSTEMD_UNIT_NAME)
         }
     }
-    // Add user-local data dir.
-    if let Some(home) = env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        paths.push(home.join(".local/share/sbh"));
-        paths.push(home.join(".config/sbh"));
+
+    // ---------------------------------------------------------------------------
+    // Systemd service manager
+    // ---------------------------------------------------------------------------
+
+    /// [`ServiceManager`] implementation that drives `systemctl` and generates
+    /// a hardened systemd unit file.
+    #[derive(Debug, Clone)]
+    pub struct SystemdServiceManager {
+        config: SystemdConfig,
     }
-    paths
-}
 
-// ---------------------------------------------------------------------------
-// Launchd configuration (macOS)
-// ---------------------------------------------------------------------------
+    impl SystemdServiceManager {
+        /// Create a new manager with the given config.
+        #[must_use]
+        pub fn new(config: SystemdConfig) -> Self {
+            Self { config }
+        }
 
-/// Plist label used for the launchd service.
-const LAUNCHD_LABEL: &str = "com.sbh.daemon";
+        /// Create a manager from the current environment.
+        pub fn from_env(user_scope: bool) -> Result<Self> {
+            Ok(Self::new(SystemdConfig::from_env(user_scope)?))
+        }
 
-/// Parameters controlling launchd plist generation and lifecycle commands.
-#[derive(Debug, Clone)]
-pub struct LaunchdConfig {
-    /// Whether to install as user agent (vs system daemon).
-    pub user_scope: bool,
-    /// Absolute path to the sbh binary.
-    pub binary_path: PathBuf,
-    /// Path to stdout log file.
-    pub stdout_log: PathBuf,
-    /// Path to stderr log file.
-    pub stderr_log: PathBuf,
-}
+        /// Access the underlying config (for reading unit path, etc.).
+        #[must_use]
+        pub fn config(&self) -> &SystemdConfig {
+            &self.config
+        }
 
-impl LaunchdConfig {
-    /// Build a config from the current environment.
-    ///
-    /// If `user_scope` is false but the current process is not running as root,
-    /// automatically escalates to user-scope to avoid permission errors when
-    /// creating log directories under `/usr/local/var/log/`.
-    pub fn from_env(user_scope: bool) -> Result<Self> {
-        let effective_user_scope = if !user_scope && !is_running_as_root() {
-            eprintln!("[SBH] Not running as root — defaulting to user-scope launchd installation");
-            true
-        } else {
-            user_scope
-        };
+        /// Generate the full systemd unit file content.
+        #[must_use]
+        pub fn generate_unit_file(&self) -> String {
+            let binary = self.config.binary_path.display();
+            let rw_paths = self
+                .config
+                .read_write_paths
+                .iter()
+                .map(|p| {
+                    let s = p.display().to_string();
+                    if s.contains(' ') || s.contains('"') {
+                        // Systemd quote escaping: escape internal quotes and wrap in quotes.
+                        format!("\"{}\"", s.replace('"', "\\\""))
+                    } else {
+                        s
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
 
-        let binary_path = resolve_sbh_binary()?;
-        let (stdout_log, stderr_log) = default_launchd_log_paths(effective_user_scope);
-        Ok(Self {
-            user_scope: effective_user_scope,
-            binary_path,
-            stdout_log,
-            stderr_log,
+            let mut unit = String::with_capacity(2048);
+
+            // -- [Unit] section ------------------------------------------------
+            writeln!(unit, "[Unit]").ok();
+            writeln!(
+                unit,
+                "Description=Storage Ballast Helper - Disk Space Guardian"
+            )
+            .ok();
+            writeln!(
+                unit,
+                "Documentation=https://github.com/Dicklesworthstone/storage_ballast_helper"
+            )
+            .ok();
+            writeln!(unit, "After=local-fs.target").ok();
+            writeln!(unit, "Wants=local-fs.target").ok();
+            writeln!(unit).ok();
+
+            // -- [Service] section ---------------------------------------------
+            writeln!(unit, "[Service]").ok();
+
+            if self.config.user_scope {
+                // User services cannot use Type=notify without a sd_notify capable
+                // supervisor; use simple for safety.
+                writeln!(unit, "Type=simple").ok();
+            } else {
+                writeln!(unit, "Type=notify").ok();
+                writeln!(unit, "WatchdogSec=60").ok();
+            }
+
+            writeln!(unit, "ExecStart={binary} daemon").ok();
+            writeln!(unit, "ExecReload=/bin/kill -HUP $MAINPID").ok();
+            writeln!(unit, "Restart=on-failure").ok();
+            writeln!(unit, "RestartSec=10").ok();
+            writeln!(unit, "TimeoutStopSec=30").ok();
+            writeln!(unit).ok();
+
+            // -- Scheduling: lowest priority -----------------------------------
+            writeln!(unit, "# Low priority — never compete with build workloads").ok();
+            writeln!(unit, "Nice=19").ok();
+            writeln!(unit, "IOSchedulingClass=idle").ok();
+            writeln!(unit, "IOSchedulingPriority=7").ok();
+            writeln!(unit).ok();
+
+            // -- Security hardening -------------------------------------------
+            writeln!(unit, "# Security hardening").ok();
+            writeln!(unit, "NoNewPrivileges=true").ok();
+
+            if !self.config.user_scope {
+                // System services get strict protection; user services inherit
+                // user-session sandboxing and cannot use ProtectSystem.
+                writeln!(unit, "ProtectSystem=strict").ok();
+                writeln!(unit, "ReadWritePaths={rw_paths}").ok();
+                writeln!(unit, "ProtectHome=false").ok();
+                writeln!(unit, "PrivateTmp=false").ok();
+                writeln!(unit, "ProtectKernelTunables=true").ok();
+                writeln!(unit, "ProtectControlGroups=true").ok();
+                writeln!(unit, "RestrictSUIDSGID=true").ok();
+                writeln!(unit, "LimitNOFILE=4096").ok();
+            }
+            writeln!(unit).ok();
+
+            // -- Resource limits -----------------------------------------------
+            writeln!(unit, "# Resource limits").ok();
+            writeln!(unit, "MemoryMax=256M").ok();
+            writeln!(unit, "CPUQuota=10%").ok();
+            writeln!(unit).ok();
+
+            // -- Logging -------------------------------------------------------
+            if !self.config.user_scope {
+                writeln!(unit, "# Logging").ok();
+                writeln!(unit, "StandardOutput=journal").ok();
+                writeln!(unit, "StandardError=journal").ok();
+                writeln!(unit, "SyslogIdentifier=sbh").ok();
+                writeln!(unit).ok();
+            }
+
+            // -- [Install] section ---------------------------------------------
+            writeln!(unit, "[Install]").ok();
+            if self.config.user_scope {
+                writeln!(unit, "WantedBy=default.target").ok();
+            } else {
+                writeln!(unit, "WantedBy=multi-user.target").ok();
+            }
+
+            unit
+        }
+
+        // -- systemctl helpers -------------------------------------------------
+
+        fn check_binary_ownership(&self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if !self.config.user_scope
+                    && let Ok(meta) = fs::metadata(&self.config.binary_path)
+                    && meta.uid() != 0
+                {
+                    eprintln!(
+                        "[SBH-WARN] SECURITY RISK: System service binary '{}' is NOT owned by root (uid={}).",
+                        self.config.binary_path.display(),
+                        meta.uid()
+                    );
+                    eprintln!(
+                        "[SBH-WARN] A non-root user could replace this binary and gain root privileges."
+                    );
+                    let group = if cfg!(target_os = "macos") {
+                        "wheel"
+                    } else {
+                        "root"
+                    };
+                    eprintln!(
+                        "[SBH-WARN] Recommendation: 'sudo chown root:{group} {}'",
+                        self.config.binary_path.display()
+                    );
+                }
+            }
+        }
+
+        fn systemctl_args(&self, args: &[&str]) -> Vec<String> {
+            let mut cmd_args: Vec<String> = Vec::with_capacity(args.len() + 1);
+            if self.config.user_scope {
+                cmd_args.push("--user".to_string());
+            }
+            cmd_args.extend(args.iter().map(|s| (*s).to_string()));
+            cmd_args
+        }
+
+        fn run_systemctl(&self, args: &[&str]) -> Result<String> {
+            let full_args = self.systemctl_args(args);
+            let output = Command::new("systemctl")
+                .args(&full_args)
+                .output()
+                .map_err(|source| SbhError::Io {
+                    path: PathBuf::from("systemctl"),
+                    source,
+                })?;
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            if output.status.success() {
+                Ok(stdout.trim().to_string())
+            } else {
+                Err(SbhError::Runtime {
+                    details: format!(
+                        "systemctl {} failed (exit {}): {}",
+                        full_args.join(" "),
+                        output.status.code().unwrap_or(-1),
+                        stderr.trim()
+                    ),
+                })
+            }
+        }
+
+        /// Run systemctl but don't error on non-zero exit (used for stop/disable
+        /// where the service may already be stopped/disabled).
+        fn run_systemctl_lenient(&self, args: &[&str]) -> String {
+            let full_args = self.systemctl_args(args);
+            let output = Command::new("systemctl").args(&full_args).output();
+            match output {
+                Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                Err(_) => String::new(),
+            }
+        }
+    }
+
+    impl ServiceManager for SystemdServiceManager {
+        fn install(&self) -> Result<()> {
+            self.check_binary_ownership();
+
+            let unit_dir = self.config.unit_dir();
+            let unit_path = self.config.unit_path();
+            let unit_content = self.generate_unit_file();
+
+            // 1. Ensure parent directory exists.
+            fs::create_dir_all(&unit_dir).map_err(|source| SbhError::Io {
+                path: unit_dir.clone(),
+                source,
+            })?;
+
+            // 2. Write unit file.
+            fs::write(&unit_path, &unit_content).map_err(|source| SbhError::Io {
+                path: unit_path.clone(),
+                source,
+            })?;
+
+            // 3. Reload systemd daemon.
+            self.run_systemctl(&["daemon-reload"])?;
+
+            // 4. Enable the service.
+            self.run_systemctl(&["enable", SYSTEMD_UNIT_NAME])?;
+
+            Ok(())
+        }
+
+        fn uninstall(&self) -> Result<()> {
+            let unit_path = self.config.unit_path();
+
+            // 1. Stop service (lenient — may already be stopped).
+            self.run_systemctl_lenient(&["stop", SYSTEMD_UNIT_NAME]);
+
+            // 2. Disable service (lenient — may not be enabled).
+            self.run_systemctl_lenient(&["disable", SYSTEMD_UNIT_NAME]);
+
+            // 3. Remove unit file if it exists.
+            if unit_path.exists() {
+                fs::remove_file(&unit_path).map_err(|source| SbhError::Io {
+                    path: unit_path.clone(),
+                    source,
+                })?;
+            }
+
+            // 4. Reload systemd daemon.
+            self.run_systemctl(&["daemon-reload"])?;
+
+            Ok(())
+        }
+
+        fn status(&self) -> Result<String> {
+            // is-active returns non-zero for inactive/failed, so use lenient.
+            let state = self.run_systemctl_lenient(&["is-active", SYSTEMD_UNIT_NAME]);
+            if state.is_empty() {
+                return Ok("unknown".to_string());
+            }
+            Ok(state)
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Service installation result (for structured CLI output)
+    // ---------------------------------------------------------------------------
+
+    /// Structured result from an install or uninstall operation.
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct ServiceActionResult {
+        /// The action performed (`"install"` or `"uninstall"`).
+        pub action: &'static str,
+        /// Service system type (e.g., `"systemd"`, `"launchd"`).
+        pub service_type: &'static str,
+        /// Service scope (`"system"` or `"user"`).
+        pub scope: &'static str,
+        /// Path to the generated/removed unit file.
+        pub unit_path: PathBuf,
+        /// Whether the operation succeeded.
+        pub success: bool,
+        /// Error message if the operation failed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub error: Option<String>,
+    }
+
+    // ---------------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------------
+
+    /// Resolve the sbh binary path (prefers the running binary, falls back to PATH).
+    fn resolve_sbh_binary() -> Result<PathBuf> {
+        // First try: the currently running executable.
+        if let Ok(exe) = env::current_exe()
+            && exe.exists()
+        {
+            return Ok(exe);
+        }
+        // Fallback: search PATH.
+        for candidate in &["/usr/local/bin/sbh", "/usr/bin/sbh"] {
+            let p = Path::new(candidate);
+            if p.exists() {
+                return Ok(p.to_path_buf());
+            }
+        }
+        Err(SbhError::Runtime {
+            details: "could not locate sbh binary; install it to a PATH directory first"
+                .to_string(),
         })
     }
 
-    /// Directory where the plist is installed.
-    #[must_use]
-    pub fn plist_dir(&self) -> PathBuf {
-        if self.user_scope {
-            let home = env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-            home.join("Library/LaunchAgents")
-        } else {
-            PathBuf::from("/Library/LaunchDaemons")
+    /// Default paths that sbh needs write access to under `ProtectSystem=strict`.
+    ///
+    /// Includes common cleanup targets (/tmp, /var/tmp) and sbh's own state dirs.
+    /// Also probes for `/data` and `/data/tmp` since these are universal on the
+    /// agent-fleet machines this tool was built for (Contabo VPS layout) and
+    /// omitting them produces silent NotWritable skips that defeat the daemon's
+    /// purpose. Callers (cli_app::install) further extend this list with the
+    /// scanner.root_paths from the user's config.
+    fn default_read_write_paths(user_scope: bool) -> Vec<PathBuf> {
+        let mut paths = vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")];
+        if !user_scope {
+            paths.push(PathBuf::from("/var/lib/sbh"));
+        }
+        // Probe for /data layouts common on agent-fleet machines. Only add them
+        // if the directory exists so we don't pollute ReadWritePaths on hosts
+        // without /data (which would make systemd refuse to start the unit).
+        for candidate in ["/data", "/data/tmp"] {
+            let p = PathBuf::from(candidate);
+            if p.is_dir() {
+                paths.push(p);
+            }
+        }
+        // Add user-local data dir.
+        if let Some(home) = env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            paths.push(home.join(".local/share/sbh"));
+            paths.push(home.join(".config/sbh"));
+        }
+        paths
+    }
+
+    // ---------------------------------------------------------------------------
+    // Launchd configuration (macOS)
+    // ---------------------------------------------------------------------------
+
+    /// Plist label used for the launchd service.
+    const LAUNCHD_LABEL: &str = "com.sbh.daemon";
+
+    /// Parameters controlling launchd plist generation and lifecycle commands.
+    #[derive(Debug, Clone)]
+    pub struct LaunchdConfig {
+        /// Whether to install as user agent (vs system daemon).
+        pub user_scope: bool,
+        /// Absolute path to the sbh binary.
+        pub binary_path: PathBuf,
+        /// Path to stdout log file.
+        pub stdout_log: PathBuf,
+        /// Path to stderr log file.
+        pub stderr_log: PathBuf,
+    }
+
+    impl LaunchdConfig {
+        /// Build a config from the current environment.
+        ///
+        /// If `user_scope` is false but the current process is not running as root,
+        /// automatically escalates to user-scope to avoid permission errors when
+        /// creating log directories under `/usr/local/var/log/`.
+        pub fn from_env(user_scope: bool) -> Result<Self> {
+            let effective_user_scope = if !user_scope && !is_running_as_root() {
+                eprintln!(
+                    "[SBH] Not running as root — defaulting to user-scope launchd installation"
+                );
+                true
+            } else {
+                user_scope
+            };
+
+            let binary_path = resolve_sbh_binary()?;
+            let (stdout_log, stderr_log) = default_launchd_log_paths(effective_user_scope);
+            Ok(Self {
+                user_scope: effective_user_scope,
+                binary_path,
+                stdout_log,
+                stderr_log,
+            })
+        }
+
+        /// Directory where the plist is installed.
+        #[must_use]
+        pub fn plist_dir(&self) -> PathBuf {
+            if self.user_scope {
+                let home = env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+                home.join("Library/LaunchAgents")
+            } else {
+                PathBuf::from("/Library/LaunchDaemons")
+            }
+        }
+
+        /// Full path to the plist file.
+        #[must_use]
+        pub fn plist_path(&self) -> PathBuf {
+            self.plist_dir().join(format!("{LAUNCHD_LABEL}.plist"))
         }
     }
 
-    /// Full path to the plist file.
-    #[must_use]
-    pub fn plist_path(&self) -> PathBuf {
-        self.plist_dir().join(format!("{LAUNCHD_LABEL}.plist"))
-    }
-}
+    // ---------------------------------------------------------------------------
+    // Launchd service manager
+    // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Launchd service manager
-// ---------------------------------------------------------------------------
-
-/// [`ServiceManager`] implementation that generates a launchd plist and drives
-/// `launchctl` for lifecycle operations on macOS.
-#[derive(Debug, Clone)]
-pub struct LaunchdServiceManager {
-    config: LaunchdConfig,
-}
-
-impl LaunchdServiceManager {
-    /// Create a new manager with the given config.
-    #[must_use]
-    pub fn new(config: LaunchdConfig) -> Self {
-        Self { config }
+    /// [`ServiceManager`] implementation that generates a launchd plist and drives
+    /// `launchctl` for lifecycle operations on macOS.
+    #[derive(Debug, Clone)]
+    pub struct LaunchdServiceManager {
+        config: LaunchdConfig,
     }
 
-    /// Create a manager from the current environment.
-    pub fn from_env(user_scope: bool) -> Result<Self> {
-        Ok(Self::new(LaunchdConfig::from_env(user_scope)?))
-    }
+    impl LaunchdServiceManager {
+        /// Create a new manager with the given config.
+        #[must_use]
+        pub fn new(config: LaunchdConfig) -> Self {
+            Self { config }
+        }
 
-    /// Access the underlying config.
-    #[must_use]
-    pub fn config(&self) -> &LaunchdConfig {
-        &self.config
-    }
+        /// Create a manager from the current environment.
+        pub fn from_env(user_scope: bool) -> Result<Self> {
+            Ok(Self::new(LaunchdConfig::from_env(user_scope)?))
+        }
 
-    /// Generate the launchd plist XML content.
-    #[must_use]
-    pub fn generate_plist(&self) -> String {
-        let binary = escape_xml(&self.config.binary_path.to_string_lossy());
-        let stdout_log = escape_xml(&self.config.stdout_log.to_string_lossy());
-        let stderr_log = escape_xml(&self.config.stderr_log.to_string_lossy());
+        /// Access the underlying config.
+        #[must_use]
+        pub fn config(&self) -> &LaunchdConfig {
+            &self.config
+        }
 
-        format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
+        /// Generate the launchd plist XML content.
+        #[must_use]
+        pub fn generate_plist(&self) -> String {
+            let binary = escape_xml(&self.config.binary_path.to_string_lossy());
+            let stdout_log = escape_xml(&self.config.stdout_log.to_string_lossy());
+            let stderr_log = escape_xml(&self.config.stderr_log.to_string_lossy());
+
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -545,160 +634,161 @@ impl LaunchdServiceManager {
 </dict>
 </plist>
 "#
-        )
+            )
+        }
+
+        /// Run launchctl with the given arguments.
+        #[allow(clippy::unused_self)]
+        fn run_launchctl(&self, args: &[&str]) -> Result<String> {
+            let output = Command::new("launchctl")
+                .args(args)
+                .output()
+                .map_err(|source| SbhError::Io {
+                    path: PathBuf::from("launchctl"),
+                    source,
+                })?;
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            if output.status.success() {
+                Ok(stdout.trim().to_string())
+            } else {
+                Err(SbhError::Runtime {
+                    details: format!(
+                        "launchctl {} failed (exit {}): {}",
+                        args.join(" "),
+                        output.status.code().unwrap_or(-1),
+                        stderr.trim()
+                    ),
+                })
+            }
+        }
+
+        /// Run launchctl without erroring on failure.
+        #[allow(clippy::unused_self)]
+        fn run_launchctl_lenient(&self, args: &[&str]) -> String {
+            let output = Command::new("launchctl").args(args).output();
+            match output {
+                Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                Err(_) => String::new(),
+            }
+        }
     }
 
-    /// Run launchctl with the given arguments.
-    #[allow(clippy::unused_self)]
-    fn run_launchctl(&self, args: &[&str]) -> Result<String> {
-        let output = Command::new("launchctl")
-            .args(args)
-            .output()
-            .map_err(|source| SbhError::Io {
-                path: PathBuf::from("launchctl"),
+    impl ServiceManager for LaunchdServiceManager {
+        fn install(&self) -> Result<()> {
+            let plist_dir = self.config.plist_dir();
+            let plist_path = self.config.plist_path();
+            let plist_content = self.generate_plist();
+
+            // Ensure log directory exists.
+            if let Some(log_parent) = self.config.stdout_log.parent() {
+                fs::create_dir_all(log_parent).map_err(|source| SbhError::Io {
+                    path: log_parent.to_path_buf(),
+                    source,
+                })?;
+            }
+
+            // Ensure plist directory exists.
+            fs::create_dir_all(&plist_dir).map_err(|source| SbhError::Io {
+                path: plist_dir.clone(),
                 source,
             })?;
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        if output.status.success() {
-            Ok(stdout.trim().to_string())
-        } else {
-            Err(SbhError::Runtime {
-                details: format!(
-                    "launchctl {} failed (exit {}): {}",
-                    args.join(" "),
-                    output.status.code().unwrap_or(-1),
-                    stderr.trim()
-                ),
-            })
-        }
-    }
 
-    /// Run launchctl without erroring on failure.
-    #[allow(clippy::unused_self)]
-    fn run_launchctl_lenient(&self, args: &[&str]) -> String {
-        let output = Command::new("launchctl").args(args).output();
-        match output {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            Err(_) => String::new(),
-        }
-    }
-}
-
-impl ServiceManager for LaunchdServiceManager {
-    fn install(&self) -> Result<()> {
-        let plist_dir = self.config.plist_dir();
-        let plist_path = self.config.plist_path();
-        let plist_content = self.generate_plist();
-
-        // Ensure log directory exists.
-        if let Some(log_parent) = self.config.stdout_log.parent() {
-            fs::create_dir_all(log_parent).map_err(|source| SbhError::Io {
-                path: log_parent.to_path_buf(),
-                source,
-            })?;
-        }
-
-        // Ensure plist directory exists.
-        fs::create_dir_all(&plist_dir).map_err(|source| SbhError::Io {
-            path: plist_dir.clone(),
-            source,
-        })?;
-
-        // Write plist file.
-        fs::write(&plist_path, &plist_content).map_err(|source| SbhError::Io {
-            path: plist_path.clone(),
-            source,
-        })?;
-
-        // Load the service.
-        let path_str = plist_path
-            .to_str()
-            .ok_or_else(|| SbhError::Runtime {
-                details: "plist path is not valid UTF-8".to_string(),
-            })?
-            .to_string();
-        self.run_launchctl(&["load", &path_str])?;
-
-        Ok(())
-    }
-
-    fn uninstall(&self) -> Result<()> {
-        let plist_path = self.config.plist_path();
-
-        // Unload (lenient — may not be loaded).
-        if let Ok(path_str) = plist_path.to_str().ok_or(()) {
-            self.run_launchctl_lenient(&["unload", path_str]);
-        }
-
-        // Remove plist file.
-        if plist_path.exists() {
-            fs::remove_file(&plist_path).map_err(|source| SbhError::Io {
+            // Write plist file.
+            fs::write(&plist_path, &plist_content).map_err(|source| SbhError::Io {
                 path: plist_path.clone(),
                 source,
             })?;
+
+            // Load the service.
+            let path_str = plist_path
+                .to_str()
+                .ok_or_else(|| SbhError::Runtime {
+                    details: "plist path is not valid UTF-8".to_string(),
+                })?
+                .to_string();
+            self.run_launchctl(&["load", &path_str])?;
+
+            Ok(())
         }
 
-        Ok(())
+        fn uninstall(&self) -> Result<()> {
+            let plist_path = self.config.plist_path();
+
+            // Unload (lenient — may not be loaded).
+            if let Ok(path_str) = plist_path.to_str().ok_or(()) {
+                self.run_launchctl_lenient(&["unload", path_str]);
+            }
+
+            // Remove plist file.
+            if plist_path.exists() {
+                fs::remove_file(&plist_path).map_err(|source| SbhError::Io {
+                    path: plist_path.clone(),
+                    source,
+                })?;
+            }
+
+            Ok(())
+        }
+
+        fn status(&self) -> Result<String> {
+            let output = self.run_launchctl_lenient(&["list", LAUNCHD_LABEL]);
+            if output.is_empty() {
+                return Ok("not loaded".to_string());
+            }
+            // Parse basic status from launchctl list output.
+            if output.contains("\"Label\"") || output.contains(LAUNCHD_LABEL) {
+                Ok("loaded".to_string())
+            } else {
+                Ok("unknown".to_string())
+            }
+        }
     }
 
-    fn status(&self) -> Result<String> {
-        let output = self.run_launchctl_lenient(&["list", LAUNCHD_LABEL]);
-        if output.is_empty() {
-            return Ok("not loaded".to_string());
+    /// Minimal XML escaping for plist values.
+    fn escape_xml(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '&' => out.push_str("&amp;"),
+                '"' => out.push_str("&quot;"),
+                '\'' => out.push_str("&apos;"),
+                _ => out.push(c),
+            }
         }
-        // Parse basic status from launchctl list output.
-        if output.contains("\"Label\"") || output.contains(LAUNCHD_LABEL) {
-            Ok("loaded".to_string())
+        out
+    }
+
+    /// Check whether the current process is running as root.
+    ///
+    /// Uses `nix::unistd::geteuid()` on Unix; always returns `false` on other
+    /// platforms (launchd is macOS-only, but this keeps the code compilable
+    /// everywhere).
+    fn is_running_as_root() -> bool {
+        #[cfg(unix)]
+        {
+            nix::unistd::geteuid().is_root()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// Default log file paths for launchd service.
+    fn default_launchd_log_paths(user_scope: bool) -> (PathBuf, PathBuf) {
+        if user_scope {
+            let home = env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+            let log_dir = home.join("Library/Logs/sbh");
+            (log_dir.join("sbh.log"), log_dir.join("sbh.err"))
         } else {
-            Ok("unknown".to_string())
+            (
+                PathBuf::from("/usr/local/var/log/sbh/sbh.log"),
+                PathBuf::from("/usr/local/var/log/sbh/sbh.err"),
+            )
         }
-    }
-}
-
-/// Minimal XML escaping for plist values.
-fn escape_xml(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '&' => out.push_str("&amp;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Check whether the current process is running as root.
-///
-/// Uses `nix::unistd::geteuid()` on Unix; always returns `false` on other
-/// platforms (launchd is macOS-only, but this keeps the code compilable
-/// everywhere).
-fn is_running_as_root() -> bool {
-    #[cfg(unix)]
-    {
-        nix::unistd::geteuid().is_root()
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
-}
-
-/// Default log file paths for launchd service.
-fn default_launchd_log_paths(user_scope: bool) -> (PathBuf, PathBuf) {
-    if user_scope {
-        let home = env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-        let log_dir = home.join("Library/Logs/sbh");
-        (log_dir.join("sbh.log"), log_dir.join("sbh.err"))
-    } else {
-        (
-            PathBuf::from("/usr/local/var/log/sbh/sbh.log"),
-            PathBuf::from("/usr/local/var/log/sbh/sbh.err"),
-        )
     }
 }
 
@@ -709,6 +799,7 @@ fn default_launchd_log_paths(user_scope: bool) -> (PathBuf, PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::pal::MockPlatform;
 
     fn test_config(user_scope: bool) -> SystemdConfig {
         SystemdConfig {
@@ -730,6 +821,23 @@ mod tests {
         assert!(unit.contains("[Unit]"));
         assert!(unit.contains("[Service]"));
         assert!(unit.contains("[Install]"));
+    }
+
+    #[test]
+    fn service_kind_dispatcher_returns_noop_for_none() {
+        let mgr = service_manager_for_kind(ServiceKind::None, false);
+
+        assert_eq!(mgr.status().unwrap(), "unknown");
+        assert_eq!(mgr.logs_path().unwrap(), None);
+        assert!(!mgr.is_loaded().unwrap());
+    }
+
+    #[test]
+    fn platform_dispatcher_uses_pal_service_kind() {
+        let platform = MockPlatform::healthy().with_service_kind(ServiceKind::None);
+        let mgr = service_manager_for_platform(&platform, false);
+
+        assert_eq!(mgr.status().unwrap(), "unknown");
     }
 
     #[test]
