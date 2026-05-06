@@ -224,6 +224,9 @@ struct ScanArgs {
     /// Include protected paths in output report.
     #[arg(long)]
     show_protected: bool,
+    /// Include per-candidate confidence and safety-check traces.
+    #[arg(long)]
+    explain: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize)]
@@ -3656,6 +3659,131 @@ fn run_unprotect(cli: &Cli, args: &UnprotectArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct ScoredScanEntry {
+    score: CandidacyScore,
+    trace: ScanTrace,
+}
+
+#[derive(Debug, Clone)]
+struct ScanTrace {
+    pattern_name: String,
+    category: String,
+    mtime_check: String,
+    fd_check: String,
+    exec_check: String,
+    mmap_check: String,
+    sacred_overlap_check: String,
+    final_confidence: f64,
+    final_action: String,
+    veto_reason: Option<String>,
+}
+
+fn build_scan_trace(
+    input: &CandidateInput,
+    score: &CandidacyScore,
+    min_file_age_seconds: u64,
+) -> ScanTrace {
+    let open_fd_count = input
+        .active_references
+        .processes
+        .iter()
+        .map(|process| process.open_file_descriptors)
+        .sum::<usize>();
+    let running_exec_count = input
+        .active_references
+        .processes
+        .iter()
+        .filter(|process| process.running_executable)
+        .count();
+    let mmap_region_count = input
+        .active_references
+        .processes
+        .iter()
+        .map(|process| process.mmap_regions)
+        .sum::<usize>();
+
+    ScanTrace {
+        pattern_name: input.classification.pattern_name.to_string(),
+        category: format!("{:?}", input.classification.category),
+        mtime_check: if input.age.as_secs() < min_file_age_seconds {
+            format!(
+                "age {}s below minimum {}s",
+                input.age.as_secs(),
+                min_file_age_seconds
+            )
+        } else {
+            format!(
+                "age {}s meets minimum {}s",
+                input.age.as_secs(),
+                min_file_age_seconds
+            )
+        },
+        fd_check: if open_fd_count > 0 {
+            format!("{open_fd_count} open file descriptor(s)")
+        } else if input.is_open {
+            "open file detected by fallback scanner".to_string()
+        } else {
+            "clear".to_string()
+        },
+        exec_check: if running_exec_count > 0 {
+            format!("{running_exec_count} running executable(s)")
+        } else {
+            "clear".to_string()
+        },
+        mmap_check: if mmap_region_count > 0 {
+            format!("{mmap_region_count} mmap region(s)")
+        } else {
+            "clear".to_string()
+        },
+        sacred_overlap_check: if input.excluded {
+            "matched protection or exclusion".to_string()
+        } else if input.signals.has_git {
+            "contains .git".to_string()
+        } else {
+            "clear".to_string()
+        },
+        final_confidence: score.decision.posterior_abandoned,
+        final_action: format!("{:?}", score.decision.action),
+        veto_reason: score.veto_reason.as_ref().map(ToString::to_string),
+    }
+}
+
+fn scan_trace_json(trace: &ScanTrace) -> Value {
+    json!({
+        "pattern_name": &trace.pattern_name,
+        "category": &trace.category,
+        "mtime_check": &trace.mtime_check,
+        "fd_check": &trace.fd_check,
+        "exec_check": &trace.exec_check,
+        "mmap_check": &trace.mmap_check,
+        "sacred_overlap_check": &trace.sacred_overlap_check,
+        "final_confidence": trace.final_confidence,
+        "final_action": &trace.final_action,
+        "veto_reason": trace.veto_reason.as_deref(),
+    })
+}
+
+fn print_scan_trace(entry: &ScoredScanEntry) {
+    println!("    {}", entry.score.path.display());
+    println!(
+        "      pattern: {} ({})",
+        entry.trace.pattern_name, entry.trace.category
+    );
+    println!("      mtime: {}", entry.trace.mtime_check);
+    println!("      fd: {}", entry.trace.fd_check);
+    println!("      exec: {}", entry.trace.exec_check);
+    println!("      mmap: {}", entry.trace.mmap_check);
+    println!("      sacred: {}", entry.trace.sacred_overlap_check);
+    println!(
+        "      final: action={}, confidence={:.3}, score={:.2}",
+        entry.trace.final_action, entry.trace.final_confidence, entry.score.total_score
+    );
+    if let Some(reason) = &entry.trace.veto_reason {
+        println!("      veto: {reason}");
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     let config =
@@ -3719,15 +3847,15 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
         .map_err(|e| CliError::Runtime(e.to_string()))?;
     let dir_count = entries.len();
 
-    // Classify and score each entry first. Open-file checks are expensive and only
-    // needed for candidates that survive score/veto filters.
+    // Classify and score each entry with active-reference evidence attached.
     let registry = ArtifactPatternRegistry::default();
     let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
     let now = SystemTime::now();
     let (open_paths, _) = collect_open_path_ancestors(&scan_roots);
     let active_reference_index = collect_active_reference_index_best_effort(&scan_roots);
+    let min_file_age_seconds = config.scanner.min_file_age_minutes.saturating_mul(60);
 
-    let mut candidates: Vec<_> = entries
+    let scored_entries = entries
         .iter()
         .map(|entry| {
             let classification = registry.classify(&entry.path, entry.structural_signals);
@@ -3744,22 +3872,41 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 is_open: is_path_open_by_ancestor(&entry.path, &open_paths),
                 excluded: false,
             };
-            engine.score_candidate(&candidate, 0.0) // No pressure urgency for manual scan.
+            let score = engine.score_candidate(&candidate, 0.0); // No pressure urgency for manual scan.
+            let trace = build_scan_trace(&candidate, &score, min_file_age_seconds);
+            ScoredScanEntry { score, trace }
         })
-        .filter(|score| !score.vetoed && score.total_score >= args.min_score)
-        .collect();
+        .collect::<Vec<_>>();
 
+    let mut candidates = scored_entries
+        .iter()
+        .filter(|entry| !entry.score.vetoed && entry.score.total_score >= args.min_score)
+        .collect::<Vec<_>>();
     candidates.sort_by(|a, b| {
-        b.total_score
-            .partial_cmp(&a.total_score)
+        b.score
+            .total_score
+            .partial_cmp(&a.score.total_score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     if candidates.len() > args.top {
         candidates.truncate(args.top);
     }
 
+    let mut rejected = if args.explain {
+        scored_entries
+            .iter()
+            .filter(|entry| entry.score.vetoed)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    rejected.sort_by(|a, b| a.score.path.cmp(&b.score.path));
+    if rejected.len() > args.top {
+        rejected.truncate(args.top);
+    }
+
     let elapsed = start.elapsed();
-    let total_reclaimable: u64 = candidates.iter().map(|c| c.size_bytes).sum();
+    let total_reclaimable: u64 = candidates.iter().map(|entry| entry.score.size_bytes).sum();
 
     match output_mode(cli) {
         OutputMode::Human => {
@@ -3780,7 +3927,8 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 );
                 println!("  {}", "-".repeat(100));
 
-                for (i, candidate) in candidates.iter().enumerate() {
+                for (i, entry) in candidates.iter().enumerate() {
+                    let candidate = &entry.score;
                     let age = candidate.age;
                     let age_str = format_duration(age);
                     let size_str = format_bytes(candidate.size_bytes);
@@ -3800,6 +3948,21 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 println!();
                 println!("  Total reclaimable: {}", format_bytes(total_reclaimable));
                 println!("  Use 'sbh clean' to delete these candidates.");
+            }
+
+            if args.explain {
+                if !candidates.is_empty() {
+                    println!("\n  Confidence trace:");
+                    for entry in &candidates {
+                        print_scan_trace(entry);
+                    }
+                }
+                if !rejected.is_empty() {
+                    println!("\n  Safety rejections:");
+                    for entry in &rejected {
+                        print_scan_trace(entry);
+                    }
+                }
             }
 
             // Show protected paths if requested.
@@ -3823,25 +3986,32 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
         OutputMode::Json => {
             let entries_json: Vec<Value> = candidates
                 .iter()
-                .map(|c| {
-                    json!({
-                        "path": c.path.to_string_lossy(),
-                        "size_bytes": c.size_bytes,
-                        "age_seconds": c.age.as_secs(),
-                        "total_score": c.total_score,
-                        "category": format!("{:?}", c.classification.category),
-                        "pattern_name": c.classification.pattern_name,
-                        "confidence": c.classification.combined_confidence,
-                        "decision": format!("{:?}", c.decision.action),
+                .map(|entry| {
+                    let candidate = &entry.score;
+                    let mut item = json!({
+                        "path": candidate.path.to_string_lossy(),
+                        "size_bytes": candidate.size_bytes,
+                        "age_seconds": candidate.age.as_secs(),
+                        "total_score": candidate.total_score,
+                        "category": format!("{:?}", candidate.classification.category),
+                        "pattern_name": candidate.classification.pattern_name,
+                        "confidence": candidate.classification.combined_confidence,
+                        "decision": format!("{:?}", candidate.decision.action),
                         "factors": {
-                            "location": c.factors.location,
-                            "name": c.factors.name,
-                            "age": c.factors.age,
-                            "size": c.factors.size,
-                            "structure": c.factors.structure,
-                            "pressure_multiplier": c.factors.pressure_multiplier,
+                            "location": candidate.factors.location,
+                            "name": candidate.factors.name,
+                            "age": candidate.factors.age,
+                            "size": candidate.factors.size,
+                            "structure": candidate.factors.structure,
+                            "pressure_multiplier": candidate.factors.pressure_multiplier,
                         },
-                    })
+                    });
+                    if args.explain
+                        && let Some(obj) = item.as_object_mut()
+                    {
+                        obj.insert("explanation".to_string(), scan_trace_json(&entry.trace));
+                    }
+                    item
                 })
                 .collect();
 
@@ -3854,6 +4024,22 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 "total_reclaimable_bytes": total_reclaimable,
                 "candidates": entries_json,
             });
+
+            if args.explain {
+                let rejected_json = rejected
+                    .iter()
+                    .map(|entry| {
+                        json!({
+                            "path": entry.score.path.to_string_lossy(),
+                            "veto_reason": entry.score.veto_reason.as_deref(),
+                            "explanation": scan_trace_json(&entry.trace),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("rejected".to_string(), json!(rejected_json));
+                }
+            }
 
             if args.show_protected {
                 let protections = {
@@ -5644,6 +5830,7 @@ mod tests {
             vec!["sbh", "unprotect", "/data/projects/critical"],
             vec!["sbh", "tune", "--apply"],
             vec!["sbh", "check", "/data", "--target-free", "20"],
+            vec!["sbh", "scan", "/tmp", "--explain", "--top", "5"],
             vec!["sbh", "blame", "--top", "10"],
             vec!["sbh", "dashboard", "--refresh-ms", "250"],
             vec!["sbh", "dashboard", "--new-dashboard"],
@@ -5659,6 +5846,43 @@ mod tests {
             let parsed = Cli::try_parse_from(case.iter().copied());
             assert!(parsed.is_ok(), "failed to parse case: {case:?}");
         }
+    }
+
+    #[test]
+    fn scan_trace_reports_active_reference_checks() {
+        let path = PathBuf::from("/tmp/cargo-target-active");
+        let mut active_references =
+            storage_ballast_helper::scanner::scoring::ActiveReferenceSummary::default();
+        active_references.add_open_file_descriptor(42, Some("rustc".to_string()));
+        active_references.add_running_executable(42, Some("rustc".to_string()));
+        active_references.add_mmap_region(42, Some("rustc".to_string()));
+
+        let input = CandidateInput {
+            path: path.clone(),
+            size_bytes: 1_073_741_824,
+            age: std::time::Duration::from_hours(2),
+            classification: ArtifactPatternRegistry::default().classify(
+                &path,
+                storage_ballast_helper::scanner::patterns::StructuralSignals::default(),
+            ),
+            signals: storage_ballast_helper::scanner::patterns::StructuralSignals::default(),
+            active_references,
+            is_open: false,
+            excluded: false,
+        };
+        let engine = ScoringEngine::from_config(
+            &storage_ballast_helper::core::config::ScoringConfig::default(),
+            30,
+        );
+        let score = engine.score_candidate(&input, 0.0);
+        let trace = build_scan_trace(&input, &score, 1_800);
+
+        assert_eq!(trace.fd_check, "1 open file descriptor(s)");
+        assert_eq!(trace.exec_check, "1 running executable(s)");
+        assert_eq!(trace.mmap_check, "1 mmap region(s)");
+        assert!(trace.veto_reason.as_deref().is_some_and(|reason| {
+            reason.contains("Cannot reclaim safely") && reason.contains("pid 42 (rustc)")
+        }));
     }
 
     #[test]
