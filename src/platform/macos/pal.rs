@@ -148,10 +148,6 @@ impl Platform for MacOsPal {
         macos_placeholder("bd-hnxg.1", "preallocate_file")
     }
 
-    fn file_block_count(&self, _path: &Path) -> Result<u64> {
-        macos_placeholder("bd-hnxg.1", "file_block_count")
-    }
-
     fn user_home(&self) -> PathBuf {
         macos_placeholder("bd-1y7j.4", "user_home")
     }
@@ -304,6 +300,9 @@ fn open_file_mode(open_flags: u32) -> OpenFileMode {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+
     use crate::platform::pal::Platform;
 
     use super::MacOsPal;
@@ -402,5 +401,28 @@ mod tests {
             process.pid == super::current_process_pid()
                 && process.executable.as_deref() == Some(expected.as_path())
         }));
+    }
+
+    #[test]
+    fn file_block_count_reports_allocated_blocks_for_macos_file() {
+        let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        let path = dir.path().join("block-count.bin");
+        let payload = vec![0x5a; 16 * 1024];
+        let mut file = std::fs::File::create(&path).expect("temp file should be created");
+        file.write_all(&payload)
+            .expect("temp file payload should be written");
+        file.sync_all().expect("temp file should sync");
+        drop(file);
+
+        let platform = MacOsPal::new();
+        let blocks = platform
+            .file_block_count(&path)
+            .expect("file block count should be readable");
+
+        let metadata_blocks = std::fs::metadata(&path)
+            .expect("temp file metadata should be readable")
+            .blocks();
+        assert_eq!(blocks, metadata_blocks);
+        assert!(blocks > 0);
     }
 }
