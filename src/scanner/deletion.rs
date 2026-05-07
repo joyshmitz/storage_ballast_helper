@@ -8,6 +8,7 @@
 //! 2. Path is not currently open by any process (Linux: /proc/*/fd)
 //! 3. Parent directory is writable
 //! 4. Directory does not contain .git/ (final safety net)
+//! 5. Directory is not a Cargo source root misclassified as a target artifact
 //!
 //! Circuit breaker: 3 consecutive failures -> halt batch (daemon retries next cycle).
 
@@ -22,6 +23,7 @@ use std::time::{Duration, Instant};
 use crate::core::errors::{Result, SbhError};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle};
 use crate::logger::jsonl::ScoreFactorsRecord;
+use crate::scanner::patterns::StructuralSignals;
 use crate::scanner::scoring::{CandidacyScore, DecisionAction, ScoreFactors};
 use crate::scanner::walker;
 
@@ -106,6 +108,7 @@ pub enum SkipReason {
     Vetoed,
     BelowThreshold,
     Symlink,
+    ContainsCargoManifest,
 }
 
 // ──────────────────── executor ────────────────────
@@ -255,10 +258,15 @@ impl DeletionExecutor {
                     if matches!(skip, SkipReason::NotWritable) {
                         report.not_writable_paths.push(candidate.path.clone());
                     }
-                    // Only log unexpected skip reasons. PathGone (parent deleted) and
-                    // ContainsGit (project root) are normal conditions that produce
-                    // excessive log noise when logged as errors.
-                    if !matches!(skip, SkipReason::PathGone | SkipReason::ContainsGit) {
+                    // Only log unexpected skip reasons. PathGone (parent deleted),
+                    // ContainsGit, and Cargo manifests are normal safety vetoes that
+                    // produce excessive log noise when logged as errors.
+                    if !matches!(
+                        skip,
+                        SkipReason::PathGone
+                            | SkipReason::ContainsGit
+                            | SkipReason::ContainsCargoManifest
+                    ) {
                         eprintln!(
                             "[SBH-EXECUTOR] skip: {} ({:?})",
                             candidate.path.display(),
@@ -351,7 +359,15 @@ impl DeletionExecutor {
             return Err(SkipReason::ContainsGit);
         }
 
-        // 5. Not currently open by any process (Linux /proc check).
+        // 5. Does not look like a Cargo source root that a target-name
+        //    heuristic misclassified. This final guard is intentionally
+        //    independent of scoring so stale/buggy candidates cannot reach
+        //    remove_dir_all.
+        if meta.is_dir() && contains_cargo_manifest_without_artifact_markers(path) {
+            return Err(SkipReason::ContainsCargoManifest);
+        }
+
+        // 6. Not currently open by any process (Linux /proc check).
         if let Some(open) = open_paths
             && walker::is_path_open_by_ancestor(path, open)
         {
@@ -458,6 +474,42 @@ fn contains_nested_git(path: &Path, max_depth: usize) -> bool {
         }
     }
     false
+}
+
+/// Shallow check for Cargo source roots.
+///
+/// The scanner can legitimately reclaim cargo target directories named
+/// `target`, `*_target`, or `*-target`, but real source crates can also have
+/// those names. A direct child `Cargo.toml` without cargo build-output markers
+/// is a hard final veto.
+fn contains_cargo_manifest_without_artifact_markers(path: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+
+    let mut signals = StructuralSignals::default();
+
+    for entry in entries.flatten() {
+        let name_os = entry.file_name();
+        let name = name_os.to_string_lossy();
+
+        if name.eq_ignore_ascii_case("cargo.toml") {
+            signals.has_cargo_toml = true;
+        } else if name == "incremental" {
+            signals.has_incremental = true;
+        } else if name == "deps" {
+            signals.has_deps = true;
+        } else if name == "build" {
+            signals.has_build = true;
+        } else if name == ".fingerprint" {
+            signals.has_fingerprint = true;
+        }
+    }
+
+    signals.has_cargo_toml
+        && !(signals.has_fingerprint
+            || (signals.has_incremental && signals.has_deps)
+            || (signals.has_build && signals.has_deps))
 }
 
 // ──────────────────── conversions ────────────────────
@@ -632,6 +684,41 @@ mod tests {
         assert_eq!(report.items_deleted, 0);
         assert_eq!(report.items_skipped, 1);
         assert!(git_dir.exists());
+    }
+
+    #[test]
+    fn skips_scored_delete_for_cargo_manifest_source_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let crate_dir = dir
+            .path()
+            .join("asupersync_ansi_c")
+            .join("tools")
+            .join("rust_fuzz_target");
+        fs::create_dir_all(crate_dir.join("src")).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"rust_fuzz_target\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(crate_dir.join("Cargo.lock"), "# lockfile").unwrap();
+        fs::write(crate_dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let c = make_candidate(&crate_dir, 5000, 0.99);
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                ..DeletionConfig::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![c]);
+        let report = executor.execute(&plan, None);
+
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert!(crate_dir.exists());
+        assert!(crate_dir.join("Cargo.toml").exists());
+        assert!(crate_dir.join("src/main.rs").exists());
     }
 
     #[test]
