@@ -5,7 +5,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand};
+use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell as CompletionShell, generate};
 use colored::control;
 use serde::Serialize;
@@ -27,6 +27,7 @@ use storage_ballast_helper::monitor::fs_stats::FsStatsCollector;
 use storage_ballast_helper::platform::pal::{
     MemoryInfo, Platform, ServiceManager, detect_platform,
 };
+use storage_ballast_helper::platform::types::ServiceKind;
 use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionPlan};
 use storage_ballast_helper::scanner::patterns::ArtifactPatternRegistry;
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
@@ -146,9 +147,12 @@ struct InstallArgs {
     /// Install launchd service plist (macOS).
     #[arg(long, conflicts_with = "systemd")]
     launchd: bool,
-    /// Install in user service scope.
-    #[arg(long)]
+    /// Install in user service scope (same as --scope user).
+    #[arg(long, conflicts_with = "scope")]
     user: bool,
+    /// Service scope for systemd or launchd installation.
+    #[arg(long, value_enum, value_name = "SCOPE", conflicts_with = "user")]
+    scope: Option<InstallScopeArg>,
     /// Build and install from source (requires cargo + git).
     #[arg(long)]
     from_source: bool,
@@ -179,6 +183,25 @@ struct InstallArgs {
     /// Show what would be done without executing.
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum InstallScopeArg {
+    User,
+    System,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedInstallService {
+    kind: ServiceKind,
+    user_scope: bool,
+}
+
+impl ResolvedInstallService {
+    const fn scope_name(self) -> &'static str {
+        if self.user_scope { "user" } else { "system" }
+    }
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -662,6 +685,90 @@ fn run_daemon(cli: &Cli, args: &DaemonArgs) -> Result<(), CliError> {
         .map_err(|e| CliError::Runtime(format!("daemon runtime failure: {e}")))
 }
 
+fn install_requests_service(args: &InstallArgs) -> bool {
+    args.systemd || args.launchd || args.user || args.scope.is_some() || !args.from_source
+}
+
+fn service_kind_name(kind: ServiceKind) -> &'static str {
+    match kind {
+        ServiceKind::Systemd => "systemd",
+        ServiceKind::Launchd => "launchd",
+        ServiceKind::None => "none",
+    }
+}
+
+fn running_as_root() -> bool {
+    #[cfg(unix)]
+    {
+        nix::unistd::geteuid().is_root()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn resolve_install_service(
+    args: &InstallArgs,
+    detected_kind: ServiceKind,
+    is_root: bool,
+) -> Result<Option<ResolvedInstallService>, CliError> {
+    if !install_requests_service(args) {
+        return Ok(None);
+    }
+
+    if args.systemd && detected_kind != ServiceKind::Systemd {
+        return Err(CliError::User(format!(
+            "Error: --systemd is only supported on Linux/systemd hosts. Detected {} on this platform; omit the service flag for auto-detection.",
+            service_kind_name(detected_kind)
+        )));
+    }
+    if args.launchd && detected_kind != ServiceKind::Launchd {
+        return Err(CliError::User(format!(
+            "Error: --launchd is only supported on macOS/launchd hosts. Detected {} on this platform; omit the service flag for auto-detection.",
+            service_kind_name(detected_kind)
+        )));
+    }
+
+    let kind = if args.systemd {
+        ServiceKind::Systemd
+    } else if args.launchd {
+        ServiceKind::Launchd
+    } else {
+        detected_kind
+    };
+
+    if kind == ServiceKind::None {
+        return Err(CliError::User(
+            "automatic service installation is not supported on this platform".to_string(),
+        ));
+    }
+
+    let user_scope = match args.scope {
+        Some(InstallScopeArg::User) => true,
+        Some(InstallScopeArg::System) => false,
+        None if args.user => true,
+        None => kind == ServiceKind::Launchd,
+    };
+
+    if !user_scope && !is_root {
+        let message = match kind {
+            ServiceKind::Systemd => {
+                "Error: system-scope systemd installation requires root. \
+                 Use `sudo sbh install --systemd --scope system` or `sbh install --scope user`."
+            }
+            ServiceKind::Launchd => {
+                "Error: system-scope launchd installation requires root. \
+                 Use `sudo sbh install --launchd --scope system` or `sbh install --scope user` for a LaunchAgent."
+            }
+            ServiceKind::None => unreachable!("ServiceKind::None was rejected above"),
+        };
+        return Err(CliError::User(message.to_string()));
+    }
+
+    Ok(Some(ResolvedInstallService { kind, user_scope }))
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     // -- wizard / auto mode ---------------------------------------------------
@@ -705,40 +812,11 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
         return Ok(());
     }
 
-    if !args.from_source && !args.systemd && !args.launchd {
-        return Err(CliError::User(
-            "specify --systemd, --launchd, --from-source, --wizard, or --auto".to_string(),
-        ));
-    }
-
     // -- early platform gates -------------------------------------------------
     // Validate service flags against the current platform BEFORE any expensive
     // work (config loading, ballast provisioning, from-source builds).
-    if args.systemd && !cfg!(target_os = "linux") {
-        return Err(CliError::User(
-            "Error: --systemd is only supported on Linux. Use --launchd on macOS.".to_string(),
-        ));
-    }
-    if args.launchd && !cfg!(target_os = "macos") {
-        return Err(CliError::User(
-            "Error: --launchd is only supported on macOS. Use --systemd on Linux.".to_string(),
-        ));
-    }
-
-    // System-scope systemd requires root; catch early with actionable guidance.
-    if args.systemd && !args.user {
-        #[cfg(unix)]
-        {
-            if !nix::unistd::geteuid().is_root() {
-                return Err(CliError::User(
-                    "Error: System-scope systemd requires root. \
-                     Use `sudo sbh install --systemd` (recommended) \
-                     or `sbh install --systemd --user` (user-scope)."
-                        .to_string(),
-                ));
-            }
-        }
-    }
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+    let service = resolve_install_service(args, platform.service_kind(), running_as_root())?;
 
     // -- from-source build ----------------------------------------------------
     if args.from_source {
@@ -795,8 +873,9 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
             ));
         }
 
-        // If no service flags were specified, we're done after the binary install.
-        if !args.systemd && !args.launchd {
+        // From-source-only installs stop after the binary install. Passing a
+        // service flag or scope asks for service registration after the build.
+        if service.is_none() {
             return Ok(());
         }
         // Otherwise, fall through to service installation below.
@@ -847,20 +926,16 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     }
 
     // -- service registration -------------------------------------------------
-    if !args.systemd && !args.launchd {
+    let Some(service) = service else {
         // No service registration requested; orchestration-only install is done.
         return Ok(());
-    }
+    };
 
-    if args.launchd {
-        let mgr = LaunchdServiceManager::from_env(args.user)
+    if service.kind == ServiceKind::Launchd {
+        let mgr = LaunchdServiceManager::from_env(service.user_scope)
             .map_err(|e| CliError::Runtime(e.to_string()))?;
         let plist_path = mgr.config().plist_path();
-        let scope = if mgr.config().user_scope {
-            "user"
-        } else {
-            "system"
-        };
+        let scope = service.scope_name();
 
         match mgr.install() {
             Ok(()) => {
@@ -913,7 +988,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
 
     // -- systemd install --------------------------------------------------
     let mut systemd_config =
-        storage_ballast_helper::daemon::service::SystemdConfig::from_env(args.user)
+        storage_ballast_helper::daemon::service::SystemdConfig::from_env(service.user_scope)
             .map_err(|e| CliError::Runtime(e.to_string()))?;
 
     // Add configured paths to ReadWritePaths to satisfy ProtectSystem=strict
@@ -930,7 +1005,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
 
     let mgr = SystemdServiceManager::new(systemd_config);
     let unit_path = mgr.config().unit_path();
-    let scope = if args.user { "user" } else { "system" };
+    let scope = service.scope_name();
 
     match mgr.install() {
         Ok(()) => {
@@ -948,7 +1023,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
                     println!("Installed systemd service ({scope} scope).");
                     println!("  Unit file: {}", unit_path.display());
                     println!("  Service enabled. Start with:");
-                    if args.user {
+                    if service.user_scope {
                         println!("    systemctl --user start sbh.service");
                     } else {
                         println!("    sudo systemctl start sbh.service");
@@ -6277,6 +6352,104 @@ mod tests {
         assert!(runtime_default.foreground);
         assert_eq!(runtime_default.pidfile, None);
         assert_eq!(runtime_default.watchdog_sec, 0);
+    }
+
+    #[test]
+    fn install_command_parses_auto_and_explicit_service_flags() {
+        for case in [
+            vec!["sbh", "install"],
+            vec!["sbh", "install", "--launchd"],
+            vec!["sbh", "install", "--systemd"],
+            vec!["sbh", "install", "--scope", "user"],
+            vec!["sbh", "install", "--scope", "system"],
+            vec!["sbh", "install", "--from-source"],
+            vec!["sbh", "install", "--from-source", "--scope", "user"],
+        ] {
+            let parsed = Cli::try_parse_from(case.iter().copied());
+            assert!(parsed.is_ok(), "failed to parse install case: {case:?}");
+        }
+
+        assert!(Cli::try_parse_from(["sbh", "install", "--scope", "user", "--user"]).is_err());
+        assert!(Cli::try_parse_from(["sbh", "install", "--systemd", "--launchd"]).is_err());
+    }
+
+    #[test]
+    fn install_auto_selects_launchd_user_scope_on_macos() {
+        let args = InstallArgs::default();
+        let service = resolve_install_service(&args, ServiceKind::Launchd, false)
+            .expect("plain install should resolve")
+            .expect("plain install should request service");
+
+        assert_eq!(service.kind, ServiceKind::Launchd);
+        assert!(service.user_scope);
+        assert_eq!(service.scope_name(), "user");
+    }
+
+    #[test]
+    fn install_auto_selects_systemd_system_scope_on_linux() {
+        let args = InstallArgs::default();
+        let service = resolve_install_service(&args, ServiceKind::Systemd, true)
+            .expect("plain install should resolve")
+            .expect("plain install should request service");
+
+        assert_eq!(service.kind, ServiceKind::Systemd);
+        assert!(!service.user_scope);
+        assert_eq!(service.scope_name(), "system");
+    }
+
+    #[test]
+    fn install_from_source_only_does_not_request_service() {
+        let args = InstallArgs {
+            from_source: true,
+            ..InstallArgs::default()
+        };
+
+        assert!(
+            resolve_install_service(&args, ServiceKind::Launchd, false)
+                .expect("from-source-only should resolve")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn install_from_source_with_scope_requests_detected_service() {
+        let args = InstallArgs {
+            from_source: true,
+            scope: Some(InstallScopeArg::User),
+            ..InstallArgs::default()
+        };
+        let service = resolve_install_service(&args, ServiceKind::Launchd, false)
+            .expect("scoped from-source install should resolve")
+            .expect("scope should request service");
+
+        assert_eq!(service.kind, ServiceKind::Launchd);
+        assert!(service.user_scope);
+    }
+
+    #[test]
+    fn install_explicit_wrong_service_errors() {
+        let args = InstallArgs {
+            systemd: true,
+            ..InstallArgs::default()
+        };
+        let err = resolve_install_service(&args, ServiceKind::Launchd, true)
+            .expect_err("--systemd should fail on launchd hosts");
+
+        assert!(err.to_string().contains("--systemd"));
+        assert!(err.to_string().contains("launchd"));
+    }
+
+    #[test]
+    fn install_system_scope_requires_root() {
+        let args = InstallArgs {
+            scope: Some(InstallScopeArg::System),
+            ..InstallArgs::default()
+        };
+        let err = resolve_install_service(&args, ServiceKind::Launchd, false)
+            .expect_err("system-scope launchd should require root");
+
+        assert!(err.to_string().contains("requires root"));
+        assert!(err.to_string().contains("--scope user"));
     }
 
     #[test]
