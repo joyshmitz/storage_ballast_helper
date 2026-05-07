@@ -236,7 +236,24 @@ impl Platform for MacOsPal {
     }
 
     fn self_stats(&self) -> Result<SelfStats> {
-        macos_not_implemented("bd-wiqg.2", "self_stats")
+        let usage = sys::current_mach_task_usage()
+            .map_err(|error| macos_method_error("self_stats", &error))?;
+        let rusage = proc_pid_rusage_v4_safe(current_process_pid())
+            .map_err(|error| macos_method_error("self_stats", &error))?;
+
+        Ok(SelfStats {
+            rss_bytes: usage.rss_bytes,
+            virtual_memory_bytes: usage.virtual_memory_bytes,
+            cpu_user_micros: usage.cpu_user_micros,
+            cpu_system_micros: usage.cpu_system_micros,
+            idle_wakeups: Some(
+                rusage
+                    .ri_pkg_idle_wkups
+                    .saturating_add(rusage.ri_interrupt_wkups),
+            ),
+            bytes_read: Some(rusage.ri_diskio_bytesread),
+            bytes_written: Some(rusage.ri_diskio_byteswritten),
+        })
     }
 
     fn preallocate_file(&self, path: &Path, size: u64) -> Result<()> {
@@ -334,10 +351,6 @@ fn collect_open_files_under(root: &Path) -> Result<Vec<OpenFile>> {
             .then_with(|| left.path.cmp(&right.path))
     });
     Ok(open_files)
-}
-
-fn macos_not_implemented<T>(bead: &'static str, method: &'static str) -> Result<T> {
-    Err(PalError::not_implemented_with_bead("macos", method, Some(bead)).into())
 }
 
 fn macos_method_error(
@@ -1526,6 +1539,34 @@ mod tests {
         assert!(io.bytes_written_total <= raw.ri_diskio_byteswritten);
         assert_eq!(io.bytes_read_recent_15m, None);
         assert_eq!(io.bytes_written_recent_15m, None);
+    }
+
+    #[test]
+    fn macos_self_stats_reports_current_process() {
+        let platform = MacOsPal::new();
+        let stats = platform
+            .self_stats()
+            .expect("macOS self stats should be readable");
+        let raw =
+            crate::platform::macos::libproc::proc_pid_rusage_v4_safe(super::current_process_pid())
+                .expect("current process raw rusage should be readable");
+
+        assert!(stats.rss_bytes > 0);
+        assert!(stats.virtual_memory_bytes >= stats.rss_bytes);
+        assert_eq!(
+            stats.idle_wakeups,
+            Some(raw.ri_pkg_idle_wkups.saturating_add(raw.ri_interrupt_wkups))
+        );
+        assert!(
+            stats
+                .bytes_read
+                .is_some_and(|bytes| bytes <= raw.ri_diskio_bytesread)
+        );
+        assert!(
+            stats
+                .bytes_written
+                .is_some_and(|bytes| bytes <= raw.ri_diskio_byteswritten)
+        );
     }
 
     #[test]

@@ -25,7 +25,8 @@ use crate::platform::pal::{
 use crate::platform::sacred_catalog::cross_platform_sacred_paths;
 #[cfg(target_os = "linux")]
 use crate::platform::types::{
-    MemoryPressure, MemoryPressureCallback, PalError, SacredPath, ServiceKind, SubscriptionHandle,
+    MemoryPressure, MemoryPressureCallback, PalError, SacredPath, SelfStats, ServiceKind,
+    SubscriptionHandle,
 };
 
 #[cfg(target_os = "linux")]
@@ -136,6 +137,10 @@ impl Platform for LinuxPal {
         memory::subscribe_memory_pressure(callback)
     }
 
+    fn self_stats(&self) -> Result<SelfStats> {
+        process::read_self_stats()
+    }
+
     fn service_manager(&self) -> Box<dyn ServiceManager> {
         service::service_manager()
     }
@@ -192,5 +197,19 @@ mod tests {
             .expect("block count should be readable")
             * 512;
         assert!(allocated_bytes >= size);
+    }
+
+    #[test]
+    fn linux_pal_self_stats_reports_current_process() {
+        let platform = LinuxPal::new();
+        let stats = platform
+            .self_stats()
+            .expect("linux self stats should be readable");
+
+        assert!(stats.rss_bytes > 0);
+        assert!(stats.virtual_memory_bytes >= stats.rss_bytes);
+        assert_eq!(stats.idle_wakeups, None);
+        assert!(stats.bytes_read.is_some());
+        assert!(stats.bytes_written.is_some());
     }
 }
