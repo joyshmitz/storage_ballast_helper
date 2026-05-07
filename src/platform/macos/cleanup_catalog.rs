@@ -619,6 +619,33 @@ mod tests {
     }
 
     #[test]
+    fn ipsw_rule_only_matches_software_update_firmware_files() {
+        let firmware =
+            Path::new("/Users/operator/Library/iTunes/iPhone Software Updates/iPhone_17.ipsw");
+        assert_eq!(match_rule(firmware), Some(&IPSW_SOFTWARE_UPDATES));
+        assert_eq!(
+            match_path_scanner_rule(firmware),
+            Some(&IPSW_SOFTWARE_UPDATES)
+        );
+
+        for path in [
+            Path::new("/Users/operator/Downloads/iPhone_17.ipsw"),
+            Path::new("/Users/operator/Library/iTunes/iPhone Software Updates/readme.txt"),
+        ] {
+            assert!(
+                match_rule(path).is_none(),
+                "non-update IPSW-adjacent path must not match: {}",
+                path.display()
+            );
+            assert!(
+                match_path_scanner_rule(path).is_none(),
+                "non-update IPSW-adjacent path must not be scanned: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
     fn time_machine_rule_uses_tmutil_not_path_deletion() {
         assert_rule(
             TIME_MACHINE_LOCAL_SNAPSHOTS,

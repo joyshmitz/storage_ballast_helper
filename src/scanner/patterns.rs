@@ -1069,6 +1069,35 @@ mod tests {
     }
 
     #[test]
+    fn ipsw_updates_are_classified_only_in_software_updates_dir() {
+        let registry = ArtifactPatternRegistry::default();
+        let firmware =
+            Path::new("/Users/operator/Library/iTunes/iPhone Software Updates/iPhone_17.ipsw");
+        let classification = classify_macos(&registry, firmware, StructuralSignals::default());
+
+        assert_eq!(classification.pattern_name, "ipsw-software-updates");
+        assert_eq!(classification.category, ArtifactCategory::CacheDir);
+        assert!(classification.combined_confidence > 0.75);
+        assert_eq!(
+            extract_macos_pattern_label(firmware.to_str().unwrap()),
+            "ipsw-software-updates"
+        );
+
+        let downloads = Path::new("/Users/operator/Downloads/iPhone_17.ipsw");
+        let downloads_classification =
+            classify_macos(&registry, downloads, StructuralSignals::default());
+
+        assert_ne!(
+            downloads_classification.pattern_name,
+            "ipsw-software-updates"
+        );
+        assert_ne!(
+            extract_macos_pattern_label(downloads.to_str().unwrap()),
+            "ipsw-software-updates"
+        );
+    }
+
+    #[test]
     fn buildroot_outside_release_work_is_not_the_release_work_pattern() {
         let registry = ArtifactPatternRegistry::default();
         for path in [

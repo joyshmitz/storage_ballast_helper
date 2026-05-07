@@ -616,6 +616,58 @@ mod tests {
     }
 
     #[test]
+    fn stale_ipsw_is_actionable_but_recent_ipsw_is_kept() {
+        let registry = ArtifactPatternRegistry::default();
+        let engine = default_engine();
+        let path =
+            PathBuf::from("/Users/operator/Library/iTunes/iPhone Software Updates/iPhone_17.ipsw");
+        let signals = StructuralSignals::default();
+        let classification = classify_macos(&registry, &path, signals);
+
+        assert_eq!(classification.pattern_name, "ipsw-software-updates");
+        assert_eq!(classification.category, ArtifactCategory::CacheDir);
+
+        let stale_score = engine.score_candidate(
+            &CandidateInput {
+                path: path.clone(),
+                size_bytes: 6 * 1_073_741_824,
+                age: Duration::from_hours(24 * 45),
+                classification: classification.clone(),
+                signals,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            0.95,
+        );
+
+        assert!(!stale_score.vetoed);
+        assert_eq!(stale_score.decision.action, DecisionAction::Delete);
+
+        let recent_score = engine.score_candidate(
+            &CandidateInput {
+                path,
+                size_bytes: 6 * 1_073_741_824,
+                age: Duration::from_hours(24 * 7),
+                classification,
+                signals,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            0.95,
+        );
+
+        assert_eq!(recent_score.decision.action, DecisionAction::Keep);
+        assert!(
+            recent_score
+                .veto_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("ipsw-software-updates age"))
+        );
+    }
+
+    #[test]
     fn private_tmp_user_named_trash_requires_review_not_delete() {
         let registry = ArtifactPatternRegistry::default();
         let engine = default_engine();
