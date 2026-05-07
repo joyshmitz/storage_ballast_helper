@@ -86,6 +86,20 @@ impl ApfsInventory {
                 })
             })
     }
+
+    #[must_use]
+    pub fn sibling_volume_names(&self, volume: &ApfsVolume) -> Vec<String> {
+        let mut siblings: Vec<String> = self
+            .volumes
+            .iter()
+            .filter(|candidate| candidate.container_id == volume.container_id)
+            .filter(|candidate| candidate.device_id != volume.device_id)
+            .map(ApfsVolume::display_name)
+            .collect();
+        siblings.sort();
+        siblings.dedup();
+        siblings
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +137,25 @@ impl ApfsVolume {
     #[must_use]
     pub fn has_role(&self, role: &ApfsVolumeRole) -> bool {
         self.roles.iter().any(|candidate| candidate == role)
+    }
+
+    #[must_use]
+    pub fn role_label(&self) -> Option<String> {
+        if self.roles.is_empty() {
+            return None;
+        }
+        Some(
+            self.roles
+                .iter()
+                .map(ApfsVolumeRole::as_str)
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| self.device_id.clone())
     }
 }
 
@@ -396,6 +429,19 @@ impl PartialOrd for ApfsVolumeRole {
 }
 
 impl ApfsVolumeRole {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Data => "Data",
+            Self::System => "System",
+            Self::Preboot => "Preboot",
+            Self::Vm => "VM",
+            Self::Update => "Update",
+            Self::Recovery => "Recovery",
+            Self::Other(value) => value,
+        }
+    }
+
     fn sort_key(&self) -> u8 {
         match self {
             Self::System => 0,

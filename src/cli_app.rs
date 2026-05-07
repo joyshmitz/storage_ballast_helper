@@ -32,7 +32,7 @@ use storage_ballast_helper::platform::pal::{
     MemoryInfo, Platform, ServiceManager, detect_platform,
 };
 use storage_ballast_helper::platform::types::{
-    FullDiskAccessState, FullDiskAccessStatus, ServiceKind,
+    Capacity, FullDiskAccessState, FullDiskAccessStatus, ServiceKind,
 };
 use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionPlan};
 use storage_ballast_helper::scanner::patterns::{ArtifactCategory, ArtifactPatternRegistry};
@@ -4135,18 +4135,18 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
 
             let mut overall_level = "green";
             for mount in &mounts {
-                let Ok(stats) = platform.fs_stats(&mount.path) else {
+                let Ok(capacity) = platform.capacity(&mount.path) else {
                     continue;
                 };
 
                 // Skip pseudo/virtual/read-only filesystems (squashfs snap
                 // mounts, proc, sysfs, etc.) — they can't fill up and don't
                 // represent actionable storage pressure.
-                if stats.total_bytes == 0 || stats.is_readonly {
+                if capacity.total_bytes == 0 || capacity.is_readonly {
                     continue;
                 }
 
-                let free_pct = stats.free_pct();
+                let free_pct = capacity_free_pct(&capacity);
                 let level = pressure_level_str(free_pct, &config);
                 if pressure_severity(level) > pressure_severity(overall_level) {
                     overall_level = level;
@@ -4161,8 +4161,8 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 println!(
                     "  {:<20}  {:>10}  {:>10}  {:>6.1}%  {:<10}",
                     format!("{}{ram_note}", mount.path.display()),
-                    format_bytes(stats.total_bytes),
-                    format_bytes(stats.available_bytes),
+                    format_bytes(capacity.total_bytes),
+                    format_bytes(capacity.available_bytes),
                     free_pct,
                     level.to_uppercase(),
                 );
@@ -4268,27 +4268,20 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
             let mut overall_level = "green";
 
             for mount in &mounts {
-                let Ok(stats) = platform.fs_stats(&mount.path) else {
+                let Ok(capacity) = platform.capacity(&mount.path) else {
                     continue;
                 };
                 // Skip pseudo/virtual/read-only filesystems.
-                if stats.total_bytes == 0 || stats.is_readonly {
+                if capacity.total_bytes == 0 || capacity.is_readonly {
                     continue;
                 }
-                let free_pct = stats.free_pct();
+                let free_pct = capacity_free_pct(&capacity);
                 let level = pressure_level_str(free_pct, &config);
                 if pressure_severity(level) > pressure_severity(overall_level) {
                     overall_level = level;
                 }
 
-                mounts_json.push(json!({
-                    "path": mount.path.to_string_lossy(),
-                    "total": stats.total_bytes,
-                    "free": stats.available_bytes,
-                    "free_pct": free_pct,
-                    "level": level,
-                    "fs_type": stats.fs_type,
-                }));
+                mounts_json.push(status_mount_json(&capacity, level, free_pct));
             }
 
             let recent = db_stats.as_ref().map(|s| {
@@ -4519,6 +4512,31 @@ fn pressure_severity(level: &str) -> u8 {
         "critical" => 4,
         _ => 0,
     }
+}
+
+fn capacity_free_pct(capacity: &Capacity) -> f64 {
+    bytes_to_pct(capacity.available_bytes, capacity.total_bytes)
+}
+
+fn status_mount_json(capacity: &Capacity, level: &str, free_pct: f64) -> Value {
+    json!({
+        "path": capacity.mount_point.to_string_lossy(),
+        "total": capacity.total_bytes,
+        "free": capacity.available_bytes,
+        "free_pct": free_pct,
+        "level": level,
+        "fs_type": capacity.fs_type,
+        "container_id": capacity.container_id,
+        "container_total": capacity.container_total_bytes,
+        "container_available": capacity.container_available_bytes,
+        "volume_total": capacity.volume_total_bytes,
+        "volume_available": capacity.volume_available_bytes,
+        "volume_role": capacity.volume_role,
+        "shared_volumes": capacity.shared_volumes,
+        "is_primary": capacity.is_primary,
+        "purgeable_bytes": capacity.purgeable_bytes,
+        "local_snapshot_bytes": capacity.local_snapshot_bytes,
+    })
 }
 
 fn bytes_to_pct(value: u64, total: u64) -> f64 {
@@ -8547,6 +8565,68 @@ mod tests {
     fn bytes_to_pct_handles_zero_total() {
         assert_eq!(bytes_to_pct(100, 0), 0.0);
         assert_eq!(bytes_to_pct(50, 200), 25.0);
+    }
+
+    #[test]
+    fn capacity_free_pct_uses_effective_capacity_totals() {
+        let capacity = Capacity {
+            mount_point: PathBuf::from("/System/Volumes/Data"),
+            fs_type: "apfs".to_string(),
+            total_bytes: 1_000,
+            free_bytes: 250,
+            available_bytes: 250,
+            is_readonly: false,
+            container_id: Some("/dev/disk3".to_string()),
+            container_total_bytes: Some(1_000),
+            container_available_bytes: Some(250),
+            volume_total_bytes: Some(400),
+            volume_available_bytes: Some(100),
+            volume_role: Some("Data".to_string()),
+            shared_volumes: vec!["Macintosh HD".to_string(), "VM".to_string()],
+            is_primary: true,
+            purgeable_bytes: None,
+            local_snapshot_bytes: None,
+        };
+
+        assert!((capacity_free_pct(&capacity) - 25.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn status_mount_json_exposes_apfs_container_metadata() {
+        let capacity = Capacity {
+            mount_point: PathBuf::from("/System/Volumes/Data"),
+            fs_type: "apfs".to_string(),
+            total_bytes: 1_000,
+            free_bytes: 250,
+            available_bytes: 250,
+            is_readonly: false,
+            container_id: Some("/dev/disk3".to_string()),
+            container_total_bytes: Some(1_000),
+            container_available_bytes: Some(250),
+            volume_total_bytes: Some(400),
+            volume_available_bytes: Some(100),
+            volume_role: Some("Data".to_string()),
+            shared_volumes: vec!["Macintosh HD".to_string(), "VM".to_string()],
+            is_primary: true,
+            purgeable_bytes: Some(32),
+            local_snapshot_bytes: Some(64),
+        };
+
+        let payload = status_mount_json(&capacity, "yellow", 25.0);
+
+        assert_eq!(payload["path"], "/System/Volumes/Data");
+        assert_eq!(payload["total"], 1_000);
+        assert_eq!(payload["free"], 250);
+        assert_eq!(payload["container_id"], "/dev/disk3");
+        assert_eq!(payload["container_total"], 1_000);
+        assert_eq!(payload["container_available"], 250);
+        assert_eq!(payload["volume_total"], 400);
+        assert_eq!(payload["volume_available"], 100);
+        assert_eq!(payload["volume_role"], "Data");
+        assert_eq!(payload["shared_volumes"], json!(["Macintosh HD", "VM"]));
+        assert_eq!(payload["is_primary"], true);
+        assert_eq!(payload["purgeable_bytes"], 32);
+        assert_eq!(payload["local_snapshot_bytes"], 64);
     }
 
     #[test]

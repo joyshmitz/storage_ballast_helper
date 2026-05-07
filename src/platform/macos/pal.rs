@@ -379,22 +379,36 @@ fn statfs_to_mount_point(stats: StatfsSnapshot) -> MountPoint {
 }
 
 fn statfs_to_capacity(stats: StatfsSnapshot, inventory: Option<&ApfsInventory>) -> Capacity {
-    let total_bytes = stats.total_bytes();
-    let free_bytes = stats.free_bytes();
-    let available_bytes = stats.available_bytes();
+    let volume_total_bytes = stats.total_bytes();
+    let volume_free_bytes = stats.free_bytes();
+    let volume_available_bytes = stats.available_bytes();
     let volume = inventory.and_then(|inventory| inventory.volume_for_device(&stats.device));
+    let container_total_bytes = volume.and_then(|volume| volume.container_total_bytes);
+    let container_available_bytes = volume.and_then(|volume| volume.container_available_bytes);
+    let effective_total_bytes = container_total_bytes.unwrap_or(volume_total_bytes);
+    let effective_available_bytes = container_available_bytes.unwrap_or(volume_available_bytes);
+    let is_primary = volume.is_some_and(|volume| volume.has_role(&ApfsVolumeRole::Data))
+        || (stats.fs_type.eq_ignore_ascii_case("apfs")
+            && stats.mount_point == Path::new("/System/Volumes/Data"));
     Capacity {
         mount_point: stats.mount_point,
         fs_type: stats.fs_type,
-        total_bytes,
-        free_bytes,
-        available_bytes,
+        total_bytes: effective_total_bytes,
+        free_bytes: container_available_bytes.unwrap_or(volume_free_bytes),
+        available_bytes: effective_available_bytes,
         is_readonly: stats.is_readonly,
         container_id: volume.map(|volume| volume.container_id.clone()),
-        container_total_bytes: volume.and_then(|volume| volume.container_total_bytes),
-        container_available_bytes: volume.and_then(|volume| volume.container_available_bytes),
-        volume_total_bytes: Some(total_bytes),
-        volume_available_bytes: Some(available_bytes),
+        container_total_bytes,
+        container_available_bytes,
+        volume_total_bytes: Some(volume_total_bytes),
+        volume_available_bytes: Some(volume_available_bytes),
+        volume_role: volume.and_then(ApfsVolume::role_label),
+        shared_volumes: inventory
+            .zip(volume)
+            .map_or_else(Vec::new, |(inventory, volume)| {
+                inventory.sibling_volume_names(volume)
+            }),
+        is_primary,
         purgeable_bytes: None,
         local_snapshot_bytes: None,
     }
@@ -619,7 +633,11 @@ fn region_protection(bits: u32) -> String {
 mod tests {
     use std::io::Write;
     use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
 
+    use crate::platform::macos::sys::{
+        ApfsContainer, ApfsInventory, ApfsVolume, ApfsVolumeRole, StatfsSnapshot,
+    };
     use crate::platform::pal::Platform;
 
     use super::MacOsPal;
@@ -631,6 +649,72 @@ mod tests {
         let platform = MacOsPal::new();
         assert_platform(&platform);
         assert_eq!(platform.name(), "macos");
+    }
+
+    #[test]
+    fn capacity_uses_apfs_container_totals_for_data_volume() {
+        let stats = StatfsSnapshot {
+            mount_point: PathBuf::from("/System/Volumes/Data"),
+            device: "/dev/disk3s5".to_string(),
+            fs_type: "apfs".to_string(),
+            block_size: 1,
+            blocks: 400,
+            blocks_free: 120,
+            blocks_available: 100,
+            is_readonly: false,
+        };
+        let inventory = ApfsInventory {
+            containers: vec![ApfsContainer {
+                container_id: "/dev/disk3".to_string(),
+                uuid: Some("container-uuid".to_string()),
+                capacity_total_bytes: Some(1_000),
+                capacity_available_bytes: Some(250),
+                physical_stores: vec!["/dev/disk0s2".to_string()],
+            }],
+            volumes: vec![
+                ApfsVolume {
+                    device_id: "/dev/disk3s1".to_string(),
+                    container_id: "/dev/disk3".to_string(),
+                    name: Some("Macintosh HD".to_string()),
+                    roles: vec![ApfsVolumeRole::System],
+                    capacity_in_use_bytes: Some(200),
+                    container_total_bytes: Some(1_000),
+                    container_available_bytes: Some(250),
+                },
+                ApfsVolume {
+                    device_id: "/dev/disk3s5".to_string(),
+                    container_id: "/dev/disk3".to_string(),
+                    name: Some("Data".to_string()),
+                    roles: vec![ApfsVolumeRole::Data],
+                    capacity_in_use_bytes: Some(650),
+                    container_total_bytes: Some(1_000),
+                    container_available_bytes: Some(250),
+                },
+                ApfsVolume {
+                    device_id: "/dev/disk3s6".to_string(),
+                    container_id: "/dev/disk3".to_string(),
+                    name: Some("VM".to_string()),
+                    roles: vec![ApfsVolumeRole::Vm],
+                    capacity_in_use_bytes: None,
+                    container_total_bytes: Some(1_000),
+                    container_available_bytes: Some(250),
+                },
+            ],
+        };
+
+        let capacity = super::statfs_to_capacity(stats, Some(&inventory));
+
+        assert_eq!(capacity.total_bytes, 1_000);
+        assert_eq!(capacity.free_bytes, 250);
+        assert_eq!(capacity.available_bytes, 250);
+        assert_eq!(capacity.container_id.as_deref(), Some("/dev/disk3"));
+        assert_eq!(capacity.container_total_bytes, Some(1_000));
+        assert_eq!(capacity.container_available_bytes, Some(250));
+        assert_eq!(capacity.volume_total_bytes, Some(400));
+        assert_eq!(capacity.volume_available_bytes, Some(100));
+        assert_eq!(capacity.volume_role.as_deref(), Some("Data"));
+        assert_eq!(capacity.shared_volumes, vec!["Macintosh HD", "VM"]);
+        assert!(capacity.is_primary);
     }
 
     #[test]

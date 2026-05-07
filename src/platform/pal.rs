@@ -82,6 +82,9 @@ impl From<FsStats> for Capacity {
             container_available_bytes: None,
             volume_total_bytes: Some(value.total_bytes),
             volume_available_bytes: Some(value.available_bytes),
+            volume_role: None,
+            shared_volumes: Vec::new(),
+            is_primary: false,
             purgeable_bytes: None,
             local_snapshot_bytes: None,
         }

@@ -124,6 +124,9 @@ pub struct Capacity {
     pub container_available_bytes: Option<u64>,
     pub volume_total_bytes: Option<u64>,
     pub volume_available_bytes: Option<u64>,
+    pub volume_role: Option<String>,
+    pub shared_volumes: Vec<String>,
+    pub is_primary: bool,
     pub purgeable_bytes: Option<u64>,
     pub local_snapshot_bytes: Option<u64>,
 }
