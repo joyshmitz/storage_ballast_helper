@@ -364,7 +364,10 @@ impl ServiceManager for LaunchdServiceManager {
             }
             Err(error) => return Err(error.into()),
         }
-        launchctl::kickstart(&self.service_target(), true)?;
+        // Bootstrap already loads the service. A non-killing kickstart asks
+        // launchd to start it without terminating the just-created job, which
+        // can otherwise leave the service throttled in "spawn scheduled".
+        launchctl::kickstart(&self.service_target(), false)?;
         launchctl::print(&self.service_target())?;
 
         Ok(())

@@ -5,6 +5,8 @@ mod common;
 
 use std::borrow::Cow;
 use std::collections::HashSet;
+#[cfg(target_os = "macos")]
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
@@ -890,6 +892,408 @@ fn macos_foreground_daemon_handles_term_hup_and_siginfo() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn macos_foreground_daemon_handles_term_hup_and_siginfo() {}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_launchd_user_service_lifecycle_bootstrap_kickstart_bootout() {
+    if env::var("SBH_RUN_LAUNCHD_LIFECYCLE_TEST").as_deref() != Ok("1") {
+        eprintln!("skipping launchd lifecycle test; set SBH_RUN_LAUNCHD_LIFECYCLE_TEST=1");
+        return;
+    }
+
+    let dir = tempfile::Builder::new()
+        .prefix("sbh_launchd_lifecycle_")
+        .tempdir_in("/private/tmp")
+        .expect("create launchd lifecycle test directory");
+    let home = dir.path().join("home");
+    let config_dir = dir.path().join("config");
+    fs::create_dir(&home).expect("create launchd test home");
+    fs::create_dir(&config_dir).expect("create launchd test config dir");
+
+    let config_path = config_dir.join("config.toml");
+    let label = launchd_test_label();
+    let env_overrides = launchd_env_overrides(&home, &config_path, &label);
+    let bin_path = launchd_test_bin_path();
+    let offline_bundle = write_launchd_offline_bundle(dir.path(), &bin_path);
+    let _guard =
+        LaunchdLifecycleGuard::new(bin_path.clone(), config_path.clone(), env_overrides.clone());
+
+    run_launchd_config_reset(&bin_path, &config_path, &env_overrides);
+    run_launchd_install(&bin_path, &config_path, &offline_bundle, &env_overrides);
+    let target =
+        launchd_status_target_after_install(&bin_path, &config_path, &label, &env_overrides);
+    assert_launchctl_live(&target);
+    run_launchd_uninstall(&bin_path, &config_path, &env_overrides);
+    wait_for_launchctl_absent(&target, Duration::from_secs(10));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn macos_launchd_user_service_lifecycle_bootstrap_kickstart_bootout() {}
+
+#[cfg(target_os = "macos")]
+struct LaunchdLifecycleGuard {
+    bin_path: PathBuf,
+    config_path: PathBuf,
+    env_overrides: Vec<(String, String)>,
+}
+
+#[cfg(target_os = "macos")]
+impl LaunchdLifecycleGuard {
+    fn new(bin_path: PathBuf, config_path: PathBuf, env_overrides: Vec<(String, String)>) -> Self {
+        Self {
+            bin_path,
+            config_path,
+            env_overrides,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for LaunchdLifecycleGuard {
+    fn drop(&mut self) {
+        let mut command = Command::new(&self.bin_path);
+        command
+            .arg("--config")
+            .arg(&self.config_path)
+            .args(["uninstall", "--launchd", "--scope", "user"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (key, value) in &self.env_overrides {
+            command.env(key, value);
+        }
+        let _ = command.status();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_test_label() -> String {
+    format!(
+        "com.dicklesworthstone.sbh.test.{}.{}",
+        std::process::id(),
+        now_millis()
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_env_overrides(home: &Path, config_path: &Path, label: &str) -> Vec<(String, String)> {
+    vec![
+        ("HOME".to_string(), home.to_string_lossy().into_owned()),
+        (
+            "SBH_CONFIG_PATH".to_string(),
+            config_path.to_string_lossy().into_owned(),
+        ),
+        (
+            "SBH_CONFIG".to_string(),
+            config_path.to_string_lossy().into_owned(),
+        ),
+        ("SBH_LAUNCHD_LABEL".to_string(), label.to_string()),
+        ("RUST_LOG".to_string(), "info".to_string()),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_test_bin_path() -> PathBuf {
+    env::var_os("SBH_LAUNCHD_TEST_BIN").map_or_else(common::sbh_bin_path, PathBuf::from)
+}
+
+#[cfg(target_os = "macos")]
+fn run_launchd_config_reset(
+    bin_path: &Path,
+    config_path: &Path,
+    env_overrides: &[(String, String)],
+) {
+    let result = run_launchd_sbh_case(
+        "macos_launchd_config_reset",
+        bin_path,
+        &[
+            "--config".to_string(),
+            config_path.to_string_lossy().into_owned(),
+            "config".to_string(),
+            "reset".to_string(),
+        ],
+        env_overrides,
+    );
+    assert!(
+        result.status.success(),
+        "config reset failed; stdout={:?}; stderr={:?}; log={}",
+        result.stdout,
+        result.stderr,
+        result.log_path.display()
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn run_launchd_install(
+    bin_path: &Path,
+    config_path: &Path,
+    offline_bundle: &Path,
+    env_overrides: &[(String, String)],
+) {
+    let result = run_launchd_sbh_case(
+        "macos_launchd_install_user_service",
+        bin_path,
+        &[
+            "--config".to_string(),
+            config_path.to_string_lossy().into_owned(),
+            "install".to_string(),
+            "--launchd".to_string(),
+            "--scope".to_string(),
+            "user".to_string(),
+            "--ballast-count".to_string(),
+            "0".to_string(),
+            "--offline".to_string(),
+            offline_bundle.to_string_lossy().into_owned(),
+        ],
+        env_overrides,
+    );
+    assert!(
+        result.status.success(),
+        "launchd install failed; stdout={:?}; stderr={:?}; log={}",
+        result.stdout,
+        result.stderr,
+        result.log_path.display()
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_status_target_after_install(
+    bin_path: &Path,
+    config_path: &Path,
+    label: &str,
+    env_overrides: &[(String, String)],
+) -> String {
+    let result = run_launchd_sbh_case(
+        "macos_launchd_status_after_install",
+        bin_path,
+        &[
+            "--config".to_string(),
+            config_path.to_string_lossy().into_owned(),
+            "--json".to_string(),
+            "service".to_string(),
+            "--launchd".to_string(),
+            "--scope".to_string(),
+            "user".to_string(),
+            "status".to_string(),
+        ],
+        env_overrides,
+    );
+    assert!(
+        result.status.success(),
+        "launchd status failed; stdout={:?}; stderr={:?}; log={}",
+        result.stdout,
+        result.stderr,
+        result.log_path.display()
+    );
+    let status_payload: Value = serde_json::from_str(result.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "expected launchd status JSON, parse failed: {err}; stdout={:?}; log={}",
+            result.stdout,
+            result.log_path.display()
+        )
+    });
+    assert_eq!(status_payload["service_type"], "launchd");
+    assert_eq!(status_payload["scope"], "user");
+    assert_eq!(status_payload["loaded"], true);
+    let target = status_payload["target"]
+        .as_str()
+        .unwrap_or_else(|| panic!("launchd status missing target: {status_payload}"));
+    assert!(
+        target.ends_with(label),
+        "launchd target {target:?} did not include unique label {label:?}"
+    );
+    let plist_path = status_payload["plist_path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("launchd status missing plist_path: {status_payload}"));
+    assert!(
+        plist_path.contains("Library/LaunchAgents")
+            && plist_path.ends_with(&format!("{label}.plist")),
+        "unexpected launchd plist path: {plist_path}"
+    );
+    target.to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn assert_launchctl_live(target: &str) {
+    let print = Command::new("launchctl")
+        .args(["print", target])
+        .output()
+        .expect("run launchctl print after install");
+    assert!(
+        print.status.success(),
+        "launchctl print {target} failed after install; stdout={:?}; stderr={:?}",
+        String::from_utf8_lossy(&print.stdout),
+        String::from_utf8_lossy(&print.stderr)
+    );
+    let print_stdout = String::from_utf8_lossy(&print.stdout);
+    assert!(
+        print_stdout.contains("state = running")
+            || print_stdout.contains("state = spawn scheduled"),
+        "launchctl print did not report a live launchd lifecycle state; stdout={print_stdout:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn run_launchd_uninstall(bin_path: &Path, config_path: &Path, env_overrides: &[(String, String)]) {
+    let result = run_launchd_sbh_case(
+        "macos_launchd_uninstall_user_service",
+        bin_path,
+        &[
+            "--config".to_string(),
+            config_path.to_string_lossy().into_owned(),
+            "uninstall".to_string(),
+            "--launchd".to_string(),
+            "--scope".to_string(),
+            "user".to_string(),
+        ],
+        env_overrides,
+    );
+    assert!(
+        result.status.success(),
+        "launchd uninstall failed; stdout={:?}; stderr={:?}; log={}",
+        result.stdout,
+        result.stderr,
+        result.log_path.display()
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn run_launchd_sbh_case(
+    case_name: &str,
+    bin_path: &Path,
+    args: &[String],
+    env_overrides: &[(String, String)],
+) -> common::CmdResult {
+    let root = std::env::temp_dir().join("sbh-test-logs");
+    fs::create_dir_all(&root).expect("create temp test log dir");
+    let log_path = root.join(format!("{case_name}-{}.log", now_millis()));
+
+    let mut command = Command::new(bin_path);
+    command
+        .args(args)
+        .env("SBH_TEST_VERBOSE", "1")
+        .env("RUST_BACKTRACE", "1");
+    for (key, value) in env_overrides {
+        command.env(key, value);
+    }
+
+    let output = command.output().expect("execute sbh launchd command");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let log_content = format!(
+        "case={case_name}\nbin={}\nargs={args:?}\nenv_overrides={env_overrides:?}\nstatus={}\n----- stdout -----\n{stdout}\n----- stderr -----\n{stderr}\n",
+        bin_path.display(),
+        output.status
+    );
+    fs::write(&log_path, log_content).expect("write launchd test log");
+
+    common::CmdResult {
+        status: output.status,
+        stdout,
+        stderr,
+        log_path,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn write_launchd_offline_bundle(root: &Path, bin_path: &Path) -> PathBuf {
+    let contract = resolve_updater_artifact_contract(
+        HostSpecifier::detect().expect("detect host"),
+        ReleaseChannel::Stable,
+        Some("9.9.9"),
+    )
+    .expect("resolve current host updater artifact contract");
+    let bundle_dir = root.join("offline-bundle");
+    let stage_dir = bundle_dir.join("stage");
+    fs::create_dir(&bundle_dir).expect("create offline bundle dir");
+    fs::create_dir(&stage_dir).expect("create offline bundle stage dir");
+
+    let staged_binary = stage_dir.join("sbh");
+    fs::copy(bin_path, &staged_binary).unwrap_or_else(|err| {
+        panic!(
+            "copy launchd test binary {} to {} failed: {err}",
+            bin_path.display(),
+            staged_binary.display()
+        )
+    });
+
+    let archive_name = contract.asset_name();
+    let archive_path = bundle_dir.join(&archive_name);
+    let tar_status = Command::new("tar")
+        .arg("cJf")
+        .arg(&archive_path)
+        .arg("-C")
+        .arg(&stage_dir)
+        .arg("sbh")
+        .status()
+        .expect("create launchd offline tarball");
+    assert!(
+        tar_status.success(),
+        "tar failed while creating launchd offline tarball at {}: {tar_status}",
+        archive_path.display()
+    );
+
+    let checksum_name = contract.checksum_name();
+    let checksum_path = bundle_dir.join(&checksum_name);
+    let checksum = sha256_file_hex(&archive_path);
+    fs::write(&checksum_path, format!("{checksum}  {archive_name}\n"))
+        .expect("write launchd offline checksum");
+
+    let manifest = OfflineBundleManifest {
+        version: "1".to_string(),
+        repository: RELEASE_REPOSITORY.to_string(),
+        release_tag: "v9.9.9".to_string(),
+        artifacts: vec![OfflineBundleArtifact {
+            target: contract.target.triple.to_string(),
+            archive: archive_name,
+            checksum: checksum_name,
+            sigstore_bundle: None,
+        }],
+    };
+    let manifest_path = bundle_dir.join("bundle-manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).expect("serialize launchd offline manifest"),
+    )
+    .expect("write launchd offline manifest");
+    manifest_path
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_launchctl_absent(target: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let output = Command::new("launchctl")
+            .args(["print", target])
+            .output()
+            .expect("run launchctl print while waiting for bootout");
+        if !output.status.success() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "launchd service remained loaded after uninstall; stdout={:?}; stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sha256_file_hex(path: &Path) -> String {
+    let bytes = fs::read(path).unwrap_or_else(|err| {
+        panic!("read {} for sha256 failed: {err}", path.display());
+    });
+    format!("{:x}", Sha256::digest(&bytes))
+}
+
+#[cfg(target_os = "macos")]
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis())
+}
 
 #[cfg(target_os = "macos")]
 fn write_signal_test_config(
