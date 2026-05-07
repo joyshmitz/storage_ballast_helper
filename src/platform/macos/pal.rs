@@ -22,6 +22,7 @@ use crate::platform::macos::sys::{
 };
 use crate::platform::pal::{
     FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
+    verify_preallocated_blocks,
 };
 use crate::platform::types::{
     Capacity, FullDiskAccessState, FullDiskAccessStatus, MappedRegion, MemoryPressure,
@@ -220,8 +221,26 @@ impl Platform for MacOsPal {
         macos_not_implemented("bd-wiqg.2", "self_stats")
     }
 
-    fn preallocate_file(&self, _path: &Path, _size: u64) -> Result<()> {
-        macos_not_implemented("bd-hnxg.1", "preallocate_file")
+    fn preallocate_file(&self, path: &Path, size: u64) -> Result<()> {
+        use rustix::fs::{FallocateFlags, fallocate};
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|error| crate::core::errors::SbhError::io(path, error))?;
+
+        fallocate(&file, FallocateFlags::empty(), 0, size).map_err(|error| {
+            PalError::method_failed("macos", "preallocate_file", error.to_string())
+        })?;
+        file.sync_all()
+            .map_err(|error| crate::core::errors::SbhError::io(path, error))?;
+
+        let blocks = self.file_block_count(path)?;
+        verify_preallocated_blocks("macos", path, size, blocks)
     }
 
     fn user_home(&self) -> PathBuf {
@@ -1570,6 +1589,26 @@ mod tests {
             .blocks();
         assert_eq!(blocks, metadata_blocks);
         assert!(blocks > 0);
+    }
+
+    #[test]
+    fn preallocate_file_reserves_blocks_on_macos() {
+        let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        let path = dir.path().join("preallocated-macos.bin");
+        let size = 1024 * 1024;
+        let platform = MacOsPal::new();
+
+        platform
+            .preallocate_file(&path, size)
+            .expect("macOS preallocation should succeed");
+
+        let metadata = std::fs::metadata(&path).expect("preallocated file should exist");
+        assert_eq!(metadata.len(), size);
+        let allocated_bytes = platform
+            .file_block_count(&path)
+            .expect("block count should be readable")
+            * 512;
+        assert!(allocated_bytes >= size);
     }
 
     #[test]

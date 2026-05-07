@@ -127,6 +127,35 @@ fn pal_not_implemented<T>(os_name: &'static str, method_name: &'static str) -> R
     Err(PalError::not_implemented(os_name, method_name).into())
 }
 
+pub(crate) fn verify_preallocated_blocks(
+    os_name: &'static str,
+    path: &Path,
+    size: u64,
+    blocks_512: u64,
+) -> Result<()> {
+    let allocated_bytes = blocks_512.checked_mul(512).ok_or_else(|| {
+        PalError::method_failed(
+            os_name,
+            "preallocate_file",
+            format!("allocated block count overflowed for {}", path.display()),
+        )
+    })?;
+
+    if allocated_bytes < size {
+        return Err(PalError::method_failed(
+            os_name,
+            "preallocate_file",
+            format!(
+                "{} has {allocated_bytes} allocated bytes after preallocation; expected at least {size}",
+                path.display()
+            ),
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
 /// Service control surface (systemd, launchd, etc.).
 pub trait ServiceManager: Send + Sync {
     fn install(&self) -> Result<()>;

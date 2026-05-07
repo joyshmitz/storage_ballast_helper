@@ -63,6 +63,7 @@ rand = "0.9"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["fs", "mount", "signal", "user"] }
 libc = "0.2"
+rustix = { version = "=1.1.3", features = ["fs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libproc = "0.14.11"

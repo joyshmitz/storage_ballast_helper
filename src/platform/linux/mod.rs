@@ -5,6 +5,8 @@
 pub mod cleanup_catalog;
 
 #[cfg(target_os = "linux")]
+use std::fs::OpenOptions;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
@@ -17,11 +19,12 @@ use crate::core::errors::{Result, SbhError};
 #[cfg(target_os = "linux")]
 use crate::platform::pal::{
     FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
+    verify_preallocated_blocks,
 };
 #[cfg(target_os = "linux")]
 use crate::platform::sacred_catalog::cross_platform_sacred_paths;
 #[cfg(target_os = "linux")]
-use crate::platform::types::{SacredPath, ServiceKind};
+use crate::platform::types::{PalError, SacredPath, ServiceKind};
 
 #[cfg(target_os = "linux")]
 pub mod disk;
@@ -124,11 +127,57 @@ impl Platform for LinuxPal {
         service::service_manager()
     }
 
+    fn preallocate_file(&self, path: &Path, size: u64) -> Result<()> {
+        use rustix::fs::{FallocateFlags, fallocate};
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|error| SbhError::io(path, error))?;
+
+        fallocate(&file, FallocateFlags::empty(), 0, size).map_err(|error| {
+            PalError::method_failed("linux", "preallocate_file", error.to_string())
+        })?;
+        file.sync_all().map_err(|error| SbhError::io(path, error))?;
+
+        let blocks = self.file_block_count(path)?;
+        verify_preallocated_blocks("linux", path, size, blocks)
+    }
+
     fn sacred_paths(&self) -> Vec<SacredPath> {
         cross_platform_sacred_paths().to_vec()
     }
 
     fn service_kind(&self) -> ServiceKind {
         ServiceKind::Systemd
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preallocate_file_reserves_blocks_on_linux() {
+        let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        let path = dir.path().join("preallocated-linux.bin");
+        let size = 1024 * 1024;
+        let platform = LinuxPal::new();
+
+        platform
+            .preallocate_file(&path, size)
+            .expect("linux preallocation should succeed");
+
+        let metadata = std::fs::metadata(&path).expect("preallocated file should exist");
+        assert_eq!(metadata.len(), size);
+        let allocated_bytes = platform
+            .file_block_count(&path)
+            .expect("block count should be readable")
+            * 512;
+        assert!(allocated_bytes >= size);
     }
 }
