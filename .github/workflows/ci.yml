@@ -86,6 +86,74 @@ jobs:
           path: integration-output.txt
           retention-days: 14
 
+  linux-arm64:
+    name: Linux arm64 Tests
+    runs-on: ubuntu-24.04-arm
+    needs: check
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Strip local-only TUI path deps
+        run: |
+          # ftui crates use /dp/frankentui/ paths unavailable in CI
+          sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
+          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-arm64
+      - name: Verify runner identity
+        run: |
+          set -euo pipefail
+          {
+            echo "runner_os=${{ runner.os }}"
+            echo "matrix_os=ubuntu-24.04-arm"
+            echo "expected_arch=aarch64"
+            echo "uname_s=$(uname -s)"
+            echo "uname_m=$(uname -m)"
+            rustc -vV
+            cargo --version
+          } | tee linux-arm64-runner-info.txt
+          test "$(uname -m)" = "aarch64"
+      - name: Run unit tests
+        run: |
+          cargo test $CI_FEATURES --lib -- --nocapture 2>&1 | tee linux-arm64-unit-lib-output.txt
+          cargo test $CI_FEATURES --bin sbh -- --nocapture 2>&1 | tee linux-arm64-unit-bin-output.txt
+      - name: Run integration tests
+        run: cargo test $CI_FEATURES --test integration_tests -- --nocapture 2>&1 | tee linux-arm64-integration-output.txt
+      - name: Build release binary
+        run: cargo build $CI_FEATURES --release 2>&1 | tee linux-arm64-release-build-output.txt
+      - name: Run selected CLI smoke checks
+        run: |
+          set -euo pipefail
+          bin="./target/release/sbh"
+          test -x "${bin}"
+          {
+            echo "case=help"
+            "${bin}" --help
+            echo "case=version-verbose"
+            "${bin}" version --verbose
+            echo "case=json-version"
+            "${bin}" --json version
+            echo "case=config-validate"
+            "${bin}" config validate
+            echo "case=json-status"
+            "${bin}" --json status
+          } 2>&1 | tee linux-arm64-smoke-output.txt
+      - name: Upload Linux arm64 logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-logs
+          path: |
+            linux-arm64-runner-info.txt
+            linux-arm64-unit-lib-output.txt
+            linux-arm64-unit-bin-output.txt
+            linux-arm64-integration-output.txt
+            linux-arm64-release-build-output.txt
+            linux-arm64-smoke-output.txt
+          retention-days: 14
+
   decision-plane:
     name: Decision Plane Tests
     runs-on: ubuntu-latest
@@ -651,7 +719,7 @@ jobs:
   provenance:
     name: Provenance Metadata
     runs-on: ubuntu-latest
-    needs: [unit, integration, decision-plane, dashboard, e2e, macos-platform, macos-coverage, macos-benchmarks, stress, artifact-contract]
+    needs: [unit, integration, linux-arm64, decision-plane, dashboard, e2e, macos-platform, macos-coverage, macos-benchmarks, stress, artifact-contract]
     steps:
       - uses: actions/checkout@v4
       - name: Strip local-only TUI path deps
