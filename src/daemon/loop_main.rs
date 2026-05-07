@@ -44,6 +44,7 @@ use crate::monitor::predictive::{PredictiveAction, PredictiveActionPolicy};
 use crate::monitor::special_locations::SpecialLocationRegistry;
 use crate::monitor::voi_scheduler::VoiScheduler;
 use crate::platform::pal::{MemoryInfo, Platform, detect_platform};
+use crate::platform::types::{FullDiskAccessState, FullDiskAccessStatus};
 use crate::scanner::deletion::{DeletionConfig, DeletionExecutor};
 use crate::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, StructuralSignals,
@@ -88,6 +89,8 @@ const SWAP_THRASH_USED_PCT_THRESHOLD: f64 = 70.0;
 const SWAP_THRASH_MIN_AVAILABLE_RAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Even under high pressure, avoid deleting extremely fresh temp artifacts.
 const TEMP_FAST_TRACK_MIN_OBSERVED_AGE: Duration = Duration::from_mins(2);
+/// Recheck macOS Full Disk Access grants without adding pressure-loop noise.
+const FULL_DISK_ACCESS_RECHECK_INTERVAL: Duration = Duration::from_mins(5);
 
 // ──────────────────── shared executor config ────────────────────
 
@@ -434,6 +437,9 @@ pub struct MonitoringDaemon {
     summary_deleted: u64,
     summary_failed: u64,
     summary_bytes_freed: u64,
+    last_full_disk_access_check: Option<Instant>,
+    last_full_disk_access_state: Option<FullDiskAccessState>,
+    full_disk_access_granted_logged: bool,
     self_monitor: SelfMonitor,
     policy_engine: Arc<Mutex<PolicyEngine>>,
     shared_guard_diagnostics: Arc<RwLock<Option<GuardDiagnostics>>>,
@@ -713,6 +719,30 @@ fn enqueue_scan_request(
     }
 }
 
+fn full_disk_access_status_log_message(
+    status: &FullDiskAccessStatus,
+    previous_state: Option<FullDiskAccessState>,
+    granted_logged: bool,
+) -> Option<String> {
+    match status.state {
+        FullDiskAccessState::Granted
+            if !granted_logged || previous_state != Some(FullDiskAccessState::Granted) =>
+        {
+            Some(format!(
+                "macOS Full Disk Access granted for sbh: {}",
+                status.doctor_message()
+            ))
+        }
+        FullDiskAccessState::Missing if previous_state != Some(FullDiskAccessState::Missing) => {
+            Some(format!(
+                "macOS Full Disk Access missing for sbh; grant access and re-check with `sbh doctor --pal`: {}",
+                status.doctor_message()
+            ))
+        }
+        _ => None,
+    }
+}
+
 impl MonitoringDaemon {
     /// Build and initialize the daemon from configuration.
     #[allow(clippy::too_many_lines)]
@@ -847,12 +877,51 @@ impl MonitoringDaemon {
             summary_deleted: 0,
             summary_failed: 0,
             summary_bytes_freed: 0,
+            last_full_disk_access_check: None,
+            last_full_disk_access_state: None,
+            full_disk_access_granted_logged: false,
             self_monitor,
             scanner_heartbeat,
             executor_heartbeat,
             shared_guard_diagnostics,
             prediction_scorecard: PredictionScorecard::new(200),
         })
+    }
+
+    fn maybe_log_full_disk_access_status(&mut self, force: bool) {
+        if !force
+            && self
+                .last_full_disk_access_check
+                .is_some_and(|checked_at| checked_at.elapsed() < FULL_DISK_ACCESS_RECHECK_INTERVAL)
+        {
+            return;
+        }
+
+        self.last_full_disk_access_check = Some(Instant::now());
+        match self.platform.full_disk_access_status() {
+            Ok(status) => {
+                if let Some(message) = full_disk_access_status_log_message(
+                    &status,
+                    self.last_full_disk_access_state,
+                    self.full_disk_access_granted_logged,
+                ) {
+                    self.logger_handle.send(ActivityEvent::Info { message });
+                }
+
+                self.full_disk_access_granted_logged = match status.state {
+                    FullDiskAccessState::Granted => true,
+                    FullDiskAccessState::Missing => false,
+                    _ => self.full_disk_access_granted_logged,
+                };
+                self.last_full_disk_access_state = Some(status.state);
+            }
+            Err(error) => {
+                self.logger_handle.send(ActivityEvent::Error {
+                    code: "SBH-1101".to_string(),
+                    message: format!("Full Disk Access recheck failed: {error}"),
+                });
+            }
+        }
     }
 
     /// Run the monitoring loop until shutdown is requested.
@@ -866,6 +935,7 @@ impl MonitoringDaemon {
             version: env!("CARGO_PKG_VERSION").to_string(),
             config_hash,
         });
+        self.maybe_log_full_disk_access_status(true);
         self.notification_manager
             .notify(&NotificationEvent::DaemonStarted {
                 version: env!("CARGO_PKG_VERSION").to_string(),
@@ -921,6 +991,9 @@ impl MonitoringDaemon {
             if self.signal_handler.should_reload() {
                 self.handle_config_reload(&scan_tx);
             }
+
+            // 2b. Periodically re-check macOS FDA grants and log success when granted.
+            self.maybe_log_full_disk_access_status(false);
 
             // 3. Collect filesystem stats and run pressure analysis.
             let response = match self.check_pressure() {
@@ -3421,6 +3494,56 @@ mod tests {
         assert!(health.record_panic());
         assert!(health.record_panic());
         assert!(!health.record_panic()); // 4th panic exceeds limit
+    }
+
+    #[test]
+    fn full_disk_access_grant_transition_logs_success_once() {
+        let status = FullDiskAccessStatus {
+            state: FullDiskAccessState::Granted,
+            probe_path: Some(PathBuf::from(
+                "/Users/me/Library/Mail/V10/MailData/Envelope Index",
+            )),
+            detail: "Mail Envelope Index was readable".to_string(),
+            cache_ttl_seconds: 60,
+            cached: false,
+        };
+
+        let first = full_disk_access_status_log_message(&status, None, false)
+            .expect("initial granted state should log");
+        assert!(first.contains("Full Disk Access granted"));
+
+        assert!(
+            full_disk_access_status_log_message(&status, Some(FullDiskAccessState::Granted), true,)
+                .is_none(),
+            "unchanged granted state should not spam logs"
+        );
+    }
+
+    #[test]
+    fn full_disk_access_missing_logs_recheck_guidance_once() {
+        let status = FullDiskAccessStatus {
+            state: FullDiskAccessState::Missing,
+            probe_path: Some(PathBuf::from(
+                "/Users/me/Library/Mail/V10/MailData/Envelope Index",
+            )),
+            detail: "permission denied while reading Mail Envelope Index".to_string(),
+            cache_ttl_seconds: 60,
+            cached: false,
+        };
+
+        let first = full_disk_access_status_log_message(&status, None, false)
+            .expect("initial missing state should log");
+        assert!(first.contains("sbh doctor --pal"));
+
+        assert!(
+            full_disk_access_status_log_message(
+                &status,
+                Some(FullDiskAccessState::Missing),
+                false,
+            )
+            .is_none(),
+            "unchanged missing state should not spam logs"
+        );
     }
 
     #[test]

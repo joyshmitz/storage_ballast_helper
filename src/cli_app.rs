@@ -31,7 +31,9 @@ use storage_ballast_helper::monitor::fs_stats::FsStatsCollector;
 use storage_ballast_helper::platform::pal::{
     MemoryInfo, Platform, ServiceManager, detect_platform,
 };
-use storage_ballast_helper::platform::types::{FullDiskAccessStatus, ServiceKind};
+use storage_ballast_helper::platform::types::{
+    FullDiskAccessState, FullDiskAccessStatus, ServiceKind,
+};
 use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionPlan};
 use storage_ballast_helper::scanner::patterns::{ArtifactCategory, ArtifactPatternRegistry};
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
@@ -3604,6 +3606,7 @@ struct PalDoctorReport {
     failed: usize,
     skipped: usize,
     methods: Vec<PalDoctorProbe>,
+    follow_up: Vec<PalDoctorFollowUp>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3614,6 +3617,17 @@ struct PalDoctorProbe {
     bead: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PalDoctorFollowUp {
+    id: &'static str,
+    title: &'static str,
+    severity: &'static str,
+    message: String,
+    docs: &'static str,
+    recheck_command: &'static str,
+    steps: Vec<String>,
 }
 
 fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
@@ -3656,6 +3670,18 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
                     }
                 }
             }
+            if !report.follow_up.is_empty() {
+                println!("\nFollow-up:");
+                for item in &report.follow_up {
+                    println!("  {} ({})", item.title, item.severity);
+                    println!("    {}", item.message);
+                    println!("    Docs: {}", item.docs);
+                    for (index, step) in item.steps.iter().enumerate() {
+                        println!("    {}. {}", index + 1, step);
+                    }
+                    println!("    Re-check: {}", item.recheck_command);
+                }
+            }
         }
     }
 
@@ -3666,6 +3692,14 @@ fn pal_doctor_report(platform: &dyn Platform) -> PalDoctorReport {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let current_pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
     let current_exe = std::env::current_exe().unwrap_or_else(|_| cwd.clone());
+    let home = platform.user_home();
+    let full_disk_access = platform.full_disk_access_status();
+    let follow_up = full_disk_access
+        .as_ref()
+        .ok()
+        .and_then(|status| full_disk_access_follow_up(status, &home, &current_exe))
+        .into_iter()
+        .collect();
     let callback = || -> storage_ballast_helper::core::errors::Result<_> {
         platform.subscribe_memory_pressure(Box::new(|_| {}))
     };
@@ -3683,7 +3717,7 @@ fn pal_doctor_report(platform: &dyn Platform) -> PalDoctorReport {
         pal_probe_result("capacity", platform.capacity(&cwd)),
         pal_probe_result("mounts", platform.mounts()),
         pal_probe_result("memory_pressure", platform.memory_pressure()),
-        pal_probe_full_disk_access(platform.full_disk_access_status()),
+        pal_probe_full_disk_access(full_disk_access),
         pal_probe_result("subscribe_memory_pressure", callback()),
         pal_probe_result("process_list", platform.process_list()),
         pal_probe_result("process_io", platform.process_io(current_pid)),
@@ -3728,7 +3762,44 @@ fn pal_doctor_report(platform: &dyn Platform) -> PalDoctorReport {
         failed,
         skipped,
         methods,
+        follow_up,
     }
+}
+
+fn full_disk_access_follow_up(
+    status: &FullDiskAccessStatus,
+    home: &Path,
+    current_exe: &Path,
+) -> Option<PalDoctorFollowUp> {
+    if status.state != FullDiskAccessState::Missing {
+        return None;
+    }
+
+    let installed_binary = home.join(".local/bin/sbh");
+    Some(PalDoctorFollowUp {
+        id: "macos_full_disk_access",
+        title: "Grant Full Disk Access",
+        severity: "action_required",
+        message: "macOS denied sbh access to Mail-protected data. Grant Full Disk Access before relying on macOS cleanup scans.".to_string(),
+        docs: "docs/macos-full-disk-access.md",
+        recheck_command: "sbh doctor --pal",
+        steps: vec![
+            "Open System Settings.".to_string(),
+            "Open Privacy & Security, then Full Disk Access.".to_string(),
+            "Click the + button and authenticate if macOS asks.".to_string(),
+            format!(
+                "Select the installed sbh binary at {}.",
+                installed_binary.display()
+            ),
+            format!(
+                "If you are testing a different binary, add this running executable too: {}.",
+                current_exe.display()
+            ),
+            "Turn sbh on in the Full Disk Access list.".to_string(),
+            "Restart the sbh launchd service or rerun the command that needs disk access.".to_string(),
+            "Run sbh doctor --pal until full_disk_access_status reports granted.".to_string(),
+        ],
+    })
 }
 
 fn pal_probe_value<T>(method: &'static str, _value: T) -> PalDoctorProbe {
@@ -7288,6 +7359,29 @@ mod tests {
         assert!(probe.message.as_deref().is_some_and(|message| {
             message.contains("missing") && message.contains("cached: true")
         }));
+        assert_eq!(report.follow_up.len(), 1);
+        assert_eq!(report.follow_up[0].id, "macos_full_disk_access");
+        assert!(
+            report.follow_up[0]
+                .steps
+                .iter()
+                .any(|step| step.contains(".local/bin/sbh"))
+        );
+    }
+
+    #[test]
+    fn pal_doctor_report_omits_full_disk_access_follow_up_when_granted() {
+        let platform = MockPlatform::healthy().with_full_disk_access_status(FullDiskAccessStatus {
+            state: FullDiskAccessState::Granted,
+            probe_path: Some("/Users/me/Library/Mail/V10/MailData/Envelope Index".into()),
+            detail: "Mail Envelope Index was readable".to_string(),
+            cache_ttl_seconds: 60,
+            cached: false,
+        });
+
+        let report = pal_doctor_report(&platform);
+
+        assert!(report.follow_up.is_empty());
     }
 
     #[test]

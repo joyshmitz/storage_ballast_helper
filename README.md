@@ -442,6 +442,7 @@ Configure via command palette (`:` then type `pref`) or directly in the preferen
 ## Operator Docs
 
 - Installer/update parity contract and security policy: `docs/installer-dx-parity-matrix.md`
+- macOS Full Disk Access grant guide: `docs/macos-full-disk-access.md`
 - Dashboard/status baseline contract (pre-overhaul): `docs/dashboard-status-contract-baseline.md`
 - Dashboard IA + navigation map (overhaul design baseline): `docs/dashboard-information-architecture.md`
 - TUI acceptance gates + performance/error budgets: `docs/tui-acceptance-gates-and-budgets.md`
