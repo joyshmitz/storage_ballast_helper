@@ -529,7 +529,7 @@ mod legacy_inline {
         ///
         /// If `user_scope` is false but the current process is not running as root,
         /// automatically escalates to user-scope to avoid permission errors when
-        /// creating log directories under `/usr/local/var/log/`.
+        /// creating log directories under `/var/log/`.
         pub fn from_env(user_scope: bool) -> Result<Self> {
             let effective_user_scope = if !user_scope && !is_running_as_root() {
                 eprintln!(
@@ -787,8 +787,8 @@ mod legacy_inline {
             (log_dir.join("sbh.log"), log_dir.join("sbh.err"))
         } else {
             (
-                PathBuf::from("/usr/local/var/log/sbh/sbh.log"),
-                PathBuf::from("/usr/local/var/log/sbh/sbh.err"),
+                PathBuf::from("/var/log/sbh/sbh.log"),
+                PathBuf::from("/var/log/sbh/sbh.err"),
             )
         }
     }
@@ -800,7 +800,10 @@ mod legacy_inline {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::Cursor;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
     use crate::platform::pal::MockPlatform;
@@ -990,8 +993,8 @@ mod tests {
             )
         } else {
             (
-                PathBuf::from("/usr/local/var/log/sbh/sbh.log"),
-                PathBuf::from("/usr/local/var/log/sbh/sbh.err"),
+                PathBuf::from("/var/log/sbh/sbh.log"),
+                PathBuf::from("/var/log/sbh/sbh.err"),
                 PathBuf::from("/var/lib/sbh"),
                 PathBuf::from("/etc/sbh/config.toml"),
             )
@@ -1086,8 +1089,29 @@ mod tests {
 
         assert!(plist.contains("<key>StandardOutPath</key>"));
         assert!(plist.contains("<key>StandardErrorPath</key>"));
-        assert!(plist.contains("/usr/local/var/log/sbh/sbh.log"));
-        assert!(plist.contains("/usr/local/var/log/sbh/sbh.err"));
+        assert!(plist.contains("/var/log/sbh/sbh.log"));
+        assert!(plist.contains("/var/log/sbh/sbh.err"));
+    }
+
+    #[test]
+    fn prepare_launchd_log_paths_creates_mode_0750_dir_and_log_files() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let log_dir = temp.path().join("Library/Logs/sbh");
+        let mut config = test_launchd_config(true);
+        config.stdout_log = log_dir.join("sbh.log");
+        config.stderr_log = log_dir.join("sbh.err");
+        let mgr = LaunchdServiceManager::new(config);
+
+        mgr.prepare_log_paths().expect("log paths should prepare");
+
+        assert!(log_dir.is_dir());
+        assert!(log_dir.join("sbh.log").is_file());
+        assert!(log_dir.join("sbh.err").is_file());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&log_dir).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
     }
 
     #[test]

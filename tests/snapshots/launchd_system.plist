@@ -29,9 +29,9 @@
 	<key>WorkingDirectory</key>
 	<string>/var/lib/sbh</string>
 	<key>StandardOutPath</key>
-	<string>/usr/local/var/log/sbh/sbh.log</string>
+	<string>/var/log/sbh/sbh.log</string>
 	<key>StandardErrorPath</key>
-	<string>/usr/local/var/log/sbh/sbh.err</string>
+	<string>/var/log/sbh/sbh.err</string>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>SBH_CONFIG_PATH</key>

@@ -1,8 +1,11 @@
 //! launchd service integration.
 
 use std::env;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use plist::{Dictionary, Value};
 
@@ -114,6 +117,11 @@ impl LaunchdServiceManager {
         LaunchctlServiceTarget::new(self.domain_target(), LAUNCHD_LABEL)
     }
 
+    pub(crate) fn prepare_log_paths(&self) -> Result<()> {
+        prepare_launchd_log_file(&self.config.stdout_log)?;
+        prepare_launchd_log_file(&self.config.stderr_log)
+    }
+
     /// Generate the launchd plist XML content.
     #[must_use]
     pub fn generate_plist(&self) -> String {
@@ -190,12 +198,7 @@ impl ServiceManager for LaunchdServiceManager {
         let plist_path = self.config.plist_path();
         let plist_content = self.generate_plist();
 
-        if let Some(log_parent) = self.config.stdout_log.parent() {
-            fs::create_dir_all(log_parent).map_err(|source| SbhError::Io {
-                path: log_parent.to_path_buf(),
-                source,
-            })?;
-        }
+        self.prepare_log_paths()?;
 
         fs::create_dir_all(&plist_dir).map_err(|source| SbhError::Io {
             path: plist_dir.clone(),
@@ -277,6 +280,65 @@ fn is_running_as_root() -> bool {
     }
 }
 
+fn current_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        nix::unistd::geteuid().as_raw()
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+fn launchd_log_dir_error(action: &str, dir: &Path, source: &io::Error) -> SbhError {
+    SbhError::Runtime {
+        details: format!(
+            "launchd log directory {} cannot be {action} by uid {}: {source}. \
+             The runtime user must be able to create and append logs in this directory.",
+            dir.display(),
+            current_uid()
+        ),
+    }
+}
+
+fn launchd_log_file_error(path: &Path, dir: &Path, source: &io::Error) -> SbhError {
+    SbhError::Runtime {
+        details: format!(
+            "launchd log file {} cannot be opened for append by uid {}: {source}. \
+             Verify directory {} exists with mode 0750 and is writable by the runtime user.",
+            path.display(),
+            current_uid(),
+            dir.display()
+        ),
+    }
+}
+
+fn prepare_launchd_log_file(path: &Path) -> Result<()> {
+    let dir = path.parent().ok_or_else(|| SbhError::Runtime {
+        details: format!(
+            "launchd log path {} has no parent directory",
+            path.display()
+        ),
+    })?;
+
+    fs::create_dir_all(dir).map_err(|source| launchd_log_dir_error("created", dir, &source))?;
+
+    #[cfg(unix)]
+    {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o750))
+            .map_err(|source| launchd_log_dir_error("chmod 0750", dir, &source))?;
+    }
+
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|source| launchd_log_file_error(path, dir, &source))?;
+
+    Ok(())
+}
+
 fn default_launchd_log_paths(user_scope: bool) -> (PathBuf, PathBuf) {
     if user_scope {
         let home = env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
@@ -284,8 +346,8 @@ fn default_launchd_log_paths(user_scope: bool) -> (PathBuf, PathBuf) {
         (log_dir.join("sbh.log"), log_dir.join("sbh.err"))
     } else {
         (
-            PathBuf::from("/usr/local/var/log/sbh/sbh.log"),
-            PathBuf::from("/usr/local/var/log/sbh/sbh.err"),
+            PathBuf::from("/var/log/sbh/sbh.log"),
+            PathBuf::from("/var/log/sbh/sbh.err"),
         )
     }
 }
