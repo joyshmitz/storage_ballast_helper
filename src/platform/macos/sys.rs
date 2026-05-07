@@ -4,6 +4,7 @@
 #![allow(missing_docs)]
 
 use std::ffi::OsStr;
+use std::fs;
 use std::io;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ const STATFS_STRUCT_SIZE_BYTES: usize = core::mem::size_of::<libc::statfs>();
 const STATFS_MOUNT_NAME_BYTES: usize = core::mem::size_of::<[libc::c_char; 1024]>();
 const STATFS_TYPE_NAME_BYTES: usize = core::mem::size_of::<[libc::c_char; 16]>();
 const IMPORTANT_USAGE_AVAILABLE_KEY: &str = "NSURLVolumeAvailableCapacityForImportantUsageKey";
+const FIRMLINK_DATA_ROOT: &str = "/System/Volumes/Data";
 
 const _: [(); 2168] = [(); STATFS_STRUCT_SIZE_BYTES];
 const _: [(); 1024] = [(); STATFS_MOUNT_NAME_BYTES];
@@ -164,6 +166,24 @@ pub struct SwapUsageInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirmlinkMap {
+    pub mappings: Vec<FirmlinkMapping>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirmlinkMapping {
+    pub visible_path: PathBuf,
+    pub data_path: PathBuf,
+    pub source: FirmlinkSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirmlinkSource {
+    SystemFirmlink,
+    SyntheticConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApfsVolumeRole {
     Data,
     System,
@@ -197,6 +217,16 @@ impl ApfsVolume {
     #[must_use]
     pub fn display_name(&self) -> String {
         self.name.clone().unwrap_or_else(|| self.device_id.clone())
+    }
+}
+
+impl FirmlinkMap {
+    #[must_use]
+    pub fn resolve(&self, path: &Path) -> PathBuf {
+        self.mappings
+            .iter()
+            .find_map(|mapping| resolve_with_mapping(path, mapping))
+            .unwrap_or_else(|| path.to_path_buf())
     }
 }
 
@@ -318,6 +348,51 @@ pub fn vm_swapusage() -> io::Result<SwapUsage> {
     sysctl::read::<String>("vm.swapusage").map(|raw| parse_vm_swapusage(&raw))
 }
 
+pub fn firmlink_map() -> io::Result<FirmlinkMap> {
+    firmlink_map_from_paths(
+        Path::new("/usr/share/firmlinks"),
+        Path::new("/etc/synthetic.conf"),
+    )
+}
+
+pub fn firmlink_map_from_paths(
+    firmlinks_path: &Path,
+    synthetic_conf_path: &Path,
+) -> io::Result<FirmlinkMap> {
+    let firmlinks = fs::read_to_string(firmlinks_path)?;
+    let synthetic_conf = match fs::read_to_string(synthetic_conf_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    Ok(parse_firmlink_map(&firmlinks, &synthetic_conf))
+}
+
+pub fn resolve_firmlinked_path(path: &Path) -> io::Result<PathBuf> {
+    firmlink_map().map(|map| map.resolve(path))
+}
+
+#[must_use]
+pub fn parse_firmlink_map(firmlinks: &str, synthetic_conf: &str) -> FirmlinkMap {
+    let mut mappings: Vec<FirmlinkMapping> = parse_system_firmlinks(firmlinks)
+        .chain(parse_synthetic_conf(synthetic_conf))
+        .collect();
+    mappings.sort_by(|left, right| {
+        right
+            .visible_path
+            .as_os_str()
+            .len()
+            .cmp(&left.visible_path.as_os_str().len())
+            .then_with(|| left.visible_path.cmp(&right.visible_path))
+    });
+    mappings.dedup_by(|left, right| {
+        left.visible_path == right.visible_path
+            && left.data_path == right.data_path
+            && left.source == right.source
+    });
+    FirmlinkMap { mappings }
+}
+
 #[must_use]
 pub fn parse_vm_swapusage(raw: &str) -> SwapUsage {
     let Some(total_bytes) = labeled_byte_count(raw, "total") else {
@@ -335,6 +410,68 @@ pub fn parse_vm_swapusage(raw: &str) -> SwapUsage {
         used_bytes,
         free_bytes,
         encrypted: raw.contains("(encrypted)"),
+    })
+}
+
+fn parse_system_firmlinks(firmlinks: &str) -> impl Iterator<Item = FirmlinkMapping> + '_ {
+    firmlinks.lines().filter_map(|line| {
+        let mut fields = config_fields(line);
+        let visible = fields.next()?;
+        let target = fields.next()?;
+        let visible_path = absolute_root_path(visible);
+        let data_path = firmlink_target_path(target);
+        Some(FirmlinkMapping {
+            visible_path,
+            data_path,
+            source: FirmlinkSource::SystemFirmlink,
+        })
+    })
+}
+
+fn parse_synthetic_conf(synthetic_conf: &str) -> impl Iterator<Item = FirmlinkMapping> + '_ {
+    synthetic_conf.lines().filter_map(|line| {
+        let mut fields = config_fields(line);
+        let visible = fields.next()?;
+        let target = fields.next()?;
+        Some(FirmlinkMapping {
+            visible_path: absolute_root_path(visible),
+            data_path: absolute_root_path(target),
+            source: FirmlinkSource::SyntheticConfig,
+        })
+    })
+}
+
+fn config_fields(line: &str) -> impl Iterator<Item = &str> {
+    line.split('#')
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+}
+
+fn absolute_root_path(path: &str) -> PathBuf {
+    let path = path.trim();
+    if path.starts_with('/') {
+        PathBuf::from(path)
+    } else {
+        Path::new("/").join(path)
+    }
+}
+
+fn firmlink_target_path(target: &str) -> PathBuf {
+    let target = target.trim();
+    if target.starts_with('/') {
+        PathBuf::from(target)
+    } else {
+        Path::new(FIRMLINK_DATA_ROOT).join(target)
+    }
+}
+
+fn resolve_with_mapping(path: &Path, mapping: &FirmlinkMapping) -> Option<PathBuf> {
+    let suffix = path.strip_prefix(&mapping.visible_path).ok()?;
+    Some(if suffix.as_os_str().is_empty() {
+        mapping.data_path.clone()
+    } else {
+        mapping.data_path.join(suffix)
     })
 }
 
@@ -852,9 +989,11 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ApfsVolumeRole, SwapUsage, SwapUsageInfo, important_usage_available_bytes,
-        mounted_filesystems, parent_apfs_volume_device, parse_apfs_inventory,
-        parse_tmutil_local_snapshots, parse_vm_swapusage, statfs, sysctl, vm_swapusage,
+        ApfsVolumeRole, FirmlinkSource, SwapUsage, SwapUsageInfo, firmlink_map,
+        firmlink_map_from_paths, important_usage_available_bytes, mounted_filesystems,
+        parent_apfs_volume_device, parse_apfs_inventory, parse_firmlink_map,
+        parse_tmutil_local_snapshots, parse_vm_swapusage, resolve_firmlinked_path, statfs, sysctl,
+        vm_swapusage,
     };
 
     const fn mib(value: u64) -> u64 {
@@ -925,6 +1064,93 @@ mod tests {
             .expect("CTL_HW/HW_MEMSIZE should be readable");
 
         assert!(memsize >= 1_073_741_824);
+    }
+
+    #[test]
+    fn parses_firmlink_and_synthetic_mappings() {
+        let firmlinks = "\
+/Users\tUsers
+/System\tSystem
+/System/Library/Caches\tSystem/Library/Caches
+";
+        let synthetic_conf = "\
+# root-level synthetic links
+dp\t/Users/jemanuel/projects
+nix
+relative-target\tVolumes/External
+";
+
+        let map = parse_firmlink_map(firmlinks, synthetic_conf);
+
+        assert_eq!(
+            map.resolve(Path::new("/Users/jemanuel")),
+            Path::new("/System/Volumes/Data/Users/jemanuel")
+        );
+        assert_eq!(
+            map.resolve(Path::new("/System/Library/Caches/com.apple")),
+            Path::new("/System/Volumes/Data/System/Library/Caches/com.apple")
+        );
+        assert_eq!(
+            map.resolve(Path::new("/dp/storage_ballast_helper")),
+            Path::new("/Users/jemanuel/projects/storage_ballast_helper")
+        );
+        assert_eq!(
+            map.resolve(Path::new("/relative-target/cache")),
+            Path::new("/Volumes/External/cache")
+        );
+        assert_eq!(
+            map.resolve(Path::new("/nix/store")),
+            Path::new("/nix/store")
+        );
+
+        assert!(map.mappings.iter().any(|mapping| {
+            mapping.visible_path == Path::new("/Users")
+                && mapping.source == FirmlinkSource::SystemFirmlink
+        }));
+        assert!(map.mappings.iter().any(|mapping| {
+            mapping.visible_path == Path::new("/dp")
+                && mapping.source == FirmlinkSource::SyntheticConfig
+        }));
+    }
+
+    #[test]
+    fn firmlink_map_from_paths_reads_synthetic_fixture_files() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let firmlinks_path = temp_dir.path().join("firmlinks");
+        let synthetic_path = temp_dir.path().join("synthetic.conf");
+        std::fs::write(&firmlinks_path, "/Applications\tApplications\n")
+            .expect("firmlink fixture should be writable");
+        std::fs::write(&synthetic_path, "data\t/Volumes/Data\n")
+            .expect("synthetic fixture should be writable");
+
+        let map = firmlink_map_from_paths(&firmlinks_path, &synthetic_path)
+            .expect("fixtures should parse");
+
+        assert_eq!(
+            map.resolve(Path::new("/Applications/Safari.app")),
+            Path::new("/System/Volumes/Data/Applications/Safari.app")
+        );
+        assert_eq!(
+            map.resolve(Path::new("/data/projects")),
+            Path::new("/Volumes/Data/projects")
+        );
+    }
+
+    #[test]
+    fn live_firmlink_map_resolves_users_when_present() {
+        let map = firmlink_map().expect("system firmlink table should be readable");
+        let has_users = map
+            .mappings
+            .iter()
+            .any(|mapping| mapping.visible_path == Path::new("/Users"));
+
+        if has_users {
+            assert_eq!(
+                resolve_firmlinked_path(Path::new("/Users/jemanuel"))
+                    .expect("firmlinked path should resolve"),
+                Path::new("/System/Volumes/Data/Users/jemanuel")
+            );
+        }
     }
 
     #[test]
