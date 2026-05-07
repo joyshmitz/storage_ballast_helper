@@ -260,6 +260,40 @@ jobs:
             codesign --verify --strict --verbose=2 "${bin}"
             codesign --display --verbose=4 "${bin}"
           } 2>&1 | tee macos-codesign-output.txt
+      - name: Exercise launchd user service lifecycle
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="./target/release/sbh"
+          test -x "${bin}"
+
+          export HOME="${RUNNER_TEMP}/sbh-launchd-home"
+          export SBH_CONFIG_PATH="${RUNNER_TEMP}/sbh-launchd/config.toml"
+          export SBH_CONFIG="${SBH_CONFIG_PATH}"
+          export SBH_LAUNCHD_LABEL="com.dicklesworthstone.sbh.test.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}.${RANDOM}"
+          export RUST_LOG=info
+
+          target="gui/$(id -u)/${SBH_LAUNCHD_LABEL}"
+          cleanup() {
+            set +e
+            "${bin}" --config "${SBH_CONFIG_PATH}" uninstall --launchd --scope user > macos-launchd-cleanup-output.txt 2>&1
+          }
+          trap cleanup EXIT
+
+          "${bin}" --config "${SBH_CONFIG_PATH}" config reset 2>&1 | tee macos-launchd-config-output.txt
+          "${bin}" --config "${SBH_CONFIG_PATH}" install --launchd --scope user --ballast-count 0 2>&1 | tee macos-launchd-install-output.txt
+          "${bin}" --config "${SBH_CONFIG_PATH}" --json service --launchd --scope user status 2>&1 | tee macos-launchd-status-output.jsonl
+          grep -q '"loaded":true' macos-launchd-status-output.jsonl
+          "${bin}" --config "${SBH_CONFIG_PATH}" --json service --launchd --scope user restart 2>&1 | tee macos-launchd-restart-output.jsonl
+          launchctl print "${target}" 2>&1 | tee macos-launchd-print-output.txt
+          "${bin}" --config "${SBH_CONFIG_PATH}" uninstall --launchd --scope user 2>&1 | tee macos-launchd-uninstall-output.txt
+          if launchctl print "${target}" > macos-launchd-post-uninstall-output.txt 2>&1; then
+            cat macos-launchd-post-uninstall-output.txt
+            echo "::error::launchd service remained loaded after uninstall"
+            exit 1
+          fi
+          cat macos-launchd-post-uninstall-output.txt
       - name: Run selected E2E smoke checks
         shell: bash
         run: |
@@ -309,6 +343,8 @@ jobs:
             macos-integration-output.txt
             macos-release-build-output.txt
             macos-codesign-output.txt
+            macos-launchd-*.txt
+            macos-launchd-*.jsonl
             macos-e2e-smoke-output.txt
             sbh-completions.zsh
           retention-days: 14

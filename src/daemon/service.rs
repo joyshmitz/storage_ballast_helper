@@ -22,6 +22,8 @@ pub use systemd::{SystemdConfig, SystemdServiceManager};
 pub const SYSTEMD_UNIT_NAME: &str = "sbh.service";
 /// Plist label used for the launchd service.
 pub const LAUNCHD_LABEL: &str = "com.sbh.daemon";
+/// Environment override for tests and isolated launchd installs.
+pub const LAUNCHD_LABEL_ENV: &str = "SBH_LAUNCHD_LABEL";
 
 /// Structured result from an install or uninstall operation.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1000,6 +1002,7 @@ mod tests {
             )
         };
         LaunchdConfig {
+            label: LAUNCHD_LABEL.to_string(),
             user_scope,
             binary_path: PathBuf::from("/usr/local/bin/sbh"),
             stdout_log,
@@ -1144,6 +1147,38 @@ mod tests {
         assert_eq!(
             env.get("RUST_LOG").and_then(plist::Value::as_string),
             Some("info")
+        );
+        assert_eq!(
+            env.get(LAUNCHD_LABEL_ENV).and_then(plist::Value::as_string),
+            Some(LAUNCHD_LABEL)
+        );
+    }
+
+    #[test]
+    fn plist_uses_configured_launchd_label_for_isolated_ci_runs() {
+        let mut config = test_launchd_config(true);
+        config.label = "com.dicklesworthstone.sbh.test.123".to_string();
+        let mgr = LaunchdServiceManager::new(config);
+        let value = parse_plist(&mgr.generate_plist());
+        let dict = value.as_dictionary().expect("plist root should be a dict");
+        let env = dict
+            .get("EnvironmentVariables")
+            .and_then(plist::Value::as_dictionary)
+            .expect("EnvironmentVariables should be a dict");
+
+        assert_eq!(
+            dict.get("Label").and_then(plist::Value::as_string),
+            Some("com.dicklesworthstone.sbh.test.123")
+        );
+        assert_eq!(
+            env.get(LAUNCHD_LABEL_ENV).and_then(plist::Value::as_string),
+            Some("com.dicklesworthstone.sbh.test.123")
+        );
+        assert!(
+            mgr.config()
+                .plist_path()
+                .to_string_lossy()
+                .ends_with("LaunchAgents/com.dicklesworthstone.sbh.test.123.plist")
         );
     }
 

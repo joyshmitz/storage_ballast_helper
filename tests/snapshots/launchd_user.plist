@@ -40,6 +40,8 @@
 		<string>/Users/tester/.config/sbh/config.toml</string>
 		<key>RUST_LOG</key>
 		<string>info</string>
+		<key>SBH_LAUNCHD_LABEL</key>
+		<string>com.sbh.daemon</string>
 	</dict>
 </dict>
 </plist>

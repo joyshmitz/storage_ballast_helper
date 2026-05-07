@@ -20,7 +20,8 @@ use storage_ballast_helper::daemon::loop_main::{
 };
 use storage_ballast_helper::daemon::self_monitor::DAEMON_STATE_STALE_THRESHOLD_SECS;
 use storage_ballast_helper::daemon::service::{
-    LaunchdServiceManager, LaunchdStatusReport, ServiceActionResult, SystemdServiceManager,
+    LAUNCHD_LABEL_ENV, LaunchdServiceManager, LaunchdStatusReport, ServiceActionResult,
+    SystemdServiceManager,
 };
 use storage_ballast_helper::logger::sqlite::SqliteLogger;
 use storage_ballast_helper::logger::stats::{StatsEngine, window_label};
@@ -801,6 +802,11 @@ fn sudo_env_assignments(cli: &Cli, kind: ServiceKind) -> Vec<(&'static str, Stri
         && let Some(home) = env_value("HOME")
     {
         push_sudo_env(&mut envs, "HOME", home);
+    }
+    if kind == ServiceKind::Launchd
+        && let Some(label) = env_value(LAUNCHD_LABEL_ENV)
+    {
+        push_sudo_env(&mut envs, LAUNCHD_LABEL_ENV, label);
     }
 
     if let Some(config) = &cli.config {

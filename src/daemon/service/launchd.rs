@@ -15,7 +15,7 @@ use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::ServiceManager;
 
 use super::launchctl::{self, LaunchctlDomain, LaunchctlServiceTarget};
-use super::{LAUNCHD_LABEL, resolve_sbh_binary};
+use super::{LAUNCHD_LABEL, LAUNCHD_LABEL_ENV, resolve_sbh_binary};
 
 /// Detailed launchd service status for CLI and JSON output.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -81,6 +81,8 @@ impl LaunchdStatusReport {
 /// Parameters controlling launchd plist generation and lifecycle commands.
 #[derive(Debug, Clone)]
 pub struct LaunchdConfig {
+    /// launchd label used in the plist and launchctl service target.
+    pub label: String,
     /// Whether to install as user agent (vs system daemon).
     pub user_scope: bool,
     /// Absolute path to the sbh binary.
@@ -120,7 +122,9 @@ impl LaunchdConfig {
             .or_else(|| env::var_os("SBH_CONFIG"))
             .map_or(paths.config_file, PathBuf::from);
         let rust_log = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+        let label = launchd_label_from_env()?;
         Ok(Self {
+            label,
             user_scope,
             binary_path,
             stdout_log,
@@ -145,7 +149,7 @@ impl LaunchdConfig {
     /// Full path to the plist file.
     #[must_use]
     pub fn plist_path(&self) -> PathBuf {
-        self.plist_dir().join(format!("{LAUNCHD_LABEL}.plist"))
+        self.plist_dir().join(format!("{}.plist", self.label))
     }
 }
 
@@ -188,7 +192,7 @@ impl LaunchdServiceManager {
     }
 
     fn service_target(&self) -> LaunchctlServiceTarget {
-        LaunchctlServiceTarget::new(self.domain_target(), LAUNCHD_LABEL)
+        LaunchctlServiceTarget::new(self.domain_target(), self.config.label.clone())
     }
 
     pub(crate) fn prepare_log_paths(&self) -> Result<()> {
@@ -283,11 +287,15 @@ impl LaunchdServiceManager {
             "RUST_LOG".to_string(),
             Value::String(self.config.rust_log.clone()),
         );
+        env_vars.insert(
+            LAUNCHD_LABEL_ENV.to_string(),
+            Value::String(self.config.label.clone()),
+        );
 
         let mut root = Dictionary::new();
         root.insert(
             "Label".to_string(),
-            Value::String(LAUNCHD_LABEL.to_string()),
+            Value::String(self.config.label.clone()),
         );
         root.insert(
             "ProgramArguments".to_string(),
@@ -347,8 +355,7 @@ impl ServiceManager for LaunchdServiceManager {
         match launchctl::bootstrap(&domain, &plist_path) {
             Ok(_) => {}
             Err(error) if error.is_already_loaded() => {
-                let target = LaunchctlServiceTarget::new(domain.clone(), LAUNCHD_LABEL);
-                let _ = launchctl::bootout(&target);
+                let _ = launchctl::bootout(&self.service_target());
                 launchctl::bootstrap(&domain, &plist_path)?;
             }
             Err(error) => return Err(error.into()),
@@ -407,6 +414,40 @@ fn is_running_as_root() -> bool {
     {
         false
     }
+}
+
+fn launchd_label_from_env() -> Result<String> {
+    match env::var(LAUNCHD_LABEL_ENV) {
+        Ok(label) => validate_launchd_label(&label),
+        Err(env::VarError::NotPresent) => Ok(LAUNCHD_LABEL.to_string()),
+        Err(env::VarError::NotUnicode(_)) => Err(SbhError::InvalidConfig {
+            details: format!("{LAUNCHD_LABEL_ENV} must be valid UTF-8"),
+        }),
+    }
+}
+
+fn validate_launchd_label(label: &str) -> Result<String> {
+    if label.is_empty() {
+        return Err(SbhError::InvalidConfig {
+            details: format!("{LAUNCHD_LABEL_ENV} must not be empty"),
+        });
+    }
+    if label.trim() != label {
+        return Err(SbhError::InvalidConfig {
+            details: format!("{LAUNCHD_LABEL_ENV} must not contain surrounding whitespace"),
+        });
+    }
+    if !label
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+    {
+        return Err(SbhError::InvalidConfig {
+            details: format!(
+                "{LAUNCHD_LABEL_ENV} may only contain ASCII letters, digits, '.', '-', or '_'"
+            ),
+        });
+    }
+    Ok(label.to_string())
 }
 
 fn current_uid() -> u32 {
@@ -499,5 +540,28 @@ fn default_launchd_log_paths(user_scope: bool) -> (PathBuf, PathBuf) {
             PathBuf::from("/var/log/sbh/sbh.log"),
             PathBuf::from("/var/log/sbh/sbh.err"),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launchd_label_validation_accepts_reverse_dns_labels() {
+        let label = validate_launchd_label("com.dicklesworthstone.sbh.test.123")
+            .expect("reverse-DNS label should validate");
+
+        assert_eq!(label, "com.dicklesworthstone.sbh.test.123");
+    }
+
+    #[test]
+    fn launchd_label_validation_rejects_path_or_shell_metacharacters() {
+        for label in ["", " com.sbh.daemon", "com/sbh/daemon", "com.sbh.$daemon"] {
+            assert!(
+                validate_launchd_label(label).is_err(),
+                "label should be rejected: {label:?}"
+            );
+        }
     }
 }
