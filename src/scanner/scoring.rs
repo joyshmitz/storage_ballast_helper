@@ -415,6 +415,9 @@ impl ScoringEngine {
         if has_git_component(&input.path) || input.signals.has_git {
             return Some(Cow::Borrowed("path contains .git"));
         }
+        if let Some(reason) = report_only_cleanup_rule_veto_reason(input) {
+            return Some(reason);
+        }
         if is_system_path(&input.path) {
             return Some(Cow::Borrowed("system path is never deletable"));
         }
@@ -498,10 +501,7 @@ fn cleanup_rule_veto_reason(input: &CandidateInput) -> Option<Cow<'static, str>>
     let rule = cleanup_rule_for_classification(&input.classification)?;
     match rule.reclaim_command {
         ReclaimCommand::ReportOnly => {
-            return Some(Cow::Owned(format!(
-                "{} cleanup rule is report-only",
-                rule.name
-            )));
+            return Some(report_only_cleanup_rule_reason(rule));
         }
         ReclaimCommand::Refuse => {
             return Some(Cow::Owned(format!(
@@ -530,6 +530,25 @@ fn cleanup_rule_veto_reason(input: &CandidateInput) -> Option<Cow<'static, str>>
         )));
     }
     None
+}
+
+fn report_only_cleanup_rule_veto_reason(input: &CandidateInput) -> Option<Cow<'static, str>> {
+    let rule = cleanup_rule_for_classification(&input.classification)?;
+    if rule.reclaim_command == ReclaimCommand::ReportOnly {
+        return Some(report_only_cleanup_rule_reason(rule));
+    }
+    None
+}
+
+fn report_only_cleanup_rule_reason(rule: &CleanupRule) -> Cow<'static, str> {
+    if rule.name == "spotlight-index-report" {
+        Cow::Owned(format!(
+            "{} cleanup rule is report-only; deleting the Spotlight index triggers a 1-4 hour rebuild and can cripple the machine",
+            rule.name
+        ))
+    } else {
+        Cow::Owned(format!("{} cleanup rule is report-only", rule.name))
+    }
 }
 
 fn cleanup_rule_allows_embedded_manifest(classification: &ArtifactClassification) -> bool {

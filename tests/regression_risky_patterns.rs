@@ -744,6 +744,43 @@ mod tests {
     }
 
     #[test]
+    fn spotlight_index_report_warns_about_rebuild_and_is_hard_kept() {
+        let registry = ArtifactPatternRegistry::default();
+        let engine = default_engine();
+        let path = PathBuf::from("/.Spotlight-V100");
+        let signals = StructuralSignals::default();
+        let classification = classify_macos(&registry, &path, signals);
+
+        assert_eq!(classification.pattern_name, "spotlight-index-report");
+        assert_eq!(classification.category, ArtifactCategory::Unknown);
+        assert!(classification.combined_confidence.abs() < f64::EPSILON);
+
+        let score = engine.score_candidate(
+            &CandidateInput {
+                path,
+                size_bytes: 12 * 1_073_741_824,
+                age: Duration::from_secs(0),
+                classification,
+                signals,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            1.0,
+        );
+
+        let reason = score
+            .veto_reason
+            .as_deref()
+            .expect("spotlight report should be vetoed");
+        assert!(score.vetoed);
+        assert_eq!(score.decision.action, DecisionAction::Keep);
+        assert!(reason.contains("spotlight-index-report cleanup rule is report-only"));
+        assert!(reason.contains("1-4 hour rebuild"));
+        assert!(reason.contains("cripple the machine"));
+    }
+
+    #[test]
     fn stale_release_work_buildroot_is_actionable_even_with_cargo_manifest() {
         let registry = ArtifactPatternRegistry::default();
         let engine = default_engine();
