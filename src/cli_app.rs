@@ -31,7 +31,7 @@ use storage_ballast_helper::monitor::fs_stats::FsStatsCollector;
 use storage_ballast_helper::platform::pal::{
     MemoryInfo, Platform, ServiceManager, detect_platform,
 };
-use storage_ballast_helper::platform::types::ServiceKind;
+use storage_ballast_helper::platform::types::{FullDiskAccessStatus, ServiceKind};
 use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionPlan};
 use storage_ballast_helper::scanner::patterns::{ArtifactCategory, ArtifactPatternRegistry};
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
@@ -3683,6 +3683,7 @@ fn pal_doctor_report(platform: &dyn Platform) -> PalDoctorReport {
         pal_probe_result("capacity", platform.capacity(&cwd)),
         pal_probe_result("mounts", platform.mounts()),
         pal_probe_result("memory_pressure", platform.memory_pressure()),
+        pal_probe_full_disk_access(platform.full_disk_access_status()),
         pal_probe_result("subscribe_memory_pressure", callback()),
         pal_probe_result("process_list", platform.process_list()),
         pal_probe_result("process_io", platform.process_io(current_pid)),
@@ -3745,6 +3746,20 @@ fn pal_probe_skipped(method: &'static str, message: impl Into<String>) -> PalDoc
         status: "skipped",
         bead: None,
         message: Some(message.into()),
+    }
+}
+
+fn pal_probe_full_disk_access(
+    result: storage_ballast_helper::core::errors::Result<FullDiskAccessStatus>,
+) -> PalDoctorProbe {
+    match result {
+        Ok(status) => PalDoctorProbe {
+            method: "full_disk_access_status",
+            status: "implemented",
+            bead: None,
+            message: Some(status.doctor_message()),
+        },
+        Err(error) => pal_probe_result::<()>("full_disk_access_status", Err(error)),
     }
 }
 
@@ -7119,6 +7134,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use storage_ballast_helper::core::config::SacredConfig;
+    use storage_ballast_helper::platform::pal::MockPlatform;
+    use storage_ballast_helper::platform::types::{FullDiskAccessState, FullDiskAccessStatus};
     use tempfile::TempDir;
 
     struct FakeServiceManager {
@@ -7248,6 +7265,29 @@ mod tests {
             let parsed = Cli::try_parse_from(case.iter().copied());
             assert!(parsed.is_ok(), "failed to parse case: {case:?}");
         }
+    }
+
+    #[test]
+    fn pal_doctor_report_includes_full_disk_access_status_detail() {
+        let platform = MockPlatform::healthy().with_full_disk_access_status(FullDiskAccessStatus {
+            state: FullDiskAccessState::Missing,
+            probe_path: Some("/Users/me/Library/Mail/V10/MailData/Envelope Index".into()),
+            detail: "permission denied while reading Mail Envelope Index".to_string(),
+            cache_ttl_seconds: 60,
+            cached: true,
+        });
+
+        let report = pal_doctor_report(&platform);
+        let probe = report
+            .methods
+            .iter()
+            .find(|probe| probe.method == "full_disk_access_status")
+            .expect("FDA probe should be reported");
+
+        assert_eq!(probe.status, "implemented");
+        assert!(probe.message.as_deref().is_some_and(|message| {
+            message.contains("missing") && message.contains("cached: true")
+        }));
     }
 
     #[test]

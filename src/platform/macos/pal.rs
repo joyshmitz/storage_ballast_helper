@@ -3,7 +3,11 @@
 #![cfg(target_os = "macos")]
 #![allow(missing_docs)]
 
+use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use crate::core::errors::Result;
 use crate::core::paths::resolve_absolute_path;
@@ -18,10 +22,16 @@ use crate::platform::pal::{
     FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
 };
 use crate::platform::types::{
-    Capacity, MappedRegion, MemoryPressure, MemoryPressureCallback, MountInfo, OpenFile,
-    OpenFileKind, OpenFileMode, PalError, ProcessInfo, ProcessIo, SacredPath, SelfStats,
-    ServiceKind, SubscriptionHandle,
+    Capacity, FullDiskAccessState, FullDiskAccessStatus, MappedRegion, MemoryPressure,
+    MemoryPressureCallback, MountInfo, OpenFile, OpenFileKind, OpenFileMode, PalError, ProcessInfo,
+    ProcessIo, SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
 };
+use parking_lot::RwLock;
+
+const FDA_CACHE_TTL_SECS: u64 = 60;
+const FDA_CACHE_TTL: Duration = Duration::from_secs(FDA_CACHE_TTL_SECS);
+static FDA_STATUS_CACHE: OnceLock<RwLock<Option<(Instant, FullDiskAccessStatus)>>> =
+    OnceLock::new();
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MacOsPal;
@@ -88,6 +98,10 @@ impl Platform for MacOsPal {
 
     fn memory_pressure(&self) -> Result<MemoryPressure> {
         macos_not_implemented("bd-hqu2.4", "memory_pressure")
+    }
+
+    fn full_disk_access_status(&self) -> Result<FullDiskAccessStatus> {
+        Ok(cached_full_disk_access_status(&self.user_home()))
     }
 
     fn subscribe_memory_pressure(
@@ -214,6 +228,133 @@ fn macos_method_error(
     error: &impl ToString,
 ) -> crate::core::errors::SbhError {
     PalError::method_failed("macos", method, error.to_string()).into()
+}
+
+fn cached_full_disk_access_status(home: &Path) -> FullDiskAccessStatus {
+    let cache = FDA_STATUS_CACHE.get_or_init(|| RwLock::new(None));
+    {
+        let cached = cache.read();
+        if let Some((checked_at, status)) = &*cached
+            && checked_at.elapsed() < FDA_CACHE_TTL
+        {
+            let mut status = status.clone();
+            status.cached = true;
+            return status;
+        }
+    }
+
+    let status = probe_full_disk_access_status(home);
+    *cache.write() = Some((Instant::now(), status.clone()));
+    status
+}
+
+fn probe_full_disk_access_status(home: &Path) -> FullDiskAccessStatus {
+    let mail_root = home.join("Library/Mail");
+    let entries = match fs::read_dir(&mail_root) {
+        Ok(entries) => entries,
+        Err(error) if is_fda_permission_denied(&error) => {
+            return fda_status(
+                FullDiskAccessState::Missing,
+                Some(mail_root),
+                "permission denied while listing Mail data; grant Full Disk Access to sbh",
+            );
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return fda_status(
+                FullDiskAccessState::NotConfigured,
+                Some(mail_root),
+                "Mail data directory is not present for this user",
+            );
+        }
+        Err(error) => {
+            return fda_status(
+                FullDiskAccessState::Unknown,
+                Some(mail_root),
+                format!("could not inspect Mail data directory: {error}"),
+            );
+        }
+    };
+
+    let mut version_dirs = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if is_fda_permission_denied(&error) => {
+                return fda_status(
+                    FullDiskAccessState::Missing,
+                    Some(mail_root),
+                    "permission denied while reading Mail data; grant Full Disk Access to sbh",
+                );
+            }
+            Err(error) => {
+                return fda_status(
+                    FullDiskAccessState::Unknown,
+                    Some(mail_root),
+                    format!("could not read Mail data entry: {error}"),
+                );
+            }
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('V') {
+            version_dirs.push(entry.path());
+        }
+    }
+    version_dirs.sort();
+
+    let mut last_probe = None;
+    for version_dir in version_dirs {
+        let probe = version_dir.join("MailData").join("Envelope Index");
+        last_probe = Some(probe.clone());
+        match File::open(&probe) {
+            Ok(_) => {
+                return fda_status(
+                    FullDiskAccessState::Granted,
+                    Some(probe),
+                    "Mail Envelope Index was readable",
+                );
+            }
+            Err(error) if is_fda_permission_denied(&error) => {
+                return fda_status(
+                    FullDiskAccessState::Missing,
+                    Some(probe),
+                    "permission denied while reading Mail Envelope Index; grant Full Disk Access to sbh",
+                );
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return fda_status(
+                    FullDiskAccessState::Unknown,
+                    Some(probe),
+                    format!("could not read Mail Envelope Index: {error}"),
+                );
+            }
+        }
+    }
+
+    fda_status(
+        FullDiskAccessState::NotConfigured,
+        Some(last_probe.unwrap_or(mail_root)),
+        "no MailData/Envelope Index probe file was found under ~/Library/Mail/V*",
+    )
+}
+
+fn fda_status(
+    state: FullDiskAccessState,
+    probe_path: Option<PathBuf>,
+    detail: impl Into<String>,
+) -> FullDiskAccessStatus {
+    FullDiskAccessStatus {
+        state,
+        probe_path,
+        detail: detail.into(),
+        cache_ttl_seconds: FDA_CACHE_TTL_SECS,
+        cached: false,
+    }
+}
+
+fn is_fda_permission_denied(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EPERM) || error.kind() == io::ErrorKind::PermissionDenied
 }
 
 fn statfs_to_fs_stats(stats: StatfsSnapshot) -> FsStats {

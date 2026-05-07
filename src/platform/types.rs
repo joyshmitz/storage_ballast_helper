@@ -168,6 +168,59 @@ pub struct MemoryPressure {
 
 pub type MemoryPressureCallback = Box<dyn Fn(MemoryPressure) + Send + Sync + 'static>;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FullDiskAccessState {
+    Granted,
+    Missing,
+    NotConfigured,
+    NotApplicable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FullDiskAccessStatus {
+    pub state: FullDiskAccessState,
+    pub probe_path: Option<PathBuf>,
+    pub detail: String,
+    pub cache_ttl_seconds: u64,
+    pub cached: bool,
+}
+
+impl FullDiskAccessStatus {
+    #[must_use]
+    pub fn not_applicable(platform: &str) -> Self {
+        Self {
+            state: FullDiskAccessState::NotApplicable,
+            probe_path: None,
+            detail: format!("Full Disk Access is not required on {platform}"),
+            cache_ttl_seconds: 0,
+            cached: false,
+        }
+    }
+
+    #[must_use]
+    pub fn doctor_message(&self) -> String {
+        let state = match self.state {
+            FullDiskAccessState::Granted => "granted",
+            FullDiskAccessState::Missing => "missing",
+            FullDiskAccessState::NotConfigured => "not_configured",
+            FullDiskAccessState::NotApplicable => "not_applicable",
+            FullDiskAccessState::Unknown => "unknown",
+        };
+        self.probe_path.as_ref().map_or_else(
+            || format!("{state}: {} (cached: {})", self.detail, self.cached),
+            |path| {
+                format!(
+                    "{state}: {} (probe: {}, cached: {})",
+                    self.detail,
+                    path.display(),
+                    self.cached,
+                )
+            },
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubscriptionHandle {
     pub source: String,
@@ -320,7 +373,10 @@ pub enum ServiceKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{PalError, SacredPath, SacredPathKind, SacredPathSource};
+    use super::{
+        FullDiskAccessState, FullDiskAccessStatus, PalError, SacredPath, SacredPathKind,
+        SacredPathSource,
+    };
 
     #[test]
     fn sacred_path_exact_match_example_round_trips() {
@@ -350,6 +406,23 @@ mod tests {
             error.to_string(),
             "PAL method 'memory_pressure' is not yet implemented on macos. See bead bd-hqu2.4 for tracking"
         );
+    }
+
+    #[test]
+    fn full_disk_access_doctor_message_includes_state_and_probe() {
+        let status = FullDiskAccessStatus {
+            state: FullDiskAccessState::Missing,
+            probe_path: Some("/Users/me/Library/Mail/V10/MailData/Envelope Index".into()),
+            detail: "permission denied while probing Mail index".to_string(),
+            cache_ttl_seconds: 60,
+            cached: true,
+        };
+
+        let message = status.doctor_message();
+
+        assert!(message.contains("missing"));
+        assert!(message.contains("Envelope Index"));
+        assert!(message.contains("cached: true"));
     }
 
     #[test]

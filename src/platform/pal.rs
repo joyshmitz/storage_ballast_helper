@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::core::config::PathsConfig;
 use crate::core::errors::{Result, SbhError};
 use crate::platform::types::{
-    Capacity, MappedRegion, MemoryPressure, MemoryPressureCallback, MemoryPressureLevel, MountInfo,
-    OpenFile, PalError, ProcessInfo, ProcessIo, SacredPath, SelfStats, ServiceKind,
-    SubscriptionHandle,
+    Capacity, FullDiskAccessStatus, MappedRegion, MemoryPressure, MemoryPressureCallback,
+    MemoryPressureLevel, MountInfo, OpenFile, PalError, ProcessInfo, ProcessIo, SacredPath,
+    SelfStats, ServiceKind, SubscriptionHandle,
 };
 
 /// Filesystem statistics for a path/mount.
@@ -170,6 +170,10 @@ pub trait Platform: Send + Sync {
         pal_not_implemented(self.name(), "memory_pressure")
     }
 
+    fn full_disk_access_status(&self) -> Result<FullDiskAccessStatus> {
+        Ok(FullDiskAccessStatus::not_applicable(self.name()))
+    }
+
     fn subscribe_memory_pressure(
         &self,
         _callback: MemoryPressureCallback,
@@ -271,6 +275,7 @@ pub struct MockPlatform {
     memory: MemoryInfo,
     paths: PlatformPaths,
     memory_pressure: MemoryPressure,
+    full_disk_access: FullDiskAccessStatus,
     subscription: SubscriptionHandle,
     processes: Vec<ProcessInfo>,
     process_io: HashMap<i32, ProcessIo>,
@@ -302,6 +307,7 @@ impl MockPlatform {
             memory,
             paths,
             memory_pressure: default_mock_memory_pressure(),
+            full_disk_access: FullDiskAccessStatus::not_applicable("mock"),
             subscription: SubscriptionHandle {
                 source: "mock".to_string(),
                 active: true,
@@ -362,6 +368,12 @@ impl MockPlatform {
     #[must_use]
     pub fn with_memory_pressure(mut self, memory_pressure: MemoryPressure) -> Self {
         self.memory_pressure = memory_pressure;
+        self
+    }
+
+    #[must_use]
+    pub fn with_full_disk_access_status(mut self, status: FullDiskAccessStatus) -> Self {
+        self.full_disk_access = status;
         self
     }
 
@@ -491,6 +503,10 @@ impl Platform for MockPlatform {
 
     fn memory_pressure(&self) -> Result<MemoryPressure> {
         Ok(self.memory_pressure.clone())
+    }
+
+    fn full_disk_access_status(&self) -> Result<FullDiskAccessStatus> {
+        Ok(self.full_disk_access.clone())
     }
 
     fn subscribe_memory_pressure(
