@@ -13,8 +13,8 @@ use crate::core::errors::Result;
 use crate::core::paths::resolve_absolute_path;
 use crate::platform::macos::libproc::{
     ProcFdInfo, ProcFdType, ProcRegionWithPathInfo, ProcTaskAllInfo, VnodeFdInfoWithPath,
-    proc_listpids_safe, proc_pid_list_fds, proc_pid_region_path, proc_pid_rusage_v4_safe,
-    proc_pidfdinfo_vnode_path, proc_pidinfo_task_all, proc_pidpath_safe,
+    proc_listpids_safe, proc_pid_command_line, proc_pid_list_fds, proc_pid_region_path,
+    proc_pid_rusage_v4_safe, proc_pidfdinfo_vnode_path, proc_pidinfo_task_all, proc_pidpath_safe,
 };
 use crate::platform::macos::sacred_catalog::platform_macos_sacred_paths;
 use crate::platform::macos::sys::{
@@ -737,11 +737,12 @@ fn process_info_for_pid(pid: i32) -> Option<ProcessInfo> {
 fn process_info_from_task_all(pid: i32, raw: ProcTaskAllInfo) -> ProcessInfo {
     let name = process_name(&raw);
     let executable = proc_pidpath_safe(pid).ok();
+    let command_line = proc_pid_command_line(pid).unwrap_or_default();
     ProcessInfo {
         pid,
         parent_pid: positive_pid(raw.pbsd.pbi_ppid.0),
         name,
-        command_line: Vec::new(),
+        command_line,
         executable,
         cwd: None,
         start_time_unix_ms: start_time_unix_ms(raw.pbsd.pbi_start_tvsec, raw.pbsd.pbi_start_tvusec),
@@ -1434,6 +1435,16 @@ mod tests {
                 .iter()
                 .any(|process| process.resident_memory_bytes.is_some())
         );
+    }
+
+    #[test]
+    fn process_info_for_current_pid_includes_command_line() {
+        let current = super::current_process_pid();
+        let process =
+            super::process_info_for_pid(current).expect("current process info should be readable");
+
+        assert_eq!(process.pid, current);
+        assert!(!process.command_line.is_empty());
     }
 
     #[test]

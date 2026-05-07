@@ -812,6 +812,23 @@ pub mod sysctl {
         }
     }
 
+    impl ReadableValue for Vec<u8> {
+        fn read_type() -> (CtlType, &'static str) {
+            (CtlType::Struct, "")
+        }
+
+        fn from_ctl_value(name: &str, value: CtlValue) -> io::Result<Self> {
+            match value {
+                CtlValue::Struct(value) | CtlValue::Node(value) => Ok(value),
+                other => Err(sysctl_type_error(
+                    name,
+                    "raw bytes",
+                    &format!("got {}", ctl_value_label(&other)),
+                )),
+            }
+        }
+    }
+
     fn format_swapusage_struct(raw: &[u8]) -> io::Result<String> {
         let total = native_u64(raw.get(0..8))
             .ok_or_else(|| malformed_struct_error("vm.swapusage", "missing total bytes"))?;
