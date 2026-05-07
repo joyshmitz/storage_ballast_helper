@@ -24,7 +24,9 @@ use crate::platform::pal::{
 #[cfg(target_os = "linux")]
 use crate::platform::sacred_catalog::cross_platform_sacred_paths;
 #[cfg(target_os = "linux")]
-use crate::platform::types::{PalError, SacredPath, ServiceKind};
+use crate::platform::types::{
+    MemoryPressure, MemoryPressureCallback, PalError, SacredPath, ServiceKind, SubscriptionHandle,
+};
 
 #[cfg(target_os = "linux")]
 pub mod disk;
@@ -121,6 +123,17 @@ impl Platform for LinuxPal {
 
     fn memory_info(&self) -> Result<MemoryInfo> {
         memory::read_memory_info()
+    }
+
+    fn memory_pressure(&self) -> Result<MemoryPressure> {
+        memory::read_memory_pressure()
+    }
+
+    fn subscribe_memory_pressure(
+        &self,
+        callback: MemoryPressureCallback,
+    ) -> Result<SubscriptionHandle> {
+        memory::subscribe_memory_pressure(callback)
     }
 
     fn service_manager(&self) -> Box<dyn ServiceManager> {

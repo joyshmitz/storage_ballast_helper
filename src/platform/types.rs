@@ -252,7 +252,6 @@ impl SubscriptionHandle {
     }
 
     #[must_use]
-    #[cfg(target_os = "macos")]
     pub(crate) fn active_with_liveness(source: impl Into<String>, liveness: Arc<()>) -> Self {
         Self {
             source: source.into(),
