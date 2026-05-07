@@ -2491,7 +2491,10 @@ fn scanner_thread_main(
         );
         let mut open_files_joined: Option<std::collections::HashSet<std::path::PathBuf>> = None;
         let mut active_reference_joined: Option<ActiveReferenceIndex> = None;
-        let sacred_paths = platform.sacred_paths();
+        let mut sacred_paths = platform.sacred_paths();
+        sacred_paths.extend(protection::sacred_paths_from_protected_patterns(
+            &current_scanner_config.protected_paths,
+        ));
 
         // ── Priority pre-scan pass ──
         // Before the general walker, do a shallow (depth 1-2) scan of each root

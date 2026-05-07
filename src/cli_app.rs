@@ -4046,9 +4046,7 @@ fn collect_sacred_status_report(config: &Config) -> Result<SacredStatusReport, C
         .map(protection_entry_view)
         .collect::<Vec<_>>();
 
-    let sacred_paths = detect_platform()
-        .map_err(|e| CliError::Runtime(e.to_string()))?
-        .sacred_paths();
+    let sacred_paths = active_sacred_paths(config)?;
     let (scan_candidate_count, sacred_overlap_candidate_count) =
         count_sacred_scan_overlaps(config, root_paths, registry, &sacred_paths)?;
 
@@ -4073,6 +4071,18 @@ fn canonical_scan_roots(config: &Config) -> Vec<PathBuf> {
         .iter()
         .filter_map(|path| path.canonicalize().ok())
         .collect()
+}
+
+fn active_sacred_paths(
+    config: &Config,
+) -> Result<Vec<storage_ballast_helper::platform::types::SacredPath>, CliError> {
+    let mut sacred_paths = detect_platform()
+        .map_err(|e| CliError::Runtime(e.to_string()))?
+        .sacred_paths();
+    sacred_paths.extend(protection::sacred_paths_from_protected_patterns(
+        &config.scanner.protected_paths,
+    ));
+    Ok(sacred_paths)
 }
 
 fn protection_entry_view(entry: &protection::ProtectionEntry) -> SacredProtectionView {
@@ -5173,8 +5183,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     // Classify and score each entry with active-reference evidence attached.
     let registry = ArtifactPatternRegistry::default();
     let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
-    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
-    let sacred_paths = platform.sacred_paths();
+    let sacred_paths = active_sacred_paths(&config)?;
     let now = SystemTime::now();
     let active_reference_scan = active_reference_scan_config(&config);
     let mut open_paths = None;
@@ -5498,8 +5507,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     let mut scoring_config = config.scoring.clone();
     scoring_config.min_score = args.min_score;
     let engine = ScoringEngine::from_config(&scoring_config, config.scanner.min_file_age_minutes);
-    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
-    let sacred_paths = platform.sacred_paths();
+    let sacred_paths = active_sacred_paths(&config)?;
     let now = SystemTime::now();
     let active_reference_scan = active_reference_scan_config(&config);
     let mut open_paths = None;
@@ -6271,8 +6279,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     // Classify and score using default weights.
     let registry = ArtifactPatternRegistry::default();
     let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
-    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
-    let sacred_paths = platform.sacred_paths();
+    let sacred_paths = active_sacred_paths(&config)?;
     let now = SystemTime::now();
 
     let scored: Vec<CandidacyScore> = entries
@@ -8438,6 +8445,33 @@ mod tests {
         assert_eq!(report.protection_count, 1);
         assert_eq!(report.config_pattern_count, 1);
         assert!(report.sacred_catalog_count > 0);
+    }
+
+    #[test]
+    fn sacred_status_report_counts_config_protected_child_overlap() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let candidate = tmp.path().join("old-target");
+        let protected = candidate.join("critical-data");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[scanner]\nroot_paths = [\"{}\"]\nprotected_paths = [\"{}\"]\n",
+                tmp.path().to_string_lossy(),
+                protected.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load(Some(&config_path)).unwrap();
+        let report = collect_sacred_status_report(&config).unwrap();
+
+        assert!(report.scan_candidate_count >= 1);
+        assert!(
+            report.sacred_overlap_candidate_count >= 1,
+            "configured protected child should make its artifact-looking parent sacred"
+        );
     }
 
     #[test]

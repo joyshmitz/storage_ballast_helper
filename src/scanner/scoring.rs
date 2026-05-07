@@ -418,13 +418,16 @@ impl ScoringEngine {
                 "contains Cargo.toml without build-artifact markers",
             ));
         }
+        if let Some(reason) = sacred_overlap_veto_reason(sacred_overlaps) {
+            return Some(reason);
+        }
+        if input.excluded {
+            return Some(Cow::Borrowed("matched user exclusion"));
+        }
         if let Some(extension) = hard_refuse_bundle_extension(&input.path) {
             return Some(Cow::Owned(format!(
                 "protected bundle/project extension .{extension}"
             )));
-        }
-        if let Some(reason) = sacred_overlap_veto_reason(sacred_overlaps) {
-            return Some(reason);
         }
         if input.age < self.min_file_age {
             return Some(Cow::Owned(format!(
@@ -432,9 +435,6 @@ impl ScoringEngine {
                 input.age.as_secs(),
                 self.min_file_age.as_secs()
             )));
-        }
-        if input.excluded {
-            return Some(Cow::Borrowed("matched user exclusion"));
         }
         if let Some(reason) = input.active_references.safe_reclaim_reason() {
             return Some(reason);

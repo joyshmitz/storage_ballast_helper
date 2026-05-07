@@ -381,6 +381,31 @@ pub fn find_sacred_overlaps(
     find_sacred_overlaps_with_config(candidate, catalog, StowawayScanConfig::default())
 }
 
+#[must_use]
+pub fn sacred_paths_from_protected_patterns(patterns: &[String]) -> Vec<SacredPath> {
+    let mut seen = HashSet::new();
+    patterns
+        .iter()
+        .filter_map(|pattern| {
+            let pattern = pattern.trim();
+            if pattern.is_empty() || !seen.insert(pattern.to_string()) {
+                return None;
+            }
+            let kind = if contains_glob_metachar(pattern) {
+                SacredPathKind::GlobMatch
+            } else {
+                SacredPathKind::ExactMatch
+            };
+            Some(SacredPath {
+                pattern: pattern.to_string(),
+                kind,
+                reason: "User-configured protected path must never be reclaimed.".to_string(),
+                source: SacredPathSource::UserConfig,
+            })
+        })
+        .collect()
+}
+
 pub fn find_sacred_overlaps_with_config(
     candidate: &Path,
     catalog: &[SacredPath],
@@ -1142,6 +1167,44 @@ protected_at = "2026-05-07T03:50:00Z"
         let reg = ProtectionRegistry::new(Some(&patterns)).unwrap();
         assert!(reg.is_protected(Path::new("/tmp/[build]")));
         assert!(!reg.is_protected(Path::new("/tmp/b")));
+    }
+
+    #[test]
+    fn protected_patterns_become_user_config_sacred_paths() {
+        let tmp = TempDir::new().unwrap();
+        let protected = tmp.path().join("critical");
+        let glob_parent = tmp.path().join("Pictures");
+        let glob = glob_parent
+            .join("*.photoslibrary")
+            .to_string_lossy()
+            .to_string();
+        let patterns = vec![
+            protected.to_string_lossy().to_string(),
+            glob,
+            protected.to_string_lossy().to_string(),
+        ];
+
+        let catalog = sacred_paths_from_protected_patterns(&patterns);
+
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog[0].kind, SacredPathKind::ExactMatch);
+        assert_eq!(catalog[0].source, SacredPathSource::UserConfig);
+        assert_eq!(catalog[1].kind, SacredPathKind::GlobMatch);
+
+        let parent_overlap = find_sacred_overlaps(tmp.path(), &catalog).unwrap();
+        assert!(parent_overlap.iter().any(|overlap| {
+            overlap.kind == SacredOverlapKind::ParentOfSacred
+                && overlap.source == SacredPathSource::UserConfig
+        }));
+
+        let child_overlap =
+            find_sacred_overlaps(&glob_parent.join("Family.photoslibrary/database"), &catalog)
+                .unwrap();
+        assert!(
+            child_overlap
+                .iter()
+                .any(|overlap| overlap.kind == SacredOverlapKind::ChildOfSacred)
+        );
     }
 
     #[test]
