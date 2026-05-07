@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::core::config::Config;
+use crate::platform::pal::{Platform, detect_platform};
+use crate::platform::types::ServiceKind;
 
 // ---------------------------------------------------------------------------
 // Wizard choices
@@ -34,6 +36,18 @@ impl fmt::Display for ServiceChoice {
             Self::Systemd => f.write_str("systemd"),
             Self::Launchd => f.write_str("launchd"),
             Self::None => f.write_str("none"),
+        }
+    }
+}
+
+impl ServiceChoice {
+    /// Translate the active PAL service backend into the wizard's service choice.
+    #[must_use]
+    pub const fn from_service_kind(kind: ServiceKind) -> Self {
+        match kind {
+            ServiceKind::Systemd => Self::Systemd,
+            ServiceKind::Launchd => Self::Launchd,
+            ServiceKind::None => Self::None,
         }
     }
 }
@@ -145,6 +159,45 @@ pub struct WizardSummary {
     pub warnings: Vec<String>,
 }
 
+/// PAL-derived defaults used by both interactive and `--auto` wizard modes.
+#[derive(Debug, Clone)]
+pub struct WizardPlatformDefaults {
+    service: ServiceChoice,
+    watched_paths: Vec<PathBuf>,
+}
+
+impl WizardPlatformDefaults {
+    /// Build wizard defaults from the active platform abstraction.
+    #[must_use]
+    pub fn from_platform(platform: &dyn Platform) -> Self {
+        Self {
+            service: ServiceChoice::from_service_kind(platform.service_kind()),
+            watched_paths: auto_detect_watched_paths_for_platform(platform),
+        }
+    }
+
+    fn detected() -> Self {
+        detect_platform().map_or_else(
+            |_| Self {
+                service: ServiceChoice::None,
+                watched_paths: auto_detect_watched_paths_from_candidates(
+                    Vec::<PathBuf>::new(),
+                    std::env::var_os("HOME").map(PathBuf::from),
+                ),
+            },
+            |platform| Self::from_platform(platform.as_ref()),
+        )
+    }
+
+    fn service_name(&self) -> &'static str {
+        match self.service {
+            ServiceChoice::Systemd => "systemd",
+            ServiceChoice::Launchd => "launchd",
+            ServiceChoice::None => "none",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Auto mode
 // ---------------------------------------------------------------------------
@@ -158,14 +211,22 @@ pub struct WizardSummary {
 /// - Scope: user service.
 #[must_use]
 pub fn auto_answers() -> WizardAnswers {
-    let service = auto_detect_service();
-    let watched = auto_detect_watched_paths();
+    auto_answers_for_defaults(&WizardPlatformDefaults::detected())
+}
+
+/// Run `--auto` mode using defaults from a caller-provided platform.
+#[must_use]
+pub fn auto_answers_for_platform(platform: &dyn Platform) -> WizardAnswers {
+    auto_answers_for_defaults(&WizardPlatformDefaults::from_platform(platform))
+}
+
+fn auto_answers_for_defaults(defaults: &WizardPlatformDefaults) -> WizardAnswers {
     let preset = BallastPreset::Medium;
 
     WizardAnswers {
-        service,
+        service: defaults.service,
         user_scope: true,
-        watched_paths: watched,
+        watched_paths: defaults.watched_paths.clone(),
         ballast_preset: preset,
         ballast_file_count: preset.file_count(),
         ballast_file_size_bytes: preset.file_size_bytes(),
@@ -173,36 +234,37 @@ pub fn auto_answers() -> WizardAnswers {
     }
 }
 
-fn auto_detect_service() -> ServiceChoice {
-    if cfg!(target_os = "macos") {
-        ServiceChoice::Launchd
-    } else if cfg!(target_os = "linux") {
-        ServiceChoice::Systemd
-    } else {
-        ServiceChoice::None
-    }
+#[cfg(test)]
+fn auto_detect_watched_paths() -> Vec<PathBuf> {
+    WizardPlatformDefaults::detected().watched_paths
 }
 
-fn auto_detect_watched_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+fn auto_detect_watched_paths_for_platform(platform: &dyn Platform) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
 
     // Standard defaults.
-    let data_projects = PathBuf::from("/data/projects");
-    if data_projects.is_dir() {
-        paths.push(data_projects);
+    candidates.push(PathBuf::from("/data/projects"));
+
+    for path in platform.temp_dirs() {
+        candidates.push(path);
+    }
+    candidates.push(PathBuf::from("/tmp"));
+
+    auto_detect_watched_paths_from_candidates(candidates, Some(platform.user_home()))
+}
+
+fn auto_detect_watched_paths_from_candidates(
+    candidates: impl IntoIterator<Item = PathBuf>,
+    home: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    for path in candidates {
+        push_existing_unique(&mut paths, path);
     }
 
-    let tmp = PathBuf::from("/tmp");
-    if tmp.is_dir() {
-        paths.push(tmp);
-    }
-
-    // User home directory.
-    if let Some(home) = std::env::var_os("HOME") {
-        let home_path = PathBuf::from(home);
-        if home_path.is_dir() && !paths.contains(&home_path) {
-            paths.push(home_path);
-        }
+    if let Some(home_path) = home {
+        push_existing_unique(&mut paths, home_path);
     }
 
     // Guarantee at least the defaults if nothing exists.
@@ -212,6 +274,12 @@ fn auto_detect_watched_paths() -> Vec<PathBuf> {
     }
 
     paths
+}
+
+fn push_existing_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if path.is_dir() && !paths.contains(&path) {
+        paths.push(path);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +293,27 @@ pub fn run_interactive<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
 ) -> io::Result<WizardAnswers> {
+    run_interactive_with_defaults(reader, writer, &WizardPlatformDefaults::detected())
+}
+
+/// Run the interactive wizard using defaults from a caller-provided platform.
+pub fn run_interactive_for_platform<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    platform: &dyn Platform,
+) -> io::Result<WizardAnswers> {
+    run_interactive_with_defaults(
+        reader,
+        writer,
+        &WizardPlatformDefaults::from_platform(platform),
+    )
+}
+
+fn run_interactive_with_defaults<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    defaults: &WizardPlatformDefaults,
+) -> io::Result<WizardAnswers> {
     let _ = writeln!(writer, "\n  Storage Ballast Helper — First-Run Setup\n");
     let _ = writeln!(
         writer,
@@ -232,7 +321,7 @@ pub fn run_interactive<R: BufRead, W: Write>(
     );
 
     // Step 1: Service manager.
-    let service = prompt_service(reader, writer)?;
+    let service = prompt_service(reader, writer, defaults)?;
 
     // Step 2: User vs system scope.
     let user_scope = if service == ServiceChoice::None {
@@ -242,7 +331,7 @@ pub fn run_interactive<R: BufRead, W: Write>(
     };
 
     // Step 3: Watched paths.
-    let watched_paths = prompt_watched_paths(reader, writer)?;
+    let watched_paths = prompt_watched_paths(reader, writer, defaults)?;
 
     // Step 4: Ballast sizing.
     let (preset, file_count, file_size) = prompt_ballast(reader, writer)?;
@@ -275,16 +364,11 @@ pub fn run_interactive<R: BufRead, W: Write>(
 fn prompt_service<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
+    defaults: &WizardPlatformDefaults,
 ) -> io::Result<ServiceChoice> {
     let _ = writeln!(writer, "  [1/4] Service manager");
 
-    let default = if cfg!(target_os = "macos") {
-        "launchd"
-    } else if cfg!(target_os = "linux") {
-        "systemd"
-    } else {
-        "none"
-    };
+    let default = defaults.service_name();
 
     let _ = writeln!(writer, "    Options: systemd, launchd, none");
     let _ = write!(writer, "    Choice [{default}]: ");
@@ -321,9 +405,10 @@ fn prompt_user_scope<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io
 fn prompt_watched_paths<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
+    defaults: &WizardPlatformDefaults,
 ) -> io::Result<Vec<PathBuf>> {
-    let defaults = auto_detect_watched_paths();
     let default_display: Vec<String> = defaults
+        .watched_paths
         .iter()
         .map(|p| p.to_string_lossy().to_string())
         .collect();
@@ -339,7 +424,7 @@ fn prompt_watched_paths<R: BufRead, W: Write>(
 
     let input = read_line(reader)?;
     if input.trim().is_empty() {
-        return Ok(defaults);
+        return Ok(defaults.watched_paths.clone());
     }
 
     let paths: Vec<PathBuf> = input
@@ -349,7 +434,7 @@ fn prompt_watched_paths<R: BufRead, W: Write>(
         .collect();
 
     if paths.is_empty() {
-        Ok(defaults)
+        Ok(defaults.watched_paths.clone())
     } else {
         Ok(paths)
     }
@@ -507,6 +592,7 @@ pub fn format_summary(summary: &WizardSummary) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::pal::MockPlatform;
 
     #[test]
     fn service_choice_display() {
@@ -546,14 +632,22 @@ mod tests {
 
     #[test]
     fn auto_answers_detects_platform_service() {
-        let answers = auto_answers();
-        if cfg!(target_os = "linux") {
-            assert_eq!(answers.service, ServiceChoice::Systemd);
-        } else if cfg!(target_os = "macos") {
-            assert_eq!(answers.service, ServiceChoice::Launchd);
-        } else {
-            assert_eq!(answers.service, ServiceChoice::None);
-        }
+        let linux = MockPlatform::healthy().with_service_kind(ServiceKind::Systemd);
+        let macos = MockPlatform::healthy().with_service_kind(ServiceKind::Launchd);
+        let unsupported = MockPlatform::healthy().with_service_kind(ServiceKind::None);
+
+        assert_eq!(
+            auto_answers_for_platform(&linux).service,
+            ServiceChoice::Systemd
+        );
+        assert_eq!(
+            auto_answers_for_platform(&macos).service,
+            ServiceChoice::Launchd
+        );
+        assert_eq!(
+            auto_answers_for_platform(&unsupported).service,
+            ServiceChoice::None
+        );
     }
 
     #[test]
@@ -583,13 +677,11 @@ mod tests {
         let input = "\n\n\n\n\n";
         let mut reader = io::Cursor::new(input.as_bytes());
         let mut output = Vec::new();
+        let platform = MockPlatform::healthy().with_service_kind(ServiceKind::Launchd);
 
-        let answers = run_interactive(&mut reader, &mut output).unwrap();
+        let answers = run_interactive_for_platform(&mut reader, &mut output, &platform).unwrap();
 
-        // Should have selected platform-appropriate service.
-        if cfg!(target_os = "linux") {
-            assert_eq!(answers.service, ServiceChoice::Systemd);
-        }
+        assert_eq!(answers.service, ServiceChoice::Launchd);
         assert!(answers.user_scope);
         assert!(!answers.watched_paths.is_empty());
         assert_eq!(answers.ballast_preset, BallastPreset::Medium);
@@ -807,16 +899,10 @@ mod tests {
         let input = "invalid_service\n\n\n\n\n";
         let mut reader = io::Cursor::new(input.as_bytes());
         let mut output = Vec::new();
+        let platform = MockPlatform::healthy().with_service_kind(ServiceKind::Launchd);
 
-        let answers = run_interactive(&mut reader, &mut output).unwrap();
-        // Should fall back to platform default.
-        if cfg!(target_os = "linux") {
-            assert_eq!(answers.service, ServiceChoice::Systemd);
-        } else if cfg!(target_os = "macos") {
-            assert_eq!(answers.service, ServiceChoice::Launchd);
-        } else {
-            assert_eq!(answers.service, ServiceChoice::None);
-        }
+        let answers = run_interactive_for_platform(&mut reader, &mut output, &platform).unwrap();
+        assert_eq!(answers.service, ServiceChoice::Launchd);
     }
 
     // bd-2j5.19 — prompt_user_scope with "n" for system scope
@@ -942,16 +1028,20 @@ mod tests {
         assert_ne!(ServiceChoice::Launchd, ServiceChoice::None);
     }
 
-    // bd-2j5.19 — auto_detect_service platform logic
+    // bd-2j5.19 — service kind mapping logic
     #[test]
-    fn auto_detect_service_matches_platform() {
-        let service = auto_detect_service();
-        if cfg!(target_os = "linux") {
-            assert_eq!(service, ServiceChoice::Systemd);
-        } else if cfg!(target_os = "macos") {
-            assert_eq!(service, ServiceChoice::Launchd);
-        } else {
-            assert_eq!(service, ServiceChoice::None);
-        }
+    fn service_choice_maps_pal_service_kind() {
+        assert_eq!(
+            ServiceChoice::from_service_kind(ServiceKind::Systemd),
+            ServiceChoice::Systemd
+        );
+        assert_eq!(
+            ServiceChoice::from_service_kind(ServiceKind::Launchd),
+            ServiceChoice::Launchd
+        );
+        assert_eq!(
+            ServiceChoice::from_service_kind(ServiceKind::None),
+            ServiceChoice::None
+        );
     }
 }

@@ -1033,16 +1033,18 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     // -- wizard / auto mode ---------------------------------------------------
     if args.wizard || args.auto {
         use storage_ballast_helper::cli::wizard::{
-            WizardSummary, auto_answers, format_summary, run_interactive, write_config,
+            WizardSummary, auto_answers_for_platform, format_summary, run_interactive_for_platform,
+            write_config,
         };
 
+        let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
         let answers = if args.auto {
-            auto_answers()
+            auto_answers_for_platform(platform.as_ref())
         } else {
             let stdin = io::stdin();
             let mut reader = stdin.lock();
             let mut writer = io::stderr();
-            run_interactive(&mut reader, &mut writer)
+            run_interactive_for_platform(&mut reader, &mut writer, platform.as_ref())
                 .map_err(|e| CliError::User(format!("wizard cancelled: {e}")))?
         };
 
