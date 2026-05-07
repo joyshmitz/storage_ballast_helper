@@ -4218,7 +4218,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 // Skip pseudo/virtual/read-only filesystems (squashfs snap
                 // mounts, proc, sysfs, etc.) — they can't fill up and don't
                 // represent actionable storage pressure.
-                if capacity.total_bytes == 0 || capacity.is_readonly {
+                if capacity.total_bytes == 0 || capacity.is_readonly || mount.is_ram_backed {
                     continue;
                 }
 
@@ -4371,7 +4371,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     continue;
                 };
                 // Skip pseudo/virtual/read-only filesystems.
-                if capacity.total_bytes == 0 || capacity.is_readonly {
+                if capacity.total_bytes == 0 || capacity.is_readonly || mount.is_ram_backed {
                     continue;
                 }
                 let free_pct = capacity_free_pct(&capacity);

@@ -157,8 +157,17 @@ impl FsStatsCollector {
 fn find_mount<'a>(path: &Path, mounts: &'a [MountPoint]) -> Option<&'a MountPoint> {
     mounts
         .iter()
-        .filter(|mount| path.starts_with(&mount.path))
+        .filter(|mount| path_matches_mount(path, &mount.path))
         .max_by_key(|mount| mount.path.as_os_str().len())
+}
+
+fn path_matches_mount(path: &Path, mount_path: &Path) -> bool {
+    if path.starts_with(mount_path) {
+        return true;
+    }
+
+    let resolved_mount = crate::core::paths::resolve_absolute_path(mount_path);
+    resolved_mount != mount_path && path.starts_with(resolved_mount)
 }
 
 #[cfg(test)]

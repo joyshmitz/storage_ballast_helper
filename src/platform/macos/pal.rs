@@ -101,7 +101,11 @@ impl Platform for MacOsPal {
             .map(|mounts| {
                 mounts
                     .into_iter()
-                    .map(|stats| statfs_to_mount_info(stats, inventory.as_ref()))
+                    .map(|stats| {
+                        let local_snapshot_bytes =
+                            local_snapshot_bytes_for_capacity(&stats, inventory.as_ref());
+                        statfs_to_mount_info(stats, inventory.as_ref(), local_snapshot_bytes)
+                    })
                     .collect()
             })
             .map_err(|error| macos_method_error("mounts", &error))
@@ -439,7 +443,11 @@ fn local_snapshot_bytes_for_capacity(
     (total > 0).then_some(total)
 }
 
-fn statfs_to_mount_info(stats: StatfsSnapshot, inventory: Option<&ApfsInventory>) -> MountInfo {
+fn statfs_to_mount_info(
+    stats: StatfsSnapshot,
+    inventory: Option<&ApfsInventory>,
+    local_snapshot_bytes: Option<u64>,
+) -> MountInfo {
     let is_apfs = stats.fs_type.eq_ignore_ascii_case("apfs");
     let total_bytes = stats.total_bytes();
     let available_bytes = stats.available_bytes();
@@ -472,7 +480,7 @@ fn statfs_to_mount_info(stats: StatfsSnapshot, inventory: Option<&ApfsInventory>
             .or(Some(total_bytes)),
         available_bytes: Some(effective_available_bytes),
         purgeable_bytes,
-        local_snapshot_bytes: None,
+        local_snapshot_bytes,
         is_readonly: stats.is_readonly,
         is_ram_backed,
         is_apfs_data_volume,
@@ -782,6 +790,156 @@ mod tests {
         assert_eq!(capacity.volume_role.as_deref(), Some("Data"));
         assert_eq!(capacity.shared_volumes, vec!["Macintosh HD", "VM"]);
         assert!(capacity.is_primary);
+    }
+
+    #[test]
+    fn mount_info_uses_apfs_container_metadata_and_snapshot_estimate() {
+        let stats = StatfsSnapshot {
+            mount_point: PathBuf::from("/Volumes/TestData"),
+            device: "/dev/disk3s5".to_string(),
+            fs_type: "apfs".to_string(),
+            block_size: 1,
+            blocks: 400,
+            blocks_free: 120,
+            blocks_available: 100,
+            is_readonly: false,
+        };
+        let inventory = ApfsInventory {
+            containers: vec![ApfsContainer {
+                container_id: "/dev/disk3".to_string(),
+                uuid: Some("container-uuid".to_string()),
+                capacity_total_bytes: Some(1_000),
+                capacity_available_bytes: Some(250),
+                physical_stores: vec!["/dev/disk0s2".to_string()],
+            }],
+            volumes: vec![
+                ApfsVolume {
+                    device_id: "/dev/disk3s1".to_string(),
+                    container_id: "/dev/disk3".to_string(),
+                    name: Some("Macintosh HD".to_string()),
+                    roles: vec![ApfsVolumeRole::System],
+                    capacity_in_use_bytes: Some(100),
+                    container_total_bytes: Some(1_000),
+                    container_available_bytes: Some(250),
+                },
+                ApfsVolume {
+                    device_id: "/dev/disk3s5".to_string(),
+                    container_id: "/dev/disk3".to_string(),
+                    name: Some("Data".to_string()),
+                    roles: vec![ApfsVolumeRole::Data],
+                    capacity_in_use_bytes: Some(600),
+                    container_total_bytes: Some(1_000),
+                    container_available_bytes: Some(250),
+                },
+            ],
+        };
+
+        let mount_info = super::statfs_to_mount_info(stats, Some(&inventory), Some(64));
+
+        assert_eq!(mount_info.container_id.as_deref(), Some("/dev/disk3"));
+        assert_eq!(mount_info.total_bytes, Some(1_000));
+        assert_eq!(mount_info.available_bytes, Some(250));
+        assert_eq!(mount_info.purgeable_bytes, Some(50));
+        assert_eq!(mount_info.local_snapshot_bytes, Some(64));
+        assert!(mount_info.is_apfs_data_volume);
+        assert!(!mount_info.is_apfs_system_snapshot);
+        assert!(!mount_info.is_apfs_vm_volume);
+    }
+
+    #[test]
+    fn mount_info_marks_apfs_system_and_vm_roles() {
+        let inventory = ApfsInventory {
+            containers: vec![ApfsContainer {
+                container_id: "/dev/disk3".to_string(),
+                uuid: Some("container-uuid".to_string()),
+                capacity_total_bytes: Some(1_000),
+                capacity_available_bytes: Some(250),
+                physical_stores: vec!["/dev/disk0s2".to_string()],
+            }],
+            volumes: vec![
+                ApfsVolume {
+                    device_id: "/dev/disk3s1".to_string(),
+                    container_id: "/dev/disk3".to_string(),
+                    name: Some("Macintosh HD".to_string()),
+                    roles: vec![ApfsVolumeRole::System],
+                    capacity_in_use_bytes: Some(100),
+                    container_total_bytes: Some(1_000),
+                    container_available_bytes: Some(250),
+                },
+                ApfsVolume {
+                    device_id: "/dev/disk3s6".to_string(),
+                    container_id: "/dev/disk3".to_string(),
+                    name: Some("VM".to_string()),
+                    roles: vec![ApfsVolumeRole::Vm],
+                    capacity_in_use_bytes: Some(50),
+                    container_total_bytes: Some(1_000),
+                    container_available_bytes: Some(250),
+                },
+            ],
+        };
+
+        let system = super::statfs_to_mount_info(
+            StatfsSnapshot {
+                mount_point: PathBuf::from("/Volumes/TestSystem"),
+                device: "/dev/disk3s1".to_string(),
+                fs_type: "apfs".to_string(),
+                block_size: 1,
+                blocks: 400,
+                blocks_free: 120,
+                blocks_available: 100,
+                is_readonly: true,
+            },
+            Some(&inventory),
+            None,
+        );
+        let vm = super::statfs_to_mount_info(
+            StatfsSnapshot {
+                mount_point: PathBuf::from("/Volumes/TestVM"),
+                device: "/dev/disk3s6".to_string(),
+                fs_type: "apfs".to_string(),
+                block_size: 1,
+                blocks: 400,
+                blocks_free: 120,
+                blocks_available: 100,
+                is_readonly: false,
+            },
+            Some(&inventory),
+            None,
+        );
+
+        assert!(system.is_apfs_system_snapshot);
+        assert!(!system.is_apfs_data_volume);
+        assert!(!system.is_apfs_vm_volume);
+        assert!(vm.is_apfs_vm_volume);
+        assert!(!vm.is_apfs_system_snapshot);
+        assert!(!vm.is_apfs_data_volume);
+    }
+
+    #[test]
+    fn macos_pal_mounts_reports_live_apfs_annotations_when_available() {
+        let Ok(inventory) = crate::platform::macos::sys::apfs_inventory() else {
+            return;
+        };
+        if inventory.volumes.is_empty() {
+            return;
+        }
+
+        let platform = MacOsPal::new();
+        let mounts = platform
+            .mounts()
+            .expect("macOS mount inventory should be readable");
+        let apfs_mounts: Vec<_> = mounts
+            .iter()
+            .filter(|mount| mount.fs_type.eq_ignore_ascii_case("apfs"))
+            .collect();
+        if apfs_mounts.is_empty() {
+            return;
+        }
+
+        assert!(apfs_mounts.iter().any(|mount| mount.container_id.is_some()));
+        assert!(apfs_mounts.iter().any(|mount| {
+            mount.is_apfs_data_volume || mount.is_apfs_system_snapshot || mount.is_apfs_vm_volume
+        }));
     }
 
     #[test]

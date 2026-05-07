@@ -3,6 +3,7 @@
 #![cfg(target_os = "macos")]
 #![allow(missing_docs)]
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -41,6 +42,12 @@ pub struct StatfsSnapshot {
     pub blocks_free: u64,
     pub blocks_available: u64,
     pub is_readonly: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountCommandEntry {
+    device: String,
+    mount_point: PathBuf,
 }
 
 impl StatfsSnapshot {
@@ -246,12 +253,12 @@ pub fn statfs(path: &Path) -> io::Result<StatfsSnapshot> {
 
 pub fn mounted_filesystems() -> io::Result<Vec<StatfsSnapshot>> {
     let mut filesystems = Vec::new();
-    for mount in whichdisk::list().map_err(io::Error::other)? {
-        match statfs_for_mount(mount.mount_point(), mount.device()) {
+    for mount in mount_command_entries()? {
+        match statfs_for_mount(&mount.mount_point, OsStr::new(&mount.device)) {
             Ok(snapshot) => filesystems.push(snapshot),
             Err(error) => eprintln!(
                 "[sbh] warning: skipping macOS mount {}: {error}",
-                mount.mount_point().display()
+                mount.mount_point.display()
             ),
         }
     }
@@ -264,6 +271,66 @@ pub fn mounted_filesystems() -> io::Result<Vec<StatfsSnapshot>> {
             .then_with(|| left.mount_point.cmp(&right.mount_point))
     });
     Ok(filesystems)
+}
+
+fn mount_command_entries() -> io::Result<Vec<MountCommandEntry>> {
+    let output = Command::new("/sbin/mount").output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let entries = parse_mount_command_output(&String::from_utf8_lossy(&output.stdout));
+            if entries.is_empty() {
+                whichdisk_mount_entries()
+            } else {
+                Ok(entries)
+            }
+        }
+        Ok(output) => {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            eprintln!(
+                "[sbh] warning: /sbin/mount failed with status {}: {}; falling back to whichdisk",
+                output.status,
+                detail.trim()
+            );
+            whichdisk_mount_entries()
+        }
+        Err(error) => {
+            eprintln!("[sbh] warning: /sbin/mount unavailable: {error}; falling back to whichdisk");
+            whichdisk_mount_entries()
+        }
+    }
+}
+
+fn whichdisk_mount_entries() -> io::Result<Vec<MountCommandEntry>> {
+    whichdisk::list().map_err(io::Error::other).map(|mounts| {
+        mounts
+            .into_iter()
+            .map(|mount| MountCommandEntry {
+                device: os_str_to_string(mount.device()),
+                mount_point: mount.mount_point().to_path_buf(),
+            })
+            .collect()
+    })
+}
+
+fn parse_mount_command_output(raw: &str) -> Vec<MountCommandEntry> {
+    let mut by_mount_point = BTreeMap::new();
+    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Some((device, rest)) = line.split_once(" on ") else {
+            continue;
+        };
+        let Some((mount_point, _options)) = rest.rsplit_once(" (") else {
+            continue;
+        };
+        by_mount_point.insert(PathBuf::from(mount_point), device.to_string());
+    }
+
+    by_mount_point
+        .into_iter()
+        .map(|(mount_point, device)| MountCommandEntry {
+            device,
+            mount_point,
+        })
+        .collect()
 }
 
 pub fn apfs_inventory() -> io::Result<ApfsInventory> {
@@ -1028,6 +1095,39 @@ mod tests {
                 .iter()
                 .any(|mount| mount.mount_point == Path::new("/"))
         );
+    }
+
+    #[test]
+    fn mounted_filesystems_include_data_volume_when_present() {
+        let data_volume = Path::new("/System/Volumes/Data");
+        if !data_volume.exists() {
+            return;
+        }
+
+        let mounts = mounted_filesystems().expect("mounted filesystems should be discoverable");
+        assert!(mounts.iter().any(|mount| mount.mount_point == data_volume));
+    }
+
+    #[test]
+    fn parses_mount_command_output_with_nobrowse_apfs_and_automount_override() {
+        let raw = "\
+/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)
+/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled, nobrowse, protect, root data)
+map -static on /Volumes/trj-data (autofs, automounted, nobrowse)
+10.10.10.1:/data on /Volumes/trj-data (nfs, nodev, nosuid, automounted, nobrowse)
+";
+
+        let entries = super::parse_mount_command_output(raw);
+
+        assert!(entries.iter().any(|entry| {
+            entry.device == "/dev/disk3s5" && entry.mount_point == Path::new("/System/Volumes/Data")
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.device == "10.10.10.1:/data"
+                && entry.mount_point == Path::new("/Volumes/trj-data")
+        }));
+        assert!(!entries.iter().any(|entry| entry.device == "map -static"
+            && entry.mount_point == Path::new("/Volumes/trj-data")));
     }
 
     #[test]
