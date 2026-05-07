@@ -364,6 +364,11 @@ impl ScoringEngine {
         if is_system_path(&input.path) {
             return Some(Cow::Borrowed("system path is never deletable"));
         }
+        if input.signals.has_cargo_toml && !input.signals.has_strong_signal() {
+            return Some(Cow::Borrowed(
+                "contains Cargo.toml without build-artifact markers",
+            ));
+        }
         if input.age < self.min_file_age {
             return Some(Cow::Owned(format!(
                 "age {}s below minimum {}s",
@@ -1066,6 +1071,40 @@ mod tests {
             score.decision.action,
             DecisionAction::Keep,
             "high-confidence target should not be kept"
+        );
+    }
+
+    #[test]
+    fn cargo_toml_target_suffix_source_root_is_hard_vetoed() {
+        let engine = default_engine();
+        let score = engine.score_candidate(
+            &CandidateInput {
+                path: PathBuf::from("/data/projects/asupersync_ansi_c/tools/rust_fuzz_target"),
+                size_bytes: 5 * 1_073_741_824,
+                age: Duration::from_hours(336),
+                classification: ArtifactClassification {
+                    pattern_name: Cow::Borrowed("underscore-target-suffix"),
+                    category: ArtifactCategory::RustTarget,
+                    name_confidence: 0.92,
+                    structural_confidence: 0.05,
+                    combined_confidence: 0.0659,
+                },
+                signals: StructuralSignals {
+                    has_cargo_toml: true,
+                    ..StructuralSignals::default()
+                },
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            0.95,
+        );
+
+        assert!(score.vetoed);
+        assert_eq!(score.decision.action, DecisionAction::Keep);
+        assert_eq!(
+            score.veto_reason.as_deref(),
+            Some("contains Cargo.toml without build-artifact markers")
         );
     }
 

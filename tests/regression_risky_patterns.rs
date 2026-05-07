@@ -97,4 +97,43 @@ mod tests {
             "SAFE: Source module 'cache' kept."
         );
     }
+
+    #[test]
+    fn fixed_underscore_target_source_crate_is_hard_kept() {
+        let registry = ArtifactPatternRegistry::default();
+        let engine = default_engine();
+
+        let path = PathBuf::from("/data/projects/asupersync_ansi_c/tools/rust_fuzz_target");
+        let signals = StructuralSignals {
+            has_cargo_toml: true,
+            ..StructuralSignals::default()
+        };
+        let classification = registry.classify(&path, signals);
+
+        assert_eq!(classification.pattern_name, "underscore-target-suffix");
+        assert!(
+            classification.combined_confidence < 0.1,
+            "Cargo.toml source root should not retain high *_target confidence: {}",
+            classification.combined_confidence
+        );
+
+        let input = CandidateInput {
+            path,
+            size_bytes: 5 * 1_073_741_824,
+            age: Duration::from_hours(336),
+            classification,
+            signals,
+            active_references: ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        };
+
+        let score = engine.score_candidate(&input, 0.95);
+
+        assert_eq!(score.decision.action, DecisionAction::Keep);
+        assert_eq!(
+            score.veto_reason.as_deref(),
+            Some("contains Cargo.toml without build-artifact markers")
+        );
+    }
 }

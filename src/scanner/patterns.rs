@@ -764,6 +764,26 @@ mod tests {
     }
 
     #[test]
+    fn underscore_target_source_root_is_penalized_by_cargo_toml() {
+        let registry = ArtifactPatternRegistry::default();
+        let classification = registry.classify(
+            Path::new("/data/projects/asupersync_ansi_c/tools/rust_fuzz_target"),
+            StructuralSignals {
+                has_cargo_toml: true,
+                ..StructuralSignals::default()
+            },
+        );
+
+        assert_eq!(classification.pattern_name, "underscore-target-suffix");
+        assert_eq!(classification.category, ArtifactCategory::RustTarget);
+        assert!(
+            classification.combined_confidence < 0.1,
+            "Cargo.toml source root should crush *_target confidence, got {}",
+            classification.combined_confidence
+        );
+    }
+
+    #[test]
     fn structural_rescue_with_few_markers_gets_base_confidence() {
         let registry = ArtifactPatternRegistry::default();
         // Only fingerprint present (1 marker) — should get base rescue confidence.
