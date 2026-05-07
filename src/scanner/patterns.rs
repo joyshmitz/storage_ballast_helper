@@ -147,12 +147,34 @@ impl ArtifactPatternRegistry {
         signals: StructuralSignals,
         cleanup_rules: &'static [CleanupRule],
     ) -> ArtifactClassification {
+        self.classify_with_cleanup_rules_inner(path, signals, cleanup_rules, None)
+    }
+
+    /// Classify one path against an explicit cleanup catalog and synthetic home root.
+    #[must_use]
+    pub fn classify_with_cleanup_rules_and_home(
+        &self,
+        path: &Path,
+        signals: StructuralSignals,
+        cleanup_rules: &'static [CleanupRule],
+        home: &Path,
+    ) -> ArtifactClassification {
+        self.classify_with_cleanup_rules_inner(path, signals, cleanup_rules, Some(home))
+    }
+
+    fn classify_with_cleanup_rules_inner(
+        &self,
+        path: &Path,
+        signals: StructuralSignals,
+        cleanup_rules: &'static [CleanupRule],
+        home: Option<&Path>,
+    ) -> ArtifactClassification {
         let Some(name_os) = path.file_name() else {
             return ArtifactClassification::unknown();
         };
         let normalized = name_os.to_string_lossy().to_lowercase();
 
-        let catalog_classification = cleanup_catalog_path_classification(path, cleanup_rules);
+        let catalog_classification = cleanup_catalog_path_classification(path, cleanup_rules, home);
         let mut best = catalog_classification
             .clone()
             .unwrap_or_else(ArtifactClassification::unknown);
@@ -258,8 +280,12 @@ fn matches_builtin(kind: MatchKind, normalized: &str) -> bool {
 fn cleanup_catalog_path_classification(
     path: &Path,
     cleanup_rules: &'static [CleanupRule],
+    home: Option<&Path>,
 ) -> Option<ArtifactClassification> {
-    let rule = cleanup_catalog::match_path_scanner_rule(path, cleanup_rules)?;
+    let rule = home.map_or_else(
+        || cleanup_catalog::match_path_scanner_rule(path, cleanup_rules),
+        |home| cleanup_catalog::match_path_scanner_rule_with_home(path, cleanup_rules, home),
+    )?;
     let confidence = cleanup_rule_name_confidence(rule);
     Some(ArtifactClassification {
         pattern_name: Cow::Borrowed(rule.scanner_label()),
@@ -693,8 +719,29 @@ pub fn extract_pattern_label_with_cleanup_rules(
     path: &str,
     cleanup_rules: &'static [CleanupRule],
 ) -> String {
+    extract_pattern_label_with_cleanup_context(path, cleanup_rules, None)
+}
+
+#[must_use]
+pub fn extract_pattern_label_with_cleanup_rules_and_home(
+    path: &str,
+    cleanup_rules: &'static [CleanupRule],
+    home: &Path,
+) -> String {
+    extract_pattern_label_with_cleanup_context(path, cleanup_rules, Some(home))
+}
+
+fn extract_pattern_label_with_cleanup_context(
+    path: &str,
+    cleanup_rules: &'static [CleanupRule],
+    home: Option<&Path>,
+) -> String {
     let p = Path::new(path);
-    if let Some(rule) = cleanup_catalog::match_path_scanner_rule(p, cleanup_rules) {
+    let cleanup_rule = home.map_or_else(
+        || cleanup_catalog::match_path_scanner_rule(p, cleanup_rules),
+        |home| cleanup_catalog::match_path_scanner_rule_with_home(p, cleanup_rules, home),
+    );
+    if let Some(rule) = cleanup_rule {
         return rule.scanner_label().to_string();
     }
 

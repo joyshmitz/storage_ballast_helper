@@ -122,6 +122,17 @@ pub fn match_rule(path: &Path, rules: &'static [CleanupRule]) -> Option<&'static
 }
 
 #[must_use]
+pub fn match_rule_with_home(
+    path: &Path,
+    rules: &'static [CleanupRule],
+    home: &Path,
+) -> Option<&'static CleanupRule> {
+    rules
+        .iter()
+        .find(|rule| path_matches_glob_with_home(path, rule.path_glob, home))
+}
+
+#[must_use]
 pub fn match_path_scanner_rule(
     path: &Path,
     rules: &'static [CleanupRule],
@@ -132,15 +143,36 @@ pub fn match_path_scanner_rule(
 }
 
 #[must_use]
+pub fn match_path_scanner_rule_with_home(
+    path: &Path,
+    rules: &'static [CleanupRule],
+    home: &Path,
+) -> Option<&'static CleanupRule> {
+    rules.iter().find(|rule| {
+        rule.is_path_scanner_candidate() && path_matches_glob_with_home(path, rule.path_glob, home)
+    })
+}
+
+#[must_use]
 pub fn path_matches_glob(path: &Path, path_glob: &str) -> bool {
+    path_matches_glob_inner(path, path_glob, None)
+}
+
+#[must_use]
+pub fn path_matches_glob_with_home(path: &Path, path_glob: &str, home: &Path) -> bool {
+    path_matches_glob_inner(path, path_glob, Some(home))
+}
+
+fn path_matches_glob_inner(path: &Path, path_glob: &str, home: Option<&Path>) -> bool {
     let path_text = normalize_path_text(path);
     let path_candidates = path_aliases(&path_text);
+    let explicit_home = home.map(normalize_path_text);
 
     if let Some(home_glob) = path_glob.strip_prefix("~/") {
         let glob = normalize_glob_text(home_glob);
         return path_candidates
             .iter()
-            .filter_map(|candidate| home_relative_path(candidate))
+            .filter_map(|candidate| home_relative_path(candidate, explicit_home.as_deref()))
             .any(|relative| glob_match(&glob, relative));
     }
 
@@ -177,16 +209,19 @@ fn path_aliases(path_text: &str) -> Vec<String> {
     aliases
 }
 
-fn home_relative_path(path_text: &str) -> Option<&str> {
+fn home_relative_path<'a>(path_text: &'a str, explicit_home: Option<&str>) -> Option<&'a str> {
+    if let Some(home) = explicit_home
+        && let Some(relative) = strip_home_prefix(path_text, home)
+    {
+        return Some(relative);
+    }
+
     if let Some(home) = std::env::var_os("HOME") {
         let home = home
             .to_string_lossy()
             .replace('\\', "/")
             .to_ascii_lowercase();
-        if path_text == home {
-            return Some("");
-        }
-        if let Some(relative) = path_text.strip_prefix(&format!("{home}/")) {
+        if let Some(relative) = strip_home_prefix(path_text, &home) {
             return Some(relative);
         }
     }
@@ -195,6 +230,13 @@ fn home_relative_path(path_text: &str) -> Option<&str> {
         .strip_prefix("/users/")
         .or_else(|| path_text.strip_prefix("/home/"))?;
     relative.split_once('/').map(|(_, rest)| rest)
+}
+
+fn strip_home_prefix<'a>(path_text: &'a str, home: &str) -> Option<&'a str> {
+    if path_text == home {
+        return Some("");
+    }
+    path_text.strip_prefix(&format!("{home}/"))
 }
 
 fn glob_match(pattern: &str, text: &str) -> bool {
@@ -284,7 +326,7 @@ const fn str_starts_with(text: &str, prefix: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CleanupRule, ReclaimCommand, path_matches_glob};
+    use super::{CleanupRule, ReclaimCommand, path_matches_glob, path_matches_glob_with_home};
     use std::path::Path;
 
     #[test]
@@ -336,6 +378,20 @@ mod tests {
         assert!(!path_matches_glob(
             Path::new("/Users/operator/projects/tool_buildroot"),
             "~/release-work/*[-_]buildroot",
+        ));
+    }
+
+    #[test]
+    fn explicit_home_globs_match_temp_home_fixtures() {
+        let home = Path::new("/tmp/sbh-fixture/Users/operator");
+        assert!(path_matches_glob_with_home(
+            Path::new("/tmp/sbh-fixture/Users/operator/Library/Logs/sbh.log"),
+            "~/Library/Logs/*",
+            home,
+        ));
+        assert!(!path_matches_glob(
+            Path::new("/tmp/sbh-fixture/Users/operator/Library/Logs/sbh.log"),
+            "~/Library/Logs/*",
         ));
     }
 

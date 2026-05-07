@@ -2,20 +2,25 @@
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use storage_ballast_helper::core::config::ScoringConfig;
+    use storage_ballast_helper::platform::cleanup_catalog::{
+        self, CleanupConfidence, CleanupRule, ReclaimCommand,
+    };
     use storage_ballast_helper::platform::macos;
     use storage_ballast_helper::platform::sacred_catalog::cross_platform_sacred_paths;
     use storage_ballast_helper::scanner::patterns::{
         ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, StructuralSignals,
+        extract_pattern_label_with_cleanup_rules_and_home,
     };
     use storage_ballast_helper::scanner::protection::find_sacred_overlaps;
     use storage_ballast_helper::scanner::scoring::{
         ActiveReferenceSummary, CandidateInput, DecisionAction, ScoringEngine,
     };
-    use tempfile::Builder as TempDirBuilder;
+    use tempfile::{Builder as TempDirBuilder, TempDir};
 
     fn default_engine() -> ScoringEngine {
         ScoringEngine::from_config(&ScoringConfig::default(), 4) // 4 hours min age
@@ -27,6 +32,283 @@ mod tests {
         signals: StructuralSignals,
     ) -> ArtifactClassification {
         registry.classify_with_cleanup_rules(path, signals, macos::cleanup_catalog::cleanup_rules())
+    }
+
+    fn classify_macos_with_home(
+        registry: &ArtifactPatternRegistry,
+        path: &Path,
+        signals: StructuralSignals,
+        home: &Path,
+    ) -> ArtifactClassification {
+        registry.classify_with_cleanup_rules_and_home(
+            path,
+            signals,
+            macos::cleanup_catalog::cleanup_rules(),
+            home,
+        )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn mac_cleanup_catalog_fixture_scans_every_pattern_with_expected_confidence() {
+        let fake_root = TempDirBuilder::new()
+            .prefix("sbh-mac-cleanup-catalog-")
+            .tempdir()
+            .expect("create synthetic mac cleanup root");
+        let fake_home = fake_root.path().join("Users").join("operator");
+        let registry = ArtifactPatternRegistry::default();
+        let rules = macos::cleanup_catalog::cleanup_rules();
+        let mut temp_dirs = Vec::new();
+        let mut matched_rule_names = BTreeSet::new();
+        let mut scanned_labels = BTreeSet::new();
+        let mut expected_scanned_labels = BTreeSet::new();
+
+        for rule in rules {
+            let (path, temp_dir, materialized) = mac_cleanup_fixture_path(rule, &fake_home);
+            if materialized {
+                materialize_cleanup_fixture(rule, &path);
+                assert!(
+                    path.exists(),
+                    "fixture path should exist for {}: {}",
+                    rule.name,
+                    path.display()
+                );
+            }
+            if let Some(temp_dir) = temp_dir {
+                temp_dirs.push(temp_dir);
+            }
+
+            let matched = cleanup_catalog::match_rule_with_home(&path, rules, &fake_home)
+                .unwrap_or_else(|| panic!("{} did not match {}", path.display(), rule.path_glob));
+            assert_eq!(
+                matched.name,
+                rule.name,
+                "fixture path matched the wrong mac cleanup rule: {}",
+                path.display()
+            );
+            assert_eq!(matched.confidence, rule.confidence);
+            matched_rule_names.insert(matched.name);
+
+            if rule.is_path_scanner_candidate() {
+                let scanner_match =
+                    cleanup_catalog::match_path_scanner_rule_with_home(&path, rules, &fake_home)
+                        .expect("path scanner should find candidate");
+                assert_eq!(scanner_match.name, rule.name);
+
+                let signals = structural_signals_for_cleanup_rule(rule);
+                let classification =
+                    classify_macos_with_home(&registry, &path, signals, &fake_home);
+                assert_eq!(classification.pattern_name.as_ref(), rule.scanner_label());
+                assert_eq!(
+                    classification.category,
+                    expected_category_for_cleanup_rule(rule)
+                );
+                assert_confidence(rule, classification.name_confidence);
+
+                let label = extract_pattern_label_with_cleanup_rules_and_home(
+                    &path.to_string_lossy(),
+                    rules,
+                    &fake_home,
+                );
+                assert_eq!(label, rule.scanner_label());
+                scanned_labels.insert(label);
+                expected_scanned_labels.insert(rule.scanner_label().to_string());
+            } else {
+                assert!(
+                    cleanup_catalog::match_path_scanner_rule_with_home(&path, rules, &fake_home)
+                        .is_none(),
+                    "{} should not be emitted as a path-scanner candidate",
+                    rule.name
+                );
+            }
+        }
+
+        assert_eq!(matched_rule_names.len(), rules.len());
+        assert_eq!(scanned_labels, expected_scanned_labels);
+        assert!(
+            !temp_dirs.is_empty(),
+            "temporary /tmp fixtures should stay alive for the whole test"
+        );
+    }
+
+    fn mac_cleanup_fixture_path(
+        rule: &CleanupRule,
+        fake_home: &Path,
+    ) -> (PathBuf, Option<TempDir>, bool) {
+        match rule.name {
+            "xcode-derived-data" => (
+                fake_home.join("Library/Developer/Xcode/DerivedData/sbh-demo-abc123"),
+                None,
+                true,
+            ),
+            "core-simulator-caches" => (
+                fake_home.join("Library/Developer/CoreSimulator/Caches/device-cache"),
+                None,
+                true,
+            ),
+            "electron-cache" => electron_fixture(fake_home, "Cache", "data_0"),
+            "electron-cache-root" => electron_root_fixture(fake_home, "Cache"),
+            "electron-service-worker-cache" => {
+                electron_fixture(fake_home, "Service Worker/CacheStorage", "session-1")
+            }
+            "electron-service-worker-cache-root" => {
+                electron_root_fixture(fake_home, "Service Worker/CacheStorage")
+            }
+            "electron-code-cache" => electron_fixture(fake_home, "Code Cache", "js-blob"),
+            "electron-code-cache-root" => electron_root_fixture(fake_home, "Code Cache"),
+            "electron-gpu-cache" => electron_fixture(fake_home, "GPUCache", "shader-blob"),
+            "electron-gpu-cache-root" => electron_root_fixture(fake_home, "GPUCache"),
+            "electron-indexed-db" => electron_fixture(fake_home, "IndexedDB", "origin.leveldb"),
+            "electron-indexed-db-root" => electron_root_fixture(fake_home, "IndexedDB"),
+            "electron-vm-bundles" => electron_fixture(fake_home, "vm_bundles", "bundle-1"),
+            "electron-vm-bundles-root" => electron_root_fixture(fake_home, "vm_bundles"),
+            "tmp-dash-target" => tmp_dir_fixture("sbh-mac-", "-target"),
+            "tmp-underscore-target" => tmp_dir_fixture("sbh-mac-", "_target"),
+            "tmp-target-underscore-prefix" => tmp_dir_fixture("target_sbh_mac_", ""),
+            "user-named-trash-exact" => (PathBuf::from("/tmp/trash"), None, false),
+            "user-named-trashed-exact" => (PathBuf::from("/tmp/trashed"), None, false),
+            "user-named-trash" => tmp_dir_fixture("sbh-mac-trash-", ""),
+            "release-work-buildroot" => (
+                fake_home.join("release-work/mcp_agent_mail_rust_buildroot"),
+                None,
+                true,
+            ),
+            "user-logs" => (fake_home.join("Library/Logs/sbh.log"), None, true),
+            "ipsw-software-updates" => (
+                fake_home.join("Library/iTunes/iPhone Software Updates/iPhone_17.ipsw"),
+                None,
+                true,
+            ),
+            "home-trash-report" => (fake_home.join(".Trash/old-session"), None, true),
+            "icloud-trash-report" => (
+                fake_home.join("Library/Mobile Documents/com~apple~CloudDocs/.Trash/old-session"),
+                None,
+                true,
+            ),
+            "time-machine-local-snapshots" => (PathBuf::from("/"), None, false),
+            "spotlight-index-report" => (PathBuf::from("/.Spotlight-V100"), None, false),
+            "photos-library-sacred" => (
+                fake_home.join("Pictures/Photos Library.photoslibrary"),
+                None,
+                true,
+            ),
+            "mail-library-sacred" => (fake_home.join("Library/Mail/V10"), None, true),
+            "messages-library-sacred" => (fake_home.join("Library/Messages/chat.db"), None, true),
+            "final-cut-library-sacred" => (fake_home.join("Movies/Cut.fcpbundle"), None, true),
+            name => panic!("missing mac cleanup fixture for {name}"),
+        }
+    }
+
+    fn electron_fixture(
+        fake_home: &Path,
+        cache_dir: &str,
+        child: &str,
+    ) -> (PathBuf, Option<TempDir>, bool) {
+        (
+            fake_home
+                .join("Library/Application Support/Claude")
+                .join(cache_dir)
+                .join(child),
+            None,
+            true,
+        )
+    }
+
+    fn electron_root_fixture(
+        fake_home: &Path,
+        cache_dir: &str,
+    ) -> (PathBuf, Option<TempDir>, bool) {
+        (
+            fake_home
+                .join("Library/Application Support/Claude")
+                .join(cache_dir),
+            None,
+            true,
+        )
+    }
+
+    fn tmp_dir_fixture(prefix: &str, suffix: &str) -> (PathBuf, Option<TempDir>, bool) {
+        let temp_dir = TempDirBuilder::new()
+            .prefix(prefix)
+            .suffix(suffix)
+            .tempdir_in("/tmp")
+            .unwrap_or_else(|err| panic!("create /tmp mac cleanup fixture: {err}"));
+        (temp_dir.path().to_path_buf(), Some(temp_dir), true)
+    }
+
+    fn materialize_cleanup_fixture(rule: &CleanupRule, path: &Path) {
+        match rule.reclaim_command {
+            ReclaimCommand::RemoveMatchingFiles => create_file_fixture(path),
+            ReclaimCommand::ReportOnly
+                if rule.name == "home-trash-report" || rule.name == "icloud-trash-report" =>
+            {
+                create_file_fixture(path);
+            }
+            _ => create_dir_fixture(path),
+        }
+    }
+
+    fn create_dir_fixture(path: &Path) {
+        fs::create_dir_all(path).expect("create cleanup fixture directory");
+        fs::write(path.join(".sbh-fixture"), b"synthetic cleanup fixture")
+            .expect("write cleanup fixture marker");
+    }
+
+    fn create_file_fixture(path: &Path) {
+        let parent = path.parent().expect("fixture file should have parent");
+        fs::create_dir_all(parent).expect("create cleanup fixture parent");
+        fs::write(path, b"synthetic cleanup fixture").expect("write cleanup fixture file");
+    }
+
+    fn structural_signals_for_cleanup_rule(rule: &CleanupRule) -> StructuralSignals {
+        if rule.name.contains("target") {
+            StructuralSignals {
+                has_incremental: true,
+                has_deps: true,
+                has_fingerprint: true,
+                ..StructuralSignals::default()
+            }
+        } else if rule.name.contains("derived-data") || rule.name.contains("buildroot") {
+            StructuralSignals {
+                has_build: true,
+                mostly_object_files: true,
+                ..StructuralSignals::default()
+            }
+        } else {
+            StructuralSignals::default()
+        }
+    }
+
+    fn expected_category_for_cleanup_rule(rule: &CleanupRule) -> ArtifactCategory {
+        if rule.name.contains("target") {
+            ArtifactCategory::RustTarget
+        } else if rule.name.starts_with("electron")
+            || rule.name.contains("cache")
+            || rule.name.contains("logs")
+            || rule.name.contains("ipsw")
+        {
+            ArtifactCategory::CacheDir
+        } else if rule.name.contains("derived-data") || rule.name.contains("buildroot") {
+            ArtifactCategory::BuildOutput
+        } else if rule.reclaim_command == ReclaimCommand::PromptBeforeRemove {
+            ArtifactCategory::TempDir
+        } else {
+            ArtifactCategory::Unknown
+        }
+    }
+
+    fn assert_confidence(rule: &CleanupRule, actual: f64) {
+        let expected = match rule.confidence {
+            CleanupConfidence::Definite => 0.96,
+            CleanupConfidence::Likely => 0.92,
+            CleanupConfidence::Unclear => 0.56,
+            CleanupConfidence::ReportOnly | CleanupConfidence::Sacred => 0.0,
+        };
+        assert!(
+            (actual - expected).abs() < f64::EPSILON,
+            "{} confidence should be {expected}, got {actual}",
+            rule.name
+        );
     }
 
     #[test]
