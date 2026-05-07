@@ -140,6 +140,68 @@ mod tests {
     }
 
     #[test]
+    fn generic_target_suffix_source_dir_without_markers_is_hard_kept() {
+        let registry = ArtifactPatternRegistry::default();
+        let engine = default_engine();
+
+        let path = PathBuf::from("/data/projects/asupersync_ansi_c/tools/rust_fuzz_target");
+        let signals = StructuralSignals::default();
+        let classification = registry.classify(&path, signals);
+
+        assert_eq!(classification.pattern_name, "underscore-target-suffix");
+
+        let score = engine.score_candidate(
+            &CandidateInput {
+                path,
+                size_bytes: 5 * 1_073_741_824,
+                age: Duration::from_hours(336),
+                classification,
+                signals,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            0.95,
+        );
+
+        assert_eq!(score.decision.action, DecisionAction::Keep);
+        assert_eq!(
+            score.veto_reason.as_deref(),
+            Some("target-like name lacks Cargo build markers outside temporary storage")
+        );
+    }
+
+    #[test]
+    fn private_tmp_target_underscore_prefix_is_actionable_when_old_and_unreferenced() {
+        let registry = ArtifactPatternRegistry::default();
+        let engine = default_engine();
+
+        let path = PathBuf::from("/private/tmp/target_rust_fuzz_42");
+        let signals = StructuralSignals::default();
+        let classification = registry.classify(&path, signals);
+
+        assert_eq!(classification.pattern_name, "target-underscore-prefix");
+        assert_eq!(classification.category, ArtifactCategory::RustTarget);
+
+        let score = engine.score_candidate(
+            &CandidateInput {
+                path,
+                size_bytes: 5 * 1_073_741_824,
+                age: Duration::from_hours(48),
+                classification,
+                signals,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            0.95,
+        );
+
+        assert!(!score.vetoed);
+        assert_eq!(score.decision.action, DecisionAction::Delete);
+    }
+
+    #[test]
     fn xcode_derived_data_project_dir_is_actionable_build_output() {
         let registry = ArtifactPatternRegistry::default();
         let engine = default_engine();

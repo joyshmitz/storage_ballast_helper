@@ -374,6 +374,12 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
             category: ArtifactCategory::RustTarget,
         },
         ArtifactPattern {
+            name: "target-underscore-prefix",
+            kind: MatchKind::Prefix("target_"),
+            confidence: 0.82,
+            category: ArtifactCategory::RustTarget,
+        },
+        ArtifactPattern {
             name: "target-suffix",
             kind: MatchKind::Suffix("-target"),
             confidence: 0.88,
@@ -739,6 +745,9 @@ pub fn extract_pattern_label(path: &str) -> String {
     if lower.starts_with("target_codex") {
         return "target_codex*".to_string();
     }
+    if lower.starts_with("target_") {
+        return "target_*".to_string();
+    }
     if lower.starts_with("frankenterm-") {
         return "frankenterm-*".to_string();
     }
@@ -809,6 +818,22 @@ mod tests {
         let classification = registry.classify(Path::new("target"), StructuralSignals::default());
         assert_eq!(classification.category, ArtifactCategory::RustTarget);
         assert!(classification.combined_confidence < 0.80);
+    }
+
+    #[test]
+    fn target_underscore_prefix_classifies_as_rust_target() {
+        let registry = ArtifactPatternRegistry::default();
+        let classification = registry.classify(
+            Path::new("target_rust_fuzz_42"),
+            StructuralSignals::default(),
+        );
+
+        assert_eq!(classification.pattern_name, "target-underscore-prefix");
+        assert_eq!(classification.category, ArtifactCategory::RustTarget);
+        assert_eq!(
+            extract_pattern_label("/private/tmp/target_rust_fuzz_42"),
+            "target_*"
+        );
     }
 
     #[test]

@@ -165,6 +165,15 @@ pub const TMP_UNDERSCORE_TARGET: CleanupRule = cleanup_rule(
     CleanupConfidence::Likely,
 );
 
+pub const TMP_TARGET_UNDERSCORE_PREFIX: CleanupRule = cleanup_rule(
+    "tmp-target-underscore-prefix",
+    "/private/tmp/target_*",
+    AgeThreshold::from_hours(24),
+    CheckRequirement::Required,
+    ReclaimCommand::RemoveTree,
+    CleanupConfidence::Likely,
+);
+
 pub const USER_NAMED_TRASH: CleanupRule = cleanup_rule(
     "user-named-trash",
     "/private/tmp/*-trash-*",
@@ -261,6 +270,7 @@ pub const MAC_CLEANUP_RULES: &[CleanupRule] = &[
     ELECTRON_VM_BUNDLES,
     TMP_DASH_TARGET,
     TMP_UNDERSCORE_TARGET,
+    TMP_TARGET_UNDERSCORE_PREFIX,
     USER_NAMED_TRASH,
     RELEASE_WORK_BUILDROOT,
     USER_LOGS,
@@ -330,8 +340,9 @@ mod tests {
         HOME_TRASH_REPORT, ICLOUD_TRASH_REPORT, IPSW_SOFTWARE_UPDATES, MAC_CLEANUP_RULES,
         MAIL_LIBRARY_SACRED, MESSAGES_LIBRARY_SACRED, PHOTOS_LIBRARY_SACRED,
         RELEASE_WORK_BUILDROOT, ReclaimCommand, SPOTLIGHT_INDEX_REPORT,
-        TIME_MACHINE_LOCAL_SNAPSHOTS, TMP_DASH_TARGET, TMP_UNDERSCORE_TARGET, USER_LOGS,
-        USER_NAMED_TRASH, XCODE_DERIVED_DATA, cleanup_rules, find_rule,
+        TIME_MACHINE_LOCAL_SNAPSHOTS, TMP_DASH_TARGET, TMP_TARGET_UNDERSCORE_PREFIX,
+        TMP_UNDERSCORE_TARGET, USER_LOGS, USER_NAMED_TRASH, XCODE_DERIVED_DATA, cleanup_rules,
+        find_rule,
     };
 
     #[test]
@@ -480,7 +491,14 @@ mod tests {
 
     #[test]
     fn temporary_cargo_target_rules_require_fd_checks() {
-        for rule in [TMP_DASH_TARGET, TMP_UNDERSCORE_TARGET] {
+        let rules = [
+            (TMP_DASH_TARGET, "/private/tmp/*-target"),
+            (TMP_UNDERSCORE_TARGET, "/private/tmp/*_target"),
+            (TMP_TARGET_UNDERSCORE_PREFIX, "/private/tmp/target_*"),
+        ];
+
+        for (rule, path_glob) in rules {
+            assert_eq!(rule.path_glob, path_glob);
             assert_eq!(rule.fd_check, CheckRequirement::Required);
             assert_eq!(rule.confidence, CleanupConfidence::Likely);
             assert_eq!(rule.reclaim_command, ReclaimCommand::RemoveTree);

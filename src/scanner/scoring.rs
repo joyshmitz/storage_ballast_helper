@@ -418,6 +418,11 @@ impl ScoringEngine {
                 "contains Cargo.toml without build-artifact markers",
             ));
         }
+        if is_ambiguous_target_name_without_cargo_markers(input) {
+            return Some(Cow::Borrowed(
+                "target-like name lacks Cargo build markers outside temporary storage",
+            ));
+        }
         if let Some(reason) = sacred_overlap_veto_reason(sacred_overlaps) {
             return Some(reason);
         }
@@ -509,6 +514,7 @@ fn factor_location(path: &Path) -> f64 {
     };
 
     if text.starts_with("/tmp")
+        || text.starts_with("/private/tmp")
         || text.starts_with("/var/tmp")
         || text.starts_with("/data/tmp")
         || text.starts_with("/dev/shm")
@@ -545,6 +551,28 @@ fn is_macos_application_support_cache_path(text: &str) -> bool {
             || contains_ci(text, "/IndexedDB")
             || contains_ci(text, "/vm_bundles")
             || (contains_ci(text, "/Service Worker/") && contains_ci(text, "/CacheStorage")))
+}
+
+fn is_ambiguous_target_name_without_cargo_markers(input: &CandidateInput) -> bool {
+    input.classification.category == ArtifactCategory::RustTarget
+        && is_generic_target_pattern(input.classification.pattern_name.as_ref())
+        && !input.signals.has_strong_signal()
+        && !is_volatile_temp_path(&input.path)
+}
+
+fn is_generic_target_pattern(pattern_name: &str) -> bool {
+    matches!(
+        pattern_name,
+        "target-prefix" | "target-underscore-prefix" | "target-suffix" | "underscore-target-suffix"
+    )
+}
+
+fn is_volatile_temp_path(path: &Path) -> bool {
+    path.starts_with("/tmp")
+        || path.starts_with("/private/tmp")
+        || path.starts_with("/var/tmp")
+        || path.starts_with("/data/tmp")
+        || path.starts_with("/dev/shm")
 }
 
 fn factor_name(path: &Path, classification: &ArtifactClassification) -> f64 {
