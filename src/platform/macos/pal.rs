@@ -32,9 +32,20 @@ use parking_lot::RwLock;
 
 const FDA_CACHE_TTL_SECS: u64 = 60;
 const FDA_CACHE_TTL: Duration = Duration::from_secs(FDA_CACHE_TTL_SECS);
+const OPEN_FILES_CACHE_TTL_SECS: u64 = 30;
+const OPEN_FILES_CACHE_TTL: Duration = Duration::from_secs(OPEN_FILES_CACHE_TTL_SECS);
+const OPEN_FILES_CACHE_MAX_ENTRIES: usize = 64;
 const MEMORY_PRESSURE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 static FDA_STATUS_CACHE: OnceLock<RwLock<Option<(Instant, FullDiskAccessStatus)>>> =
     OnceLock::new();
+static OPEN_FILES_UNDER_CACHE: OnceLock<RwLock<Vec<CachedOpenFilesUnder>>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct CachedOpenFilesUnder {
+    root: PathBuf,
+    collected_at: Instant,
+    open_files: Vec<OpenFile>,
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MacOsPal;
@@ -168,19 +179,7 @@ impl Platform for MacOsPal {
 
     fn open_files_under(&self, path: &Path) -> Result<Vec<OpenFile>> {
         let root = resolve_absolute_path(path);
-        let mut open_files: Vec<OpenFile> = proc_listpids_safe()
-            .map_err(|error| macos_method_error("open_files_under", &error))?
-            .into_iter()
-            .filter(|pid| *pid > 0)
-            .flat_map(|pid| open_files_for_pid_under(pid, &root))
-            .collect();
-        open_files.sort_by(|left, right| {
-            left.pid
-                .cmp(&right.pid)
-                .then_with(|| left.fd.cmp(&right.fd))
-                .then_with(|| left.path.cmp(&right.path))
-        });
-        Ok(open_files)
+        cached_open_files_under(&root)
     }
 
     fn executables_under(&self, path: &Path) -> Result<Vec<ProcessInfo>> {
@@ -249,6 +248,55 @@ impl Platform for MacOsPal {
     fn service_kind(&self) -> ServiceKind {
         ServiceKind::Launchd
     }
+}
+
+fn cached_open_files_under(root: &Path) -> Result<Vec<OpenFile>> {
+    let now = Instant::now();
+    let cache = OPEN_FILES_UNDER_CACHE.get_or_init(|| RwLock::new(Vec::new()));
+    {
+        let cached = cache.read();
+        if let Some(entry) = cached.iter().find(|entry| entry.root == root)
+            && now.duration_since(entry.collected_at) <= OPEN_FILES_CACHE_TTL
+        {
+            return Ok(entry.open_files.clone());
+        }
+    }
+
+    let open_files = collect_open_files_under(root)?;
+    {
+        let mut cache = cache.write();
+        cache.retain(|entry| now.duration_since(entry.collected_at) <= OPEN_FILES_CACHE_TTL);
+        if let Some(entry) = cache.iter_mut().find(|entry| entry.root == root) {
+            entry.collected_at = now;
+            entry.open_files.clone_from(&open_files);
+        } else {
+            if cache.len() >= OPEN_FILES_CACHE_MAX_ENTRIES {
+                cache.remove(0);
+            }
+            cache.push(CachedOpenFilesUnder {
+                root: root.to_path_buf(),
+                collected_at: now,
+                open_files: open_files.clone(),
+            });
+        }
+    }
+    Ok(open_files)
+}
+
+fn collect_open_files_under(root: &Path) -> Result<Vec<OpenFile>> {
+    let mut open_files: Vec<OpenFile> = proc_listpids_safe()
+        .map_err(|error| macos_method_error("open_files_under", &error))?
+        .into_iter()
+        .filter(|pid| *pid > 0)
+        .flat_map(|pid| open_files_for_pid_under(pid, root))
+        .collect();
+    open_files.sort_by(|left, right| {
+        left.pid
+            .cmp(&right.pid)
+            .then_with(|| left.fd.cmp(&right.fd))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(open_files)
 }
 
 fn macos_not_implemented<T>(bead: &'static str, method: &'static str) -> Result<T> {
@@ -1432,6 +1480,42 @@ mod tests {
         assert_eq!(actual.kind, crate::platform::types::OpenFileKind::Regular);
         assert_eq!(actual.mode, crate::platform::types::OpenFileMode::ReadWrite);
         assert!(actual.fd.is_some());
+    }
+
+    #[test]
+    fn open_files_under_reuses_recent_cached_snapshot() {
+        assert_eq!(super::OPEN_FILES_CACHE_TTL, Duration::from_secs(30));
+
+        let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        let file_path = dir.path().join("cached-open-file.txt");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&file_path)
+            .expect("temp file should stay open for first fd scan");
+        let expected = std::fs::canonicalize(&file_path).expect("temp file should canonicalize");
+
+        let platform = MacOsPal::new();
+        let first = platform
+            .open_files_under(dir.path())
+            .expect("first macOS open fd scan should be readable");
+        assert!(first.iter().any(|open_file| {
+            open_file.pid == super::current_process_pid() && open_file.path == expected
+        }));
+
+        drop(file);
+
+        let second = platform
+            .open_files_under(dir.path())
+            .expect("cached macOS open fd scan should be readable");
+        assert!(
+            second.iter().any(|open_file| {
+                open_file.pid == super::current_process_pid() && open_file.path == expected
+            }),
+            "recent open_files_under calls should reuse the cached 30s snapshot"
+        );
     }
 
     #[test]
