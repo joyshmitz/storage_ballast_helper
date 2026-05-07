@@ -226,6 +226,19 @@ sbh daemon
 sbh dashboard
 ```
 
+### Config and State Paths
+
+`sbh` uses platform-native defaults unless you explicitly override them:
+
+| Platform | Config | State, logs, ballast, update cache |
+| --- | --- | --- |
+| Linux | `~/.config/sbh/config.toml` | `~/.local/share/sbh/` |
+| Linux system service | `/etc/sbh/config.toml` | `/var/lib/sbh/` |
+| macOS user service | `~/Library/Application Support/sbh/config.toml` | `~/Library/Application Support/sbh/` |
+| macOS system service | `/Library/Application Support/sbh/config.toml` | `/private/var/sbh/` |
+
+Precedence is: `--config`, then `SBH_CONFIG`, then the platform default. On macOS, setting `SBH_USE_XDG_PATHS=1`, setting `XDG_CONFIG_HOME`/`XDG_DATA_HOME`, or already having `~/.config/sbh/config.toml` without a native App Support config opts into the XDG layout.
+
 ### Install Wizard
 
 Running `sbh install` without prior configuration launches the install wizard, which guides through four steps:

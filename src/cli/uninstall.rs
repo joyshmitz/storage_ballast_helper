@@ -11,6 +11,8 @@ use std::time::SystemTime;
 
 use serde::Serialize;
 
+use crate::core::config::PathsConfig;
+
 // ---------------------------------------------------------------------------
 // Uninstall modes
 // ---------------------------------------------------------------------------
@@ -176,32 +178,20 @@ fn home_dir() -> Option<PathBuf> {
 
 /// Discover all sbh-related paths on the system.
 fn discover_paths() -> DiscoveredPaths {
+    let defaults = PathsConfig::default();
+    let data_dir = defaults.state_file.parent().map(PathBuf::from);
+    let asset_cache = data_dir.as_ref().map(|dir| dir.join("assets"));
     let home = home_dir();
     let h = home.as_deref();
 
     DiscoveredPaths {
         binaries: discover_binaries(),
-        config_file: h.map(|d| d.join(".config").join("sbh").join("config.toml")),
-        data_dir: h.map(|d| d.join(".local").join("share").join("sbh")),
-        state_file: h.map(|d| {
-            d.join(".local")
-                .join("share")
-                .join("sbh")
-                .join("state.json")
-        }),
-        sqlite_db: h.map(|d| {
-            d.join(".local")
-                .join("share")
-                .join("sbh")
-                .join("activity.sqlite3")
-        }),
-        jsonl_log: h.map(|d| {
-            d.join(".local")
-                .join("share")
-                .join("sbh")
-                .join("activity.jsonl")
-        }),
-        asset_cache: h.map(|d| d.join(".local").join("share").join("sbh").join("assets")),
+        config_file: Some(defaults.config_file),
+        data_dir,
+        state_file: Some(defaults.state_file),
+        sqlite_db: Some(defaults.sqlite_db),
+        jsonl_log: Some(defaults.jsonl_log),
+        asset_cache,
         systemd_units: discover_systemd_units(h),
         launchd_plists: discover_launchd_plists(h),
         completions: discover_completions(h),

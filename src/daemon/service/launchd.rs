@@ -113,7 +113,11 @@ impl LaunchdConfig {
     fn from_env_unchecked(user_scope: bool) -> Result<Self> {
         let binary_path = resolve_sbh_binary()?;
         let (stdout_log, stderr_log) = default_launchd_log_paths(user_scope);
-        let paths = PathsConfig::default();
+        let paths = if user_scope {
+            PathsConfig::default()
+        } else {
+            PathsConfig::system_default()
+        };
         let working_directory = paths
             .state_file
             .parent()

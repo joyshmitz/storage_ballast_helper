@@ -328,6 +328,29 @@ pub struct PathsConfig {
     pub jsonl_log: PathBuf,
 }
 
+impl PathsConfig {
+    /// Native user-scope paths for macOS.
+    #[must_use]
+    pub fn macos_native_for_home(home_dir: &Path) -> Self {
+        let data_dir = macos_data_dir(home_dir);
+        paths_from_config_and_data_dir(macos_config_file_for_home(home_dir), &data_dir)
+    }
+
+    /// XDG user-scope paths for users who explicitly choose that layout.
+    #[must_use]
+    pub fn xdg_for_home(home_dir: &Path) -> Self {
+        let data_dir = xdg_data_dir(home_dir);
+        paths_from_config_and_data_dir(xdg_config_file_for_home(home_dir), &data_dir)
+    }
+
+    /// System-scope paths used when a service process has no user home.
+    #[must_use]
+    pub fn system_default() -> Self {
+        let data_dir = system_data_dir();
+        paths_from_config_and_data_dir(system_config_file(), &data_dir)
+    }
+}
+
 /// User-managed protection paths kept separate from the generated main config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -482,19 +505,11 @@ impl Default for TelemetryConfig {
 
 impl Default for UpdateConfig {
     fn default() -> Self {
-        let home_dir = env::var_os("HOME").map_or_else(
-            || {
-                // No HOME is expected when running as a systemd service.
-                // Use /var/lib/sbh as the canonical system-wide data directory.
-                PathBuf::from("/var/lib/sbh")
-            },
-            PathBuf::from,
-        );
-        let data_dir = if home_dir == Path::new("/var/lib/sbh") {
-            home_dir
-        } else {
-            home_dir.join(".local").join("share").join("sbh")
-        };
+        let paths = PathsConfig::default();
+        let data_dir = paths
+            .state_file
+            .parent()
+            .map_or_else(system_data_dir, PathBuf::from);
         Self {
             enabled: true,
             metadata_cache_ttl_seconds: 30 * 60,
@@ -507,30 +522,121 @@ impl Default for UpdateConfig {
 
 impl Default for PathsConfig {
     fn default() -> Self {
-        let home_dir = env::var_os("HOME").map_or_else(
-            || {
-                // No HOME is expected when running as a systemd service.
-                // Use /var/lib/sbh as the canonical system-wide data directory.
-                PathBuf::from("/var/lib/sbh")
-            },
-            PathBuf::from,
-        );
-        let (cfg, data) = if home_dir == Path::new("/var/lib/sbh") {
-            // Systemd service without HOME: use /etc/sbh and /var/lib/sbh directly.
-            (PathBuf::from("/etc/sbh/config.toml"), home_dir)
+        env::var_os("HOME").map_or_else(Self::system_default, |home| {
+            default_user_paths_for_home(&PathBuf::from(home))
+        })
+    }
+}
+
+fn default_user_paths_for_home(home_dir: &Path) -> PathsConfig {
+    #[cfg(target_os = "macos")]
+    {
+        if macos_prefers_xdg_paths(home_dir) {
+            xdg_paths_from_env_or_home(home_dir)
         } else {
-            (
-                home_dir.join(".config").join("sbh").join("config.toml"),
-                home_dir.join(".local").join("share").join("sbh"),
-            )
-        };
-        Self {
-            config_file: cfg,
-            ballast_dir: data.join("ballast"),
-            state_file: data.join("state.json"),
-            sqlite_db: data.join("activity.sqlite3"),
-            jsonl_log: data.join("activity.jsonl"),
+            PathsConfig::macos_native_for_home(home_dir)
         }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        xdg_paths_from_env_or_home(home_dir)
+    }
+}
+
+fn paths_from_config_and_data_dir(config_file: PathBuf, data_dir: &Path) -> PathsConfig {
+    PathsConfig {
+        config_file,
+        ballast_dir: data_dir.join("ballast"),
+        state_file: data_dir.join("state.json"),
+        sqlite_db: data_dir.join("activity.sqlite3"),
+        jsonl_log: data_dir.join("activity.jsonl"),
+    }
+}
+
+fn xdg_config_file_for_home(home_dir: &Path) -> PathBuf {
+    home_dir.join(".config").join("sbh").join("config.toml")
+}
+
+fn xdg_data_dir(home_dir: &Path) -> PathBuf {
+    home_dir.join(".local").join("share").join("sbh")
+}
+
+fn xdg_paths_from_env_or_home(home_dir: &Path) -> PathsConfig {
+    let data_dir = xdg_data_dir_from_env_or_home(home_dir);
+    paths_from_config_and_data_dir(xdg_config_file_from_env_or_home(home_dir), &data_dir)
+}
+
+fn xdg_config_file_from_env_or_home(home_dir: &Path) -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME").map_or_else(
+        || xdg_config_file_for_home(home_dir),
+        |dir| PathBuf::from(dir).join("sbh").join("config.toml"),
+    )
+}
+
+fn xdg_data_dir_from_env_or_home(home_dir: &Path) -> PathBuf {
+    env::var_os("XDG_DATA_HOME").map_or_else(
+        || xdg_data_dir(home_dir),
+        |dir| PathBuf::from(dir).join("sbh"),
+    )
+}
+
+fn macos_config_file_for_home(home_dir: &Path) -> PathBuf {
+    macos_data_dir(home_dir).join("config.toml")
+}
+
+fn macos_data_dir(home_dir: &Path) -> PathBuf {
+    home_dir
+        .join("Library")
+        .join("Application Support")
+        .join("sbh")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_prefers_xdg_paths(home_dir: &Path) -> bool {
+    if env_truthy("SBH_USE_XDG_PATHS")
+        || env::var_os("XDG_CONFIG_HOME").is_some()
+        || env::var_os("XDG_DATA_HOME").is_some()
+    {
+        return true;
+    }
+
+    let native_config = macos_config_file_for_home(home_dir);
+    let xdg_config = xdg_config_file_from_env_or_home(home_dir);
+    xdg_config.exists() && !native_config.exists()
+}
+
+#[cfg(target_os = "macos")]
+fn env_truthy(name: &str) -> bool {
+    env::var_os(name).is_some_and(|value| {
+        matches!(
+            value.to_string_lossy().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn system_config_file() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/Library")
+            .join("Application Support")
+            .join("sbh")
+            .join("config.toml")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        PathBuf::from("/etc/sbh/config.toml")
+    }
+}
+
+fn system_data_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/private/var/sbh")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        PathBuf::from("/var/lib/sbh")
     }
 }
 
@@ -546,7 +652,13 @@ impl Config {
     /// Resolution order for config file path:
     /// 1. Explicit `path` argument (from `--config` CLI flag)
     /// 2. `SBH_CONFIG` environment variable
-    /// 3. Default path (`~/.config/sbh/config.toml`)
+    /// 3. Platform-native default path
+    ///    - Linux/XDG: `~/.config/sbh/config.toml`
+    ///    - macOS: `~/Library/Application Support/sbh/config.toml`
+    ///      unless XDG env vars or an existing XDG config opt into XDG layout.
+    /// 4. System fallback when no user/default config exists
+    ///    - Linux: `/etc/sbh/config.toml`
+    ///    - macOS: `/Library/Application Support/sbh/config.toml`
     ///
     /// Missing config file is not an error when loading from default path; defaults are used.
     pub fn load(path: Option<&Path>) -> Result<Self> {
@@ -564,10 +676,10 @@ impl Config {
         let is_explicit_path = path.is_some() || env_config.is_some();
 
         // System-wide fallback: when no explicit path is given and user-level
-        // config doesn't exist, try /etc/sbh/config.toml before using defaults.
-        // This allows `sbh status` (run as a regular user) to find the same
-        // config that the systemd daemon uses.
-        let system_config = PathBuf::from("/etc/sbh/config.toml");
+        // config doesn't exist, try the platform system config before using
+        // defaults. This allows `sbh status` (run as a regular user) to find
+        // the same config that the system service uses.
+        let system_config = system_config_file();
         let (effective_path, is_system_fallback) =
             if !is_explicit_path && !path_buf.exists() && system_config.exists() {
                 (system_config, true)
@@ -1259,7 +1371,7 @@ fn strip_trailing_separator(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, SacredConfig, SbhError, load_sacred_config, sacred_config_path_for,
+        Config, PathsConfig, SacredConfig, SbhError, load_sacred_config, sacred_config_path_for,
         write_sacred_config,
     };
     use std::collections::HashMap;
@@ -1277,6 +1389,60 @@ mod tests {
     fn default_config_is_valid() {
         let cfg = Config::default();
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn macos_native_paths_use_application_support() {
+        let home = Path::new("/Users/operator");
+        let paths = PathsConfig::macos_native_for_home(home);
+
+        let app_support = home.join("Library").join("Application Support").join("sbh");
+        assert_eq!(paths.config_file, app_support.join("config.toml"));
+        assert_eq!(paths.ballast_dir, app_support.join("ballast"));
+        assert_eq!(paths.state_file, app_support.join("state.json"));
+        assert_eq!(paths.sqlite_db, app_support.join("activity.sqlite3"));
+        assert_eq!(paths.jsonl_log, app_support.join("activity.jsonl"));
+    }
+
+    #[test]
+    fn xdg_paths_preserve_linux_and_opt_in_layout() {
+        let home = Path::new("/home/operator");
+        let paths = PathsConfig::xdg_for_home(home);
+
+        assert_eq!(
+            paths.config_file,
+            home.join(".config").join("sbh").join("config.toml")
+        );
+        assert_eq!(
+            paths.state_file,
+            home.join(".local")
+                .join("share")
+                .join("sbh")
+                .join("state.json")
+        );
+    }
+
+    #[test]
+    fn system_default_paths_follow_platform_scope() {
+        let paths = PathsConfig::system_default();
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                paths.config_file,
+                PathBuf::from("/Library/Application Support/sbh/config.toml")
+            );
+            assert_eq!(
+                paths.state_file,
+                PathBuf::from("/private/var/sbh/state.json")
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(paths.config_file, PathBuf::from("/etc/sbh/config.toml"));
+            assert_eq!(paths.state_file, PathBuf::from("/var/lib/sbh/state.json"));
+        }
     }
 
     #[test]
