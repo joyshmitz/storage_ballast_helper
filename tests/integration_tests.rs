@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,8 @@ use storage_ballast_helper::monitor::guardrails::{
 };
 use storage_ballast_helper::monitor::pid::{PidPressureController, PressureLevel, PressureReading};
 use storage_ballast_helper::monitor::predictive::{PredictiveActionPolicy, PredictiveConfig};
+use storage_ballast_helper::platform::sacred_catalog::cross_platform_sacred_paths;
+use storage_ballast_helper::platform::types::{SacredPath, SacredPathKind, SacredPathSource};
 use storage_ballast_helper::scanner::decision_record::{
     DecisionRecordBuilder, ExplainLevel, PolicyMode, format_explain,
 };
@@ -34,7 +37,9 @@ use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor
 use storage_ballast_helper::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, StructuralSignals,
 };
-use storage_ballast_helper::scanner::protection::ProtectionRegistry;
+use storage_ballast_helper::scanner::protection::{
+    ProtectionRegistry, SacredOverlapKind, find_sacred_overlaps,
+};
 use storage_ballast_helper::scanner::scoring::{
     ActiveReferenceSummary, CandidacyScore, CandidateInput, DecisionAction, DecisionOutcome,
     EvidenceLedger, EvidenceTerm, ScoreFactors, ScoringEngine,
@@ -195,6 +200,169 @@ fn synthetic_mac_tree_fixture_has_expected_shape() {
             .join(".cargo-rch-goldenplateau")
             .is_dir()
     );
+}
+
+fn synthetic_cleanup_candidate(path: &Path) -> CandidateInput {
+    CandidateInput {
+        path: path.to_path_buf(),
+        size_bytes: 5 * 1_073_741_824,
+        age: Duration::from_hours(336),
+        classification: ArtifactClassification {
+            pattern_name: Cow::Borrowed("synthetic-high-confidence-artifact"),
+            category: ArtifactCategory::RustTarget,
+            name_confidence: 0.95,
+            structural_confidence: 0.95,
+            combined_confidence: 0.95,
+        },
+        signals: StructuralSignals {
+            has_incremental: true,
+            has_deps: true,
+            has_build: true,
+            has_fingerprint: true,
+            mostly_object_files: true,
+            ..StructuralSignals::default()
+        },
+        active_references: ActiveReferenceSummary::default(),
+        is_open: false,
+        excluded: false,
+    }
+}
+
+fn assert_sacred_keep(score: &CandidacyScore, expected_reason_fragment: &str) {
+    assert!(score.vetoed);
+    assert!(score.total_score.abs() <= f64::EPSILON);
+    assert_eq!(score.decision.action, DecisionAction::Keep);
+
+    let reason = score
+        .veto_reason
+        .as_deref()
+        .expect("sacred overlap veto should include a reason");
+    assert!(
+        reason.contains("sacred path overlap"),
+        "unexpected veto reason: {reason}"
+    );
+    assert!(
+        reason.contains(expected_reason_fragment),
+        "veto reason did not include {expected_reason_fragment:?}: {reason}"
+    );
+}
+
+fn synthetic_messages_catalog(tree: &common::SyntheticMacTree) -> Vec<SacredPath> {
+    vec![SacredPath {
+        pattern: tree
+            .user_home
+            .join("Library")
+            .join("Messages")
+            .to_string_lossy()
+            .to_string(),
+        kind: SacredPathKind::ExactMatch,
+        reason: "Messages history is user data".to_string(),
+        source: SacredPathSource::Builtin,
+    }]
+}
+
+fn synthetic_photos_catalog(tree: &common::SyntheticMacTree) -> Vec<SacredPath> {
+    vec![SacredPath {
+        pattern: tree
+            .user_home
+            .join("Pictures")
+            .join("*.photoslibrary")
+            .to_string_lossy()
+            .to_string(),
+        kind: SacredPathKind::GlobMatch,
+        reason: "Photos libraries are user data".to_string(),
+        source: SacredPathSource::Builtin,
+    }]
+}
+
+#[test]
+fn sacred_overlap_exact_match_keeps_candidate() {
+    let tree = common::SyntheticMacTree::new();
+    let candidate = tree.user_home.join("Library").join("Messages");
+    let catalog = synthetic_messages_catalog(&tree);
+    let overlaps = find_sacred_overlaps(&candidate, &catalog).expect("find sacred overlaps");
+
+    assert!(
+        overlaps
+            .iter()
+            .any(|overlap| overlap.kind == SacredOverlapKind::ExactMatch)
+    );
+
+    let engine = ScoringEngine::from_config(&ScoringConfig::default(), 30);
+    let input = synthetic_cleanup_candidate(&candidate);
+    let score = engine.score_candidate_with_sacred_overlaps(&input, 0.95, &overlaps);
+
+    assert_sacred_keep(&score, "Messages history");
+}
+
+#[test]
+fn sacred_overlap_child_of_photos_library_keeps_candidate() {
+    let tree = common::SyntheticMacTree::new();
+    let candidate = tree
+        .user_home
+        .join("Pictures")
+        .join("Photos Library.photoslibrary")
+        .join("database")
+        .join("Photos.sqlite");
+    let catalog = synthetic_photos_catalog(&tree);
+    let overlaps = find_sacred_overlaps(&candidate, &catalog).expect("find sacred overlaps");
+
+    assert!(
+        overlaps
+            .iter()
+            .any(|overlap| overlap.kind == SacredOverlapKind::ChildOfSacred)
+    );
+
+    let engine = ScoringEngine::from_config(&ScoringConfig::default(), 30);
+    let input = synthetic_cleanup_candidate(&candidate);
+    let score = engine.score_candidate_with_sacred_overlaps(&input, 0.95, &overlaps);
+
+    assert_sacred_keep(&score, "Photos libraries");
+}
+
+#[test]
+fn sacred_overlap_parent_of_messages_keeps_candidate() {
+    let tree = common::SyntheticMacTree::new();
+    let candidate = tree.user_home.join("Library");
+    let catalog = synthetic_messages_catalog(&tree);
+    let overlaps = find_sacred_overlaps(&candidate, &catalog).expect("find sacred overlaps");
+
+    assert!(
+        overlaps
+            .iter()
+            .any(|overlap| overlap.kind == SacredOverlapKind::ParentOfSacred)
+    );
+
+    let engine = ScoringEngine::from_config(&ScoringConfig::default(), 30);
+    let input = synthetic_cleanup_candidate(&candidate);
+    let score = engine.score_candidate_with_sacred_overlaps(&input, 0.95, &overlaps);
+
+    assert_sacred_keep(&score, "Messages history");
+}
+
+#[test]
+fn sacred_overlap_stowaway_beads_inside_trash_keeps_candidate() {
+    let tree = common::SyntheticMacTree::new();
+    let candidate = tree.private_tmp.join("agent-trash-20260507");
+    fs::create_dir_all(candidate.join("nested").join(".beads")).expect("create beads stowaway");
+    fs::write(
+        candidate.join("nested").join(".beads").join("beads.db"),
+        b"synthetic beads state",
+    )
+    .expect("write beads stowaway");
+
+    let overlaps =
+        find_sacred_overlaps(&candidate, cross_platform_sacred_paths()).expect("find overlaps");
+
+    assert!(overlaps.iter().any(|overlap| {
+        overlap.kind == SacredOverlapKind::ContainsSacred && overlap.pattern == ".beads/"
+    }));
+
+    let engine = ScoringEngine::from_config(&ScoringConfig::default(), 30);
+    let input = synthetic_cleanup_candidate(&candidate);
+    let score = engine.score_candidate_with_sacred_overlaps(&input, 0.95, &overlaps);
+
+    assert_sacred_keep(&score, ".beads/");
 }
 
 proptest! {
