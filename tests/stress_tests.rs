@@ -21,6 +21,7 @@ use storage_ballast_helper::monitor::guardrails::{
     AdaptiveGuard, CalibrationObservation, GuardStatus, GuardrailConfig,
 };
 use storage_ballast_helper::monitor::pid::{PidPressureController, PressureLevel, PressureReading};
+use storage_ballast_helper::platform::pal::MockPlatform;
 use storage_ballast_helper::scanner::decision_record::ActionRecord;
 use storage_ballast_helper::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, StructuralSignals,
@@ -469,7 +470,7 @@ fn stress_recovery_under_write_pressure() {
 fn stress_thread_health_overload() {
     let tmp = tempfile::tempdir().unwrap();
     let state_path = tmp.path().join("state.json");
-    let mut monitor = SelfMonitor::new(state_path);
+    let mut monitor = SelfMonitor::new(state_path, Arc::new(MockPlatform::healthy()));
     let mut report = StressReport::new("thread_health_overload");
 
     // Create heartbeats simulating multiple daemon threads.

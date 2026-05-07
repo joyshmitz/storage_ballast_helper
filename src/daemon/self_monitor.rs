@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::monitor::pid::PressureLevel;
+use crate::platform::pal::Platform;
+use crate::platform::types::SelfStats;
 
 // ──────────────────── constants ────────────────────
 
@@ -228,6 +230,7 @@ pub struct DaemonHealth {
 /// Periodic self-monitoring: writes state file, checks RSS, reports status.
 pub struct SelfMonitor {
     state_file_path: PathBuf,
+    platform: Arc<dyn Platform>,
     start_time: Instant,
     started_at_iso: String,
     write_interval: Duration,
@@ -248,10 +251,11 @@ pub struct SelfMonitor {
 
 impl SelfMonitor {
     /// Create a new self-monitor.
-    pub fn new(state_file_path: PathBuf) -> Self {
+    pub fn new(state_file_path: PathBuf, platform: Arc<dyn Platform>) -> Self {
         let now = chrono::Utc::now();
         Self {
             state_file_path,
+            platform,
             start_time: Instant::now(),
             started_at_iso: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             write_interval: Duration::from_secs(DAEMON_STATE_WRITE_INTERVAL_SECS),
@@ -290,7 +294,7 @@ impl SelfMonitor {
             return 0;
         }
 
-        let rss = read_rss_bytes();
+        let rss = self.current_rss_bytes();
 
         // Check RSS limit.
         if rss > self.rss_limit_bytes {
@@ -360,7 +364,7 @@ impl SelfMonitor {
         free_pct: f64,
         mount_path: &str,
     ) -> String {
-        let rss_mb = read_rss_bytes() / (1024 * 1024);
+        let rss_mb = self.current_rss_bytes() / (1024 * 1024);
         let gb_freed = self.bytes_freed_total as f64 / 1_073_741_824.0;
         format!(
             "{pressure_level:?} {free_pct:.1}% free on {mount_path} | \
@@ -400,7 +404,7 @@ impl SelfMonitor {
     ) -> DaemonHealth {
         DaemonHealth {
             uptime: self.start_time.elapsed(),
-            memory_rss_bytes: read_rss_bytes(),
+            memory_rss_bytes: self.current_rss_bytes(),
             scan_count: self.scan_count,
             avg_scan_duration: self.avg_scan_duration(),
             last_scan_at: self
@@ -434,6 +438,16 @@ impl SelfMonitor {
     /// Record an error.
     pub fn record_error(&mut self) {
         self.errors_total += 1;
+    }
+
+    fn current_rss_bytes(&self) -> u64 {
+        self.current_self_stats().rss_bytes
+    }
+
+    fn current_self_stats(&self) -> SelfStats {
+        self.platform
+            .self_stats()
+            .unwrap_or_else(|_| empty_self_stats())
     }
 
     /// Read the state file (for `sbh status` CLI command).
@@ -515,40 +529,16 @@ fn write_state_atomic(path: &Path, state: &DaemonState) -> std::io::Result<()> {
     result
 }
 
-// ──────────────────── RSS reading ────────────────────
-
-/// Read current process RSS in bytes from /proc/self/status.
-///
-/// Returns 0 on non-Linux or if reading fails.
-fn read_rss_bytes() -> u64 {
-    #[cfg(target_os = "linux")]
-    {
-        read_rss_linux()
+fn empty_self_stats() -> SelfStats {
+    SelfStats {
+        rss_bytes: 0,
+        virtual_memory_bytes: 0,
+        cpu_user_micros: 0,
+        cpu_system_micros: 0,
+        idle_wakeups: None,
+        bytes_read: None,
+        bytes_written: None,
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn read_rss_linux() -> u64 {
-    let Ok(status) = fs::read_to_string("/proc/self/status") else {
-        return 0;
-    };
-
-    for line in status.lines() {
-        if line.starts_with("VmRSS:") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2
-                && let Ok(kb) = parts[1].parse::<u64>()
-            {
-                return kb * 1024; // kB to bytes
-            }
-        }
-    }
-
-    0
 }
 
 // ──────────────────── tests ────────────────────
@@ -556,6 +546,27 @@ fn read_rss_linux() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::platform::pal::MockPlatform;
+
+    fn test_self_stats(rss_bytes: u64) -> SelfStats {
+        SelfStats {
+            rss_bytes,
+            virtual_memory_bytes: rss_bytes.saturating_mul(2),
+            cpu_user_micros: 1_000,
+            cpu_system_micros: 500,
+            idle_wakeups: Some(0),
+            bytes_read: Some(0),
+            bytes_written: Some(0),
+        }
+    }
+
+    fn test_monitor(path: PathBuf) -> SelfMonitor {
+        SelfMonitor::new(
+            path,
+            Arc::new(MockPlatform::healthy().with_self_stats(test_self_stats(44_040_192))),
+        )
+    }
 
     #[test]
     fn daemon_state_serializes_correctly() {
@@ -708,7 +719,7 @@ mod tests {
     fn self_monitor_write_interval() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        let mut monitor = SelfMonitor::new(path.clone());
+        let mut monitor = test_monitor(path.clone());
         monitor.write_interval = Duration::from_millis(50);
 
         // First write always happens.
@@ -734,7 +745,7 @@ mod tests {
     fn read_state_parses_correctly() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        let mut monitor = SelfMonitor::new(path.clone());
+        let mut monitor = test_monitor(path.clone());
         monitor.scan_count = 42;
         monitor.deletions_total = 7;
         monitor.bytes_freed_total = 1_000_000;
@@ -753,7 +764,7 @@ mod tests {
     #[test]
     fn record_counters_accumulate() {
         let dir = tempfile::tempdir().unwrap();
-        let mut monitor = SelfMonitor::new(dir.path().join("state.json"));
+        let mut monitor = test_monitor(dir.path().join("state.json"));
 
         monitor.record_scan(10, 3, Duration::from_millis(100));
         assert_eq!(monitor.scan_count, 1);
@@ -781,7 +792,7 @@ mod tests {
     #[test]
     fn status_line_format() {
         let dir = tempfile::tempdir().unwrap();
-        let mut monitor = SelfMonitor::new(dir.path().join("state.json"));
+        let mut monitor = test_monitor(dir.path().join("state.json"));
         monitor.deletions_total = 312;
         monitor.bytes_freed_total = 502_000_000_000;
 
@@ -823,14 +834,14 @@ mod tests {
     #[test]
     fn avg_scan_duration_zero_when_no_scans() {
         let dir = tempfile::tempdir().unwrap();
-        let monitor = SelfMonitor::new(dir.path().join("state.json"));
+        let monitor = test_monitor(dir.path().join("state.json"));
         assert_eq!(monitor.avg_scan_duration(), Duration::ZERO);
     }
 
     #[test]
     fn health_snapshot_includes_thread_status() {
         let dir = tempfile::tempdir().unwrap();
-        let mut monitor = SelfMonitor::new(dir.path().join("state.json"));
+        let mut monitor = test_monitor(dir.path().join("state.json"));
         monitor.record_scan(10, 2, Duration::from_millis(150));
         monitor.record_deletions(2, 5000);
 
@@ -857,7 +868,7 @@ mod tests {
     #[test]
     fn health_snapshot_detects_stalled_thread() {
         let dir = tempfile::tempdir().unwrap();
-        let monitor = SelfMonitor::new(dir.path().join("state.json"));
+        let monitor = test_monitor(dir.path().join("state.json"));
 
         let hb = ThreadHeartbeat::new("stalled-worker");
         // Don't beat — with 1ms threshold after sleeping, it's stale.
@@ -877,7 +888,7 @@ mod tests {
     #[test]
     fn health_snapshot_restores_last_scan_age_from_timestamp() {
         let dir = tempfile::tempdir().unwrap();
-        let mut monitor = SelfMonitor::new(dir.path().join("state.json"));
+        let mut monitor = test_monitor(dir.path().join("state.json"));
         monitor.last_scan_at = Some(
             (chrono::Utc::now() - chrono::Duration::seconds(120))
                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -902,11 +913,15 @@ mod tests {
         assert_eq!(status.name(), "worker");
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn read_rss_returns_nonzero() {
-        let rss = read_rss_bytes();
-        assert!(rss > 0, "RSS should be > 0 on Linux");
+    fn current_rss_comes_from_platform_self_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let monitor = SelfMonitor::new(
+            dir.path().join("state.json"),
+            Arc::new(MockPlatform::healthy().with_self_stats(test_self_stats(12_345_678))),
+        );
+
+        assert_eq!(monitor.current_rss_bytes(), 12_345_678);
     }
 
     // ──────── failure-injection tests ────────
@@ -1022,7 +1037,7 @@ mod tests {
         // Inject: state file path in non-creatable directory → write fails.
         // Expect: last_write is NOT updated, so next call retries immediately.
         let bad_path = PathBuf::from("/nonexistent_sbh_selfmon_test/state.json");
-        let mut monitor = SelfMonitor::new(bad_path);
+        let mut monitor = test_monitor(bad_path);
 
         // First write fails (bad path).
         monitor.maybe_write_state(PressureLevel::Green, 30.0, "/data", 5, 5, 0, "enforce");
@@ -1058,7 +1073,7 @@ mod tests {
     fn atomic_write_leaves_no_tmp_on_success() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("clean_state.json");
-        let mut monitor = SelfMonitor::new(path.clone());
+        let mut monitor = test_monitor(path.clone());
 
         monitor.maybe_write_state(PressureLevel::Green, 40.0, "/data", 10, 10, 0, "enforce");
 
@@ -1074,7 +1089,7 @@ mod tests {
         // Verify atomic write means readers never see partial state.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("concurrent_state.json");
-        let mut monitor = SelfMonitor::new(path.clone());
+        let mut monitor = test_monitor(path.clone());
         monitor.write_interval = Duration::from_millis(0); // Allow every write.
 
         // Write 20 times with different pressure levels.

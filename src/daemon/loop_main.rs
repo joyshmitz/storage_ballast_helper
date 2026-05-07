@@ -523,23 +523,6 @@ pub struct MonitoringDaemon {
     prediction_scorecard: PredictionScorecard,
 }
 
-/// Read the current process's RSS in megabytes from /proc/self/status.
-/// Returns 0 on non-Linux platforms or if the read fails.
-fn read_rss_mb() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    for line in status.lines() {
-        if let Some(value) = line.strip_prefix("VmRSS:") {
-            let trimmed = value
-                .trim()
-                .strip_suffix("kB")
-                .unwrap_or_else(|| value.trim())
-                .trim();
-            return trimmed.parse::<u64>().ok().map(|kb| kb / 1024);
-        }
-    }
-    None
-}
-
 fn compute_primary_path(config: &Config) -> PathBuf {
     config
         .scanner
@@ -929,7 +912,7 @@ impl MonitoringDaemon {
         let shared_scanner_config = Arc::new(RwLock::new(config.scanner.clone()));
 
         // 11. Self-monitor (writes state.json for CLI, tracks health).
-        let self_monitor = SelfMonitor::new(config.paths.state_file.clone());
+        let self_monitor = SelfMonitor::new(config.paths.state_file.clone(), Arc::clone(&platform));
 
         // 12. Thread heartbeats for worker health detection.
         let scanner_heartbeat = ThreadHeartbeat::new("sbh-scanner");
@@ -1480,7 +1463,10 @@ impl MonitoringDaemon {
 
             // 10. Periodic summary report (every 5 minutes).
             if self.last_summary_report.elapsed() >= Duration::from_mins(5) {
-                let rss_mb = read_rss_mb().unwrap_or(0);
+                let rss_mb = self
+                    .platform
+                    .self_stats()
+                    .map_or(0, |stats| stats.rss_bytes / (1024 * 1024));
                 let guard_diag_snapshot = self.shared_guard_diagnostics.read().clone();
                 let guard_str = guard_diag_snapshot.as_ref().map_or_else(
                     || "none".to_string(),
