@@ -333,7 +333,11 @@ impl PathsConfig {
     #[must_use]
     pub fn macos_native_for_home(home_dir: &Path) -> Self {
         let data_dir = macos_data_dir(home_dir);
-        paths_from_config_and_data_dir(macos_config_file_for_home(home_dir), &data_dir)
+        paths_from_config_data_and_ballast_dir(
+            macos_config_file_for_home(home_dir),
+            &data_dir,
+            macos_native_ballast_dir_for_data_dir(&data_dir),
+        )
     }
 
     /// XDG user-scope paths for users who explicitly choose that layout.
@@ -347,7 +351,21 @@ impl PathsConfig {
     #[must_use]
     pub fn system_default() -> Self {
         let data_dir = system_data_dir();
-        paths_from_config_and_data_dir(system_config_file(), &data_dir)
+        paths_from_config_data_and_ballast_dir(
+            system_config_file(),
+            &data_dir,
+            system_ballast_dir_for_data_dir(&data_dir),
+        )
+    }
+
+    /// Default paths for a service scope.
+    #[must_use]
+    pub fn for_service_scope(user_scope: bool) -> Self {
+        if user_scope {
+            Self::default()
+        } else {
+            Self::system_default()
+        }
     }
 }
 
@@ -506,14 +524,10 @@ impl Default for TelemetryConfig {
 impl Default for UpdateConfig {
     fn default() -> Self {
         let paths = PathsConfig::default();
-        let data_dir = paths
-            .state_file
-            .parent()
-            .map_or_else(system_data_dir, PathBuf::from);
         Self {
             enabled: true,
             metadata_cache_ttl_seconds: 30 * 60,
-            metadata_cache_file: data_dir.join("update-metadata.json"),
+            metadata_cache_file: default_update_metadata_cache_file(&paths),
             background_refresh: true,
             notices_enabled: true,
         }
@@ -544,9 +558,17 @@ fn default_user_paths_for_home(home_dir: &Path) -> PathsConfig {
 }
 
 fn paths_from_config_and_data_dir(config_file: PathBuf, data_dir: &Path) -> PathsConfig {
+    paths_from_config_data_and_ballast_dir(config_file, data_dir, data_dir.join("ballast"))
+}
+
+fn paths_from_config_data_and_ballast_dir(
+    config_file: PathBuf,
+    data_dir: &Path,
+    ballast_dir: PathBuf,
+) -> PathsConfig {
     PathsConfig {
         config_file,
-        ballast_dir: data_dir.join("ballast"),
+        ballast_dir,
         state_file: data_dir.join("state.json"),
         sqlite_db: data_dir.join("activity.sqlite3"),
         jsonl_log: data_dir.join("activity.jsonl"),
@@ -589,6 +611,21 @@ fn macos_data_dir(home_dir: &Path) -> PathBuf {
         .join("Library")
         .join("Application Support")
         .join("sbh")
+}
+
+fn macos_native_ballast_dir_for_data_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("ballast.bin")
+}
+
+fn system_ballast_dir_for_data_dir(data_dir: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        data_dir.join("ballast.bin")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        data_dir.join("ballast")
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -640,11 +677,62 @@ fn system_data_dir() -> PathBuf {
     }
 }
 
+fn default_update_metadata_cache_file(paths: &PathsConfig) -> PathBuf {
+    data_dir_for_paths(paths).join("update-metadata.json")
+}
+
+fn data_dir_for_paths(paths: &PathsConfig) -> PathBuf {
+    paths
+        .state_file
+        .parent()
+        .map_or_else(system_data_dir, PathBuf::from)
+}
+
+fn apply_missing_path_defaults(
+    paths: &mut PathsConfig,
+    raw_value: &toml::Value,
+    defaults: &PathsConfig,
+) {
+    if !raw_paths_contains_key(raw_value, "ballast_dir") {
+        paths.ballast_dir.clone_from(&defaults.ballast_dir);
+    }
+    if !raw_paths_contains_key(raw_value, "state_file") {
+        paths.state_file.clone_from(&defaults.state_file);
+    }
+    if !raw_paths_contains_key(raw_value, "sqlite_db") {
+        paths.sqlite_db.clone_from(&defaults.sqlite_db);
+    }
+    if !raw_paths_contains_key(raw_value, "jsonl_log") {
+        paths.jsonl_log.clone_from(&defaults.jsonl_log);
+    }
+}
+
+fn raw_paths_contains_key(raw_value: &toml::Value, key: &str) -> bool {
+    raw_value
+        .get("paths")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|paths| paths.contains_key(key))
+}
+
 impl Config {
+    /// Build a default config with an explicit path layout.
+    #[must_use]
+    pub fn with_paths(paths: PathsConfig) -> Self {
+        let mut config = Self::default();
+        config.update.metadata_cache_file = default_update_metadata_cache_file(&paths);
+        config.paths = paths;
+        config
+    }
+
     /// Default configuration path.
     #[must_use]
     pub fn default_path() -> PathBuf {
         PathsConfig::default().config_file
+    }
+
+    /// Load config using service-scope defaults when no explicit config path is given.
+    pub fn load_for_service_scope(path: Option<&Path>, user_scope: bool) -> Result<Self> {
+        Self::load_with_default_paths(path, PathsConfig::for_service_scope(user_scope), false)
     }
 
     /// Load config from default or explicit path, then apply env overrides.
@@ -662,6 +750,14 @@ impl Config {
     ///
     /// Missing config file is not an error when loading from default path; defaults are used.
     pub fn load(path: Option<&Path>) -> Result<Self> {
+        Self::load_with_default_paths(path, PathsConfig::default(), true)
+    }
+
+    fn load_with_default_paths(
+        path: Option<&Path>,
+        default_paths: PathsConfig,
+        allow_system_fallback: bool,
+    ) -> Result<Self> {
         // Check SBH_CONFIG env var if no explicit path was given.
         let env_config = if path.is_none() {
             env::var_os("SBH_CONFIG").map(PathBuf::from)
@@ -670,7 +766,11 @@ impl Config {
         };
 
         let path_buf = path.map_or_else(
-            || env_config.clone().unwrap_or_else(Self::default_path),
+            || {
+                env_config
+                    .clone()
+                    .unwrap_or_else(|| default_paths.config_file.clone())
+            },
             Path::to_path_buf,
         );
         let is_explicit_path = path.is_some() || env_config.is_some();
@@ -680,19 +780,31 @@ impl Config {
         // defaults. This allows `sbh status` (run as a regular user) to find
         // the same config that the system service uses.
         let system_config = system_config_file();
-        let (effective_path, is_system_fallback) =
-            if !is_explicit_path && !path_buf.exists() && system_config.exists() {
-                (system_config, true)
-            } else {
-                (path_buf, false)
-            };
+        let (effective_path, is_system_fallback) = if allow_system_fallback
+            && !is_explicit_path
+            && !path_buf.exists()
+            && system_config.exists()
+        {
+            (system_config, true)
+        } else {
+            (path_buf, false)
+        };
 
         let mut cfg = if effective_path.exists() {
             let raw = fs::read_to_string(&effective_path).map_err(|source| SbhError::Io {
                 path: effective_path.clone(),
                 source,
             })?;
-            let parsed: Self = toml::from_str(&raw)?;
+            let raw_value: toml::Value = toml::from_str(&raw)?;
+            let mut parsed: Self = toml::from_str(&raw)?;
+            let system_path_defaults;
+            let path_defaults = if is_system_fallback || effective_path == system_config_file() {
+                system_path_defaults = PathsConfig::system_default();
+                &system_path_defaults
+            } else {
+                &default_paths
+            };
+            apply_missing_path_defaults(&mut parsed.paths, &raw_value, path_defaults);
             if is_system_fallback {
                 eprintln!(
                     "[SBH-CONFIG] Using system config at {}",
@@ -705,7 +817,7 @@ impl Config {
                 path: effective_path,
             });
         } else {
-            Self::default()
+            Self::with_paths(default_paths)
         };
 
         cfg.paths.config_file = effective_path;
@@ -1398,7 +1510,7 @@ mod tests {
 
         let app_support = home.join("Library").join("Application Support").join("sbh");
         assert_eq!(paths.config_file, app_support.join("config.toml"));
-        assert_eq!(paths.ballast_dir, app_support.join("ballast"));
+        assert_eq!(paths.ballast_dir, app_support.join("ballast.bin"));
         assert_eq!(paths.state_file, app_support.join("state.json"));
         assert_eq!(paths.sqlite_db, app_support.join("activity.sqlite3"));
         assert_eq!(paths.jsonl_log, app_support.join("activity.jsonl"));
@@ -1436,13 +1548,66 @@ mod tests {
                 paths.state_file,
                 PathBuf::from("/private/var/sbh/state.json")
             );
+            assert_eq!(
+                paths.ballast_dir,
+                PathBuf::from("/private/var/sbh/ballast.bin")
+            );
         }
 
         #[cfg(target_os = "linux")]
         {
             assert_eq!(paths.config_file, PathBuf::from("/etc/sbh/config.toml"));
             assert_eq!(paths.state_file, PathBuf::from("/var/lib/sbh/state.json"));
+            assert_eq!(paths.ballast_dir, PathBuf::from("/var/lib/sbh/ballast"));
         }
+    }
+
+    #[test]
+    fn service_scope_defaults_use_system_paths_for_system_services() {
+        let paths = PathsConfig::for_service_scope(false);
+        assert_eq!(paths, PathsConfig::system_default());
+    }
+
+    #[test]
+    fn config_with_paths_keeps_update_cache_in_same_data_dir() {
+        let paths = PathsConfig {
+            config_file: PathBuf::from("/tmp/sbh/config.toml"),
+            ballast_dir: PathBuf::from("/tmp/sbh/ballast"),
+            state_file: PathBuf::from("/tmp/sbh/state.json"),
+            sqlite_db: PathBuf::from("/tmp/sbh/activity.sqlite3"),
+            jsonl_log: PathBuf::from("/tmp/sbh/activity.jsonl"),
+        };
+
+        let cfg = Config::with_paths(paths);
+
+        assert_eq!(
+            cfg.update.metadata_cache_file,
+            PathBuf::from("/tmp/sbh/update-metadata.json")
+        );
+    }
+
+    #[test]
+    fn load_with_scoped_defaults_fills_missing_paths_from_scope() {
+        let tmp = TempDir::new().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[ballast]\nfile_count = 3\n").expect("write config");
+        let scoped_paths = PathsConfig {
+            config_file: config_path.clone(),
+            ballast_dir: tmp.path().join("system").join("ballast.bin"),
+            state_file: tmp.path().join("system").join("state.json"),
+            sqlite_db: tmp.path().join("system").join("activity.sqlite3"),
+            jsonl_log: tmp.path().join("system").join("activity.jsonl"),
+        };
+
+        let cfg = Config::load_with_default_paths(Some(&config_path), scoped_paths.clone(), false)
+            .expect("config should load");
+
+        assert_eq!(cfg.ballast.file_count, 3);
+        assert_eq!(cfg.paths.config_file, config_path);
+        assert_eq!(cfg.paths.ballast_dir, scoped_paths.ballast_dir);
+        assert_eq!(cfg.paths.state_file, scoped_paths.state_file);
+        assert_eq!(cfg.paths.sqlite_db, scoped_paths.sqlite_db);
+        assert_eq!(cfg.paths.jsonl_log, scoped_paths.jsonl_log);
     }
 
     #[test]

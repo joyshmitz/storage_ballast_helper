@@ -15,7 +15,7 @@ use thiserror::Error;
 use storage_ballast_helper::ballast::manager::BallastManager;
 use storage_ballast_helper::cli::update::{UpdateReport, UpdateServiceRestart};
 use storage_ballast_helper::core::config::{
-    Config, load_sacred_config, sacred_config_path_for, write_sacred_config,
+    Config, PathsConfig, load_sacred_config, sacred_config_path_for, write_sacred_config,
 };
 use storage_ballast_helper::daemon::loop_main::{
     DaemonArgs as RuntimeDaemonArgs, MonitoringDaemon,
@@ -989,6 +989,22 @@ fn macos_install_dir_for_service(service: Option<ResolvedInstallService>) -> Pat
     )
 }
 
+fn install_default_paths_for_service(service: Option<ResolvedInstallService>) -> PathsConfig {
+    service.map_or_else(PathsConfig::default, |service| {
+        PathsConfig::for_service_scope(service.user_scope)
+    })
+}
+
+fn load_install_config(cli: &Cli, service: Option<ResolvedInstallService>) -> Config {
+    let default_paths = install_default_paths_for_service(service);
+    let loaded = service.map_or_else(
+        || Config::load(cli.config.as_deref()),
+        |service| Config::load_for_service_scope(cli.config.as_deref(), service.user_scope),
+    );
+
+    loaded.unwrap_or_else(|_| Config::with_paths(default_paths))
+}
+
 fn build_macos_release_install_options(
     args: &InstallArgs,
     config: &Config,
@@ -1188,7 +1204,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     let service_kind = platform.service_kind();
     let sudo_command = format_sudo_rerun_command(cli, service_kind);
     let service = resolve_install_service(args, service_kind, running_as_root(), &sudo_command)?;
-    let config = Config::load(cli.config.as_deref()).unwrap_or_default();
+    let config = load_install_config(cli, service);
     let macos_binary_path = if service_kind == ServiceKind::Launchd && !args.from_source {
         run_macos_release_binary_install(cli, args, &config, service)?
     } else {
@@ -1313,6 +1329,14 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
         if let Some(binary_path) = macos_binary_path {
             launchd_config.binary_path = binary_path;
         }
+        launchd_config
+            .config_path
+            .clone_from(&config.paths.config_file);
+        launchd_config.working_directory = config
+            .paths
+            .state_file
+            .parent()
+            .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
         let mgr = LaunchdServiceManager::new(launchd_config);
         let plist_path = mgr.config().plist_path();
         let scope = service.scope_name();
@@ -8478,7 +8502,7 @@ mod tests {
                 swap_free_bytes: 1024 * 1024 * 1024,
             },
             PlatformPaths {
-                ballast_dir: PathBuf::from("/Users/me/Library/Application Support/sbh/ballast"),
+                ballast_dir: PathBuf::from("/Users/me/Library/Application Support/sbh/ballast.bin"),
                 state_file: PathBuf::from("/Users/me/Library/Application Support/sbh/state.json"),
                 sqlite_db: PathBuf::from(
                     "/Users/me/Library/Application Support/sbh/activity.sqlite3",
@@ -8947,6 +8971,28 @@ mod tests {
         let opts = build_macos_release_install_options(&args, &config, service);
 
         assert_eq!(opts.install_dir, PathBuf::from("/usr/local/bin"));
+    }
+
+    #[test]
+    fn install_default_paths_follow_service_scope() {
+        let system_paths = install_default_paths_for_service(Some(ResolvedInstallService {
+            kind: ServiceKind::Launchd,
+            user_scope: false,
+        }));
+
+        assert_eq!(system_paths, PathsConfig::system_default());
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            system_paths.ballast_dir,
+            PathBuf::from("/private/var/sbh/ballast.bin")
+        );
+
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            system_paths.ballast_dir,
+            PathBuf::from("/var/lib/sbh/ballast")
+        );
     }
 
     #[test]

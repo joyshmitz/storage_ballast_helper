@@ -237,6 +237,8 @@ sbh dashboard
 | macOS user service | `~/Library/Application Support/sbh/config.toml` | `~/Library/Application Support/sbh/` |
 | macOS system service | `/Library/Application Support/sbh/config.toml` | `/private/var/sbh/` |
 
+The default ballast pool is `~/.local/share/sbh/ballast` for Linux user installs, `/var/lib/sbh/ballast` for Linux system services, `~/Library/Application Support/sbh/ballast.bin` for macOS LaunchAgents, and `/private/var/sbh/ballast.bin` for macOS LaunchDaemons. Override `[paths].ballast_dir` in the config file when the ballast pool must live on a specific volume.
+
 Precedence is: `--config`, then `SBH_CONFIG`, then the platform default. On macOS, setting `SBH_USE_XDG_PATHS=1`, setting `XDG_CONFIG_HOME`/`XDG_DATA_HOME`, or already having `~/.config/sbh/config.toml` without a native App Support config opts into the XDG layout.
 
 ### Install Wizard
@@ -975,6 +977,8 @@ Ballast files are pre-allocated sacrificial space that can be released instantly
 #### Provisioning
 
 Each watched volume gets its own ballast pool. Files are named `SBH_BALLAST_FILE_00001.dat` through `SBH_BALLAST_FILE_NNNNN.dat`, with a 4096-byte JSON header containing the magic string `SBH_BALLAST_v1`, file index, creation timestamp, and size metadata.
+
+On macOS, service scope controls the default pool path: user LaunchAgents use `~/Library/Application Support/sbh/ballast.bin`; system LaunchDaemons use `/private/var/sbh/ballast.bin`. This path is still a ballast pool directory in the current multi-file implementation, and `[paths].ballast_dir` remains the override for custom placement.
 
 The data payload is written differently depending on the filesystem:
 

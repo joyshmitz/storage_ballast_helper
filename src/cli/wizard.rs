@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::core::config::Config;
+use crate::core::config::{Config, PathsConfig};
 use crate::platform::pal::{Platform, detect_platform};
 use crate::platform::types::ServiceKind;
 
@@ -133,7 +133,11 @@ impl WizardAnswers {
     /// Build a `Config` from the wizard answers.
     #[must_use]
     pub fn to_config(&self) -> Config {
-        let mut config = Config::default();
+        let mut config = if self.service != ServiceChoice::None && !self.user_scope {
+            Config::with_paths(PathsConfig::system_default())
+        } else {
+            Config::default()
+        };
 
         // Override scanner root paths with wizard selections.
         config.scanner.root_paths.clone_from(&self.watched_paths);
@@ -669,6 +673,32 @@ mod tests {
         );
         assert_eq!(config.ballast.file_count, 5);
         assert_eq!(config.ballast.file_size_bytes, 1_073_741_824);
+    }
+
+    #[test]
+    fn wizard_system_scope_uses_system_paths() {
+        let answers = WizardAnswers {
+            service: ServiceChoice::Launchd,
+            user_scope: false,
+            watched_paths: vec![PathBuf::from("/tmp")],
+            ballast_preset: BallastPreset::Medium,
+            ballast_file_count: 10,
+            ballast_file_size_bytes: 1_073_741_824,
+            auto_mode: false,
+        };
+
+        let config = answers.to_config();
+
+        assert_eq!(config.paths, PathsConfig::system_default());
+        assert_eq!(
+            config.update.metadata_cache_file,
+            config
+                .paths
+                .state_file
+                .parent()
+                .expect("system state path has parent")
+                .join("update-metadata.json")
+        );
     }
 
     #[test]
