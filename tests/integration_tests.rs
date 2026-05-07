@@ -174,38 +174,11 @@ fn macos_status_json_matches_diskutil_apfs_capacity() {
             )
         });
 
-    let diskutil = std::process::Command::new("/usr/sbin/diskutil")
-        .args(["apfs", "list", "-plist"])
-        .output()
-        .expect("diskutil should execute on macOS");
-    assert!(
-        diskutil.status.success(),
-        "diskutil apfs list -plist failed: status={} stderr={}",
-        diskutil.status,
-        String::from_utf8_lossy(&diskutil.stderr)
-    );
-    let inventory =
-        storage_ballast_helper::platform::macos::sys::parse_apfs_inventory(&diskutil.stdout)
-            .expect("diskutil APFS plist should parse");
-
     let container_id = data_mount["container_id"]
         .as_str()
         .expect("primary APFS mount should report container_id");
-    let diskutil_container = inventory
-        .containers
-        .iter()
-        .find(|container| container.container_id == container_id)
-        .unwrap_or_else(|| {
-            panic!(
-                "status container_id {container_id:?} not found in diskutil inventory; status_mount={data_mount}"
-            )
-        });
-    let diskutil_total = diskutil_container
-        .capacity_total_bytes
-        .expect("diskutil container should include total capacity");
-    let diskutil_available = diskutil_container
-        .capacity_available_bytes
-        .expect("diskutil container should include available capacity");
+    let (diskutil_total, diskutil_available) =
+        diskutil_container_capacity(container_id, &format!("status_mount={data_mount}"));
 
     assert_eq!(data_mount["free_excludes_purgeable"], true);
     assert_eq!(data_mount["is_primary"], true);
@@ -225,6 +198,23 @@ fn macos_status_json_matches_diskutil_apfs_capacity() {
         TOLERANCE_BYTES,
     );
     assert_json_bytes_close(data_mount, "free", diskutil_available, TOLERANCE_BYTES);
+
+    let apfs = &data_mount["platform"]["darwin"]["apfs"];
+    assert_eq!(apfs["container_id"].as_str(), Some(container_id));
+    assert_eq!(apfs["volume_role"].as_str(), Some("Data"));
+    assert_eq!(apfs["free_excludes_purgeable"], true);
+    assert_json_bytes_close(
+        apfs,
+        "container_total_bytes",
+        diskutil_total,
+        TOLERANCE_BYTES,
+    );
+    assert_json_bytes_close(
+        apfs,
+        "container_available_bytes",
+        diskutil_available,
+        TOLERANCE_BYTES,
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -239,9 +229,107 @@ fn assert_json_bytes_close(mount: &Value, key: &'static str, expected: u64, tole
     );
 }
 
+#[cfg(target_os = "macos")]
+fn diskutil_container_capacity(container_id: &str, context: &str) -> (u64, u64) {
+    let diskutil = std::process::Command::new("/usr/sbin/diskutil")
+        .args(["apfs", "list", "-plist"])
+        .output()
+        .expect("diskutil should execute on macOS");
+    assert!(
+        diskutil.status.success(),
+        "diskutil apfs list -plist failed: status={} stderr={}",
+        diskutil.status,
+        String::from_utf8_lossy(&diskutil.stderr)
+    );
+    let inventory =
+        storage_ballast_helper::platform::macos::sys::parse_apfs_inventory(&diskutil.stdout)
+            .expect("diskutil APFS plist should parse");
+    let container = inventory
+        .containers
+        .iter()
+        .find(|container| container.container_id == container_id)
+        .unwrap_or_else(|| {
+            panic!("container_id {container_id:?} not found in diskutil inventory; {context}")
+        });
+    let total = container
+        .capacity_total_bytes
+        .expect("diskutil container should include total capacity");
+    let available = container
+        .capacity_available_bytes
+        .expect("diskutil container should include available capacity");
+    (total, available)
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn macos_status_json_matches_diskutil_apfs_capacity() {}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_check_json_matches_diskutil_apfs_capacity() {
+    const TOLERANCE_BYTES: u64 = 100 * 1_048_576;
+
+    let result = common::run_cli_case(
+        "macos_check_json_matches_diskutil_apfs_capacity",
+        &["--json", "check", "--target-free", "0", "/"],
+    );
+    assert!(
+        result.status.success(),
+        "check --json failed; stderr={:?}; log={}",
+        result.stderr,
+        result.log_path.display()
+    );
+    let payload: Value = serde_json::from_str(result.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "expected check JSON, parse failed: {err}; stdout={:?}; log={}",
+            result.stdout,
+            result.log_path.display()
+        )
+    });
+
+    let container_id = payload["container_id"]
+        .as_str()
+        .expect("check JSON should report APFS container_id for /");
+    let (diskutil_total, diskutil_available) =
+        diskutil_container_capacity(container_id, &format!("payload={payload}"));
+
+    assert_eq!(payload["command"].as_str(), Some("check"));
+    assert_eq!(payload["status"].as_str(), Some("ok"));
+    assert_json_bytes_close(
+        &payload,
+        "container_total_bytes",
+        diskutil_total,
+        TOLERANCE_BYTES,
+    );
+    assert_json_bytes_close(&payload, "total_bytes", diskutil_total, TOLERANCE_BYTES);
+    assert_json_bytes_close(
+        &payload,
+        "container_available_bytes",
+        diskutil_available,
+        TOLERANCE_BYTES,
+    );
+    assert_json_bytes_close(&payload, "free_bytes", diskutil_available, TOLERANCE_BYTES);
+
+    let apfs = &payload["platform"]["darwin"]["apfs"];
+    assert_eq!(apfs["container_id"].as_str(), Some(container_id));
+    assert_eq!(apfs["free_excludes_purgeable"], true);
+    assert_json_bytes_close(
+        apfs,
+        "container_total_bytes",
+        diskutil_total,
+        TOLERANCE_BYTES,
+    );
+    assert_json_bytes_close(
+        apfs,
+        "container_available_bytes",
+        diskutil_available,
+        TOLERANCE_BYTES,
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn macos_check_json_matches_diskutil_apfs_capacity() {}
 
 #[test]
 fn completions_command_generates_shell_script() {

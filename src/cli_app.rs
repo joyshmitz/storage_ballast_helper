@@ -4637,6 +4637,27 @@ fn status_mount_json(capacity: &Capacity, level: &str, free_pct: f64) -> Value {
         "free_excludes_purgeable": true,
         "local_snapshot_bytes": capacity.local_snapshot_bytes,
         "local_snapshot_reclaim_command": local_snapshot_reclaim_command(capacity),
+        "platform": capacity_platform_json(capacity),
+    })
+}
+
+fn capacity_platform_json(capacity: &Capacity) -> Value {
+    json!({
+        "darwin": {
+            "apfs": {
+                "container_id": capacity.container_id.as_deref(),
+                "container_total_bytes": capacity.container_total_bytes,
+                "container_available_bytes": capacity.container_available_bytes,
+                "volume_total_bytes": capacity.volume_total_bytes,
+                "volume_available_bytes": capacity.volume_available_bytes,
+                "volume_role": capacity.volume_role.as_deref(),
+                "shared_volumes": &capacity.shared_volumes,
+                "is_primary": capacity.is_primary,
+                "purgeable_bytes": capacity.purgeable_bytes,
+                "local_snapshot_bytes": capacity.local_snapshot_bytes,
+                "free_excludes_purgeable": true,
+            }
+        }
     })
 }
 
@@ -5977,11 +5998,11 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
 
-    let stats = platform
-        .fs_stats(&check_path)
+    let capacity = platform
+        .capacity(&check_path)
         .map_err(|e| CliError::Runtime(e.to_string()))?;
 
-    let free_pct = stats.free_pct();
+    let free_pct = capacity_free_pct(&capacity);
     let config = Config::load(cli.config.as_deref()).unwrap_or_default();
     let threshold_pct = args
         .target_free
@@ -5989,14 +6010,14 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
 
     // Check 1: absolute free space requirement.
     if let Some(need_bytes) = args.need
-        && stats.available_bytes < need_bytes
+        && capacity.available_bytes < need_bytes
     {
         match output_mode(cli) {
             OutputMode::Human => {
                 eprintln!(
                     "sbh: {} has {} free but {} required. Run: sbh emergency {}",
-                    stats.mount_point.display(),
-                    format_bytes(stats.available_bytes),
+                    capacity.mount_point.display(),
+                    format_bytes(capacity.available_bytes),
                     format_bytes(need_bytes),
                     check_path.display(),
                 );
@@ -6006,10 +6027,19 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                     "command": "check",
                     "status": "critical",
                     "path": check_path.to_string_lossy(),
-                    "mount_point": stats.mount_point.to_string_lossy(),
-                    "free_bytes": stats.available_bytes,
+                    "mount_point": capacity.mount_point.to_string_lossy(),
+                    "free_bytes": capacity.available_bytes,
+                    "total_bytes": capacity.total_bytes,
                     "need_bytes": need_bytes,
                     "free_pct": free_pct,
+                    "container_id": capacity.container_id.as_deref(),
+                    "container_total_bytes": capacity.container_total_bytes,
+                    "container_available_bytes": capacity.container_available_bytes,
+                    "volume_total_bytes": capacity.volume_total_bytes,
+                    "volume_available_bytes": capacity.volume_available_bytes,
+                    "volume_role": capacity.volume_role.as_deref(),
+                    "free_excludes_purgeable": true,
+                    "platform": capacity_platform_json(&capacity),
                     "exit_code": 2,
                 });
                 write_json_line(&payload)?;
@@ -6024,8 +6054,8 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
             OutputMode::Human => {
                 eprintln!(
                     "sbh: {} has {} free ({:.1}%). Run: sbh emergency {}",
-                    stats.mount_point.display(),
-                    format_bytes(stats.available_bytes),
+                    capacity.mount_point.display(),
+                    format_bytes(capacity.available_bytes),
                     free_pct,
                     check_path.display(),
                 );
@@ -6035,11 +6065,19 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                     "command": "check",
                     "status": "critical",
                     "path": check_path.to_string_lossy(),
-                    "mount_point": stats.mount_point.to_string_lossy(),
-                    "free_bytes": stats.available_bytes,
-                    "total_bytes": stats.total_bytes,
+                    "mount_point": capacity.mount_point.to_string_lossy(),
+                    "free_bytes": capacity.available_bytes,
+                    "total_bytes": capacity.total_bytes,
                     "free_pct": free_pct,
                     "threshold_pct": threshold_pct,
+                    "container_id": capacity.container_id.as_deref(),
+                    "container_total_bytes": capacity.container_total_bytes,
+                    "container_available_bytes": capacity.container_available_bytes,
+                    "volume_total_bytes": capacity.volume_total_bytes,
+                    "volume_available_bytes": capacity.volume_available_bytes,
+                    "volume_role": capacity.volume_role.as_deref(),
+                    "free_excludes_purgeable": true,
+                    "platform": capacity_platform_json(&capacity),
                     "exit_code": 2,
                 });
                 write_json_line(&payload)?;
@@ -6066,12 +6104,12 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
 
     // Check 3: prediction from daemon state.json (if available and --predict requested).
     if let Some(predict_minutes) = args.predict {
-        match read_daemon_prediction(&config.paths.state_file, &stats.mount_point) {
+        match read_daemon_prediction(&config.paths.state_file, &capacity.mount_point) {
             Some(rate_bps) if rate_bps > 0.0 => {
                 // Positive rate means filling; estimate time to threshold.
-                let bytes_until_threshold = stats
+                let bytes_until_threshold = capacity
                     .available_bytes
-                    .saturating_sub((threshold_pct / 100.0 * stats.total_bytes as f64) as u64);
+                    .saturating_sub((threshold_pct / 100.0 * capacity.total_bytes as f64) as u64);
                 let seconds_left = bytes_until_threshold as f64 / rate_bps;
                 let minutes_left = seconds_left / 60.0;
 
@@ -6080,8 +6118,8 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                         OutputMode::Human => {
                             eprintln!(
                                 "sbh: {} has {} free but predicted full in {:.0} min (need {} min)",
-                                stats.mount_point.display(),
-                                format_bytes(stats.available_bytes),
+                                capacity.mount_point.display(),
+                                format_bytes(capacity.available_bytes),
                                 minutes_left,
                                 predict_minutes,
                             );
@@ -6091,12 +6129,21 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                                 "command": "check",
                                 "status": "warning",
                                 "path": check_path.to_string_lossy(),
-                                "mount_point": stats.mount_point.to_string_lossy(),
-                                "free_bytes": stats.available_bytes,
+                                "mount_point": capacity.mount_point.to_string_lossy(),
+                                "free_bytes": capacity.available_bytes,
+                                "total_bytes": capacity.total_bytes,
                                 "free_pct": free_pct,
                                 "rate_bytes_per_sec": rate_bps,
                                 "minutes_until_full": minutes_left,
                                 "predict_minutes": predict_minutes,
+                                "container_id": capacity.container_id.as_deref(),
+                                "container_total_bytes": capacity.container_total_bytes,
+                                "container_available_bytes": capacity.container_available_bytes,
+                                "volume_total_bytes": capacity.volume_total_bytes,
+                                "volume_available_bytes": capacity.volume_available_bytes,
+                                "volume_role": capacity.volume_role.as_deref(),
+                                "free_excludes_purgeable": true,
+                                "platform": capacity_platform_json(&capacity),
                                 "exit_code": 1,
                             });
                             write_json_line(&payload)?;
@@ -6120,10 +6167,18 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
             "command": "check",
             "status": "ok",
             "path": check_path.to_string_lossy(),
-            "mount_point": stats.mount_point.to_string_lossy(),
-            "free_bytes": stats.available_bytes,
-            "total_bytes": stats.total_bytes,
+            "mount_point": capacity.mount_point.to_string_lossy(),
+            "free_bytes": capacity.available_bytes,
+            "total_bytes": capacity.total_bytes,
             "free_pct": free_pct,
+            "container_id": capacity.container_id.as_deref(),
+            "container_total_bytes": capacity.container_total_bytes,
+            "container_available_bytes": capacity.container_available_bytes,
+            "volume_total_bytes": capacity.volume_total_bytes,
+            "volume_available_bytes": capacity.volume_available_bytes,
+            "volume_role": capacity.volume_role.as_deref(),
+            "free_excludes_purgeable": true,
+            "platform": capacity_platform_json(&capacity),
             "exit_code": 0,
         });
         write_json_line(&payload)?;
@@ -8821,6 +8876,19 @@ mod tests {
             payload["local_snapshot_reclaim_command"],
             "sudo tmutil thinlocalsnapshots /System/Volumes/Data 9999999999999999 4"
         );
+
+        let apfs = &payload["platform"]["darwin"]["apfs"];
+        assert_eq!(apfs["container_id"], "/dev/disk3");
+        assert_eq!(apfs["container_total_bytes"], 1_000);
+        assert_eq!(apfs["container_available_bytes"], 250);
+        assert_eq!(apfs["volume_total_bytes"], 400);
+        assert_eq!(apfs["volume_available_bytes"], 100);
+        assert_eq!(apfs["volume_role"], "Data");
+        assert_eq!(apfs["shared_volumes"], json!(["Macintosh HD", "VM"]));
+        assert_eq!(apfs["is_primary"], true);
+        assert_eq!(apfs["purgeable_bytes"], 32);
+        assert_eq!(apfs["local_snapshot_bytes"], 64);
+        assert_eq!(apfs["free_excludes_purgeable"], true);
     }
 
     #[test]

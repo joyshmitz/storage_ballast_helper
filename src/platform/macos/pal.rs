@@ -51,9 +51,12 @@ impl Platform for MacOsPal {
     }
 
     fn fs_stats(&self, path: &Path) -> Result<FsStats> {
-        sys::statfs(path)
-            .map(statfs_to_fs_stats)
-            .map_err(|error| macos_method_error("fs_stats", &error))
+        let stats = sys::statfs(path).map_err(|error| macos_method_error("fs_stats", &error))?;
+        let inventory = sys::apfs_inventory().ok();
+        Ok(capacity_to_fs_stats(statfs_to_capacity(
+            stats,
+            inventory.as_ref(),
+        )))
     }
 
     fn mount_points(&self) -> Result<Vec<MountPoint>> {
@@ -372,14 +375,14 @@ fn is_fda_permission_denied(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::EPERM) || error.kind() == io::ErrorKind::PermissionDenied
 }
 
-fn statfs_to_fs_stats(stats: StatfsSnapshot) -> FsStats {
+fn capacity_to_fs_stats(capacity: Capacity) -> FsStats {
     FsStats {
-        total_bytes: stats.total_bytes(),
-        free_bytes: stats.free_bytes(),
-        available_bytes: stats.available_bytes(),
-        fs_type: stats.fs_type,
-        mount_point: stats.mount_point,
-        is_readonly: stats.is_readonly,
+        total_bytes: capacity.total_bytes,
+        free_bytes: capacity.free_bytes,
+        available_bytes: capacity.available_bytes,
+        fs_type: capacity.fs_type,
+        mount_point: capacity.mount_point,
+        is_readonly: capacity.is_readonly,
     }
 }
 
@@ -790,6 +793,36 @@ mod tests {
         assert_eq!(capacity.volume_role.as_deref(), Some("Data"));
         assert_eq!(capacity.shared_volumes, vec!["Macintosh HD", "VM"]);
         assert!(capacity.is_primary);
+    }
+
+    #[test]
+    fn fs_stats_projection_uses_effective_apfs_container_capacity() {
+        let capacity = crate::platform::types::Capacity {
+            mount_point: PathBuf::from("/System/Volumes/Data"),
+            fs_type: "apfs".to_string(),
+            total_bytes: 1_000,
+            free_bytes: 250,
+            available_bytes: 250,
+            is_readonly: false,
+            container_id: Some("/dev/disk3".to_string()),
+            container_total_bytes: Some(1_000),
+            container_available_bytes: Some(250),
+            volume_total_bytes: Some(400),
+            volume_available_bytes: Some(100),
+            volume_role: Some("Data".to_string()),
+            shared_volumes: vec!["Macintosh HD".to_string()],
+            is_primary: true,
+            purgeable_bytes: Some(50),
+            local_snapshot_bytes: Some(64),
+        };
+
+        let stats = super::capacity_to_fs_stats(capacity);
+
+        assert_eq!(stats.total_bytes, 1_000);
+        assert_eq!(stats.free_bytes, 250);
+        assert_eq!(stats.available_bytes, 250);
+        assert!((stats.free_pct() - 25.0).abs() < f64::EPSILON);
+        assert_eq!(stats.mount_point, PathBuf::from("/System/Volumes/Data"));
     }
 
     #[test]
