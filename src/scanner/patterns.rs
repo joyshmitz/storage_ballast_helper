@@ -6,6 +6,8 @@
 use std::borrow::Cow;
 use std::path::Path;
 
+use crate::platform::cleanup_catalog::{self, CleanupConfidence, CleanupRule, ReclaimCommand};
+
 /// High-level artifact category used by the scorer and CLI reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactCategory {
@@ -134,13 +136,26 @@ impl ArtifactPatternRegistry {
     /// Classify one path name with optional structural evidence.
     #[must_use]
     pub fn classify(&self, path: &Path, signals: StructuralSignals) -> ArtifactClassification {
+        self.classify_with_cleanup_rules(path, signals, platform_cleanup_rules())
+    }
+
+    /// Classify one path name against an explicit cleanup catalog.
+    #[must_use]
+    pub fn classify_with_cleanup_rules(
+        &self,
+        path: &Path,
+        signals: StructuralSignals,
+        cleanup_rules: &'static [CleanupRule],
+    ) -> ArtifactClassification {
         let Some(name_os) = path.file_name() else {
             return ArtifactClassification::unknown();
         };
         let normalized = name_os.to_string_lossy().to_lowercase();
 
-        let mut best =
-            macos_cleanup_path_classification(path).unwrap_or_else(ArtifactClassification::unknown);
+        let catalog_classification = cleanup_catalog_path_classification(path, cleanup_rules);
+        let mut best = catalog_classification
+            .clone()
+            .unwrap_or_else(ArtifactClassification::unknown);
         for pattern in &self.builtins {
             if matches_builtin(pattern.kind, &normalized)
                 && pattern.confidence > best.name_confidence
@@ -169,22 +184,8 @@ impl ArtifactPatternRegistry {
             }
         }
 
-        if let Some(pattern_name) = release_work_buildroot_pattern_name(path) {
-            best = ArtifactClassification {
-                pattern_name: Cow::Borrowed(pattern_name),
-                category: ArtifactCategory::BuildOutput,
-                name_confidence: 0.88,
-                structural_confidence: 0.0,
-                combined_confidence: 0.88,
-            };
-        } else if user_named_trash_pattern_name(path).is_some() {
-            best = ArtifactClassification {
-                pattern_name: Cow::Borrowed("user-named-trash"),
-                category: ArtifactCategory::TempDir,
-                name_confidence: 0.56,
-                structural_confidence: 0.0,
-                combined_confidence: 0.56,
-            };
+        if let Some(classification) = catalog_classification {
+            best = classification;
         }
 
         // Structural rescue path: name is ambiguous but layout screams "Rust target".
@@ -229,6 +230,22 @@ impl ArtifactPatternRegistry {
     }
 }
 
+#[must_use]
+pub fn platform_cleanup_rules() -> &'static [CleanupRule] {
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::macos::cleanup_catalog::cleanup_rules()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::platform::linux::cleanup_catalog::cleanup_rules()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        &[]
+    }
+}
+
 fn matches_builtin(kind: MatchKind, normalized: &str) -> bool {
     match kind {
         MatchKind::Exact(token) => normalized == token,
@@ -238,138 +255,46 @@ fn matches_builtin(kind: MatchKind, normalized: &str) -> bool {
     }
 }
 
-fn macos_cleanup_path_classification(path: &Path) -> Option<ArtifactClassification> {
-    if is_xcode_derived_data_project_root(path) {
-        Some(ArtifactClassification {
-            pattern_name: Cow::Borrowed("xcode-derived-data"),
-            category: ArtifactCategory::BuildOutput,
-            name_confidence: 0.96,
-            structural_confidence: 0.0,
-            combined_confidence: 0.96,
-        })
-    } else if let Some(pattern_name) = release_work_buildroot_pattern_name(path) {
-        Some(ArtifactClassification {
-            pattern_name: Cow::Borrowed(pattern_name),
-            category: ArtifactCategory::BuildOutput,
-            name_confidence: 0.88,
-            structural_confidence: 0.0,
-            combined_confidence: 0.88,
-        })
-    } else if user_named_trash_pattern_name(path).is_some() {
-        Some(ArtifactClassification {
-            pattern_name: Cow::Borrowed("user-named-trash"),
-            category: ArtifactCategory::TempDir,
-            name_confidence: 0.56,
-            structural_confidence: 0.0,
-            combined_confidence: 0.56,
-        })
-    } else {
-        electron_cache_pattern_name(path).map(|pattern_name| ArtifactClassification {
-            pattern_name: Cow::Borrowed(pattern_name),
-            category: ArtifactCategory::CacheDir,
-            name_confidence: 0.92,
-            structural_confidence: 0.0,
-            combined_confidence: 0.92,
-        })
+fn cleanup_catalog_path_classification(
+    path: &Path,
+    cleanup_rules: &'static [CleanupRule],
+) -> Option<ArtifactClassification> {
+    let rule = cleanup_catalog::match_path_scanner_rule(path, cleanup_rules)?;
+    let confidence = cleanup_rule_name_confidence(rule);
+    Some(ArtifactClassification {
+        pattern_name: Cow::Borrowed(rule.scanner_label()),
+        category: cleanup_rule_category(rule),
+        name_confidence: confidence,
+        structural_confidence: 0.0,
+        combined_confidence: confidence,
+    })
+}
+
+fn cleanup_rule_name_confidence(rule: &CleanupRule) -> f64 {
+    match rule.confidence {
+        CleanupConfidence::Definite => 0.96,
+        CleanupConfidence::Likely => 0.92,
+        CleanupConfidence::Unclear => 0.56,
+        CleanupConfidence::ReportOnly | CleanupConfidence::Sacred => 0.0,
     }
 }
 
-fn release_work_buildroot_pattern_name(path: &Path) -> Option<&'static str> {
-    let parent = path.parent()?;
-    if !path_component_eq(parent, "release-work") {
-        return None;
-    }
-
-    let name = path.file_name().and_then(|name| name.to_str())?;
-    let normalized = name.to_ascii_lowercase();
-    if normalized.ends_with("-buildroot") || normalized.ends_with("_buildroot") {
-        Some("release-work-buildroot")
-    } else {
-        None
-    }
-}
-
-fn user_named_trash_pattern_name(path: &Path) -> Option<&'static str> {
-    let parent = path.parent()?;
-    if !is_volatile_temp_root(parent) {
-        return None;
-    }
-
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())?
-        .to_ascii_lowercase();
-    if name == "trash" || name == "trashed" || name.contains("-trash-") {
-        Some("user-named-trash")
-    } else {
-        None
-    }
-}
-
-fn is_volatile_temp_root(path: &Path) -> bool {
-    matches!(
-        path.to_string_lossy().as_ref(),
-        "/tmp" | "/private/tmp" | "/var/tmp" | "/data/tmp" | "/dev/shm"
-    )
-}
-
-fn is_xcode_derived_data_project_root(path: &Path) -> bool {
-    let Some(parent) = path.parent() else {
-        return false;
-    };
-    path.file_name().is_some()
-        && path_component_eq(parent, "DerivedData")
-        && parent
-            .parent()
-            .is_some_and(|xcode| path_component_eq(xcode, "Xcode"))
-        && parent
-            .parent()
-            .and_then(Path::parent)
-            .is_some_and(|developer| path_component_eq(developer, "Developer"))
-        && parent
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .is_some_and(|library| path_component_eq(library, "Library"))
-}
-
-fn path_component_eq(path: &Path, expected: &str) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case(expected))
-}
-
-fn electron_cache_pattern_name(path: &Path) -> Option<&'static str> {
-    let components = path
-        .iter()
-        .filter_map(|component| component.to_str())
-        .collect::<Vec<_>>();
-    let app_support = components.windows(2).position(|window| {
-        window[0].eq_ignore_ascii_case("Library")
-            && window[1].eq_ignore_ascii_case("Application Support")
-    })?;
-    let app_component = app_support + 2;
-    let relative = components.get(app_component + 1..)?;
-    let first = relative.first()?;
-
-    if first.eq_ignore_ascii_case("Cache") {
-        Some("electron-cache")
-    } else if first.eq_ignore_ascii_case("Code Cache") {
-        Some("electron-code-cache")
-    } else if first.eq_ignore_ascii_case("GPUCache") {
-        Some("electron-gpu-cache")
-    } else if first.eq_ignore_ascii_case("IndexedDB") {
-        Some("electron-indexed-db")
-    } else if first.eq_ignore_ascii_case("vm_bundles") {
-        Some("electron-vm-bundles")
-    } else if first.eq_ignore_ascii_case("Service Worker")
-        && relative
-            .get(1)
-            .is_some_and(|component| component.eq_ignore_ascii_case("CacheStorage"))
+fn cleanup_rule_category(rule: &CleanupRule) -> ArtifactCategory {
+    let name = rule.name;
+    if name.contains("target") {
+        ArtifactCategory::RustTarget
+    } else if name.starts_with("electron")
+        || name.contains("cache")
+        || name.contains("logs")
+        || name.contains("ipsw")
     {
-        Some("electron-service-worker-cache")
+        ArtifactCategory::CacheDir
+    } else if name.contains("derived-data") || name.contains("buildroot") {
+        ArtifactCategory::BuildOutput
+    } else if rule.reclaim_command == ReclaimCommand::PromptBeforeRemove {
+        ArtifactCategory::TempDir
     } else {
-        None
+        ArtifactCategory::Unknown
     }
 }
 
@@ -760,18 +685,17 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
 /// Used by stats aggregation to group deleted items by pattern.
 /// Returns a simplified pattern string like "target/" or ".target*".
 pub fn extract_pattern_label(path: &str) -> String {
+    extract_pattern_label_with_cleanup_rules(path, platform_cleanup_rules())
+}
+
+#[must_use]
+pub fn extract_pattern_label_with_cleanup_rules(
+    path: &str,
+    cleanup_rules: &'static [CleanupRule],
+) -> String {
     let p = Path::new(path);
-    if is_xcode_derived_data_project_root(p) {
-        return "xcode-derived-data".to_string();
-    }
-    if release_work_buildroot_pattern_name(p).is_some() {
-        return "release-work-buildroot".to_string();
-    }
-    if user_named_trash_pattern_name(p).is_some() {
-        return "user-named-trash".to_string();
-    }
-    if let Some(pattern_name) = electron_cache_pattern_name(p) {
-        return pattern_name.to_string();
+    if let Some(rule) = cleanup_catalog::match_path_scanner_rule(p, cleanup_rules) {
+        return rule.scanner_label().to_string();
     }
 
     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
@@ -870,10 +794,31 @@ pub fn extract_pattern_label(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactCategory, ArtifactPatternRegistry, CustomPattern, StructuralSignals,
-        extract_pattern_label,
+        ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, CustomPattern,
+        StructuralSignals, extract_pattern_label, extract_pattern_label_with_cleanup_rules,
     };
+    use crate::platform::{linux, macos};
     use std::path::Path;
+
+    fn classify_macos(
+        registry: &ArtifactPatternRegistry,
+        path: &Path,
+        signals: StructuralSignals,
+    ) -> ArtifactClassification {
+        registry.classify_with_cleanup_rules(path, signals, macos::cleanup_catalog::cleanup_rules())
+    }
+
+    fn extract_macos_pattern_label(path: &str) -> String {
+        extract_pattern_label_with_cleanup_rules(path, macos::cleanup_catalog::cleanup_rules())
+    }
+
+    fn classify_linux(
+        registry: &ArtifactPatternRegistry,
+        path: &Path,
+        signals: StructuralSignals,
+    ) -> ArtifactClassification {
+        registry.classify_with_cleanup_rules(path, signals, linux::cleanup_catalog::cleanup_rules())
+    }
 
     #[test]
     fn rust_target_with_markers_gets_high_confidence() {
@@ -910,7 +855,7 @@ mod tests {
         assert_eq!(classification.pattern_name, "target-underscore-prefix");
         assert_eq!(classification.category, ArtifactCategory::RustTarget);
         assert_eq!(
-            extract_pattern_label("/private/tmp/target_rust_fuzz_42"),
+            extract_pattern_label("/data/projects/target_rust_fuzz_42"),
             "target_*"
         );
     }
@@ -943,7 +888,8 @@ mod tests {
     fn xcode_derived_data_project_root_is_build_output() {
         let registry = ArtifactPatternRegistry::default();
         let path = Path::new("/Users/operator/Library/Developer/Xcode/DerivedData/sbh-demo-abc123");
-        let classification = registry.classify(
+        let classification = classify_macos(
+            &registry,
             path,
             StructuralSignals {
                 has_build: true,
@@ -956,7 +902,7 @@ mod tests {
         assert_eq!(classification.category, ArtifactCategory::BuildOutput);
         assert!(classification.combined_confidence > 0.80);
         assert_eq!(
-            extract_pattern_label(path.to_str().unwrap()),
+            extract_macos_pattern_label(path.to_str().unwrap()),
             "xcode-derived-data"
         );
     }
@@ -964,7 +910,8 @@ mod tests {
     #[test]
     fn xcode_derived_data_root_itself_is_not_the_cleanup_candidate() {
         let registry = ArtifactPatternRegistry::default();
-        let classification = registry.classify(
+        let classification = classify_macos(
+            &registry,
             Path::new("/Users/operator/Library/Developer/Xcode/DerivedData"),
             StructuralSignals::default(),
         );
@@ -1003,21 +950,23 @@ mod tests {
         ];
 
         for (path, expected_pattern) in cases {
-            let classification = registry.classify(Path::new(path), StructuralSignals::default());
+            let classification =
+                classify_macos(&registry, Path::new(path), StructuralSignals::default());
             assert_eq!(
                 classification.pattern_name, expected_pattern,
                 "unexpected pattern for {path}"
             );
             assert_eq!(classification.category, ArtifactCategory::CacheDir);
             assert!(classification.combined_confidence > 0.70);
-            assert_eq!(extract_pattern_label(path), expected_pattern);
+            assert_eq!(extract_macos_pattern_label(path), expected_pattern);
         }
     }
 
     #[test]
     fn application_support_app_root_is_not_an_electron_cache_candidate() {
         let registry = ArtifactPatternRegistry::default();
-        let classification = registry.classify(
+        let classification = classify_macos(
+            &registry,
             Path::new("/Users/operator/Library/Application Support/Claude"),
             StructuralSignals::default(),
         );
@@ -1033,12 +982,13 @@ mod tests {
             "/Users/operator/release-work/mcp_agent_mail_rust_buildroot",
             "/Users/operator/release-work/mcp-agent-mail-rust-buildroot",
         ] {
-            let classification = registry.classify(Path::new(path), StructuralSignals::default());
+            let classification =
+                classify_macos(&registry, Path::new(path), StructuralSignals::default());
 
             assert_eq!(classification.pattern_name, "release-work-buildroot");
             assert_eq!(classification.category, ArtifactCategory::BuildOutput);
             assert!(classification.combined_confidence > 0.70);
-            assert_eq!(extract_pattern_label(path), "release-work-buildroot");
+            assert_eq!(extract_macos_pattern_label(path), "release-work-buildroot");
         }
     }
 
@@ -1049,7 +999,8 @@ mod tests {
             "/Users/operator/projects/app-buildroot",
             "/Users/operator/projects/app_buildroot",
         ] {
-            let classification = registry.classify(Path::new(path), StructuralSignals::default());
+            let classification =
+                classify_macos(&registry, Path::new(path), StructuralSignals::default());
 
             assert_ne!(classification.pattern_name, "release-work-buildroot");
         }
@@ -1064,26 +1015,48 @@ mod tests {
             "/private/tmp/frankenterm-trash-20260503",
             "/tmp/agent-trash-20260507",
         ] {
-            let classification = registry.classify(Path::new(path), StructuralSignals::default());
+            let classification =
+                classify_macos(&registry, Path::new(path), StructuralSignals::default());
 
             assert_eq!(
                 classification.pattern_name, "user-named-trash",
                 "unexpected pattern for {path}"
             );
             assert_eq!(classification.category, ArtifactCategory::TempDir);
-            assert_eq!(extract_pattern_label(path), "user-named-trash");
+            assert_eq!(extract_macos_pattern_label(path), "user-named-trash");
         }
     }
 
     #[test]
     fn project_trash_name_is_not_a_cleanup_pattern() {
         let registry = ArtifactPatternRegistry::default();
-        let classification = registry.classify(
+        let classification = classify_macos(
+            &registry,
             Path::new("/data/projects/app/trash"),
             StructuralSignals::default(),
         );
 
         assert_ne!(classification.pattern_name, "user-named-trash");
+    }
+
+    #[test]
+    fn linux_temp_target_catalog_uses_shared_classification() {
+        let registry = ArtifactPatternRegistry::default();
+        let path = Path::new("/data/tmp/cass_append_baseline_target");
+        let classification = classify_linux(&registry, path, StructuralSignals::default());
+
+        assert_eq!(
+            classification.pattern_name,
+            "linux-data-tmp-underscore-target"
+        );
+        assert_eq!(classification.category, ArtifactCategory::RustTarget);
+        assert_eq!(
+            extract_pattern_label_with_cleanup_rules(
+                path.to_str().unwrap(),
+                linux::cleanup_catalog::cleanup_rules(),
+            ),
+            "linux-data-tmp-underscore-target"
+        );
     }
 
     #[test]
@@ -1415,10 +1388,13 @@ mod tests {
         );
         // _target suffix family.
         assert_eq!(
-            extract_pattern_label("/tmp/cass_append_baseline_target"),
+            extract_pattern_label("/data/projects/cass_append_baseline_target"),
             "*_target"
         );
-        assert_eq!(extract_pattern_label("/tmp/build_target"), "*_target");
+        assert_eq!(
+            extract_pattern_label("/data/projects/build_target"),
+            "*_target"
+        );
         // frankentui family — both forms collapse.
         assert_eq!(
             extract_pattern_label("/tmp/frankentui-codex-bd-2vr05-10-2-workspace"),

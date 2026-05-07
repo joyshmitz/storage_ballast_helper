@@ -2,78 +2,10 @@
 
 #![allow(missing_docs)]
 
-use std::time::Duration;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CleanupConfidence {
-    Definite,
-    Likely,
-    Unclear,
-    ReportOnly,
-    Sacred,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CheckRequirement {
-    Required,
-    NotRequired,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReclaimCommand {
-    RemoveTree,
-    RemoveMatchingFiles,
-    ThinLocalSnapshots,
-    PromptBeforeRemove,
-    ReportOnly,
-    Refuse,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AgeThreshold {
-    pub minimum_age: Duration,
-}
-
-impl AgeThreshold {
-    pub const NONE: Self = Self {
-        minimum_age: Duration::ZERO,
-    };
-
-    pub const fn from_hours(hours: u64) -> Self {
-        Self {
-            minimum_age: Duration::from_secs(hours * 60 * 60),
-        }
-    }
-
-    pub const fn from_days(days: u64) -> Self {
-        Self::from_hours(days * 24)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CleanupRule {
-    pub name: &'static str,
-    pub path_glob: &'static str,
-    pub age_threshold: AgeThreshold,
-    pub fd_check: CheckRequirement,
-    pub parent_check: CheckRequirement,
-    pub sacred_overlaps_check: CheckRequirement,
-    pub reclaim_command: ReclaimCommand,
-    pub confidence: CleanupConfidence,
-}
-
-impl CleanupRule {
-    #[must_use]
-    pub const fn is_destructive(&self) -> bool {
-        matches!(
-            self.reclaim_command,
-            ReclaimCommand::RemoveTree
-                | ReclaimCommand::RemoveMatchingFiles
-                | ReclaimCommand::ThinLocalSnapshots
-                | ReclaimCommand::PromptBeforeRemove
-        )
-    }
-}
+use crate::platform::cleanup_catalog;
+pub use crate::platform::cleanup_catalog::{
+    AgeThreshold, CheckRequirement, CleanupConfidence, CleanupRule, ReclaimCommand,
+};
 
 pub const XCODE_DERIVED_DATA: CleanupRule = cleanup_rule(
     "xcode-derived-data",
@@ -102,9 +34,27 @@ pub const ELECTRON_CACHE: CleanupRule = cleanup_rule(
     CleanupConfidence::Likely,
 );
 
+pub const ELECTRON_CACHE_ROOT: CleanupRule = cleanup_rule(
+    "electron-cache-root",
+    "~/Library/Application Support/*/Cache",
+    AgeThreshold::from_hours(1),
+    CheckRequirement::Required,
+    ReclaimCommand::RemoveTree,
+    CleanupConfidence::Likely,
+);
+
 pub const ELECTRON_SERVICE_WORKER_CACHE: CleanupRule = cleanup_rule(
     "electron-service-worker-cache",
     "~/Library/Application Support/*/Service Worker/CacheStorage/*",
+    AgeThreshold::from_hours(1),
+    CheckRequirement::Required,
+    ReclaimCommand::RemoveTree,
+    CleanupConfidence::Likely,
+);
+
+pub const ELECTRON_SERVICE_WORKER_CACHE_ROOT: CleanupRule = cleanup_rule(
+    "electron-service-worker-cache-root",
+    "~/Library/Application Support/*/Service Worker/CacheStorage",
     AgeThreshold::from_hours(1),
     CheckRequirement::Required,
     ReclaimCommand::RemoveTree,
@@ -120,9 +70,27 @@ pub const ELECTRON_CODE_CACHE: CleanupRule = cleanup_rule(
     CleanupConfidence::Likely,
 );
 
+pub const ELECTRON_CODE_CACHE_ROOT: CleanupRule = cleanup_rule(
+    "electron-code-cache-root",
+    "~/Library/Application Support/*/Code Cache",
+    AgeThreshold::from_hours(1),
+    CheckRequirement::Required,
+    ReclaimCommand::RemoveTree,
+    CleanupConfidence::Likely,
+);
+
 pub const ELECTRON_GPU_CACHE: CleanupRule = cleanup_rule(
     "electron-gpu-cache",
     "~/Library/Application Support/*/GPUCache/*",
+    AgeThreshold::from_hours(1),
+    CheckRequirement::Required,
+    ReclaimCommand::RemoveTree,
+    CleanupConfidence::Likely,
+);
+
+pub const ELECTRON_GPU_CACHE_ROOT: CleanupRule = cleanup_rule(
+    "electron-gpu-cache-root",
+    "~/Library/Application Support/*/GPUCache",
     AgeThreshold::from_hours(1),
     CheckRequirement::Required,
     ReclaimCommand::RemoveTree,
@@ -138,9 +106,27 @@ pub const ELECTRON_INDEXED_DB: CleanupRule = cleanup_rule(
     CleanupConfidence::Likely,
 );
 
+pub const ELECTRON_INDEXED_DB_ROOT: CleanupRule = cleanup_rule(
+    "electron-indexed-db-root",
+    "~/Library/Application Support/*/IndexedDB",
+    AgeThreshold::from_hours(1),
+    CheckRequirement::Required,
+    ReclaimCommand::RemoveTree,
+    CleanupConfidence::Likely,
+);
+
 pub const ELECTRON_VM_BUNDLES: CleanupRule = cleanup_rule(
     "electron-vm-bundles",
     "~/Library/Application Support/*/vm_bundles/*",
+    AgeThreshold::from_hours(24),
+    CheckRequirement::Required,
+    ReclaimCommand::RemoveTree,
+    CleanupConfidence::Likely,
+);
+
+pub const ELECTRON_VM_BUNDLES_ROOT: CleanupRule = cleanup_rule(
+    "electron-vm-bundles-root",
+    "~/Library/Application Support/*/vm_bundles",
     AgeThreshold::from_hours(24),
     CheckRequirement::Required,
     ReclaimCommand::RemoveTree,
@@ -281,11 +267,17 @@ pub const MAC_CLEANUP_RULES: &[CleanupRule] = &[
     XCODE_DERIVED_DATA,
     CORE_SIMULATOR_CACHES,
     ELECTRON_CACHE,
+    ELECTRON_CACHE_ROOT,
     ELECTRON_SERVICE_WORKER_CACHE,
+    ELECTRON_SERVICE_WORKER_CACHE_ROOT,
     ELECTRON_CODE_CACHE,
+    ELECTRON_CODE_CACHE_ROOT,
     ELECTRON_GPU_CACHE,
+    ELECTRON_GPU_CACHE_ROOT,
     ELECTRON_INDEXED_DB,
+    ELECTRON_INDEXED_DB_ROOT,
     ELECTRON_VM_BUNDLES,
+    ELECTRON_VM_BUNDLES_ROOT,
     TMP_DASH_TARGET,
     TMP_UNDERSCORE_TARGET,
     TMP_TARGET_UNDERSCORE_PREFIX,
@@ -312,7 +304,17 @@ pub fn cleanup_rules() -> &'static [CleanupRule] {
 
 #[must_use]
 pub fn find_rule(name: &str) -> Option<&'static CleanupRule> {
-    MAC_CLEANUP_RULES.iter().find(|rule| rule.name == name)
+    cleanup_catalog::find_rule(MAC_CLEANUP_RULES, name)
+}
+
+#[must_use]
+pub fn match_rule(path: &std::path::Path) -> Option<&'static CleanupRule> {
+    cleanup_catalog::match_rule(path, MAC_CLEANUP_RULES)
+}
+
+#[must_use]
+pub fn match_path_scanner_rule(path: &std::path::Path) -> Option<&'static CleanupRule> {
+    cleanup_catalog::match_path_scanner_rule(path, MAC_CLEANUP_RULES)
 }
 
 const fn cleanup_rule(

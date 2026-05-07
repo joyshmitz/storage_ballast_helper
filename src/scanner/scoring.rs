@@ -11,6 +11,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::core::config::ScoringConfig;
+use crate::platform::cleanup_catalog::{CleanupRule, ReclaimCommand};
+use crate::platform::{linux, macos};
 use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
 use crate::scanner::protection::SacredOverlap;
 
@@ -233,7 +235,6 @@ const HARD_REFUSE_BUNDLE_EXTENSIONS: &[&str] = &[
     "lrlibrary",
     "aplibrary",
 ];
-const RELEASE_WORK_BUILDROOT_MIN_AGE: Duration = Duration::from_hours(24 * 7);
 
 /// Deterministic score engine with expected-loss decision layer.
 #[derive(Debug, Clone)]
@@ -419,7 +420,7 @@ impl ScoringEngine {
         }
         if input.signals.has_cargo_toml
             && !input.signals.has_strong_signal()
-            && input.classification.pattern_name != "release-work-buildroot"
+            && !cleanup_rule_allows_embedded_manifest(&input.classification)
         {
             return Some(Cow::Borrowed(
                 "contains Cargo.toml without build-artifact markers",
@@ -433,13 +434,8 @@ impl ScoringEngine {
         if let Some(reason) = sacred_overlap_veto_reason(sacred_overlaps) {
             return Some(reason);
         }
-        if input.classification.pattern_name == "release-work-buildroot"
-            && input.age < RELEASE_WORK_BUILDROOT_MIN_AGE
-        {
-            return Some(Cow::Owned(format!(
-                "release-work buildroot age {}s below 604800s",
-                input.age.as_secs()
-            )));
+        if let Some(reason) = cleanup_rule_veto_reason(input) {
+            return Some(reason);
         }
         if input.excluded {
             return Some(Cow::Borrowed("matched user exclusion"));
@@ -496,6 +492,56 @@ impl ScoringEngine {
             },
         }
     }
+}
+
+fn cleanup_rule_veto_reason(input: &CandidateInput) -> Option<Cow<'static, str>> {
+    let rule = cleanup_rule_for_classification(&input.classification)?;
+    match rule.reclaim_command {
+        ReclaimCommand::ReportOnly => {
+            return Some(Cow::Owned(format!(
+                "{} cleanup rule is report-only",
+                rule.name
+            )));
+        }
+        ReclaimCommand::Refuse => {
+            return Some(Cow::Owned(format!(
+                "{} cleanup rule refuses reclaim",
+                rule.name
+            )));
+        }
+        ReclaimCommand::ThinLocalSnapshots => {
+            return Some(Cow::Owned(format!(
+                "{} requires platform snapshot tooling, not path deletion",
+                rule.name
+            )));
+        }
+        ReclaimCommand::RemoveTree
+        | ReclaimCommand::RemoveMatchingFiles
+        | ReclaimCommand::PromptBeforeRemove => {}
+    }
+
+    let minimum_age = rule.age_threshold.minimum_age;
+    if input.age < minimum_age {
+        return Some(Cow::Owned(format!(
+            "{} age {}s below {}s",
+            rule.name,
+            input.age.as_secs(),
+            minimum_age.as_secs()
+        )));
+    }
+    None
+}
+
+fn cleanup_rule_allows_embedded_manifest(classification: &ArtifactClassification) -> bool {
+    cleanup_rule_for_classification(classification)
+        .is_some_and(|rule| rule.name == "release-work-buildroot")
+}
+
+fn cleanup_rule_for_classification(
+    classification: &ArtifactClassification,
+) -> Option<&'static CleanupRule> {
+    macos::cleanup_catalog::find_rule(classification.pattern_name.as_ref())
+        .or_else(|| linux::cleanup_catalog::find_rule(classification.pattern_name.as_ref()))
 }
 
 fn sacred_overlap_veto_reason(overlaps: &[SacredOverlap]) -> Option<Cow<'static, str>> {
@@ -770,7 +816,10 @@ fn manual_review_override(
     classification: &ArtifactClassification,
     action: DecisionAction,
 ) -> DecisionAction {
-    if action == DecisionAction::Delete && classification.pattern_name == "user-named-trash" {
+    if action == DecisionAction::Delete
+        && cleanup_rule_for_classification(classification)
+            .is_some_and(|rule| rule.reclaim_command == ReclaimCommand::PromptBeforeRemove)
+    {
         DecisionAction::Review
     } else {
         action
@@ -1550,7 +1599,7 @@ mod tests {
         assert_eq!(score.decision.action, DecisionAction::Keep);
         assert_eq!(
             score.veto_reason.as_deref(),
-            Some("release-work buildroot age 518400s below 604800s")
+            Some("release-work-buildroot age 518400s below 604800s")
         );
     }
 

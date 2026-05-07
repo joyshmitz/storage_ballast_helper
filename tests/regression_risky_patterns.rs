@@ -3,12 +3,13 @@
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
     use storage_ballast_helper::core::config::ScoringConfig;
+    use storage_ballast_helper::platform::macos;
     use storage_ballast_helper::platform::sacred_catalog::cross_platform_sacred_paths;
     use storage_ballast_helper::scanner::patterns::{
-        ArtifactCategory, ArtifactPatternRegistry, StructuralSignals,
+        ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, StructuralSignals,
     };
     use storage_ballast_helper::scanner::protection::find_sacred_overlaps;
     use storage_ballast_helper::scanner::scoring::{
@@ -18,6 +19,14 @@ mod tests {
 
     fn default_engine() -> ScoringEngine {
         ScoringEngine::from_config(&ScoringConfig::default(), 4) // 4 hours min age
+    }
+
+    fn classify_macos(
+        registry: &ArtifactPatternRegistry,
+        path: &Path,
+        signals: StructuralSignals,
+    ) -> ArtifactClassification {
+        registry.classify_with_cleanup_rules(path, signals, macos::cleanup_catalog::cleanup_rules())
     }
 
     #[test]
@@ -30,7 +39,7 @@ mod tests {
         let path = PathBuf::from("/data/projects/mycrate/src/cargo_utils");
         let signals = StructuralSignals::default(); // No markers
 
-        let classification = registry.classify(&path, signals);
+        let classification = classify_macos(&registry, &path, signals);
 
         // Assert that it DOES NOT match the dangerous "cargo-prefix" pattern anymore.
         // It should fall back to unknown or some other low-confidence match.
@@ -71,7 +80,7 @@ mod tests {
         let path = PathBuf::from("/data/projects/mycrate/src/cache");
         let signals = StructuralSignals::default();
 
-        let classification = registry.classify(&path, signals);
+        let classification = classify_macos(&registry, &path, signals);
 
         // Matches generic-cache-exact, but confidence should be lower (0.45).
         assert_eq!(classification.pattern_name, "generic-cache-exact");
@@ -114,7 +123,7 @@ mod tests {
             has_cargo_toml: true,
             ..StructuralSignals::default()
         };
-        let classification = registry.classify(&path, signals);
+        let classification = classify_macos(&registry, &path, signals);
 
         assert_eq!(classification.pattern_name, "underscore-target-suffix");
         assert!(
@@ -150,7 +159,7 @@ mod tests {
 
         let path = PathBuf::from("/data/projects/asupersync_ansi_c/tools/rust_fuzz_target");
         let signals = StructuralSignals::default();
-        let classification = registry.classify(&path, signals);
+        let classification = classify_macos(&registry, &path, signals);
 
         assert_eq!(classification.pattern_name, "underscore-target-suffix");
 
@@ -182,9 +191,9 @@ mod tests {
 
         let path = PathBuf::from("/private/tmp/target_rust_fuzz_42");
         let signals = StructuralSignals::default();
-        let classification = registry.classify(&path, signals);
+        let classification = classify_macos(&registry, &path, signals);
 
-        assert_eq!(classification.pattern_name, "target-underscore-prefix");
+        assert_eq!(classification.pattern_name, "tmp-target-underscore-prefix");
         assert_eq!(classification.category, ArtifactCategory::RustTarget);
 
         let score = engine.score_candidate(
@@ -387,7 +396,7 @@ mod tests {
         let registry = ArtifactPatternRegistry::default();
         let engine = default_engine();
         let signals = StructuralSignals::default();
-        let classification = registry.classify(&candidate_path, signals);
+        let classification = classify_macos(&registry, &candidate_path, signals);
         let overlaps = find_sacred_overlaps(&candidate_path, cross_platform_sacred_paths())
             .expect("scan stowaways");
 

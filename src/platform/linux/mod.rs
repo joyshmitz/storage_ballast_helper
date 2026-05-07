@@ -1,38 +1,53 @@
 //! Linux PAL implementation.
 
-#![cfg(target_os = "linux")]
 #![allow(missing_docs)]
 
+pub mod cleanup_catalog;
+
+#[cfg(target_os = "linux")]
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use parking_lot::RwLock;
 
+#[cfg(target_os = "linux")]
 use crate::core::errors::{Result, SbhError};
+#[cfg(target_os = "linux")]
 use crate::platform::pal::{
     FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
 };
+#[cfg(target_os = "linux")]
 use crate::platform::sacred_catalog::cross_platform_sacred_paths;
+#[cfg(target_os = "linux")]
 use crate::platform::types::{SacredPath, ServiceKind};
 
+#[cfg(target_os = "linux")]
 pub mod disk;
+#[cfg(target_os = "linux")]
 pub mod memory;
+#[cfg(target_os = "linux")]
 pub mod process;
+#[cfg(target_os = "linux")]
 pub mod service;
 
 /// Linux platform implementation using `/proc` + `statvfs`.
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct LinuxPal {
     mounts_cache: RwLock<Option<(Vec<MountPoint>, Instant)>>,
     cache_ttl: Duration,
 }
 
+#[cfg(target_os = "linux")]
 impl Default for LinuxPal {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(target_os = "linux")]
 impl LinuxPal {
     #[must_use]
     pub fn new() -> Self {
@@ -58,6 +73,7 @@ impl LinuxPal {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Platform for LinuxPal {
     fn name(&self) -> &'static str {
         "linux"
