@@ -150,6 +150,20 @@ pub struct LocalSnapshotInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapUsage {
+    Known(SwapUsageInfo),
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwapUsageInfo {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+    pub encrypted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApfsVolumeRole {
     Data,
     System,
@@ -298,6 +312,30 @@ pub fn important_usage_available_bytes(mount: &Path) -> io::Result<Option<u64>> 
     };
 
     Ok(Some(number.unsignedLongLongValue()))
+}
+
+pub fn vm_swapusage() -> io::Result<SwapUsage> {
+    sysctl::read::<String>("vm.swapusage").map(|raw| parse_vm_swapusage(&raw))
+}
+
+#[must_use]
+pub fn parse_vm_swapusage(raw: &str) -> SwapUsage {
+    let Some(total_bytes) = labeled_byte_count(raw, "total") else {
+        return SwapUsage::Unknown;
+    };
+    let Some(used_bytes) = labeled_byte_count(raw, "used") else {
+        return SwapUsage::Unknown;
+    };
+    let Some(free_bytes) = labeled_byte_count(raw, "free") else {
+        return SwapUsage::Unknown;
+    };
+
+    SwapUsage::Known(SwapUsageInfo {
+        total_bytes,
+        used_bytes,
+        free_bytes,
+        encrypted: raw.contains("(encrypted)"),
+    })
 }
 
 pub mod sysctl {
@@ -470,6 +508,49 @@ pub mod sysctl {
             CtlValue::S16(_) => "i16",
         }
     }
+}
+
+fn labeled_byte_count(raw: &str, label: &str) -> Option<u64> {
+    let (_, after_label) = raw.split_once(label)?;
+    let after_equals = after_label.trim_start().strip_prefix('=')?;
+    let token = after_equals.split_whitespace().next()?;
+    parse_size_token(token)
+}
+
+fn parse_size_token(token: &str) -> Option<u64> {
+    let token = token.trim().trim_end_matches(',');
+    if token.is_empty() {
+        return None;
+    }
+    let (number, multiplier) = match token.as_bytes().last().copied()? {
+        b'K' | b'k' => (&token[..token.len() - 1], 1024_u128),
+        b'M' | b'm' => (&token[..token.len() - 1], 1_048_576_u128),
+        b'G' | b'g' => (&token[..token.len() - 1], 1_073_741_824_u128),
+        b'T' | b't' => (&token[..token.len() - 1], 1_099_511_627_776_u128),
+        b'B' | b'b' => (&token[..token.len() - 1], 1_u128),
+        candidate if candidate.is_ascii_digit() => (token, 1_u128),
+        _ => return None,
+    };
+    decimal_to_units(number, multiplier)
+}
+
+fn decimal_to_units(number: &str, multiplier: u128) -> Option<u64> {
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty() || !whole.chars().all(|candidate| candidate.is_ascii_digit()) {
+        return None;
+    }
+    if !fraction.chars().all(|candidate| candidate.is_ascii_digit()) {
+        return None;
+    }
+
+    let whole_units = whole.parse::<u128>().ok()?.checked_mul(multiplier)?;
+    let fraction_units = if fraction.is_empty() {
+        0
+    } else {
+        let scale = 10_u128.checked_pow(u32::try_from(fraction.len()).ok()?)?;
+        fraction.parse::<u128>().ok()?.checked_mul(multiplier)? / scale
+    };
+    u64::try_from(whole_units.checked_add(fraction_units)?).ok()
 }
 
 #[must_use]
@@ -771,10 +852,22 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ApfsVolumeRole, important_usage_available_bytes, mounted_filesystems,
-        parent_apfs_volume_device, parse_apfs_inventory, parse_tmutil_local_snapshots, statfs,
-        sysctl,
+        ApfsVolumeRole, SwapUsage, SwapUsageInfo, important_usage_available_bytes,
+        mounted_filesystems, parent_apfs_volume_device, parse_apfs_inventory,
+        parse_tmutil_local_snapshots, parse_vm_swapusage, statfs, sysctl, vm_swapusage,
     };
+
+    const fn mib(value: u64) -> u64 {
+        value * 1_048_576
+    }
+
+    const fn gib(value: u64) -> u64 {
+        value * 1_073_741_824
+    }
+
+    const fn tib(value: u64) -> u64 {
+        value * 1_099_511_627_776
+    }
 
     #[test]
     fn statfs_tmp_reports_plausible_values() {
@@ -832,6 +925,80 @@ mod tests {
             .expect("CTL_HW/HW_MEMSIZE should be readable");
 
         assert!(memsize >= 1_073_741_824);
+    }
+
+    #[test]
+    fn live_vm_swapusage_parses_when_readable() {
+        let usage = vm_swapusage().expect("vm.swapusage should be readable");
+
+        let SwapUsage::Known(usage) = usage else {
+            panic!("current macOS vm.swapusage output should parse");
+        };
+        assert!(usage.total_bytes >= usage.used_bytes);
+        assert!(usage.total_bytes >= usage.free_bytes);
+    }
+
+    #[test]
+    fn parses_vm_swapusage_string_variants() {
+        let cases = [
+            (
+                "typical encrypted",
+                "total = 8192.00M  used = 1234.50M  free = 6957.50M  (encrypted)",
+                SwapUsageInfo {
+                    total_bytes: mib(8192),
+                    used_bytes: mib(1234) + mib(1) / 2,
+                    free_bytes: mib(6957) + mib(1) / 2,
+                    encrypted: true,
+                },
+            ),
+            (
+                "all zero",
+                "total = 0.00M used = 0.00M free = 0.00M (encrypted)",
+                SwapUsageInfo {
+                    total_bytes: 0,
+                    used_bytes: 0,
+                    free_bytes: 0,
+                    encrypted: true,
+                },
+            ),
+            (
+                "large tebibyte units",
+                "total = 2.00T used = 512.00G free = 1536.00G",
+                SwapUsageInfo {
+                    total_bytes: tib(2),
+                    used_bytes: gib(512),
+                    free_bytes: gib(1536),
+                    encrypted: false,
+                },
+            ),
+            (
+                "without encrypted suffix",
+                "total = 4096.00M used = 128.00M free = 3968.00M",
+                SwapUsageInfo {
+                    total_bytes: mib(4096),
+                    used_bytes: mib(128),
+                    free_bytes: mib(3968),
+                    encrypted: false,
+                },
+            ),
+        ];
+
+        for (name, raw, expected) in cases {
+            assert_eq!(
+                parse_vm_swapusage(raw),
+                SwapUsage::Known(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn vm_swapusage_parse_failure_is_unknown() {
+        assert_eq!(parse_vm_swapusage("total unavailable"), SwapUsage::Unknown);
+        assert_eq!(
+            parse_vm_swapusage("total = nope used = 1.00M free = 2.00M"),
+            SwapUsage::Unknown
+        );
     }
 
     #[test]
