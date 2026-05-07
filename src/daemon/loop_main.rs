@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
 use parking_lot::{Mutex, RwLock};
+use serde_json::{Value, json};
 
 use crate::ballast::coordinator::BallastPoolCoordinator;
 use crate::ballast::release::BallastReleaseController;
@@ -34,7 +35,7 @@ use crate::daemon::policy::{
     ScanAggressiveness,
 };
 use crate::daemon::process_io_history::ProcessIoHistory;
-use crate::daemon::self_monitor::{SelfMonitor, ThreadHeartbeat};
+use crate::daemon::self_monitor::{SelfMonitor, ThreadHeartbeat, ThreadStatus};
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, spawn_logger};
 use crate::logger::jsonl::JsonlConfig;
@@ -43,7 +44,9 @@ use crate::monitor::fs_stats::FsStatsCollector;
 use crate::monitor::guardrails::{
     AdaptiveGuard, CalibrationObservation, GuardDiagnostics, GuardStatus, PredictionScorecard,
 };
-use crate::monitor::pid::{PidPressureController, PressureLevel, PressureReading};
+use crate::monitor::pid::{
+    PidPressureController, PressureLevel, PressureReading, PressureResponse,
+};
 use crate::monitor::predictive::{PredictiveAction, PredictiveActionPolicy};
 use crate::monitor::special_locations::SpecialLocationRegistry;
 use crate::monitor::voi_scheduler::VoiScheduler;
@@ -839,6 +842,174 @@ fn behavior_mode_summary(mode: BehaviorMode) -> String {
     )
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct StatusDumpCounters {
+    window_scans: u64,
+    window_scan_timeouts: u64,
+    window_candidates: u64,
+    window_deleted: u64,
+    window_failed: u64,
+    window_bytes_freed: u64,
+    scans_total: u64,
+    deletions_total: u64,
+    bytes_freed_total: u64,
+    errors_total: u64,
+    dropped_log_events: u64,
+}
+
+struct StatusDumpPayloadInput<'a> {
+    timestamp: String,
+    version: &'static str,
+    pid: u32,
+    uptime_seconds: u64,
+    response: &'a PressureResponse,
+    mount_free_pct: Option<f64>,
+    mount_total_bytes: Option<u64>,
+    mount_available_bytes: Option<u64>,
+    ballast_available: usize,
+    ballast_total: usize,
+    memory_info: Option<&'a MemoryInfo>,
+    policy_mode: String,
+    behavior_mode: BehaviorMode,
+    last_predictive_action: String,
+    last_ewma_confidence: f64,
+    guard: Option<&'a GuardDiagnostics>,
+    counters: StatusDumpCounters,
+    thread_status: &'a [ThreadStatus],
+}
+
+fn pressure_level_json(level: PressureLevel) -> String {
+    format!("{level:?}").to_lowercase()
+}
+
+fn finite_f64(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn thread_status_json(status: &ThreadStatus) -> Value {
+    match status {
+        ThreadStatus::Running {
+            name,
+            last_heartbeat,
+        } => json!({
+            "name": name,
+            "status": "running",
+            "last_heartbeat_age_ms": duration_millis(Instant::now().saturating_duration_since(*last_heartbeat)),
+        }),
+        ThreadStatus::Stalled {
+            name,
+            stalled_since,
+        } => json!({
+            "name": name,
+            "status": "stalled",
+            "stalled_for_ms": duration_millis(Instant::now().saturating_duration_since(*stalled_since)),
+        }),
+        ThreadStatus::Dead {
+            name,
+            died_at,
+            error,
+        } => json!({
+            "name": name,
+            "status": "dead",
+            "dead_for_ms": duration_millis(Instant::now().saturating_duration_since(*died_at)),
+            "error": error,
+        }),
+    }
+}
+
+fn memory_status_json(memory: &MemoryInfo) -> Value {
+    let swap_used_bytes = memory
+        .swap_total_bytes
+        .saturating_sub(memory.swap_free_bytes);
+    json!({
+        "ram_total_bytes": memory.total_bytes,
+        "ram_available_bytes": memory.available_bytes,
+        "ram_free_pct": finite_f64(bytes_to_pct(memory.available_bytes, memory.total_bytes)),
+        "swap_total_bytes": memory.swap_total_bytes,
+        "swap_free_bytes": memory.swap_free_bytes,
+        "swap_used_bytes": swap_used_bytes,
+        "swap_used_pct": finite_f64(bytes_to_pct(swap_used_bytes, memory.swap_total_bytes)),
+        "swap_thrash_risk": is_swap_thrash_risk(memory),
+    })
+}
+
+fn guard_diagnostics_json(guard: &GuardDiagnostics) -> Value {
+    json!({
+        "status": guard.status.to_string(),
+        "observation_count": guard.observation_count,
+        "median_rate_error": finite_f64(guard.median_rate_error),
+        "conservative_fraction": finite_f64(guard.conservative_fraction),
+        "e_process_value": finite_f64(guard.e_process_value),
+        "e_process_alarm": guard.e_process_alarm,
+        "consecutive_clean": guard.consecutive_clean,
+        "reason": &guard.reason,
+    })
+}
+
+fn build_status_dump_payload(input: &StatusDumpPayloadInput<'_>) -> Value {
+    let response = input.response;
+    let counters = input.counters;
+    json!({
+        "event": "siginfo_status",
+        "version": input.version,
+        "pid": input.pid,
+        "timestamp": input.timestamp,
+        "uptime_seconds": input.uptime_seconds,
+        "pressure": {
+            "overall": pressure_level_json(response.level),
+            "urgency": finite_f64(response.urgency),
+            "causing_mount": response.causing_mount.to_string_lossy(),
+            "free_pct": input.mount_free_pct.and_then(finite_f64),
+            "available_bytes": input.mount_available_bytes,
+            "total_bytes": input.mount_total_bytes,
+            "predicted_seconds": response.predicted_seconds.and_then(finite_f64),
+            "scan_interval_ms": duration_millis(response.scan_interval),
+            "release_ballast_files": response.release_ballast_files,
+            "max_delete_batch": response.max_delete_batch,
+            "fallback_active": response.fallback_active,
+        },
+        "ballast": {
+            "available": input.ballast_available,
+            "total": input.ballast_total,
+            "released": input.ballast_total.saturating_sub(input.ballast_available),
+        },
+            "memory": input.memory_info.map(memory_status_json),
+            "policy": {
+            "mode": &input.policy_mode,
+            "behavior": input.behavior_mode,
+            "last_predictive_action": &input.last_predictive_action,
+            "last_ewma_confidence": finite_f64(input.last_ewma_confidence),
+            "guard": input.guard.map(guard_diagnostics_json),
+        },
+        "counters": {
+            "window": {
+                "scans": counters.window_scans,
+                "scan_timeouts": counters.window_scan_timeouts,
+                "candidates": counters.window_candidates,
+                "deleted": counters.window_deleted,
+                "failed": counters.window_failed,
+                "bytes_freed": counters.window_bytes_freed,
+            },
+            "total": {
+                "scans": counters.scans_total,
+                "deletions": counters.deletions_total,
+                "bytes_freed": counters.bytes_freed_total,
+                "errors": counters.errors_total,
+                "dropped_log_events": counters.dropped_log_events,
+            },
+        },
+        "threads": input
+            .thread_status
+            .iter()
+            .map(thread_status_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
 impl MonitoringDaemon {
     /// Build and initialize the daemon from configuration.
     #[allow(clippy::too_many_lines)]
@@ -1137,6 +1308,9 @@ impl MonitoringDaemon {
             if remaining.is_zero() {
                 break;
             }
+            if self.signal_handler.has_pending_status_dump() {
+                break;
+            }
 
             let wait = remaining.min(MEMORY_PRESSURE_WAKE_INTERVAL);
             match rx.recv_timeout(wait) {
@@ -1153,6 +1327,67 @@ impl MonitoringDaemon {
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
+    }
+
+    fn emit_status_dump(&self, response: &PressureResponse) {
+        let mount_stats = self.fs_collector.collect(&response.causing_mount).ok();
+        let ballast_inventory = self.ballast_coordinator.inventory();
+        let ballast_available = ballast_inventory
+            .iter()
+            .map(|entry| entry.files_available)
+            .sum();
+        let ballast_total = ballast_inventory
+            .iter()
+            .map(|entry| entry.files_total)
+            .sum();
+        let memory_info = self.platform.memory_info().ok();
+        let health = self.self_monitor.health_snapshot(
+            &[
+                Arc::clone(&self.scanner_heartbeat),
+                Arc::clone(&self.executor_heartbeat),
+            ],
+            THREAD_HEALTH_CHECK_INTERVAL,
+            response.level,
+        );
+        let guard = self.shared_guard_diagnostics.read().clone();
+
+        let payload_input = StatusDumpPayloadInput {
+            timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            version: env!("CARGO_PKG_VERSION"),
+            pid: std::process::id(),
+            uptime_seconds: self.start_time.elapsed().as_secs(),
+            response,
+            mount_free_pct: mount_stats
+                .as_ref()
+                .map(crate::platform::pal::FsStats::free_pct),
+            mount_total_bytes: mount_stats.as_ref().map(|stats| stats.total_bytes),
+            mount_available_bytes: mount_stats.as_ref().map(|stats| stats.available_bytes),
+            ballast_available,
+            ballast_total,
+            memory_info: memory_info.as_ref(),
+            policy_mode: self.policy_engine.lock().mode().to_string(),
+            behavior_mode: self.behavior_state.mode,
+            last_predictive_action: format!("{:?}", &self.last_predictive_action),
+            last_ewma_confidence: self.last_ewma_confidence,
+            guard: guard.as_ref(),
+            counters: StatusDumpCounters {
+                window_scans: self.summary_scans,
+                window_scan_timeouts: self.summary_scan_timeouts,
+                window_candidates: self.summary_candidates,
+                window_deleted: self.summary_deleted,
+                window_failed: self.summary_failed,
+                window_bytes_freed: self.summary_bytes_freed,
+                scans_total: self.self_monitor.scan_count,
+                deletions_total: self.self_monitor.deletions_total,
+                bytes_freed_total: self.self_monitor.bytes_freed_total,
+                errors_total: self.self_monitor.errors_total,
+                dropped_log_events: self.logger_handle.dropped_events(),
+            },
+            thread_status: &health.thread_status,
+        };
+        let payload = build_status_dump_payload(&payload_input);
+
+        eprintln!("{payload}");
     }
 
     /// Run the monitoring loop until shutdown is requested.
@@ -1396,12 +1631,17 @@ impl MonitoringDaemon {
                 );
             }
 
-            // 8. Forced scan signal (SIGUSR1).
+            // 8. Foreground status dump signal (macOS SIGINFO / Ctrl+T).
+            if self.signal_handler.should_dump_status() {
+                self.emit_status_dump(&response);
+            }
+
+            // 9. Forced scan signal (SIGUSR1).
             if self.signal_handler.should_scan() {
                 self.trigger_forced_scan(&scan_tx, &response);
             }
 
-            // 9. Thread health check.
+            // 10. Thread health check.
             if last_health_check.elapsed() >= THREAD_HEALTH_CHECK_INTERVAL {
                 last_health_check = Instant::now();
 
@@ -1481,7 +1721,7 @@ impl MonitoringDaemon {
                 }
             }
 
-            // 10. Periodic summary report (every 5 minutes).
+            // 11. Periodic summary report (every 5 minutes).
             if self.last_summary_report.elapsed() >= Duration::from_mins(5) {
                 let rss_mb = self
                     .platform
@@ -1527,7 +1767,7 @@ impl MonitoringDaemon {
                 self.last_summary_report = Instant::now();
             }
 
-            // 11. Sleep for the PID-adjusted interval, but wake immediately
+            // 12. Sleep for the PID-adjusted interval, but wake immediately
             // for memory-pressure transitions so behavior changes are not
             // delayed until the next disk-pressure poll.
             self.sleep_with_memory_pressure_events(
@@ -3920,6 +4160,70 @@ mod tests {
         assert!(args.foreground);
         assert!(args.pidfile.is_none());
         assert_eq!(args.watchdog_sec, 0);
+    }
+
+    #[test]
+    fn siginfo_status_dump_payload_serializes_as_single_json_object() {
+        let response = PressureResponse {
+            level: PressureLevel::Yellow,
+            urgency: 0.42,
+            scan_interval: Duration::from_secs(3),
+            release_ballast_files: 1,
+            max_delete_batch: 7,
+            fallback_active: false,
+            causing_mount: PathBuf::from("/"),
+            predicted_seconds: Some(120.0),
+        };
+        let memory = MemoryInfo {
+            total_bytes: 16,
+            available_bytes: 8,
+            swap_total_bytes: 4,
+            swap_free_bytes: 3,
+        };
+        let thread_status = vec![ThreadStatus::Running {
+            name: "sbh-scanner".to_string(),
+            last_heartbeat: Instant::now(),
+        }];
+        let behavior_mode = BehaviorDispatchTable::default()
+            .mode_for(MemoryPressureLevel::Normal, PressureLevel::Yellow);
+
+        let payload_input = StatusDumpPayloadInput {
+            timestamp: "2026-05-07T21:22:00.000Z".to_string(),
+            version: "test-version",
+            pid: 42,
+            uptime_seconds: 9,
+            response: &response,
+            mount_free_pct: Some(50.0),
+            mount_total_bytes: Some(16),
+            mount_available_bytes: Some(8),
+            ballast_available: 2,
+            ballast_total: 5,
+            memory_info: Some(&memory),
+            policy_mode: "enforce".to_string(),
+            behavior_mode,
+            last_predictive_action: "Clear".to_string(),
+            last_ewma_confidence: 0.75,
+            guard: None,
+            counters: StatusDumpCounters {
+                window_scans: 1,
+                window_candidates: 3,
+                scans_total: 4,
+                dropped_log_events: 2,
+                ..StatusDumpCounters::default()
+            },
+            thread_status: &thread_status,
+        };
+        let payload = build_status_dump_payload(&payload_input);
+
+        let rendered = serde_json::to_string(&payload).expect("status dump should serialize");
+        let parsed: Value =
+            serde_json::from_str(&rendered).expect("status dump should be valid JSON");
+        assert_eq!(parsed["event"], "siginfo_status");
+        assert_eq!(parsed["pressure"]["overall"], "yellow");
+        assert_eq!(parsed["pressure"]["causing_mount"], "/");
+        assert_eq!(parsed["ballast"]["released"], 3);
+        assert_eq!(parsed["memory"]["ram_free_pct"], 50.0);
+        assert_eq!(parsed["threads"][0]["status"], "running");
     }
 
     #[test]

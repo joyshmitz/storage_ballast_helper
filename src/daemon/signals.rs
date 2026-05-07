@@ -72,6 +72,12 @@ impl SignalHandler {
         self.status_dump_flag.swap(false, Ordering::Relaxed)
     }
 
+    /// Check whether a foreground status dump is pending without clearing it.
+    #[must_use]
+    pub fn has_pending_status_dump(&self) -> bool {
+        self.status_dump_flag.load(Ordering::Relaxed)
+    }
+
     /// Programmatically request shutdown (e.g., from watchdog timeout or error escalation).
     pub fn request_shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::Relaxed);
@@ -338,6 +344,21 @@ mod tests {
         handler.request_status_dump();
         assert!(handler.should_dump_status());
         assert!(!handler.should_dump_status());
+    }
+
+    #[test]
+    fn pending_status_dump_check_does_not_clear_flag() {
+        let handler = SignalHandler {
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            reload_flag: Arc::new(AtomicBool::new(false)),
+            scan_flag: Arc::new(AtomicBool::new(false)),
+            status_dump_flag: Arc::new(AtomicBool::new(false)),
+        };
+
+        handler.request_status_dump();
+        assert!(handler.has_pending_status_dump());
+        assert!(handler.should_dump_status());
+        assert!(!handler.has_pending_status_dump());
     }
 
     #[cfg(target_os = "macos")]
