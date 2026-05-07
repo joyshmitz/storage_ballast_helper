@@ -28,7 +28,7 @@ pub const DEFAULT_STOWAWAY_SCAN_DEPTH: usize = 3;
 pub struct ProtectionMetadata {
     #[serde(default)]
     pub reason: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "added_by", alias = "protected_by")]
     pub protected_by: Option<String>,
     #[serde(default)]
     pub protected_at: Option<String>,
@@ -341,11 +341,14 @@ impl ProtectionRegistry {
 
 /// Create a `.sbh-protect` marker file at the given directory path.
 ///
-/// If `metadata` is provided, writes it as JSON. Otherwise creates an empty file.
+/// If `metadata` is provided, writes it as TOML. Otherwise creates an empty file.
 pub fn create_marker(dir: &Path, metadata: Option<&ProtectionMetadata>) -> Result<()> {
     let marker_path = normalize_path_for_protection(dir).join(MARKER_FILENAME);
     let content = match metadata {
-        Some(meta) => serde_json::to_string_pretty(meta)?,
+        Some(meta) => toml::to_string_pretty(meta).map_err(|source| SbhError::Serialization {
+            context: "toml",
+            details: source.to_string(),
+        })?,
         None => String::new(),
     };
     fs::write(&marker_path, content).map_err(|source| SbhError::Io {
@@ -486,14 +489,20 @@ pub fn scan_stowaways_with_config(
 
 /// Read optional metadata from a `.sbh-protect` marker file.
 ///
-/// Returns `None` if the file is empty, doesn't exist, or isn't valid JSON.
+/// Returns `None` if the file is empty, doesn't exist, or isn't valid TOML/JSON.
 fn read_marker_metadata(marker_path: &Path) -> Option<ProtectionMetadata> {
     let content = fs::read_to_string(marker_path).ok()?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return None;
     }
-    serde_json::from_str(trimmed).ok()
+    parse_marker_metadata(trimmed)
+}
+
+fn parse_marker_metadata(raw: &str) -> Option<ProtectionMetadata> {
+    toml::from_str(raw)
+        .or_else(|_| serde_json::from_str(raw))
+        .ok()
 }
 
 /// Validate that a glob pattern can be compiled.
@@ -887,7 +896,9 @@ mod tests {
 
         let marker = tmp.path().join(MARKER_FILENAME);
         let content = fs::read_to_string(&marker).unwrap();
-        let parsed: ProtectionMetadata = serde_json::from_str(&content).unwrap();
+        assert!(content.contains("reason = \"Production build - 6 hour compile\""));
+        assert!(content.contains("added_by = \"jeff\""));
+        let parsed: ProtectionMetadata = toml::from_str(&content).unwrap();
         assert_eq!(parsed, meta);
     }
 
@@ -1055,12 +1066,15 @@ mod tests {
     #[test]
     fn marker_file_with_json_metadata_is_read() {
         let tmp = TempDir::new().unwrap();
-        let meta = ProtectionMetadata {
-            reason: Some("Critical production build".to_string()),
-            protected_by: Some("admin".to_string()),
-            protected_at: None,
-        };
-        create_marker(tmp.path(), Some(&meta)).unwrap();
+        let marker = tmp.path().join(MARKER_FILENAME);
+        fs::write(
+            &marker,
+            r#"{
+  "reason": "Critical production build",
+  "protected_by": "admin"
+}"#,
+        )
+        .unwrap();
 
         let mut reg = ProtectionRegistry::marker_only();
         reg.discover_markers(tmp.path(), 1).unwrap();
@@ -1072,6 +1086,38 @@ mod tests {
         assert_eq!(
             entry.metadata.as_ref().unwrap().reason,
             Some("Critical production build".to_string())
+        );
+        assert_eq!(
+            entry.metadata.as_ref().unwrap().protected_by,
+            Some("admin".to_string())
+        );
+    }
+
+    #[test]
+    fn marker_file_with_toml_metadata_is_read() {
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join(MARKER_FILENAME);
+        fs::write(
+            &marker,
+            r#"
+reason = "year-end backup"
+added_by = "jemanuel"
+protected_at = "2026-05-07T03:50:00Z"
+"#,
+        )
+        .unwrap();
+
+        let mut reg = ProtectionRegistry::marker_only();
+        reg.discover_markers(tmp.path(), 1).unwrap();
+
+        let entries = reg.list_protections();
+        assert_eq!(entries.len(), 1);
+        let metadata = entries[0].metadata.as_ref().unwrap();
+        assert_eq!(metadata.reason.as_deref(), Some("year-end backup"));
+        assert_eq!(metadata.protected_by.as_deref(), Some("jemanuel"));
+        assert_eq!(
+            metadata.protected_at.as_deref(),
+            Some("2026-05-07T03:50:00Z")
         );
     }
 
@@ -1125,6 +1171,11 @@ mod tests {
     #[test]
     fn protection_metadata_optional_fields() {
         let meta: ProtectionMetadata = serde_json::from_str("{}").unwrap();
+        assert!(meta.reason.is_none());
+        assert!(meta.protected_by.is_none());
+        assert!(meta.protected_at.is_none());
+
+        let meta: ProtectionMetadata = toml::from_str("").unwrap();
         assert!(meta.reason.is_none());
         assert!(meta.protected_by.is_none());
         assert!(meta.protected_at.is_none());

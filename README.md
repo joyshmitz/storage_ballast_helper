@@ -849,7 +849,12 @@ When guardrails report a non-Pass status, a penalty (default 50.0) is added to t
 
 Two protection mechanisms prevent cleanup of important directories:
 
-- **Marker files**: Place a `.sbh-protect` file in any directory. That directory and all descendants are permanently excluded from scanning and deletion. No configuration needed.
+- **Marker files**: Place a `.sbh-protect` file in any directory. That directory and all descendants are permanently excluded from scanning and deletion. An empty file is valid; optional TOML metadata can record why it exists:
+  ```toml
+  reason = "year-end backup"
+  added_by = "jemanuel"
+  protected_at = "2026-05-07T03:50:00Z"
+  ```
 - **Config globs**: Shell-style patterns in `scanner.protected_paths` (e.g., `/data/projects/production-*`). Evaluated at scan time against every candidate path.
 
 #### Layer 2: Pre-Flight Safety Checks
