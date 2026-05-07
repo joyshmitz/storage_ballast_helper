@@ -1,9 +1,10 @@
 //! Ballast file manager: create/verify/reclaim pre-allocated sacrificial space files.
 //!
 //! Ballast files are named `SBH_BALLAST_FILE_NNNNN.dat` and contain a 4096-byte
-//! JSON header followed by random data. On ext4/xfs, provisioning uses `fallocate()`
-//! for instant allocation; on CoW filesystems (btrfs, zfs), random data is written
-//! in 4 MB chunks to defeat deduplication.
+//! JSON header followed by reserved data blocks. On platforms with native
+//! preallocation, provisioning uses the PAL for instant allocation; on CoW
+//! filesystems (btrfs, zfs), random data is written in 4 MB chunks to defeat
+//! deduplication.
 //!
 //! Access to the ballast directory is serialized via `flock()` on a lockfile so
 //! concurrent daemon + CLI operations don't race.
@@ -17,12 +18,14 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
 use crate::core::config::BallastConfig;
 use crate::core::errors::{Result, SbhError};
+use crate::platform::pal::Platform;
 
 // ──────────────────── constants ────────────────────
 
@@ -109,21 +112,33 @@ pub struct BallastManager {
     ballast_dir: PathBuf,
     config: BallastConfig,
     inventory: Vec<BallastFile>,
-    /// When true, skip `fallocate` and always write random data.
-    /// Set for CoW filesystems (btrfs, zfs) where fallocate-allocated zeros
-    /// are trivially deduplicated, defeating the purpose of ballast.
+    platform: Arc<dyn Platform>,
+    /// When true, skip platform preallocation and always write random data.
+    /// Set for CoW filesystems (btrfs, zfs) where zero-allocated extents can
+    /// be trivially deduplicated, defeating the purpose of ballast.
     skip_fallocate: bool,
 }
 
 impl BallastManager {
     /// Create a new manager for the given directory and configuration.
     pub fn new(ballast_dir: PathBuf, config: BallastConfig) -> Result<Self> {
+        let platform: Arc<dyn Platform> = Arc::new(crate::platform::current());
+        Self::with_platform(ballast_dir, config, platform)
+    }
+
+    /// Create a new manager with an explicit platform implementation.
+    pub fn with_platform(
+        ballast_dir: PathBuf,
+        config: BallastConfig,
+        platform: Arc<dyn Platform>,
+    ) -> Result<Self> {
         fs::create_dir_all(&ballast_dir).map_err(|e| SbhError::io(&ballast_dir, e))?;
 
         let mut mgr = Self {
             ballast_dir,
             config,
             inventory: Vec::new(),
+            platform,
             skip_fallocate: false,
         };
         // Prune any existing files that exceed the initial configuration count.
@@ -531,6 +546,20 @@ impl BallastManager {
             ));
         }
 
+        let blocks = self
+            .platform
+            .file_block_count(path)
+            .map_err(|e| format!("block count: {e}"))?;
+        let allocated_bytes = blocks
+            .checked_mul(512)
+            .ok_or_else(|| "allocated block count overflow".to_string())?;
+        if allocated_bytes < self.config.file_size_bytes {
+            return Err(format!(
+                "allocated bytes mismatch: expected at least {} got {allocated_bytes}",
+                self.config.file_size_bytes
+            ));
+        }
+
         Ok(())
     }
 
@@ -553,47 +582,32 @@ impl BallastManager {
     }
 
     fn write_ballast_file_inner(&self, index: u32, path: &Path, size: u64) -> Result<()> {
-        let mut file = {
-            let mut opts = OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                opts.mode(0o600);
-            }
-            opts.open(path).map_err(|e| SbhError::io(path, e))?
-        };
+        let header_buf = ballast_header_buffer(index, size)?;
 
-        // Write header (4096 bytes, null-padded).
-        let header = BallastHeader::new(index, size);
-        let header_json = serde_json::to_string(&header)?;
-        if header_json.len() > HEADER_SIZE {
-            return Err(SbhError::Runtime {
-                details: format!(
-                    "ballast header JSON ({} bytes) exceeds HEADER_SIZE ({HEADER_SIZE})",
-                    header_json.len()
-                ),
-            });
-        }
-        let mut header_buf = vec![0u8; HEADER_SIZE];
-        header_buf[..header_json.len()].copy_from_slice(header_json.as_bytes());
-        file.write_all(&header_buf)
-            .map_err(|e| SbhError::io(path, e))?;
-
-        // Write data portion.
-        let data_size = size - HEADER_SIZE as u64;
-
-        // Try fallocate (instant on ext4/xfs, no unsafe needed).
-        // Skipped on CoW filesystems where zero-filled blocks defeat dedup.
-        #[cfg(target_os = "linux")]
-        if !self.skip_fallocate && try_fallocate_fd(&file, HEADER_SIZE as u64, data_size) {
-            file.sync_all().map_err(|e| SbhError::io(path, e))?;
+        if !self.skip_fallocate && self.platform.preallocate_file(path, size).is_ok() {
+            Self::write_header_to_preallocated_file(path, size, &header_buf)?;
             return Ok(());
         }
 
-        // Fallback: write random data in chunks (works on all FS including CoW).
+        let data_size = size - HEADER_SIZE as u64;
+        let mut file = create_truncated_ballast_file(path)?;
+        file.write_all(&header_buf)
+            .map_err(|e| SbhError::io(path, e))?;
         self.write_random_data(&mut file, data_size, path)?;
+        file.sync_all().map_err(|e| SbhError::io(path, e))?;
+        Ok(())
+    }
 
+    fn write_header_to_preallocated_file(path: &Path, size: u64, header_buf: &[u8]) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(false)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| SbhError::io(path, e))?;
+        file.set_len(size).map_err(|e| SbhError::io(path, e))?;
+        file.write_all(header_buf)
+            .map_err(|e| SbhError::io(path, e))?;
         file.sync_all().map_err(|e| SbhError::io(path, e))?;
         Ok(())
     }
@@ -629,27 +643,31 @@ impl BallastManager {
     }
 }
 
-// ──────────────────── fallocate (Linux) ────────────────────
-
-/// Try to use `fallocate` for instant block allocation on ext4/xfs.
-///
-/// Falls back to random data writing if the syscall is not available or fails
-/// (e.g., on CoW filesystems like btrfs/zfs where fallocate doesn't prevent dedup).
-#[cfg(target_os = "linux")]
-fn try_fallocate_fd(file: &File, offset: u64, len: u64) -> bool {
-    use nix::fcntl::{FallocateFlags, fallocate};
-    use std::os::unix::io::AsRawFd;
-
-    // fallocate(fd, mode, offset, len)
-    match fallocate(
-        file.as_raw_fd(),
-        FallocateFlags::empty(),
-        offset.cast_signed(),
-        len.cast_signed(),
-    ) {
-        Ok(()) => true,
-        Err(_) => false,
+fn ballast_header_buffer(index: u32, size: u64) -> Result<Vec<u8>> {
+    let header = BallastHeader::new(index, size);
+    let header_json = serde_json::to_string(&header)?;
+    if header_json.len() > HEADER_SIZE {
+        return Err(SbhError::Runtime {
+            details: format!(
+                "ballast header JSON ({} bytes) exceeds HEADER_SIZE ({HEADER_SIZE})",
+                header_json.len()
+            ),
+        });
     }
+    let mut header_buf = vec![0u8; HEADER_SIZE];
+    header_buf[..header_json.len()].copy_from_slice(header_json.as_bytes());
+    Ok(header_buf)
+}
+
+fn create_truncated_ballast_file(path: &Path) -> Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    opts.open(path).map_err(|e| SbhError::io(path, e))
 }
 
 // ──────────────────── tests ────────────────────
@@ -657,6 +675,9 @@ fn try_fallocate_fd(file: &File, offset: u64, len: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::platform::pal::{MockPlatform, Platform};
 
     fn small_config() -> BallastConfig {
         BallastConfig {
@@ -741,6 +762,61 @@ mod tests {
         let report = mgr.verify().unwrap();
         assert_eq!(report.files_ok, 2);
         assert_eq!(report.files_corrupted, 1);
+    }
+
+    #[test]
+    fn verify_detects_sparse_or_underallocated_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = small_config();
+        let expected_blocks = config.file_size_bytes.div_ceil(512);
+        let platform = MockPlatform::healthy()
+            .with_block_count(
+                dir.path().join("SBH_BALLAST_FILE_00001.dat"),
+                expected_blocks.saturating_sub(1),
+            )
+            .with_block_count(
+                dir.path().join("SBH_BALLAST_FILE_00002.dat"),
+                expected_blocks,
+            )
+            .with_block_count(
+                dir.path().join("SBH_BALLAST_FILE_00003.dat"),
+                expected_blocks,
+            );
+        let mut mgr =
+            BallastManager::with_platform(dir.path().to_path_buf(), config, Arc::new(platform))
+                .unwrap();
+        mgr.provision(None).unwrap();
+
+        let report = mgr.verify().unwrap();
+        assert_eq!(report.files_ok, 2);
+        assert_eq!(report.files_corrupted, 1);
+        assert!(
+            report
+                .details
+                .iter()
+                .any(|detail| detail.contains("allocated bytes mismatch")),
+            "sparse ballast file should fail allocated-block verification: {:?}",
+            report.details
+        );
+    }
+
+    #[test]
+    fn provisioned_files_have_allocated_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        mgr.provision(None).unwrap();
+        let platform = crate::platform::current();
+
+        for i in 1..=3 {
+            let path = dir.path().join(format!("SBH_BALLAST_FILE_{i:05}.dat"));
+            let allocated_bytes = platform.file_block_count(&path).unwrap() * 512;
+            assert!(
+                allocated_bytes >= small_config().file_size_bytes,
+                "{} allocated {allocated_bytes} bytes, expected at least {}",
+                path.display(),
+                small_config().file_size_bytes
+            );
+        }
     }
 
     #[test]

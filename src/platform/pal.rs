@@ -593,25 +593,44 @@ impl Platform for MockPlatform {
     }
 
     fn preallocate_file(&self, path: &Path, size: u64) -> Result<()> {
-        if self
+        let request_is_expected = self
             .preallocated
             .iter()
             .any(|(expected_path, expected_size)| expected_path == path && *expected_size == size)
+            || self.preallocated.is_empty();
+
+        if !request_is_expected {
+            return Err(PalError::method_failed(
+                self.name(),
+                "preallocate_file",
+                format!(
+                    "unexpected mock preallocation request for {}",
+                    path.display()
+                ),
+            )
+            .into());
+        }
+
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
         {
-            return Ok(());
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
         }
-        if self.preallocated.is_empty() {
-            return Ok(());
-        }
-        Err(PalError::method_failed(
-            self.name(),
-            "preallocate_file",
-            format!(
-                "unexpected mock preallocation request for {}",
-                path.display()
-            ),
-        )
-        .into())
+        let file = opts.open(path).map_err(|source| SbhError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        file.set_len(size).map_err(|source| SbhError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        file.sync_all().map_err(|source| SbhError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(())
     }
 
     fn file_block_count(&self, path: &Path) -> Result<u64> {
