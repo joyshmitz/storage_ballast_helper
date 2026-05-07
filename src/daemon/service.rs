@@ -4,6 +4,7 @@
 //! `service/launchd.rs`. This file remains the module root so the repo can split
 //! the code without deleting or moving `src/daemon/service.rs`.
 
+mod launchctl;
 mod launchd;
 mod systemd;
 
@@ -13,6 +14,7 @@ use crate::core::errors::Result;
 use crate::platform::pal::{NoopServiceManager, Platform, ServiceManager};
 use crate::platform::types::ServiceKind;
 
+pub use launchctl::{LaunchctlDomain, LaunchctlServiceTarget};
 pub use launchd::{LaunchdConfig, LaunchdServiceManager};
 pub use systemd::{SystemdConfig, SystemdServiceManager};
 

@@ -3,12 +3,11 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::ServiceManager;
-use crate::platform::types::PalError;
 
+use super::launchctl::{self, LaunchctlDomain, LaunchctlServiceTarget};
 use super::{LAUNCHD_LABEL, resolve_sbh_binary};
 
 /// Parameters controlling launchd plist generation and lifecycle commands.
@@ -91,6 +90,14 @@ impl LaunchdServiceManager {
         &self.config
     }
 
+    fn domain_target(&self) -> LaunchctlDomain {
+        launchctl::domain_for_scope(self.config.user_scope)
+    }
+
+    fn service_target(&self) -> LaunchctlServiceTarget {
+        LaunchctlServiceTarget::new(self.domain_target(), LAUNCHD_LABEL)
+    }
+
     /// Generate the launchd plist XML content.
     #[must_use]
     pub fn generate_plist(&self) -> String {
@@ -132,40 +139,6 @@ impl LaunchdServiceManager {
 "#
         )
     }
-
-    #[allow(clippy::unused_self)]
-    fn run_launchctl(&self, args: &[&str]) -> Result<String> {
-        let output = Command::new("launchctl")
-            .args(args)
-            .output()
-            .map_err(|source| SbhError::Io {
-                path: PathBuf::from("launchctl"),
-                source,
-            })?;
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        if output.status.success() {
-            Ok(stdout.trim().to_string())
-        } else {
-            Err(SbhError::Runtime {
-                details: format!(
-                    "launchctl {} failed (exit {}): {}",
-                    args.join(" "),
-                    output.status.code().unwrap_or(-1),
-                    stderr.trim()
-                ),
-            })
-        }
-    }
-
-    #[allow(clippy::unused_self)]
-    fn run_launchctl_lenient(&self, args: &[&str]) -> String {
-        let output = Command::new("launchctl").args(args).output();
-        match output {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            Err(_) => String::new(),
-        }
-    }
 }
 
 impl ServiceManager for LaunchdServiceManager {
@@ -191,13 +164,16 @@ impl ServiceManager for LaunchdServiceManager {
             source,
         })?;
 
-        let path_str = plist_path
-            .to_str()
-            .ok_or_else(|| SbhError::Runtime {
-                details: "plist path is not valid UTF-8".to_string(),
-            })?
-            .to_string();
-        self.run_launchctl(&["load", &path_str])?;
+        let domain = self.domain_target();
+        match launchctl::bootstrap(&domain, &plist_path) {
+            Ok(_) => {}
+            Err(error) if error.is_already_loaded() => {
+                let target = LaunchctlServiceTarget::new(domain.clone(), LAUNCHD_LABEL);
+                let _ = launchctl::bootout(&target);
+                launchctl::bootstrap(&domain, &plist_path)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
 
         Ok(())
     }
@@ -205,8 +181,10 @@ impl ServiceManager for LaunchdServiceManager {
     fn uninstall(&self) -> Result<()> {
         let plist_path = self.config.plist_path();
 
-        if let Ok(path_str) = plist_path.to_str().ok_or(()) {
-            self.run_launchctl_lenient(&["unload", path_str]);
+        if let Err(error) = launchctl::bootout(&self.service_target())
+            && !error.is_not_loaded()
+        {
+            return Err(error.into());
         }
 
         if plist_path.exists() {
@@ -220,19 +198,16 @@ impl ServiceManager for LaunchdServiceManager {
     }
 
     fn status(&self) -> Result<String> {
-        let output = self.run_launchctl_lenient(&["list", LAUNCHD_LABEL]);
-        if output.is_empty() {
-            return Ok("not loaded".to_string());
-        }
-        if output.contains("\"Label\"") || output.contains(LAUNCHD_LABEL) {
-            Ok("loaded".to_string())
-        } else {
-            Ok("unknown".to_string())
+        match launchctl::print(&self.service_target()) {
+            Ok(status) => Ok(status.summary()),
+            Err(error) if error.is_not_loaded() => Ok("not loaded".to_string()),
+            Err(error) => Err(error.into()),
         }
     }
 
     fn restart(&self) -> Result<()> {
-        Err(PalError::not_implemented_with_bead("launchd", "restart", Some("bd-1y7j.3")).into())
+        launchctl::kickstart(&self.service_target(), true)?;
+        Ok(())
     }
 
     fn logs_path(&self) -> Result<Option<PathBuf>> {
@@ -240,7 +215,11 @@ impl ServiceManager for LaunchdServiceManager {
     }
 
     fn is_loaded(&self) -> Result<bool> {
-        Ok(self.status()? == "loaded")
+        match launchctl::print(&self.service_target()) {
+            Ok(_) => Ok(true),
+            Err(error) if error.is_not_loaded() => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
