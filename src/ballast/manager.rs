@@ -16,7 +16,7 @@
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -271,7 +271,9 @@ impl BallastManager {
                     report.total_bytes += actual_size;
                 }
                 Err(e) => {
-                    report.errors.push(format!("file {index}: {e}"));
+                    if record_create_error(&mut report, index, &path, &e) {
+                        break;
+                    }
                 }
             }
         }
@@ -437,7 +439,9 @@ impl BallastManager {
                     break;
                 }
                 Err(e) => {
-                    report.errors.push(format!("file {index}: {e}"));
+                    if record_create_error(&mut report, index, &path, &e) {
+                        break;
+                    }
                 }
             }
         }
@@ -612,9 +616,15 @@ impl BallastManager {
     fn write_ballast_file_inner(&self, index: u32, path: &Path, size: u64) -> Result<()> {
         let header_buf = ballast_header_buffer(index, size)?;
 
-        if !self.skip_fallocate && self.platform.preallocate_file(path, size).is_ok() {
-            Self::write_header_to_preallocated_file(path, size, &header_buf)?;
-            return Ok(());
+        if !self.skip_fallocate {
+            match self.platform.preallocate_file(path, size) {
+                Ok(()) => {
+                    Self::write_header_to_preallocated_file(path, size, &header_buf)?;
+                    return Ok(());
+                }
+                Err(error) if is_storage_exhausted_error(&error) => return Err(error),
+                Err(_) => {}
+            }
         }
 
         let data_size = size - HEADER_SIZE as u64;
@@ -698,6 +708,71 @@ fn create_truncated_ballast_file(path: &Path) -> Result<File> {
     opts.open(path).map_err(|e| SbhError::io(path, e))
 }
 
+fn record_create_error(
+    report: &mut ProvisionReport,
+    index: u32,
+    path: &Path,
+    error: &SbhError,
+) -> bool {
+    if is_storage_exhausted_error(error) {
+        report.errors.push(format!(
+            "file {index}: storage exhausted while creating ballast at {}; skipping remaining ballast provisioning so scanner and cleanup defenses can continue. Reduce ballast.file_count or ballast.file_size_bytes, free space, or run `sbh ballast replenish` after pressure clears: {error}",
+            path.display()
+        ));
+        true
+    } else {
+        report.errors.push(format!("file {index}: {error}"));
+        false
+    }
+}
+
+fn is_storage_exhausted_error(error: &SbhError) -> bool {
+    match error {
+        SbhError::Io { source, .. } => io_error_is_storage_full(source),
+        SbhError::Pal {
+            source:
+                crate::platform::types::PalError::MethodFailed {
+                    details,
+                    method_name,
+                    ..
+                },
+        } if method_name == "preallocate_file" => message_mentions_storage_full(details),
+        SbhError::Runtime { details } => message_mentions_storage_full(details),
+        _ => false,
+    }
+}
+
+fn io_error_is_storage_full(error: &std::io::Error) -> bool {
+    error.kind() == ErrorKind::StorageFull
+        || error
+            .raw_os_error()
+            .is_some_and(raw_os_error_is_storage_full)
+}
+
+#[cfg(unix)]
+fn raw_os_error_is_storage_full(code: i32) -> bool {
+    code == libc::ENOSPC
+}
+
+#[cfg(windows)]
+fn raw_os_error_is_storage_full(code: i32) -> bool {
+    code == 112
+}
+
+#[cfg(not(any(unix, windows)))]
+fn raw_os_error_is_storage_full(_code: i32) -> bool {
+    false
+}
+
+fn message_mentions_storage_full(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("no space left on device")
+        || message.contains("enospc")
+        || message.contains("storage full")
+        || message.contains("disk full")
+        || message.contains("not enough space")
+}
+
 fn time_machine_snapshot_release_warning(
     mount: &Path,
     snapshots: &[crate::platform::types::LocalSnapshotInfo],
@@ -756,6 +831,7 @@ mod tests {
 
     use crate::platform::pal::{MockPlatform, Platform};
     use crate::platform::types::LocalSnapshotInfo;
+    use crate::platform::types::PalError;
 
     fn small_config() -> BallastConfig {
         BallastConfig {
@@ -986,6 +1062,43 @@ mod tests {
         let report = mgr.provision(Some(&|| 5.0)).unwrap();
         assert_eq!(report.files_created, 0);
         assert!(!report.errors.is_empty());
+    }
+
+    #[test]
+    fn provision_stops_gracefully_when_storage_is_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_ballast = dir.path().join("SBH_BALLAST_FILE_00001.dat");
+        let second_ballast = dir.path().join("SBH_BALLAST_FILE_00002.dat");
+        let platform = MockPlatform::healthy().with_preallocate_failure(
+            first_ballast.clone(),
+            PalError::method_failed(
+                "macos",
+                "preallocate_file",
+                "No space left on device (os error 28)",
+            ),
+        );
+        let mut mgr = BallastManager::with_platform(
+            dir.path().to_path_buf(),
+            small_config(),
+            Arc::new(platform),
+        )
+        .unwrap();
+
+        let report = mgr.provision(None).unwrap();
+
+        assert_eq!(report.files_created, 0);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("storage exhausted"));
+        assert!(report.errors[0].contains("sbh ballast replenish"));
+        assert!(
+            !first_ballast.exists(),
+            "partial ballast file should not remain after storage exhaustion"
+        );
+        assert!(
+            !second_ballast.exists(),
+            "provisioning should stop after storage exhaustion instead of hammering the volume"
+        );
+        assert_eq!(mgr.available_count(), 0);
     }
 
     #[test]

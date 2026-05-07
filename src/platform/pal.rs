@@ -330,6 +330,7 @@ pub struct MockPlatform {
     mmap_regions: Vec<MappedRegion>,
     self_stats: SelfStats,
     preallocated: Vec<(PathBuf, u64)>,
+    preallocate_failures: HashMap<PathBuf, PalError>,
     block_counts: HashMap<PathBuf, u64>,
     local_snapshots: HashMap<PathBuf, Vec<LocalSnapshotInfo>>,
     home: PathBuf,
@@ -363,6 +364,7 @@ impl MockPlatform {
             mmap_regions: Vec::new(),
             self_stats: default_mock_self_stats(),
             preallocated: Vec::new(),
+            preallocate_failures: HashMap::new(),
             block_counts: HashMap::new(),
             local_snapshots: HashMap::new(),
             home: PathBuf::from("/home/mock"),
@@ -467,6 +469,12 @@ impl MockPlatform {
     #[must_use]
     pub fn with_preallocated_file(mut self, path: impl Into<PathBuf>, size: u64) -> Self {
         self.preallocated.push((path.into(), size));
+        self
+    }
+
+    #[must_use]
+    pub fn with_preallocate_failure(mut self, path: impl Into<PathBuf>, failure: PalError) -> Self {
+        self.preallocate_failures.insert(path.into(), failure);
         self
     }
 
@@ -623,6 +631,12 @@ impl Platform for MockPlatform {
     }
 
     fn preallocate_file(&self, path: &Path, size: u64) -> Result<()> {
+        if let Some(failure) = self.preallocate_failures.get(path) {
+            return Err(SbhError::Pal {
+                source: failure.clone(),
+            });
+        }
+
         let request_is_expected = self
             .preallocated
             .iter()

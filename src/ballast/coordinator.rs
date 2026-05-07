@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::ballast::manager::{BallastManager, ProvisionReport, ReleaseReport, VerifyReport};
 use crate::core::config::BallastConfig;
@@ -138,6 +139,16 @@ impl BallastPoolCoordinator {
         watched_paths: &[PathBuf],
         platform: &dyn Platform,
     ) -> Result<Self> {
+        let manager_platform: Arc<dyn Platform> = Arc::new(crate::platform::current());
+        Self::discover_with_manager_platform(config, watched_paths, platform, &manager_platform)
+    }
+
+    pub(crate) fn discover_with_manager_platform(
+        config: &BallastConfig,
+        watched_paths: &[PathBuf],
+        platform: &dyn Platform,
+        manager_platform: &Arc<dyn Platform>,
+    ) -> Result<Self> {
         let mounts = platform.mount_points()?;
         let mut pools = HashMap::new();
         let mut skipped_pools = HashMap::new();
@@ -225,7 +236,11 @@ impl BallastPoolCoordinator {
                 overrides: BTreeMap::new(),
             };
 
-            let mut manager = match BallastManager::new(ballast_dir.clone(), pool_config) {
+            let mut manager = match BallastManager::with_platform(
+                ballast_dir.clone(),
+                pool_config,
+                Arc::clone(manager_platform),
+            ) {
                 Ok(manager) => manager,
                 Err(err) => {
                     skip_with(format!("failed to initialize ballast manager: {err}"));
@@ -493,6 +508,7 @@ mod tests {
     use super::*;
     use crate::core::config::BallastVolumeOverride;
     use crate::platform::pal::{FsStats, MemoryInfo, MockPlatform, PlatformPaths};
+    use crate::platform::types::PalError;
     use std::collections::HashMap;
 
     fn tiny_ballast_config() -> BallastConfig {
@@ -691,13 +707,72 @@ mod tests {
         ];
         let config = tiny_ballast_config();
 
-        let mut coordinator =
-            BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        let manager_platform: Arc<dyn Platform> = Arc::new(platform.clone());
+        let mut coordinator = BallastPoolCoordinator::discover_with_manager_platform(
+            &config,
+            &watched,
+            &platform,
+            &manager_platform,
+        )
+        .unwrap();
         let report = coordinator.provision_all(&platform).unwrap();
 
         assert_eq!(report.total_files_created(), 6); // 3 per volume
         assert!(report.skipped_volumes.is_empty());
         assert!(!report.has_errors());
+    }
+
+    #[test]
+    fn provision_all_reports_storage_full_without_aborting_other_volumes() {
+        let dir_data = tempfile::tempdir().unwrap();
+        let dir_scratch = tempfile::tempdir().unwrap();
+        let failing_ballast = dir_data
+            .path()
+            .join(BALLAST_SUBDIR)
+            .join("SBH_BALLAST_FILE_00001.dat");
+        let platform = mock_platform_two_volumes(dir_data.path(), dir_scratch.path())
+            .with_preallocate_failure(
+                failing_ballast,
+                PalError::method_failed(
+                    "macos",
+                    "preallocate_file",
+                    "No space left on device (os error 28)",
+                ),
+            );
+
+        let watched = vec![
+            dir_data.path().to_path_buf(),
+            dir_scratch.path().to_path_buf(),
+        ];
+        let config = tiny_ballast_config();
+
+        let manager_platform: Arc<dyn Platform> = Arc::new(platform.clone());
+        let mut coordinator = BallastPoolCoordinator::discover_with_manager_platform(
+            &config,
+            &watched,
+            &platform,
+            &manager_platform,
+        )
+        .unwrap();
+        let report = coordinator.provision_all(&platform).unwrap();
+
+        let failed = report
+            .per_volume
+            .iter()
+            .find(|(mount, _)| mount == dir_data.path())
+            .expect("failed volume should still have a provision report");
+        let succeeded = report
+            .per_volume
+            .iter()
+            .find(|(mount, _)| mount == dir_scratch.path())
+            .expect("healthy volume should still provision");
+
+        assert_eq!(failed.1.files_created, 0);
+        assert_eq!(failed.1.errors.len(), 1);
+        assert!(failed.1.errors[0].contains("storage exhausted"));
+        assert_eq!(succeeded.1.files_created, 3);
+        assert!(report.skipped_volumes.is_empty());
+        assert!(report.has_errors());
     }
 
     #[test]

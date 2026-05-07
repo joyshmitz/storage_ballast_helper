@@ -1051,8 +1051,12 @@ impl MonitoringDaemon {
 
         // 6. Initialize ballast coordinator (multi-volume).
         let discovery_paths = ballast_discovery_paths(&config, &special_locations);
-        let ballast_coordinator =
-            BallastPoolCoordinator::discover(&config.ballast, &discovery_paths, platform.as_ref())?;
+        let ballast_coordinator = BallastPoolCoordinator::discover_with_manager_platform(
+            &config.ballast,
+            &discovery_paths,
+            platform.as_ref(),
+            &platform,
+        )?;
 
         // 7. Release controller.
         let release_controller =
@@ -2582,6 +2586,16 @@ impl MonitoringDaemon {
             );
         }
 
+        for (path, provision_report) in &report.per_volume {
+            for err in &provision_report.errors {
+                eprintln!(
+                    "[SBH-DAEMON] ballast provision incomplete for {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
+
         for (path, err) in &report.skipped_volumes {
             eprintln!(
                 "[SBH-DAEMON] ballast provision skipped for {}: {}",
@@ -2618,10 +2632,11 @@ impl MonitoringDaemon {
                     self.release_controller.reset();
                     let discovery_paths =
                         ballast_discovery_paths(&new_config, &self.special_locations);
-                    match BallastPoolCoordinator::discover(
+                    match BallastPoolCoordinator::discover_with_manager_platform(
                         &new_config.ballast,
                         &discovery_paths,
                         self.platform.as_ref(),
+                        &self.platform,
                     ) {
                         Ok(coordinator) => {
                             self.ballast_coordinator = coordinator;
