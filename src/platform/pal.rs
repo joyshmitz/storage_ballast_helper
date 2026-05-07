@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::core::config::PathsConfig;
 use crate::core::errors::{Result, SbhError};
 use crate::platform::types::{
-    Capacity, FullDiskAccessStatus, MappedRegion, MemoryPressure, MemoryPressureCallback,
-    MemoryPressureLevel, MountInfo, OpenFile, PalError, ProcessInfo, ProcessIo, SacredPath,
-    SelfStats, ServiceKind, SubscriptionHandle,
+    Capacity, FullDiskAccessStatus, LocalSnapshotInfo, MappedRegion, MemoryPressure,
+    MemoryPressureCallback, MemoryPressureLevel, MountInfo, OpenFile, PalError, ProcessInfo,
+    ProcessIo, SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
 };
 
 /// Filesystem statistics for a path/mount.
@@ -198,6 +198,10 @@ pub trait Platform: Send + Sync {
             .map(|mounts| mounts.into_iter().map(Into::into).collect())
     }
 
+    fn local_time_machine_snapshots(&self, _mount: &Path) -> Result<Vec<LocalSnapshotInfo>> {
+        Ok(Vec::new())
+    }
+
     fn memory_pressure(&self) -> Result<MemoryPressure> {
         pal_not_implemented(self.name(), "memory_pressure")
     }
@@ -317,6 +321,7 @@ pub struct MockPlatform {
     self_stats: SelfStats,
     preallocated: Vec<(PathBuf, u64)>,
     block_counts: HashMap<PathBuf, u64>,
+    local_snapshots: HashMap<PathBuf, Vec<LocalSnapshotInfo>>,
     home: PathBuf,
     temp_dirs: Vec<PathBuf>,
     cache_roots: Vec<PathBuf>,
@@ -349,6 +354,7 @@ impl MockPlatform {
             self_stats: default_mock_self_stats(),
             preallocated: Vec::new(),
             block_counts: HashMap::new(),
+            local_snapshots: HashMap::new(),
             home: PathBuf::from("/home/mock"),
             temp_dirs: vec![PathBuf::from("/tmp")],
             cache_roots: vec![PathBuf::from("/home/mock/.cache")],
@@ -461,6 +467,16 @@ impl MockPlatform {
     }
 
     #[must_use]
+    pub fn with_local_time_machine_snapshots(
+        mut self,
+        mount: impl Into<PathBuf>,
+        snapshots: Vec<LocalSnapshotInfo>,
+    ) -> Self {
+        self.local_snapshots.insert(mount.into(), snapshots);
+        self
+    }
+
+    #[must_use]
     pub fn with_home(mut self, home: impl Into<PathBuf>) -> Self {
         self.home = home.into();
         self
@@ -512,6 +528,10 @@ impl Platform for MockPlatform {
 
     fn mount_points(&self) -> Result<Vec<MountPoint>> {
         Ok(self.mounts.clone())
+    }
+
+    fn local_time_machine_snapshots(&self, mount: &Path) -> Result<Vec<LocalSnapshotInfo>> {
+        Ok(self.local_snapshots.get(mount).cloned().unwrap_or_default())
     }
 
     fn is_ram_backed(&self, path: &Path) -> Result<bool> {

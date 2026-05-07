@@ -3345,6 +3345,12 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
                     );
                     println!("  Bytes freed: {}", format_bytes(report.bytes_freed));
                     println!("  Remaining: {} files", manager.available_count());
+                    if !report.warnings.is_empty() {
+                        println!("  Warnings:");
+                        for warning in &report.warnings {
+                            eprintln!("    {warning}");
+                        }
+                    }
                     if !report.errors.is_empty() {
                         println!("  Errors:");
                         for err in &report.errors {
@@ -3359,6 +3365,7 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
                         "files_released": report.files_released,
                         "bytes_freed": report.bytes_freed,
                         "remaining": manager.available_count(),
+                        "warnings": report.warnings,
                         "errors": report.errors,
                     });
                     write_json_line(&payload)?;

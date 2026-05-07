@@ -25,9 +25,10 @@ use crate::platform::pal::{
     verify_preallocated_blocks,
 };
 use crate::platform::types::{
-    Capacity, FullDiskAccessState, FullDiskAccessStatus, MappedRegion, MemoryPressure,
-    MemoryPressureCallback, MemoryPressureLevel, MountInfo, OpenFile, OpenFileKind, OpenFileMode,
-    PalError, ProcessInfo, ProcessIo, SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
+    Capacity, FullDiskAccessState, FullDiskAccessStatus, LocalSnapshotInfo, MappedRegion,
+    MemoryPressure, MemoryPressureCallback, MemoryPressureLevel, MountInfo, OpenFile, OpenFileKind,
+    OpenFileMode, PalError, ProcessInfo, ProcessIo, SacredPath, SelfStats, ServiceKind,
+    SubscriptionHandle,
 };
 use parking_lot::RwLock;
 
@@ -130,6 +131,23 @@ impl Platform for MacOsPal {
                     .collect()
             })
             .map_err(|error| macos_method_error("mounts", &error))
+    }
+
+    fn local_time_machine_snapshots(&self, mount: &Path) -> Result<Vec<LocalSnapshotInfo>> {
+        let stats = sys::statfs(mount)
+            .map_err(|error| macos_method_error("local_time_machine_snapshots", &error))?;
+        let inventory = sys::apfs_inventory().ok();
+        let volume = inventory
+            .as_ref()
+            .and_then(|inventory| inventory.volume_for_device(&stats.device));
+        sys::local_time_machine_snapshots(&stats.mount_point, inventory.as_ref(), volume)
+            .map(|snapshots| {
+                snapshots
+                    .into_iter()
+                    .map(local_snapshot_info_from_sys)
+                    .collect()
+            })
+            .map_err(|error| macos_method_error("local_time_machine_snapshots", &error))
     }
 
     fn memory_pressure(&self) -> Result<MemoryPressure> {
@@ -663,6 +681,15 @@ fn local_snapshot_bytes_for_capacity(
     (total > 0).then_some(total)
 }
 
+fn local_snapshot_info_from_sys(snapshot: sys::LocalSnapshotInfo) -> LocalSnapshotInfo {
+    LocalSnapshotInfo {
+        name: snapshot.name,
+        date: snapshot.date,
+        retained_bytes_estimate: snapshot.retained_bytes_estimate,
+        mount_path: snapshot.mount_path,
+    }
+}
+
 fn statfs_to_mount_info(
     stats: StatfsSnapshot,
     inventory: Option<&ApfsInventory>,
@@ -935,8 +962,9 @@ mod tests {
     use std::time::Duration;
 
     use crate::platform::macos::sys::{
-        ApfsContainer, ApfsInventory, ApfsVolume, ApfsVolumeRole, StatfsSnapshot, SwapUsage,
-        SwapUsageInfo, VmStats,
+        ApfsContainer, ApfsInventory, ApfsVolume, ApfsVolumeRole,
+        LocalSnapshotInfo as SysLocalSnapshotInfo, StatfsSnapshot, SwapUsage, SwapUsageInfo,
+        VmStats,
     };
     use crate::platform::pal::Platform;
     use crate::platform::types::{MemoryPressure, MemoryPressureLevel};
@@ -1229,6 +1257,23 @@ mod tests {
         assert_eq!(stats.available_bytes, 250);
         assert!((stats.free_pct() - 25.0).abs() < f64::EPSILON);
         assert_eq!(stats.mount_point, PathBuf::from("/System/Volumes/Data"));
+    }
+
+    #[test]
+    fn local_snapshot_info_mapping_preserves_tmutil_fields() {
+        let snapshot = SysLocalSnapshotInfo {
+            name: "com.apple.TimeMachine.2026-05-07-010203.local".to_string(),
+            date: Some("2026-05-07-010203".to_string()),
+            retained_bytes_estimate: Some(64),
+            mount_path: PathBuf::from("/"),
+        };
+
+        let mapped = super::local_snapshot_info_from_sys(snapshot);
+
+        assert_eq!(mapped.name, "com.apple.TimeMachine.2026-05-07-010203.local");
+        assert_eq!(mapped.date.as_deref(), Some("2026-05-07-010203"));
+        assert_eq!(mapped.retained_bytes_estimate, Some(64));
+        assert_eq!(mapped.mount_path, PathBuf::from("/"));
     }
 
     #[test]

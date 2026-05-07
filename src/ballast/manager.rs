@@ -102,6 +102,7 @@ pub struct VerifyReport {
 pub struct ReleaseReport {
     pub files_released: usize,
     pub bytes_freed: u64,
+    pub warnings: Vec<String>,
     pub errors: Vec<String>,
 }
 
@@ -287,6 +288,7 @@ impl BallastManager {
         let mut report = ReleaseReport {
             files_released: 0,
             bytes_freed: 0,
+            warnings: Vec::new(),
             errors: Vec::new(),
         };
 
@@ -310,8 +312,34 @@ impl BallastManager {
             }
         }
 
+        if report.files_released > 0 {
+            report
+                .warnings
+                .extend(self.local_snapshot_release_warnings());
+        }
+
         self.scan_existing();
         Ok(report)
+    }
+
+    fn local_snapshot_release_warnings(&self) -> Vec<String> {
+        let Ok(capacity) = self.platform.capacity(&self.ballast_dir) else {
+            return Vec::new();
+        };
+        let Ok(snapshots) = self
+            .platform
+            .local_time_machine_snapshots(&capacity.mount_point)
+        else {
+            return Vec::new();
+        };
+        if snapshots.is_empty() {
+            return Vec::new();
+        }
+
+        vec![time_machine_snapshot_release_warning(
+            &capacity.mount_point,
+            &snapshots,
+        )]
     }
 
     // ──────────────────── verify ────────────────────
@@ -670,6 +698,55 @@ fn create_truncated_ballast_file(path: &Path) -> Result<File> {
     opts.open(path).map_err(|e| SbhError::io(path, e))
 }
 
+fn time_machine_snapshot_release_warning(
+    mount: &Path,
+    snapshots: &[crate::platform::types::LocalSnapshotInfo],
+) -> String {
+    let count = snapshots.len();
+    let snapshot_word = if count == 1 {
+        "snapshot is"
+    } else {
+        "snapshots are"
+    };
+    let retained_bytes = snapshots
+        .iter()
+        .filter_map(|snapshot| snapshot.retained_bytes_estimate)
+        .fold(0_u64, u64::saturating_add);
+    let retained_clause = if retained_bytes == 0 {
+        String::new()
+    } else {
+        format!(" Estimated retained bytes: {retained_bytes}.")
+    };
+
+    format!(
+        "{count} Time Machine local {snapshot_word} present on {}. macOS may retain released ballast bytes until snapshots expire or are thinned.{retained_clause} Thin manually with: {}",
+        mount.display(),
+        time_machine_thin_command(mount)
+    )
+}
+
+fn time_machine_thin_command(mount: &Path) -> String {
+    let mount_text = mount.to_string_lossy();
+    format!(
+        "sudo tmutil thinlocalsnapshots {} 9999999999999999 4",
+        shell_quote_for_warning(mount_text.as_ref())
+    )
+}
+
+fn shell_quote_for_warning(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+
+    if value.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '@' | '%' | '+')
+    }) {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 // ──────────────────── tests ────────────────────
 
 #[cfg(test)]
@@ -678,6 +755,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::platform::pal::{MockPlatform, Platform};
+    use crate::platform::types::LocalSnapshotInfo;
 
     fn small_config() -> BallastConfig {
         BallastConfig {
@@ -836,6 +914,37 @@ mod tests {
 
         assert_eq!(mgr.inventory().len(), 1);
         assert_eq!(mgr.available_count(), 1);
+    }
+
+    #[test]
+    fn release_warns_when_time_machine_local_snapshots_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let platform = MockPlatform::healthy()
+            .with_name("macos")
+            .with_local_time_machine_snapshots(
+                PathBuf::from("/"),
+                vec![LocalSnapshotInfo {
+                    name: "com.apple.TimeMachine.2026-05-07-010203.local".to_string(),
+                    date: Some("2026-05-07-010203".to_string()),
+                    retained_bytes_estimate: Some(64),
+                    mount_path: PathBuf::from("/"),
+                }],
+            );
+        let mut mgr = BallastManager::with_platform(
+            dir.path().to_path_buf(),
+            small_config(),
+            Arc::new(platform),
+        )
+        .unwrap();
+        mgr.provision(None).unwrap();
+
+        let report = mgr.release(1).unwrap();
+
+        assert_eq!(report.files_released, 1);
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("1 Time Machine local snapshot is present on /"));
+        assert!(report.warnings[0].contains("Estimated retained bytes: 64"));
+        assert!(report.warnings[0].contains("sudo tmutil thinlocalsnapshots / 9999999999999999 4"));
     }
 
     #[test]

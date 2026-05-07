@@ -1681,6 +1681,10 @@ impl MonitoringDaemon {
         if count > 0
             && let Some(report) = self.ballast_coordinator.release_for_mount(mount, count)?
         {
+            for warning in &report.warnings {
+                eprintln!("[sbh] warning: {warning}");
+            }
+
             self.release_controller
                 .on_released(mount, report.files_released);
 

@@ -150,6 +150,14 @@ pub struct MountInfo {
     pub is_apfs_vm_volume: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalSnapshotInfo {
+    pub name: String,
+    pub date: Option<String>,
+    pub retained_bytes_estimate: Option<u64>,
+    pub mount_path: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MemoryPressureLevel {
     Normal,
