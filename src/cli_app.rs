@@ -1,6 +1,6 @@
 //! Top-level CLI definition and dispatch.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -20,6 +20,7 @@ use storage_ballast_helper::core::config::{
 use storage_ballast_helper::daemon::loop_main::{
     DaemonArgs as RuntimeDaemonArgs, MonitoringDaemon,
 };
+use storage_ballast_helper::daemon::process_io_history::ProcessIoHistory;
 use storage_ballast_helper::daemon::self_monitor::DAEMON_STATE_STALE_THRESHOLD_SECS;
 use storage_ballast_helper::daemon::service::{
     LAUNCHD_LABEL_ENV, LaunchdConfig, LaunchdServiceManager, LaunchdStatusReport,
@@ -34,7 +35,7 @@ use storage_ballast_helper::platform::pal::{
 };
 use storage_ballast_helper::platform::types::{
     Capacity, FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureLevel,
-    ServiceKind,
+    ProcessInfo, ProcessIo, ServiceKind,
 };
 use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionPlan};
 use storage_ballast_helper::scanner::patterns::{ArtifactCategory, ArtifactPatternRegistry};
@@ -522,11 +523,21 @@ struct BlameArgs {
     /// Maximum rows to return.
     #[arg(long, default_value_t = 25, value_name = "N")]
     top: usize,
+    /// Attribution window (for example: `1m`, `15m`, `1h`).
+    #[arg(long, default_value = "15m", value_name = "DURATION")]
+    since: String,
+    /// Render parent-child process tree in human output.
+    #[arg(long)]
+    tree: bool,
 }
 
 impl Default for BlameArgs {
     fn default() -> Self {
-        Self { top: 25 }
+        Self {
+            top: 25,
+            since: "15m".to_string(),
+            tree: false,
+        }
     }
 }
 
@@ -2191,275 +2202,359 @@ fn print_pressure_bar(label: &str, pct: f64) {
     println!("    {label:<9} {pct:>5.1}% |{bar:<bar_width$}|");
 }
 
-/// Information about a running process for blame attribution.
 #[derive(Debug, Clone)]
-struct ProcessBlameInfo {
-    pid: u32,
-    comm: String,
-    cwd: PathBuf,
+struct BlameReport {
+    rows: Vec<BlameRow>,
+    since: Duration,
+    process_count: usize,
+    io_error_count: usize,
+    open_file_error_count: usize,
+    open_file_roots: Vec<PathBuf>,
 }
 
-/// A group of artifacts attributed to a single process or "orphaned".
-#[derive(Debug, Clone)]
-struct BlameGroup {
-    label: String,
-    pid: Option<u32>,
-    build_dirs: Vec<PathBuf>,
-    total_bytes: u64,
-    oldest: Option<SystemTime>,
-    newest: Option<SystemTime>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlameRow {
+    pid: i32,
+    parent_pid: Option<i32>,
+    name: String,
+    command: String,
+    executable: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+    recent_read_bytes: u64,
+    recent_written_bytes: u64,
+    open_files: Vec<PathBuf>,
 }
 
-#[allow(unused_mut)]
-fn collect_process_info() -> Vec<ProcessBlameInfo> {
-    let mut procs = Vec::new();
-
-    #[cfg(target_os = "linux")]
-    {
-        let Ok(proc_dir) = std::fs::read_dir("/proc") else {
-            return procs;
-        };
-
-        for entry in proc_dir {
-            let Ok(entry) = entry else {
-                continue;
-            };
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-
-            if !name_str.chars().all(|c| c.is_ascii_digit()) {
-                continue;
-            }
-            let Ok(pid) = name_str.parse::<u32>() else {
-                continue;
-            };
-
-            let proc_path = entry.path();
-
-            // Read cwd symlink.
-            let Ok(cwd) = std::fs::read_link(proc_path.join("cwd")) else {
-                continue;
-            };
-            if !cwd.is_absolute() {
-                continue;
-            }
-
-            // Read comm (process name).
-            let comm = std::fs::read_to_string(proc_path.join("comm"))
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-
-            if comm.is_empty() {
-                continue;
-            }
-
-            procs.push(ProcessBlameInfo { pid, comm, cwd });
-        }
-    }
-
-    procs
-}
-
-#[allow(clippy::too_many_lines)]
 fn run_blame(cli: &Cli, args: &BlameArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let since = parse_window_duration(&args.since)?;
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+    let history = ProcessIoHistory::load_or_new(ProcessIoHistory::snapshot_path_for_state_file(
+        &config.paths.state_file,
+    ));
     let start = std::time::Instant::now();
-
-    // Collect process information.
-    let processes = collect_process_info();
-
-    // Walk the configured roots for build artifacts.
-    // Canonicalize to ensure absolute paths for system protection checks.
-    let raw_roots = config.scanner.root_paths.clone();
-    let root_paths: Vec<PathBuf> = raw_roots
-        .into_iter()
-        .filter_map(|p| match p.canonicalize() {
-            Ok(abs) => Some(abs),
-            Err(e) => {
-                if output_mode(cli) == OutputMode::Human {
-                    eprintln!(
-                        "Warning: skipping invalid configured path {}: {}",
-                        p.display(),
-                        e
-                    );
-                }
-                None
-            }
-        })
-        .collect();
-
-    let protection_patterns = if config.scanner.protected_paths.is_empty() {
-        None
-    } else {
-        Some(config.scanner.protected_paths.as_slice())
-    };
-    let protection = ProtectionRegistry::new(protection_patterns)
-        .map_err(|e| CliError::Runtime(e.to_string()))?;
-
-    let walker_config = WalkerConfig {
-        root_paths,
-        max_depth: config.scanner.max_depth,
-        follow_symlinks: config.scanner.follow_symlinks,
-        cross_devices: config.scanner.cross_devices,
-        parallelism: config.scanner.parallelism,
-        excluded_paths: config
-            .scanner
-            .excluded_paths
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>(),
-    };
-    let walker = DirectoryWalker::new(walker_config, protection);
-
-    let entries = walker
-        .walk()
-        .map_err(|e| CliError::Runtime(e.to_string()))?;
-
-    // Only consider directories (build artifact roots).
-    let dir_entries: Vec<_> = entries.iter().filter(|e| e.metadata.is_dir).collect();
-
-    // Build a map: process label --> BlameGroup.
-    let mut groups: std::collections::HashMap<String, BlameGroup> =
-        std::collections::HashMap::new();
-    let now = SystemTime::now();
-
-    for entry in &dir_entries {
-        // Find the process whose CWD is a prefix of this artifact's path.
-        let owner = processes.iter().find(|p| entry.path.starts_with(&p.cwd));
-
-        let (label, pid) = owner.map_or_else(
-            || ("(orphaned)".to_string(), None),
-            |proc| (format!("{} (PID {})", proc.comm, proc.pid), Some(proc.pid)),
-        );
-
-        let group = groups.entry(label.clone()).or_insert_with(|| BlameGroup {
-            label,
-            pid,
-            build_dirs: Vec::new(),
-            total_bytes: 0,
-            oldest: None,
-            newest: None,
-        });
-
-        group.build_dirs.push(entry.path.clone());
-        group.total_bytes += entry.metadata.size_bytes;
-
-        let mtime = entry.metadata.modified;
-        group.oldest = Some(group.oldest.map_or(mtime, |prev| prev.min(mtime)));
-        group.newest = Some(group.newest.map_or(mtime, |prev| prev.max(mtime)));
-    }
-
-    // Sort groups by total size descending.
-    let mut sorted_groups: Vec<BlameGroup> = groups.into_values().collect();
-    sorted_groups.sort_by_key(|g| std::cmp::Reverse(g.total_bytes));
-    sorted_groups.truncate(args.top);
-
-    let total_dirs: usize = sorted_groups.iter().map(|g| g.build_dirs.len()).sum();
-    let total_bytes: u64 = sorted_groups.iter().map(|g| g.total_bytes).sum();
+    let report = collect_blame_report_at(
+        &config,
+        platform.as_ref(),
+        &history,
+        since,
+        args.top,
+        unix_time_ms_for_cli(),
+    )?;
     let elapsed = start.elapsed();
 
     match output_mode(cli) {
         OutputMode::Human => {
             println!(
-                "Disk Usage by Agent/Process (scanned in {:.1}s):",
-                elapsed.as_secs_f64()
+                "Process I/O blame - last {} (sampled in {:.1}s):",
+                window_label(report.since),
+                elapsed.as_secs_f64(),
             );
             println!();
 
-            if sorted_groups.is_empty() {
-                println!("  No build artifacts found.");
+            if report.rows.is_empty() {
+                println!("  No process I/O attribution data found.");
             } else {
-                println!(
-                    "  {:<30}  {:>10}  {:>10}  {:>10}  {:>10}",
-                    "Agent/Process", "Build Dirs", "Total Size", "Oldest", "Newest"
-                );
-                println!("  {}", "-".repeat(76));
+                print_blame_human(&report, args.tree);
+            }
 
-                for group in &sorted_groups {
-                    let oldest_str = group
-                        .oldest
-                        .and_then(|t| now.duration_since(t).ok())
-                        .map_or_else(
-                            || "-".to_string(),
-                            |d| format!("{} ago", format_duration(d)),
-                        );
-                    let newest_str = group
-                        .newest
-                        .and_then(|t| now.duration_since(t).ok())
-                        .map_or_else(
-                            || "-".to_string(),
-                            |d| format!("{} ago", format_duration(d)),
-                        );
-
-                    println!(
-                        "  {:<30}  {:>10}  {:>10}  {:>10}  {:>10}",
-                        group.label,
-                        group.build_dirs.len(),
-                        format_bytes(group.total_bytes),
-                        oldest_str,
-                        newest_str,
-                    );
-                }
-
+            if report.io_error_count > 0 || report.open_file_error_count > 0 {
                 println!();
                 println!(
-                    "  Total: {} build dirs, {}",
-                    total_dirs,
-                    format_bytes(total_bytes),
+                    "  Partial attribution: {} process I/O read errors, {} open-file root errors",
+                    report.io_error_count, report.open_file_error_count,
                 );
-
-                let orphaned_bytes: u64 = sorted_groups
-                    .iter()
-                    .filter(|g| g.pid.is_none())
-                    .map(|g| g.total_bytes)
-                    .sum();
-                if orphaned_bytes > 0 {
-                    println!(
-                        "  Orphaned dirs (no running process) are the safest to clean: {}",
-                        format_bytes(orphaned_bytes),
-                    );
-                }
             }
         }
         OutputMode::Json => {
-            let groups_json: Vec<Value> = sorted_groups
+            let rows_json: Vec<Value> = report
+                .rows
                 .iter()
-                .map(|g| {
-                    let oldest_age = g
-                        .oldest
-                        .and_then(|t| now.duration_since(t).ok())
-                        .map(|d| d.as_secs());
-                    let newest_age = g
-                        .newest
-                        .and_then(|t| now.duration_since(t).ok())
-                        .map(|d| d.as_secs());
-
+                .map(|row| {
                     json!({
-                        "label": g.label,
-                        "pid": g.pid,
-                        "build_dirs": g.build_dirs.len(),
-                        "total_bytes": g.total_bytes,
-                        "oldest_age_secs": oldest_age,
-                        "newest_age_secs": newest_age,
+                        "pid": row.pid,
+                        "parent_pid": row.parent_pid,
+                        "name": row.name,
+                        "command": row.command,
+                        "executable": row.executable.as_ref().map(|path| path.display().to_string()),
+                        "cwd": row.cwd.as_ref().map(|path| path.display().to_string()),
+                        "recent_bytes_written": row.recent_written_bytes,
+                        "recent_bytes_read": row.recent_read_bytes,
+                        "open_files": row.open_files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
                     })
                 })
                 .collect();
 
             let payload = json!({
                 "command": "blame",
-                "groups": groups_json,
-                "total_dirs": total_dirs,
-                "total_bytes": total_bytes,
+                "since_secs": report.since.as_secs(),
+                "since_label": window_label(report.since),
+                "tree_mode": args.tree,
+                "rows": rows_json,
                 "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-                "processes_scanned": processes.len(),
+                "processes_scanned": report.process_count,
+                "io_error_count": report.io_error_count,
+                "open_file_error_count": report.open_file_error_count,
+                "open_file_roots": report.open_file_roots.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
             });
             write_json_line(&payload)?;
         }
     }
 
     Ok(())
+}
+
+fn collect_blame_report_at(
+    config: &Config,
+    platform: &dyn Platform,
+    history: &ProcessIoHistory,
+    since: Duration,
+    top: usize,
+    collected_at_unix_ms: i64,
+) -> Result<BlameReport, CliError> {
+    let processes = platform
+        .process_list()
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    let open_file_roots = canonical_blame_roots(config);
+    let (open_files_by_pid, open_file_error_count) =
+        collect_blame_open_files(platform, &open_file_roots);
+    let mut io_error_count = 0;
+    let mut rows = Vec::with_capacity(processes.len());
+
+    for process in &processes {
+        let io = platform.process_io(process.pid).unwrap_or_else(|_| {
+            io_error_count += 1;
+            ProcessIo {
+                pid: process.pid,
+                bytes_read_total: 0,
+                bytes_written_total: 0,
+                bytes_read_recent_15m: None,
+                bytes_written_recent_15m: None,
+            }
+        });
+        let recent = blame_recent_totals(history, process, &io, since, collected_at_unix_ms);
+        let mut open_files = open_files_by_pid
+            .get(&process.pid)
+            .cloned()
+            .unwrap_or_default();
+        open_files.sort();
+
+        rows.push(BlameRow {
+            pid: process.pid,
+            parent_pid: process.parent_pid,
+            name: process.name.clone(),
+            command: process_command(process),
+            executable: process.executable.clone(),
+            cwd: process.cwd.clone(),
+            recent_read_bytes: recent.0,
+            recent_written_bytes: recent.1,
+            open_files,
+        });
+    }
+
+    rows.sort_by(|left, right| {
+        right
+            .recent_written_bytes
+            .cmp(&left.recent_written_bytes)
+            .then_with(|| right.recent_read_bytes.cmp(&left.recent_read_bytes))
+            .then_with(|| right.open_files.len().cmp(&left.open_files.len()))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.pid.cmp(&right.pid))
+    });
+    rows.truncate(top);
+
+    Ok(BlameReport {
+        rows,
+        since,
+        process_count: processes.len(),
+        io_error_count,
+        open_file_error_count,
+        open_file_roots,
+    })
+}
+
+fn blame_recent_totals(
+    history: &ProcessIoHistory,
+    process: &ProcessInfo,
+    io: &ProcessIo,
+    since: Duration,
+    collected_at_unix_ms: i64,
+) -> (u64, u64) {
+    if let Some(recent) = history.recent_totals_for_process(
+        io,
+        process.start_time_unix_ms,
+        collected_at_unix_ms,
+        since,
+    ) {
+        return (recent.bytes_read, recent.bytes_written);
+    }
+
+    if since == Duration::from_mins(15)
+        && let (Some(read), Some(written)) = (io.bytes_read_recent_15m, io.bytes_written_recent_15m)
+    {
+        return (read, written);
+    }
+
+    (0, 0)
+}
+
+fn canonical_blame_roots(config: &Config) -> Vec<PathBuf> {
+    config
+        .scanner
+        .root_paths
+        .iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect()
+}
+
+fn collect_blame_open_files(
+    platform: &dyn Platform,
+    roots: &[PathBuf],
+) -> (HashMap<i32, Vec<PathBuf>>, usize) {
+    let mut by_pid: HashMap<i32, BTreeSet<PathBuf>> = HashMap::new();
+    let mut errors = 0;
+
+    for root in roots {
+        match platform.open_files_under(root) {
+            Ok(open_files) => {
+                for open_file in open_files {
+                    by_pid
+                        .entry(open_file.pid)
+                        .or_default()
+                        .insert(open_file.path);
+                }
+            }
+            Err(_) => errors += 1,
+        }
+    }
+
+    (
+        by_pid
+            .into_iter()
+            .map(|(pid, paths)| (pid, paths.into_iter().collect()))
+            .collect(),
+        errors,
+    )
+}
+
+fn process_command(process: &ProcessInfo) -> String {
+    if process.command_line.is_empty() {
+        process.name.clone()
+    } else {
+        process.command_line.join(" ")
+    }
+}
+
+fn print_blame_human(report: &BlameReport, tree: bool) {
+    println!(
+        "  {:>7}  {:>7}  {:>12}  {:>12}  {:>5}  Command",
+        "PID", "PPID", "Written", "Read", "Open"
+    );
+    println!("  {}", "-".repeat(68));
+
+    if tree {
+        for (index, depth) in blame_tree_order(&report.rows) {
+            print_blame_row_human(&report.rows[index], depth);
+        }
+    } else {
+        for row in &report.rows {
+            print_blame_row_human(row, 0);
+        }
+    }
+}
+
+fn print_blame_row_human(row: &BlameRow, depth: usize) {
+    let indent = "  ".repeat(depth);
+    println!(
+        "  {indent}{:>7}  {:>7}  {:>12}  {:>12}  {:>5}  {}",
+        row.pid,
+        row.parent_pid
+            .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+        format_bytes(row.recent_written_bytes),
+        format_bytes(row.recent_read_bytes),
+        row.open_files.len(),
+        row.command,
+    );
+    if let Some(executable) = &row.executable {
+        println!("  {indent}         exe: {}", executable.display());
+    }
+    if let Some(cwd) = &row.cwd {
+        println!("  {indent}         cwd: {}", cwd.display());
+    }
+    if !row.open_files.is_empty() {
+        let open_files = row
+            .open_files
+            .iter()
+            .take(5)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suffix = if row.open_files.len() > 5 {
+            format!(", +{} more", row.open_files.len() - 5)
+        } else {
+            String::new()
+        };
+        println!("  {indent}         open: {open_files}{suffix}");
+    }
+}
+
+fn blame_tree_order(rows: &[BlameRow]) -> Vec<(usize, usize)> {
+    let by_pid: HashMap<i32, usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| (row.pid, index))
+        .collect();
+    let mut children: HashMap<Option<i32>, Vec<usize>> = HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        let parent = row.parent_pid.filter(|pid| by_pid.contains_key(pid));
+        children.entry(parent).or_default().push(index);
+    }
+
+    let mut order = Vec::with_capacity(rows.len());
+    let mut visited = HashSet::new();
+    append_blame_tree_children(None, 0, rows, &children, &mut visited, &mut order);
+    for index in 0..rows.len() {
+        if visited.insert(index) {
+            order.push((index, 0));
+        }
+    }
+    order
+}
+
+fn append_blame_tree_children(
+    parent: Option<i32>,
+    depth: usize,
+    rows: &[BlameRow],
+    children: &HashMap<Option<i32>, Vec<usize>>,
+    visited: &mut HashSet<usize>,
+    order: &mut Vec<(usize, usize)>,
+) {
+    let Some(indices) = children.get(&parent) else {
+        return;
+    };
+    for index in indices {
+        if !visited.insert(*index) {
+            continue;
+        }
+        order.push((*index, depth));
+        append_blame_tree_children(
+            Some(rows[*index].pid),
+            depth + 1,
+            rows,
+            children,
+            visited,
+            order,
+        );
+    }
+}
+
+fn unix_time_ms_for_cli() -> i64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 // ──────────────────── tuning engine ────────────────────
@@ -8081,7 +8176,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use storage_ballast_helper::core::config::SacredConfig;
     use storage_ballast_helper::platform::pal::{FsStats, MockPlatform, MountPoint, PlatformPaths};
-    use storage_ballast_helper::platform::types::{FullDiskAccessState, FullDiskAccessStatus};
+    use storage_ballast_helper::platform::types::{
+        FullDiskAccessState, FullDiskAccessStatus, OpenFile, OpenFileKind, OpenFileMode,
+        ProcessInfo, ProcessIo,
+    };
     use tempfile::TempDir;
 
     struct FakeServiceManager {
@@ -8154,6 +8252,38 @@ mod tests {
             success: true,
             follow_up: Vec::new(),
             service_restart: None,
+        }
+    }
+
+    fn blame_process(
+        pid: i32,
+        parent_pid: Option<i32>,
+        name: &str,
+        command_line: Vec<&str>,
+        start_time_unix_ms: Option<i64>,
+    ) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            parent_pid,
+            name: name.to_string(),
+            command_line: command_line.into_iter().map(str::to_string).collect(),
+            executable: Some(PathBuf::from(format!("/usr/bin/{name}"))),
+            cwd: Some(PathBuf::from(format!("/tmp/{name}"))),
+            start_time_unix_ms,
+            virtual_memory_bytes: None,
+            resident_memory_bytes: None,
+            cpu_user_micros: None,
+            cpu_system_micros: None,
+        }
+    }
+
+    fn blame_io(pid: i32, bytes_read_total: u64, bytes_written_total: u64) -> ProcessIo {
+        ProcessIo {
+            pid,
+            bytes_read_total,
+            bytes_written_total,
+            bytes_read_recent_15m: None,
+            bytes_written_recent_15m: None,
         }
     }
 
@@ -9345,6 +9475,110 @@ mod tests {
         assert!(parse_window_duration("").is_err());
         assert!(parse_window_duration("abc").is_err());
         assert!(parse_window_duration("10x").is_err());
+    }
+
+    #[test]
+    fn blame_command_parses_since_and_tree_flags() {
+        let parsed = Cli::try_parse_from(["sbh", "blame", "--top", "5", "--since", "1h", "--tree"])
+            .expect("blame flags should parse");
+
+        let Command::Blame(args) = parsed.command else {
+            panic!("expected blame command");
+        };
+        assert_eq!(args.top, 5);
+        assert_eq!(args.since, "1h");
+        assert!(args.tree);
+    }
+
+    #[test]
+    fn blame_report_ranks_processes_by_recent_writes_and_open_files() {
+        let dir = TempDir::new().expect("temp dir should be created");
+        let raw_root = dir.path().join("work");
+        std::fs::create_dir(&raw_root).expect("root should be created");
+        let root = raw_root.canonicalize().expect("root should canonicalize");
+        let now = 1_700_000_000_000;
+        let old_start = Some(now - (60 * 60 * 1_000));
+        let mut config = Config::default();
+        config.scanner.root_paths = vec![root.clone()];
+        config.paths.state_file = dir.path().join("state.json");
+
+        let mut history = ProcessIoHistory::new(dir.path().join("io_history.bin"));
+        let _ = history.record_process_sample_at(
+            blame_io(42, 1_000, 2_000),
+            old_start,
+            now - (10 * 60 * 1_000),
+        );
+
+        let open_path = root.join("target/debug/object.o");
+        let platform = MockPlatform::healthy()
+            .with_process(blame_process(
+                42,
+                Some(7),
+                "rustc",
+                vec!["rustc", "--crate-name", "demo"],
+                old_start,
+            ))
+            .with_process_io(blame_io(42, 1_500, 102_000))
+            .with_process(blame_process(
+                7,
+                None,
+                "cargo",
+                vec!["cargo", "test"],
+                old_start,
+            ))
+            .with_process_io(blame_io(7, 10, 20))
+            .with_open_file(OpenFile {
+                pid: 42,
+                path: open_path.clone(),
+                fd: Some(3),
+                kind: OpenFileKind::Regular,
+                mode: OpenFileMode::ReadWrite,
+            });
+
+        let report = collect_blame_report_at(
+            &config,
+            &platform,
+            &history,
+            Duration::from_mins(15),
+            10,
+            now,
+        )
+        .expect("blame report should collect");
+
+        assert_eq!(report.rows[0].pid, 42);
+        assert_eq!(report.rows[0].recent_written_bytes, 100_000);
+        assert_eq!(report.rows[0].recent_read_bytes, 500);
+        assert_eq!(report.rows[0].open_files, vec![open_path]);
+    }
+
+    #[test]
+    fn blame_tree_order_places_children_under_selected_parents() {
+        let rows = vec![
+            BlameRow {
+                pid: 7,
+                parent_pid: None,
+                name: "cargo".to_string(),
+                command: "cargo test".to_string(),
+                executable: None,
+                cwd: None,
+                recent_read_bytes: 0,
+                recent_written_bytes: 20,
+                open_files: Vec::new(),
+            },
+            BlameRow {
+                pid: 42,
+                parent_pid: Some(7),
+                name: "rustc".to_string(),
+                command: "rustc".to_string(),
+                executable: None,
+                cwd: None,
+                recent_read_bytes: 0,
+                recent_written_bytes: 10,
+                open_files: Vec::new(),
+            },
+        ];
+
+        assert_eq!(blame_tree_order(&rows), vec![(0, 0), (1, 1)]);
     }
 
     #[test]

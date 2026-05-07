@@ -29,6 +29,12 @@ pub struct ProcessIoHistoryReport {
     pub persisted: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessIoRecentTotals {
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+}
+
 impl ProcessIoHistoryReport {
     const fn skipped() -> Self {
         Self {
@@ -207,7 +213,7 @@ impl ProcessIoHistory {
         let samples = self.samples_by_process.entry(key).or_default();
         samples.push_back(sample);
         prune_samples(samples, collected_at_unix_ms.saturating_sub(window_ms));
-        self.io_with_recent_for_process(io, start_time_unix_ms)
+        self.io_with_recent_for_process_at(io, start_time_unix_ms, collected_at_unix_ms)
     }
 
     #[must_use]
@@ -218,21 +224,59 @@ impl ProcessIoHistory {
     #[must_use]
     pub fn io_with_recent_for_process(
         &self,
-        mut io: ProcessIo,
+        io: ProcessIo,
         start_time_unix_ms: Option<i64>,
     ) -> ProcessIo {
+        self.io_with_recent_for_process_at(io, start_time_unix_ms, unix_time_ms())
+    }
+
+    fn io_with_recent_for_process_at(
+        &self,
+        mut io: ProcessIo,
+        start_time_unix_ms: Option<i64>,
+        collected_at_unix_ms: i64,
+    ) -> ProcessIo {
+        if let Some(recent) = self.recent_totals_for_process(
+            &io,
+            start_time_unix_ms,
+            collected_at_unix_ms,
+            self.recent_window,
+        ) {
+            io.bytes_read_recent_15m = Some(recent.bytes_read);
+            io.bytes_written_recent_15m = Some(recent.bytes_written);
+        }
+        io
+    }
+
+    #[must_use]
+    pub fn recent_totals_for_process(
+        &self,
+        io: &ProcessIo,
+        start_time_unix_ms: Option<i64>,
+        collected_at_unix_ms: i64,
+        window: Duration,
+    ) -> Option<ProcessIoRecentTotals> {
+        let cutoff = collected_at_unix_ms.saturating_sub(duration_ms_i64(window));
+        if start_time_unix_ms.is_some_and(|start| start >= cutoff) {
+            return Some(ProcessIoRecentTotals {
+                bytes_read: io.bytes_read_total,
+                bytes_written: io.bytes_written_total,
+            });
+        }
+
         let key = ProcessIoHistoryKey {
             pid: io.pid,
             start_time_unix_ms,
         };
         if let Some(samples) = self.samples_by_process.get(&key)
-            && let Some((read_recent, written_recent)) =
-                recent_delta(samples, duration_ms_i64(self.recent_window))
+            && let Some((read_recent, written_recent)) = current_delta_since(samples, io, cutoff)
         {
-            io.bytes_read_recent_15m = Some(read_recent);
-            io.bytes_written_recent_15m = Some(written_recent);
+            return Some(ProcessIoRecentTotals {
+                bytes_read: read_recent,
+                bytes_written: written_recent,
+            });
         }
-        io
+        None
     }
 
     fn load_snapshot(&mut self) {
@@ -321,20 +365,19 @@ impl ProcessIoHistory {
     }
 }
 
-fn recent_delta(samples: &VecDeque<ProcessIoSample>, window_ms: i64) -> Option<(u64, u64)> {
-    let latest = samples.back()?;
-    let cutoff = latest.collected_at_unix_ms.saturating_sub(window_ms);
+fn current_delta_since(
+    samples: &VecDeque<ProcessIoSample>,
+    io: &ProcessIo,
+    cutoff_unix_ms: i64,
+) -> Option<(u64, u64)> {
     let baseline = samples
         .iter()
-        .find(|sample| sample.collected_at_unix_ms >= cutoff)
-        .unwrap_or(latest);
+        .find(|sample| sample.collected_at_unix_ms >= cutoff_unix_ms)?;
 
     Some((
-        latest
-            .bytes_read_total
+        io.bytes_read_total
             .saturating_sub(baseline.bytes_read_total),
-        latest
-            .bytes_written_total
+        io.bytes_written_total
             .saturating_sub(baseline.bytes_written_total),
     ))
 }
@@ -432,9 +475,46 @@ mod tests {
         let _ = history.record_process_sample_at(io(42, 1_000, 2_000), Some(100), 0);
         let reused = history.record_process_sample_at(io(42, 50, 75), Some(200), 15_000);
 
-        assert_eq!(reused.bytes_read_recent_15m, Some(0));
-        assert_eq!(reused.bytes_written_recent_15m, Some(0));
+        assert_eq!(reused.bytes_read_recent_15m, Some(50));
+        assert_eq!(reused.bytes_written_recent_15m, Some(75));
         assert_eq!(history.samples_by_process.len(), 2);
+    }
+
+    #[test]
+    fn recent_totals_use_lifetime_for_process_started_inside_window() {
+        let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        let history = ProcessIoHistory::new(dir.path().join("io_history.bin"));
+
+        let recent = history
+            .recent_totals_for_process(
+                &io(42, 1_024, 2_048),
+                Some(10 * 60 * 1_000),
+                15 * 60 * 1_000,
+                Duration::from_mins(15),
+            )
+            .expect("recent process lifetime should count as recent I/O");
+
+        assert_eq!(recent.bytes_read, 1_024);
+        assert_eq!(recent.bytes_written, 2_048);
+    }
+
+    #[test]
+    fn recent_totals_use_history_baseline_for_old_process() {
+        let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        let mut history = ProcessIoHistory::new(dir.path().join("io_history.bin"));
+        let _ = history.record_process_sample_at(io(42, 100, 200), Some(0), 10 * 60 * 1_000);
+
+        let recent = history
+            .recent_totals_for_process(
+                &io(42, 150, 900),
+                Some(0),
+                20 * 60 * 1_000,
+                Duration::from_mins(15),
+            )
+            .expect("history sample inside window should provide a baseline");
+
+        assert_eq!(recent.bytes_read, 50);
+        assert_eq!(recent.bytes_written, 700);
     }
 
     #[test]
