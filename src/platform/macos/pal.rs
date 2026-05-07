@@ -18,15 +18,15 @@ use crate::platform::macos::libproc::{
 };
 use crate::platform::macos::sacred_catalog::platform_macos_sacred_paths;
 use crate::platform::macos::sys::{
-    self, ApfsInventory, ApfsVolume, ApfsVolumeRole, StatfsSnapshot,
+    self, ApfsInventory, ApfsVolume, ApfsVolumeRole, StatfsSnapshot, SwapUsage, VmStats,
 };
 use crate::platform::pal::{
     FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
 };
 use crate::platform::types::{
     Capacity, FullDiskAccessState, FullDiskAccessStatus, MappedRegion, MemoryPressure,
-    MemoryPressureCallback, MountInfo, OpenFile, OpenFileKind, OpenFileMode, PalError, ProcessInfo,
-    ProcessIo, SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
+    MemoryPressureCallback, MemoryPressureLevel, MountInfo, OpenFile, OpenFileKind, OpenFileMode,
+    PalError, ProcessInfo, ProcessIo, SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
 };
 use parking_lot::RwLock;
 
@@ -76,7 +76,12 @@ impl Platform for MacOsPal {
     }
 
     fn memory_info(&self) -> Result<MemoryInfo> {
-        macos_not_implemented("bd-hqu2.4", "memory_info")
+        let total_bytes = macos_total_memory_bytes("memory_info")?;
+        let stats =
+            sys::read_vm_stats().map_err(|error| macos_method_error("memory_info", &error))?;
+        let swap =
+            sys::vm_swapusage().map_err(|error| macos_method_error("memory_info", &error))?;
+        Ok(memory_info_from_vm_stats(total_bytes, stats, &swap))
     }
 
     fn service_manager(&self) -> Box<dyn ServiceManager> {
@@ -115,7 +120,12 @@ impl Platform for MacOsPal {
     }
 
     fn memory_pressure(&self) -> Result<MemoryPressure> {
-        macos_not_implemented("bd-hqu2.4", "memory_pressure")
+        let total_bytes = macos_total_memory_bytes("memory_pressure")?;
+        let stats =
+            sys::read_vm_stats().map_err(|error| macos_method_error("memory_pressure", &error))?;
+        let swap =
+            sys::vm_swapusage().map_err(|error| macos_method_error("memory_pressure", &error))?;
+        Ok(memory_pressure_from_vm_stats(total_bytes, stats, &swap))
     }
 
     fn full_disk_access_status(&self) -> Result<FullDiskAccessStatus> {
@@ -246,6 +256,98 @@ fn macos_method_error(
     error: &impl ToString,
 ) -> crate::core::errors::SbhError {
     PalError::method_failed("macos", method, error.to_string()).into()
+}
+
+fn macos_total_memory_bytes(method: &'static str) -> Result<u64> {
+    sys::sysctl::read::<u64>("hw.memsize").map_err(|error| macos_method_error(method, &error))
+}
+
+fn memory_info_from_vm_stats(total_bytes: u64, stats: VmStats, swap: &SwapUsage) -> MemoryInfo {
+    let available_pages = stats
+        .free_count
+        .saturating_add(stats.inactive_count)
+        .min(total_pages(total_bytes, stats.page_size_bytes));
+    let (swap_total_bytes, swap_free_bytes) = match swap {
+        SwapUsage::Known(usage) => (usage.total_bytes, usage.free_bytes),
+        SwapUsage::Unknown => (0, 0),
+    };
+
+    MemoryInfo {
+        total_bytes,
+        available_bytes: available_pages.saturating_mul(stats.page_size_bytes),
+        swap_total_bytes,
+        swap_free_bytes,
+    }
+}
+
+fn memory_pressure_from_vm_stats(
+    total_bytes: u64,
+    stats: VmStats,
+    swap: &SwapUsage,
+) -> MemoryPressure {
+    let total_pages = total_pages(total_bytes, stats.page_size_bytes);
+    let used_pages = total_pages.checked_sub(stats.free_count);
+    let compressor_used_bytes = Some(
+        stats
+            .compressor_page_count
+            .saturating_mul(stats.page_size_bytes),
+    );
+    let (swap_total_bytes, swap_used_bytes) = match swap {
+        SwapUsage::Known(usage) => (
+            Some(usage.total_bytes),
+            Some(usage.total_bytes.saturating_sub(usage.free_bytes)),
+        ),
+        SwapUsage::Unknown => (None, None),
+    };
+
+    MemoryPressure {
+        level: infer_macos_memory_pressure_level(total_pages, stats, swap_used_bytes),
+        free_pages: Some(stats.free_count),
+        used_pages,
+        page_size_bytes: Some(stats.page_size_bytes),
+        compressor_used_bytes,
+        swap_total_bytes,
+        swap_used_bytes,
+        linux_psi_avg10: None,
+    }
+}
+
+fn total_pages(total_bytes: u64, page_size_bytes: u64) -> u64 {
+    total_bytes.checked_div(page_size_bytes).unwrap_or(0)
+}
+
+fn infer_macos_memory_pressure_level(
+    total_pages: u64,
+    stats: VmStats,
+    swap_used_bytes: Option<u64>,
+) -> MemoryPressureLevel {
+    if total_pages == 0 {
+        return MemoryPressureLevel::Unknown;
+    }
+
+    let free_pct = pages_pct(stats.free_count, total_pages);
+    let compressor_pct = pages_pct(stats.compressor_page_count, total_pages);
+    let swap_is_active = swap_used_bytes.is_some_and(|bytes| bytes > 0);
+
+    // Apple exposes dispatch memory-pressure levels but not the exact numeric
+    // thresholds. Until bd-hqu2.5 wires event notifications, keep the mapping
+    // conservative: warn only when free pages are scarce and the compressor is
+    // doing meaningful work; critical requires near-exhausted free pages plus
+    // evidence that memory pressure has spilled into swap.
+    if free_pct < 2.0 && swap_is_active {
+        MemoryPressureLevel::Critical
+    } else if free_pct < 5.0 && (compressor_pct >= 10.0 || swap_is_active) {
+        MemoryPressureLevel::Warn
+    } else {
+        MemoryPressureLevel::Normal
+    }
+}
+
+fn pages_pct(pages: u64, total_pages: u64) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    {
+        (pages as f64 * 100.0) / total_pages as f64
+    }
 }
 
 fn cached_full_disk_access_status(home: &Path) -> FullDiskAccessStatus {
@@ -714,9 +816,11 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::platform::macos::sys::{
-        ApfsContainer, ApfsInventory, ApfsVolume, ApfsVolumeRole, StatfsSnapshot,
+        ApfsContainer, ApfsInventory, ApfsVolume, ApfsVolumeRole, StatfsSnapshot, SwapUsage,
+        SwapUsageInfo, VmStats,
     };
     use crate::platform::pal::Platform;
+    use crate::platform::types::MemoryPressureLevel;
 
     use super::MacOsPal;
 
@@ -727,6 +831,133 @@ mod tests {
         let platform = MacOsPal::new();
         assert_platform(&platform);
         assert_eq!(platform.name(), "macos");
+    }
+
+    #[test]
+    fn memory_info_projects_available_memory_and_swap() {
+        let stats = VmStats {
+            page_size_bytes: 4096,
+            free_count: 10,
+            active_count: 120,
+            inactive_count: 30,
+            wire_count: 80,
+            speculative_count: 4,
+            compressor_page_count: 20,
+            throttled_count: 0,
+        };
+        let swap = SwapUsage::Known(SwapUsageInfo {
+            total_bytes: 1_000,
+            used_bytes: 400,
+            free_bytes: 600,
+            encrypted: true,
+        });
+
+        let memory = super::memory_info_from_vm_stats(1_024 * 4096, stats, &swap);
+
+        assert_eq!(memory.total_bytes, 1_024 * 4096);
+        assert_eq!(memory.available_bytes, 40 * 4096);
+        assert_eq!(memory.swap_total_bytes, 1_000);
+        assert_eq!(memory.swap_free_bytes, 600);
+    }
+
+    #[test]
+    fn memory_pressure_maps_normal_warn_and_critical_levels() {
+        let total_pages = 1_000;
+        let total_bytes = total_pages * 4096;
+        let base = VmStats {
+            page_size_bytes: 4096,
+            free_count: 400,
+            active_count: 300,
+            inactive_count: 200,
+            wire_count: 80,
+            speculative_count: 20,
+            compressor_page_count: 10,
+            throttled_count: 0,
+        };
+        let no_swap = SwapUsage::Known(SwapUsageInfo {
+            total_bytes: 1_000,
+            used_bytes: 0,
+            free_bytes: 1_000,
+            encrypted: true,
+        });
+        let active_swap = SwapUsage::Known(SwapUsageInfo {
+            total_bytes: 1_000,
+            used_bytes: 500,
+            free_bytes: 500,
+            encrypted: true,
+        });
+
+        let normal = super::memory_pressure_from_vm_stats(total_bytes, base, &no_swap);
+        assert_eq!(normal.level, MemoryPressureLevel::Normal);
+        assert_eq!(normal.free_pages, Some(400));
+        assert_eq!(normal.used_pages, Some(600));
+        assert_eq!(normal.page_size_bytes, Some(4096));
+        assert_eq!(normal.compressor_used_bytes, Some(10 * 4096));
+        assert_eq!(normal.swap_total_bytes, Some(1_000));
+        assert_eq!(normal.swap_used_bytes, Some(0));
+        assert_eq!(normal.linux_psi_avg10, None);
+
+        let warn = super::memory_pressure_from_vm_stats(
+            total_bytes,
+            VmStats {
+                free_count: 40,
+                compressor_page_count: 150,
+                ..base
+            },
+            &no_swap,
+        );
+        assert_eq!(warn.level, MemoryPressureLevel::Warn);
+
+        let critical = super::memory_pressure_from_vm_stats(
+            total_bytes,
+            VmStats {
+                free_count: 10,
+                compressor_page_count: 150,
+                ..base
+            },
+            &active_swap,
+        );
+        assert_eq!(critical.level, MemoryPressureLevel::Critical);
+    }
+
+    #[test]
+    fn memory_pressure_reports_unknown_without_page_size() {
+        let pressure = super::memory_pressure_from_vm_stats(
+            16 * 4096,
+            VmStats {
+                page_size_bytes: 0,
+                free_count: 0,
+                active_count: 0,
+                inactive_count: 0,
+                wire_count: 0,
+                speculative_count: 0,
+                compressor_page_count: 0,
+                throttled_count: 0,
+            },
+            &SwapUsage::Unknown,
+        );
+
+        assert_eq!(pressure.level, MemoryPressureLevel::Unknown);
+        assert_eq!(pressure.swap_total_bytes, None);
+        assert_eq!(pressure.swap_used_bytes, None);
+    }
+
+    #[test]
+    fn macos_pal_memory_methods_return_live_data() {
+        let platform = MacOsPal::new();
+        let memory = platform
+            .memory_info()
+            .expect("macOS memory info should be readable");
+        let pressure = platform
+            .memory_pressure()
+            .expect("macOS memory pressure should be readable");
+
+        assert!(memory.total_bytes > 0);
+        assert!(memory.available_bytes <= memory.total_bytes);
+        assert!(pressure.page_size_bytes.is_some_and(|bytes| bytes >= 4096));
+        assert!(pressure.free_pages.is_some());
+        assert!(pressure.used_pages.is_some());
+        assert_eq!(pressure.linux_psi_avg10, None);
     }
 
     #[test]
