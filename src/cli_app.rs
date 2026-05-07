@@ -4209,6 +4209,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
 
             let mut overall_level = "green";
             let mut snapshot_warnings = Vec::new();
+            let mut purgeable_notices = Vec::new();
             for mount in &mounts {
                 let Ok(capacity) = platform.capacity(&mount.path) else {
                     continue;
@@ -4228,6 +4229,9 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 }
                 if let Some(warning) = local_snapshot_warning(&capacity) {
                     snapshot_warnings.push(warning);
+                }
+                if let Some(notice) = purgeable_storage_notice(&capacity) {
+                    purgeable_notices.push(notice);
                 }
 
                 let ram_note = if platform.is_ram_backed(&mount.path).unwrap_or(false) {
@@ -4251,6 +4255,16 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 for warning in snapshot_warnings {
                     println!("  {warning}");
                 }
+            }
+
+            if !purgeable_notices.is_empty() {
+                println!("\nPurgeable Storage:");
+                for notice in purgeable_notices {
+                    println!("  {notice}");
+                }
+                println!(
+                    "  sbh reports purgeable storage separately and does not count it as free space for pressure decisions."
+                );
             }
 
             if let Some(memory) = &memory_info {
@@ -4620,9 +4634,19 @@ fn status_mount_json(capacity: &Capacity, level: &str, free_pct: f64) -> Value {
         "shared_volumes": capacity.shared_volumes,
         "is_primary": capacity.is_primary,
         "purgeable_bytes": capacity.purgeable_bytes,
+        "free_excludes_purgeable": true,
         "local_snapshot_bytes": capacity.local_snapshot_bytes,
         "local_snapshot_reclaim_command": local_snapshot_reclaim_command(capacity),
     })
+}
+
+fn purgeable_storage_notice(capacity: &Capacity) -> Option<String> {
+    let bytes = capacity.purgeable_bytes.filter(|bytes| *bytes > 0)?;
+    Some(format!(
+        "{} reports {} purgeable APFS storage",
+        capacity.mount_point.display(),
+        format_bytes(bytes)
+    ))
 }
 
 fn local_snapshot_warning(capacity: &Capacity) -> Option<String> {
@@ -8733,6 +8757,30 @@ mod tests {
     }
 
     #[test]
+    fn capacity_free_pct_excludes_purgeable_capacity() {
+        let capacity = Capacity {
+            mount_point: PathBuf::from("/System/Volumes/Data"),
+            fs_type: "apfs".to_string(),
+            total_bytes: 1_000,
+            free_bytes: 100,
+            available_bytes: 100,
+            is_readonly: false,
+            container_id: Some("/dev/disk3".to_string()),
+            container_total_bytes: Some(1_000),
+            container_available_bytes: Some(100),
+            volume_total_bytes: Some(400),
+            volume_available_bytes: Some(100),
+            volume_role: Some("Data".to_string()),
+            shared_volumes: Vec::new(),
+            is_primary: true,
+            purgeable_bytes: Some(500),
+            local_snapshot_bytes: None,
+        };
+
+        assert!((capacity_free_pct(&capacity) - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn status_mount_json_exposes_apfs_container_metadata() {
         let capacity = Capacity {
             mount_point: PathBuf::from("/System/Volumes/Data"),
@@ -8767,11 +8815,38 @@ mod tests {
         assert_eq!(payload["shared_volumes"], json!(["Macintosh HD", "VM"]));
         assert_eq!(payload["is_primary"], true);
         assert_eq!(payload["purgeable_bytes"], 32);
+        assert_eq!(payload["free_excludes_purgeable"], true);
         assert_eq!(payload["local_snapshot_bytes"], 64);
         assert_eq!(
             payload["local_snapshot_reclaim_command"],
             "sudo tmutil thinlocalsnapshots /System/Volumes/Data 9999999999999999 4"
         );
+    }
+
+    #[test]
+    fn purgeable_storage_notice_reports_bytes_separately() {
+        let capacity = Capacity {
+            mount_point: PathBuf::from("/"),
+            fs_type: "apfs".to_string(),
+            total_bytes: 1_000,
+            free_bytes: 250,
+            available_bytes: 250,
+            is_readonly: false,
+            container_id: Some("/dev/disk3".to_string()),
+            container_total_bytes: Some(1_000),
+            container_available_bytes: Some(250),
+            volume_total_bytes: Some(400),
+            volume_available_bytes: Some(100),
+            volume_role: Some("Data".to_string()),
+            shared_volumes: Vec::new(),
+            is_primary: true,
+            purgeable_bytes: Some(64),
+            local_snapshot_bytes: None,
+        };
+
+        let notice = purgeable_storage_notice(&capacity).expect("notice should be present");
+
+        assert!(notice.contains("/ reports 64 B purgeable APFS storage"));
     }
 
     #[test]

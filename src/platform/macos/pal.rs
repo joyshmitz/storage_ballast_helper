@@ -17,7 +17,9 @@ use crate::platform::macos::libproc::{
     proc_pidfdinfo_vnode_path, proc_pidinfo_task_all, proc_pidpath_safe,
 };
 use crate::platform::macos::sacred_catalog::platform_macos_sacred_paths;
-use crate::platform::macos::sys::{self, ApfsInventory, ApfsVolumeRole, StatfsSnapshot};
+use crate::platform::macos::sys::{
+    self, ApfsInventory, ApfsVolume, ApfsVolumeRole, StatfsSnapshot,
+};
 use crate::platform::pal::{
     FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
 };
@@ -83,6 +85,12 @@ impl Platform for MacOsPal {
         let inventory = sys::apfs_inventory().ok();
         let local_snapshot_bytes = local_snapshot_bytes_for_capacity(&stats, inventory.as_ref());
         let mut capacity = statfs_to_capacity(stats, inventory.as_ref());
+        capacity.purgeable_bytes = purgeable_bytes_for_volume(
+            &capacity.mount_point,
+            capacity.available_bytes,
+            inventory.as_ref(),
+            capacity.container_id.as_deref(),
+        );
         capacity.local_snapshot_bytes = local_snapshot_bytes;
         Ok(capacity)
     }
@@ -444,6 +452,15 @@ fn statfs_to_mount_info(stats: StatfsSnapshot, inventory: Option<&ApfsInventory>
         || (is_apfs && stats.mount_point == Path::new("/") && stats.is_readonly);
     let is_apfs_vm_volume = volume.is_some_and(|volume| volume.has_role(&ApfsVolumeRole::Vm))
         || (is_apfs && stats.mount_point == Path::new("/System/Volumes/VM"));
+    let effective_available_bytes = volume
+        .and_then(|volume| volume.container_available_bytes)
+        .unwrap_or(available_bytes);
+    let purgeable_bytes = purgeable_bytes_for_volume(
+        &stats.mount_point,
+        effective_available_bytes,
+        inventory,
+        volume.map(|volume| volume.container_id.as_str()),
+    );
     let mount_point = stats.mount_point;
     MountInfo {
         device: stats.device,
@@ -453,10 +470,8 @@ fn statfs_to_mount_info(stats: StatfsSnapshot, inventory: Option<&ApfsInventory>
         total_bytes: volume
             .and_then(|volume| volume.container_total_bytes)
             .or(Some(total_bytes)),
-        available_bytes: volume
-            .and_then(|volume| volume.container_available_bytes)
-            .or(Some(available_bytes)),
-        purgeable_bytes: None,
+        available_bytes: Some(effective_available_bytes),
+        purgeable_bytes,
         local_snapshot_bytes: None,
         is_readonly: stats.is_readonly,
         is_ram_backed,
@@ -464,6 +479,41 @@ fn statfs_to_mount_info(stats: StatfsSnapshot, inventory: Option<&ApfsInventory>
         is_apfs_system_snapshot,
         is_apfs_vm_volume,
     }
+}
+
+fn purgeable_bytes_for_volume(
+    mount_point: &Path,
+    counted_available_bytes: u64,
+    inventory: Option<&ApfsInventory>,
+    container_id: Option<&str>,
+) -> Option<u64> {
+    let foundation_estimate = sys::important_usage_available_bytes(mount_point)
+        .ok()
+        .flatten()
+        .and_then(|important_available| {
+            purgeable_bytes_from_important_available(important_available, counted_available_bytes)
+        });
+
+    foundation_estimate.or_else(|| purgeable_bytes_from_apfs_inventory(inventory, container_id))
+}
+
+fn purgeable_bytes_from_important_available(
+    important_available_bytes: u64,
+    counted_available_bytes: u64,
+) -> Option<u64> {
+    important_available_bytes
+        .checked_sub(counted_available_bytes)
+        .filter(|bytes| *bytes > 0)
+}
+
+fn purgeable_bytes_from_apfs_inventory(
+    inventory: Option<&ApfsInventory>,
+    container_id: Option<&str>,
+) -> Option<u64> {
+    let container_id = container_id?;
+    inventory?
+        .unattributed_container_used_bytes(container_id)
+        .filter(|bytes| *bytes > 0)
 }
 
 fn current_process_pid() -> i32 {
@@ -732,6 +782,60 @@ mod tests {
         assert_eq!(capacity.volume_role.as_deref(), Some("Data"));
         assert_eq!(capacity.shared_volumes, vec!["Macintosh HD", "VM"]);
         assert!(capacity.is_primary);
+    }
+
+    #[test]
+    fn purgeable_estimate_subtracts_counted_free_space() {
+        assert_eq!(
+            super::purgeable_bytes_from_important_available(900, 250),
+            Some(650)
+        );
+        assert_eq!(
+            super::purgeable_bytes_from_important_available(250, 250),
+            None
+        );
+        assert_eq!(
+            super::purgeable_bytes_from_important_available(200, 250),
+            None
+        );
+    }
+
+    #[test]
+    fn purgeable_inventory_fallback_uses_unattributed_container_bytes() {
+        let inventory = ApfsInventory {
+            containers: vec![ApfsContainer {
+                container_id: "/dev/disk3".to_string(),
+                uuid: Some("container-uuid".to_string()),
+                capacity_total_bytes: Some(1_000),
+                capacity_available_bytes: Some(250),
+                physical_stores: vec!["/dev/disk0s2".to_string()],
+            }],
+            volumes: vec![
+                ApfsVolume {
+                    device_id: "/dev/disk3s1".to_string(),
+                    container_id: "/dev/disk3".to_string(),
+                    name: Some("Macintosh HD".to_string()),
+                    roles: vec![ApfsVolumeRole::System],
+                    capacity_in_use_bytes: Some(200),
+                    container_total_bytes: Some(1_000),
+                    container_available_bytes: Some(250),
+                },
+                ApfsVolume {
+                    device_id: "/dev/disk3s5".to_string(),
+                    container_id: "/dev/disk3".to_string(),
+                    name: Some("Data".to_string()),
+                    roles: vec![ApfsVolumeRole::Data],
+                    capacity_in_use_bytes: Some(500),
+                    container_total_bytes: Some(1_000),
+                    container_available_bytes: Some(250),
+                },
+            ],
+        };
+
+        assert_eq!(
+            super::purgeable_bytes_from_apfs_inventory(Some(&inventory), Some("/dev/disk3")),
+            Some(50)
+        );
     }
 
     #[test]

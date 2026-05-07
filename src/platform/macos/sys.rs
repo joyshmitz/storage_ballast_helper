@@ -19,6 +19,7 @@ use std::sync::OnceLock;
 const STATFS_STRUCT_SIZE_BYTES: usize = core::mem::size_of::<libc::statfs>();
 const STATFS_MOUNT_NAME_BYTES: usize = core::mem::size_of::<[libc::c_char; 1024]>();
 const STATFS_TYPE_NAME_BYTES: usize = core::mem::size_of::<[libc::c_char; 16]>();
+const IMPORTANT_USAGE_AVAILABLE_KEY: &str = "NSURLVolumeAvailableCapacityForImportantUsageKey";
 
 const _: [(); 2168] = [(); STATFS_STRUCT_SIZE_BYTES];
 const _: [(); 1024] = [(); STATFS_MOUNT_NAME_BYTES];
@@ -277,6 +278,26 @@ pub fn local_time_machine_snapshots(
         mount,
         retained_total_estimate,
     ))
+}
+
+pub fn important_usage_available_bytes(mount: &Path) -> io::Result<Option<u64>> {
+    use objc2_foundation::{NSArray, NSNumber, NSString, NSURL};
+
+    let path = NSString::from_str(&mount.to_string_lossy());
+    let url = NSURL::fileURLWithPath(&path);
+    let key = NSString::from_str(IMPORTANT_USAGE_AVAILABLE_KEY);
+    let keys = NSArray::from_slice(&[&*key]);
+    let values = url
+        .resourceValuesForKeys_error(&keys)
+        .map_err(|_| io::Error::other("NSURL resourceValuesForKeys failed"))?;
+    let Some(value) = values.objectForKey(&key) else {
+        return Ok(None);
+    };
+    let Some(number) = value.downcast_ref::<NSNumber>() else {
+        return Ok(None);
+    };
+
+    Ok(Some(number.unsignedLongLongValue()))
 }
 
 #[must_use]
@@ -578,8 +599,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ApfsVolumeRole, mounted_filesystems, parent_apfs_volume_device, parse_apfs_inventory,
-        parse_tmutil_local_snapshots, statfs,
+        ApfsVolumeRole, important_usage_available_bytes, mounted_filesystems,
+        parent_apfs_volume_device, parse_apfs_inventory, parse_tmutil_local_snapshots, statfs,
     };
 
     #[test]
@@ -602,6 +623,14 @@ mod tests {
                 .iter()
                 .any(|mount| mount.mount_point == Path::new("/"))
         );
+    }
+
+    #[test]
+    fn important_usage_available_capacity_reports_for_root_volume() {
+        let capacity = important_usage_available_bytes(Path::new("/"))
+            .expect("Foundation should report root capacity");
+
+        assert!(capacity.is_some_and(|bytes| bytes > 0));
     }
 
     #[test]
