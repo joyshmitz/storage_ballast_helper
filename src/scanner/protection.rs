@@ -17,9 +17,11 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::core::errors::{Result, SbhError};
+use crate::platform::types::{SacredPath, SacredPathKind, SacredPathSource};
 
 /// Filename placed in directories to protect them from sbh cleanup.
 pub const MARKER_FILENAME: &str = ".sbh-protect";
+pub const DEFAULT_STOWAWAY_SCAN_DEPTH: usize = 3;
 
 /// Optional metadata stored inside a `.sbh-protect` file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,6 +49,31 @@ pub enum ProtectionSource {
     MarkerFile,
     /// Protected by a config-level glob pattern.
     ConfigPattern(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StowawayScanConfig {
+    pub max_depth: usize,
+    pub stop_after_first: bool,
+}
+
+impl Default for StowawayScanConfig {
+    fn default() -> Self {
+        Self {
+            max_depth: DEFAULT_STOWAWAY_SCAN_DEPTH,
+            stop_after_first: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StowawayMatch {
+    pub path: PathBuf,
+    pub depth: usize,
+    pub pattern: String,
+    pub kind: SacredPathKind,
+    pub source: SacredPathSource,
+    pub reason: String,
 }
 
 /// Compiled glob pattern for path matching.
@@ -308,6 +335,75 @@ pub fn remove_marker(dir: &Path) -> Result<bool> {
     }
 }
 
+pub fn scan_stowaways(root: &Path, catalog: &[SacredPath]) -> Result<Vec<StowawayMatch>> {
+    scan_stowaways_with_config(root, catalog, StowawayScanConfig::default())
+}
+
+pub fn scan_stowaways_with_config(
+    root: &Path,
+    catalog: &[SacredPath],
+    config: StowawayScanConfig,
+) -> Result<Vec<StowawayMatch>> {
+    let rules = build_stowaway_rules(catalog)?;
+    let mut matches = Vec::new();
+    let root = normalize_path_for_protection(root);
+    let mut queue = vec![(root.clone(), 0usize)];
+
+    while let Some((path, depth)) = queue.pop() {
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => continue,
+            Err(source) => return Err(SbhError::Io { path, source }),
+        };
+        let file_type = metadata.file_type();
+        let is_dir = file_type.is_dir();
+        let is_symlink = file_type.is_symlink();
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let relative_path = normalized_relative_path(&root, &path);
+
+        for rule in &rules {
+            if rule.matches(&file_name, &relative_path, is_dir) {
+                matches.push(StowawayMatch {
+                    path: path.clone(),
+                    depth,
+                    pattern: rule.pattern.clone(),
+                    kind: rule.kind,
+                    source: rule.source,
+                    reason: rule.reason.clone(),
+                });
+                if config.stop_after_first {
+                    return Ok(matches);
+                }
+                break;
+            }
+        }
+
+        if !is_dir || is_symlink || depth >= config.max_depth {
+            continue;
+        }
+
+        let entries = match fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => continue,
+            Err(source) => return Err(SbhError::Io { path, source }),
+        };
+
+        for entry_result in entries {
+            let Ok(entry) = entry_result else {
+                continue;
+            };
+            queue.push((entry.path(), depth + 1));
+        }
+    }
+
+    Ok(matches)
+}
+
 /// Read optional metadata from a `.sbh-protect` marker file.
 ///
 /// Returns `None` if the file is empty, doesn't exist, or isn't valid JSON.
@@ -387,9 +483,105 @@ fn normalize_path_for_protection(path: &Path) -> PathBuf {
     crate::core::paths::resolve_absolute_path(path)
 }
 
+#[derive(Debug)]
+struct StowawayRule {
+    pattern: String,
+    kind: SacredPathKind,
+    source: SacredPathSource,
+    reason: String,
+    matcher: StowawayMatcher,
+}
+
+#[derive(Debug)]
+enum StowawayMatcher {
+    ContainsDirName(String),
+    ContainsRelativePath(String),
+    ExactName(String),
+    GlobPath(Regex),
+}
+
+impl StowawayRule {
+    fn matches(&self, file_name: &str, relative_path: &str, is_dir: bool) -> bool {
+        match &self.matcher {
+            StowawayMatcher::ContainsDirName(name) => is_dir && file_name == name,
+            StowawayMatcher::ContainsRelativePath(path) => {
+                is_dir && path_suffix_matches(relative_path, path)
+            }
+            StowawayMatcher::ExactName(name) => {
+                file_name == name || path_suffix_matches(relative_path, name)
+            }
+            StowawayMatcher::GlobPath(regex) => {
+                regex.is_match(file_name) || regex.is_match(relative_path)
+            }
+        }
+    }
+}
+
+fn build_stowaway_rules(catalog: &[SacredPath]) -> Result<Vec<StowawayRule>> {
+    let mut rules = catalog
+        .iter()
+        .filter_map(stowaway_rule_from_sacred_path)
+        .collect::<Result<Vec<_>>>()?;
+    rules.push(StowawayRule {
+        pattern: MARKER_FILENAME.to_string(),
+        kind: SacredPathKind::StowawayMarker,
+        source: SacredPathSource::Marker,
+        reason: "Protection marker present inside cleanup candidate.".to_string(),
+        matcher: StowawayMatcher::ExactName(MARKER_FILENAME.to_string()),
+    });
+    Ok(rules)
+}
+
+fn stowaway_rule_from_sacred_path(entry: &SacredPath) -> Option<Result<StowawayRule>> {
+    let pattern = normalized_sacred_pattern(&entry.pattern);
+    let matcher = match entry.kind {
+        SacredPathKind::ContainsAny if pattern.contains('/') => {
+            StowawayMatcher::ContainsRelativePath(pattern)
+        }
+        SacredPathKind::ContainsAny => StowawayMatcher::ContainsDirName(pattern),
+        SacredPathKind::StowawayMarker if contains_glob_metachar(&pattern) => {
+            match glob_to_regex(&pattern) {
+                Ok(regex) => StowawayMatcher::GlobPath(regex),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        SacredPathKind::StowawayMarker => StowawayMatcher::ExactName(pattern),
+        SacredPathKind::ExactMatch | SacredPathKind::GlobMatch => return None,
+    };
+
+    Some(Ok(StowawayRule {
+        pattern: entry.pattern.clone(),
+        kind: entry.kind,
+        source: entry.source,
+        reason: entry.reason.clone(),
+        matcher,
+    }))
+}
+
+fn normalized_sacred_pattern(pattern: &str) -> String {
+    pattern.replace('\\', "/").trim_end_matches('/').to_string()
+}
+
+fn contains_glob_metachar(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?')
+}
+
+fn normalized_relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .ok()
+        .map(normalize_path_for_matching)
+        .filter(|path| !path.is_empty())
+        .unwrap_or_default()
+}
+
+fn path_suffix_matches(path: &str, suffix: &str) -> bool {
+    path == suffix || path.ends_with(&format!("/{suffix}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::sacred_catalog::cross_platform_sacred_paths;
     use std::fs;
     use tempfile::TempDir;
 
@@ -781,5 +973,125 @@ mod tests {
         let removed = remove_marker(&alias).unwrap();
         assert!(removed);
         assert!(!real.join(MARKER_FILENAME).exists());
+    }
+
+    #[test]
+    fn scan_stowaways_finds_cross_platform_markers() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("old-trash");
+        fs::create_dir_all(candidate.join("nested").join(".beads")).unwrap();
+        fs::write(
+            candidate.join("nested").join(".beads").join("beads.db"),
+            b"db",
+        )
+        .unwrap();
+        fs::write(candidate.join("state.sqlite3"), b"sqlite").unwrap();
+
+        let matches = scan_stowaways_with_config(
+            &candidate,
+            cross_platform_sacred_paths(),
+            StowawayScanConfig {
+                max_depth: 3,
+                stop_after_first: false,
+            },
+        )
+        .unwrap();
+        let patterns = matches
+            .iter()
+            .map(|matched| matched.pattern.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(patterns.contains(".beads/"));
+        assert!(patterns.contains("beads.db"));
+        assert!(patterns.contains("*.sqlite3"));
+    }
+
+    #[test]
+    fn scan_stowaways_short_circuits_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("cache");
+        fs::create_dir_all(candidate.join(".git")).unwrap();
+        fs::write(candidate.join("state.sqlite3"), b"sqlite").unwrap();
+
+        let matches = scan_stowaways(&candidate, cross_platform_sacred_paths()).unwrap();
+
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn scan_stowaways_respects_max_depth() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("cache");
+        let deep = candidate.join("a").join("b").join("c").join("d");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("beads.db"), b"db").unwrap();
+
+        let shallow = scan_stowaways_with_config(
+            &candidate,
+            cross_platform_sacred_paths(),
+            StowawayScanConfig {
+                max_depth: 3,
+                stop_after_first: false,
+            },
+        )
+        .unwrap();
+        assert!(shallow.is_empty());
+
+        let deep = scan_stowaways_with_config(
+            &candidate,
+            cross_platform_sacred_paths(),
+            StowawayScanConfig {
+                max_depth: 5,
+                stop_after_first: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(deep.len(), 1);
+        assert_eq!(deep[0].pattern, "beads.db");
+    }
+
+    #[test]
+    fn scan_stowaways_detects_protection_marker_without_catalog_entry() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("cache");
+        fs::create_dir_all(&candidate).unwrap();
+        create_marker(&candidate, None).unwrap();
+
+        let matches = scan_stowaways_with_config(
+            &candidate,
+            &[],
+            StowawayScanConfig {
+                max_depth: 1,
+                stop_after_first: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].pattern, MARKER_FILENAME);
+        assert_eq!(matches[0].source, SacredPathSource::Marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_stowaways_does_not_follow_symlinks() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("cache");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(outside.join(".git")).unwrap();
+        fs::create_dir_all(&candidate).unwrap();
+        std::os::unix::fs::symlink(&outside, candidate.join("linked-outside")).unwrap();
+
+        let matches = scan_stowaways_with_config(
+            &candidate,
+            cross_platform_sacred_paths(),
+            StowawayScanConfig {
+                max_depth: 3,
+                stop_after_first: false,
+            },
+        )
+        .unwrap();
+
+        assert!(matches.is_empty());
     }
 }
