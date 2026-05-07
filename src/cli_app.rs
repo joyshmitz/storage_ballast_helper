@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use storage_ballast_helper::ballast::manager::BallastManager;
+use storage_ballast_helper::cli::update::{UpdateReport, UpdateServiceRestart};
 use storage_ballast_helper::core::config::Config;
 use storage_ballast_helper::daemon::loop_main::{
     DaemonArgs as RuntimeDaemonArgs, MonitoringDaemon,
@@ -959,6 +960,28 @@ fn resolve_service_control(
     };
 
     Ok(ResolvedServiceControl { kind, user_scope })
+}
+
+fn resolve_update_service_control(
+    args: &UpdateArgs,
+    detected_kind: ServiceKind,
+) -> Option<ResolvedServiceControl> {
+    if detected_kind == ServiceKind::None {
+        return None;
+    }
+
+    let user_scope = if args.user {
+        true
+    } else if args.system {
+        false
+    } else {
+        detected_kind == ServiceKind::Launchd
+    };
+
+    Some(ResolvedServiceControl {
+        kind: detected_kind,
+        user_scope,
+    })
 }
 
 fn ensure_privileged_service_action(
@@ -6127,7 +6150,8 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<(), CliError> {
     let config = Config::load(cli.config.as_deref()).unwrap_or_default();
     let opts = build_update_options(args, &config, install_dir);
 
-    let report = run_update_sequence(&opts);
+    let mut report = run_update_sequence(&opts);
+    maybe_restart_service_after_update(cli, args, &mut report);
 
     match output_mode(cli) {
         OutputMode::Human => {
@@ -6141,9 +6165,127 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<(), CliError> {
 
     if report.success {
         Ok(())
+    } else if report.applied {
+        Err(CliError::Runtime(
+            "update applied but service restart failed".to_string(),
+        ))
     } else {
         Err(CliError::Runtime("update failed".to_string()))
     }
+}
+
+fn maybe_restart_service_after_update(cli: &Cli, args: &UpdateArgs, report: &mut UpdateReport) {
+    if !report.applied || !report.success {
+        return;
+    }
+
+    let platform = match detect_platform() {
+        Ok(platform) => platform,
+        Err(error) => {
+            record_update_service_restart_failure(
+                report,
+                ServiceKind::None,
+                "unknown",
+                format!("failed to detect service backend after update: {error}"),
+            );
+            return;
+        }
+    };
+
+    let Some(service) = resolve_update_service_control(args, platform.service_kind()) else {
+        return;
+    };
+
+    let manager = match service_manager_for_control(service) {
+        Ok(manager) => manager,
+        Err(error) => {
+            record_update_service_restart_failure(
+                report,
+                service.kind,
+                service.scope_name(),
+                error.to_string(),
+            );
+            return;
+        }
+    };
+
+    let sudo_command = format_sudo_rerun_command(cli, service.kind);
+    let privilege_error = service_system_scope_root_message("restart", service.kind, &sudo_command);
+    restart_loaded_service_after_update(
+        report,
+        service,
+        manager.as_ref(),
+        running_as_root(),
+        &privilege_error,
+    );
+}
+
+fn restart_loaded_service_after_update(
+    report: &mut UpdateReport,
+    service: ResolvedServiceControl,
+    manager: &dyn ServiceManager,
+    running_as_root: bool,
+    privilege_error: &str,
+) {
+    let service_type = service_kind_name(service.kind);
+    let scope = service.scope_name();
+
+    match manager.is_loaded() {
+        Ok(false) => {
+            report.record_service_restart(UpdateServiceRestart::skipped(
+                service_type,
+                scope,
+                "service is not loaded",
+            ));
+        }
+        Ok(true) => {
+            if !service.user_scope && !running_as_root {
+                record_update_service_restart_failure(
+                    report,
+                    service.kind,
+                    scope,
+                    privilege_error.to_string(),
+                );
+                return;
+            }
+
+            match manager.restart() {
+                Ok(()) => report
+                    .record_service_restart(UpdateServiceRestart::restarted(service_type, scope)),
+                Err(error) => record_update_service_restart_failure(
+                    report,
+                    service.kind,
+                    scope,
+                    error.to_string(),
+                ),
+            }
+        }
+        Err(error) => record_update_service_restart_failure(
+            report,
+            service.kind,
+            scope,
+            format!("failed to determine whether service is loaded: {error}"),
+        ),
+    }
+}
+
+fn record_update_service_restart_failure(
+    report: &mut UpdateReport,
+    service_kind: ServiceKind,
+    scope: &str,
+    error: String,
+) {
+    if report.notices_enabled {
+        report
+            .follow_up
+            .push(format!("Service restart failed after update: {error}"));
+    }
+    report.record_service_restart(UpdateServiceRestart::failed(
+        service_kind_name(service_kind),
+        scope,
+        error,
+    ));
+    report.success = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -6647,6 +6789,80 @@ fn shell_completion_dir(shell: CompletionShell) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FakeServiceManager {
+        loaded: std::result::Result<bool, &'static str>,
+        restart: std::result::Result<(), &'static str>,
+        restart_calls: AtomicUsize,
+    }
+
+    impl FakeServiceManager {
+        fn new(
+            loaded: std::result::Result<bool, &'static str>,
+            restart: std::result::Result<(), &'static str>,
+        ) -> Self {
+            Self {
+                loaded,
+                restart,
+                restart_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn restart_calls(&self) -> usize {
+            self.restart_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ServiceManager for FakeServiceManager {
+        fn install(&self) -> storage_ballast_helper::core::errors::Result<()> {
+            Ok(())
+        }
+
+        fn uninstall(&self) -> storage_ballast_helper::core::errors::Result<()> {
+            Ok(())
+        }
+
+        fn status(&self) -> storage_ballast_helper::core::errors::Result<String> {
+            Ok("test".to_string())
+        }
+
+        fn restart(&self) -> storage_ballast_helper::core::errors::Result<()> {
+            self.restart_calls.fetch_add(1, Ordering::SeqCst);
+            self.restart.map_err(|details| {
+                storage_ballast_helper::core::errors::SbhError::Runtime {
+                    details: details.to_string(),
+                }
+            })
+        }
+
+        fn is_loaded(&self) -> storage_ballast_helper::core::errors::Result<bool> {
+            self.loaded.map_err(
+                |details| storage_ballast_helper::core::errors::SbhError::Runtime {
+                    details: details.to_string(),
+                },
+            )
+        }
+    }
+
+    fn applied_update_report() -> UpdateReport {
+        UpdateReport {
+            current_version: "0.1.0".to_string(),
+            target_version: Some("v0.2.0".to_string()),
+            update_available: true,
+            applied: true,
+            check_only: false,
+            dry_run: false,
+            artifact_url: None,
+            notices_enabled: true,
+            install_path: None,
+            backup_id: None,
+            steps: Vec::new(),
+            success: true,
+            follow_up: Vec::new(),
+            service_restart: None,
+        }
+    }
 
     #[test]
     fn parses_global_flags_before_and_after_subcommand() {
@@ -6755,6 +6971,113 @@ mod tests {
 
         assert!(err.to_string().contains("--systemd"));
         assert!(err.to_string().contains("launchd"));
+    }
+
+    #[test]
+    fn update_service_control_defaults_to_platform_scope() {
+        let args = UpdateArgs::default();
+
+        let launchd = resolve_update_service_control(&args, ServiceKind::Launchd)
+            .expect("launchd service should resolve");
+        let systemd = resolve_update_service_control(&args, ServiceKind::Systemd)
+            .expect("systemd service should resolve");
+
+        assert!(launchd.user_scope);
+        assert_eq!(launchd.scope_name(), "user");
+        assert!(!systemd.user_scope);
+        assert_eq!(systemd.scope_name(), "system");
+    }
+
+    #[test]
+    fn update_service_control_honors_explicit_user_scope() {
+        let args = UpdateArgs {
+            user: true,
+            ..UpdateArgs::default()
+        };
+
+        let service = resolve_update_service_control(&args, ServiceKind::Systemd)
+            .expect("systemd service should resolve");
+
+        assert_eq!(service.kind, ServiceKind::Systemd);
+        assert!(service.user_scope);
+    }
+
+    #[test]
+    fn update_restart_restarts_loaded_service() {
+        let manager = FakeServiceManager::new(Ok(true), Ok(()));
+        let service = ResolvedServiceControl {
+            kind: ServiceKind::Launchd,
+            user_scope: true,
+        };
+        let mut report = applied_update_report();
+
+        restart_loaded_service_after_update(&mut report, service, &manager, false, "sudo needed");
+
+        assert!(report.success);
+        assert_eq!(manager.restart_calls(), 1);
+        assert_eq!(
+            report
+                .service_restart
+                .as_ref()
+                .map(|restart| &restart.status),
+            Some(&storage_ballast_helper::cli::update::UpdateServiceRestartStatus::Restarted)
+        );
+    }
+
+    #[test]
+    fn update_restart_skips_unloaded_service() {
+        let manager = FakeServiceManager::new(Ok(false), Ok(()));
+        let service = ResolvedServiceControl {
+            kind: ServiceKind::Launchd,
+            user_scope: true,
+        };
+        let mut report = applied_update_report();
+
+        restart_loaded_service_after_update(&mut report, service, &manager, false, "sudo needed");
+
+        assert!(report.success);
+        assert_eq!(manager.restart_calls(), 0);
+        assert_eq!(
+            report
+                .service_restart
+                .as_ref()
+                .map(|restart| &restart.status),
+            Some(&storage_ballast_helper::cli::update::UpdateServiceRestartStatus::Skipped)
+        );
+    }
+
+    #[test]
+    fn update_restart_marks_failure_when_system_scope_needs_root() {
+        let manager = FakeServiceManager::new(Ok(true), Ok(()));
+        let service = ResolvedServiceControl {
+            kind: ServiceKind::Systemd,
+            user_scope: false,
+        };
+        let mut report = applied_update_report();
+
+        restart_loaded_service_after_update(
+            &mut report,
+            service,
+            &manager,
+            false,
+            "rerun with sudo",
+        );
+
+        assert!(!report.success);
+        assert_eq!(manager.restart_calls(), 0);
+        assert!(
+            report
+                .follow_up
+                .iter()
+                .any(|message| message.contains("rerun with sudo"))
+        );
+        assert_eq!(
+            report
+                .service_restart
+                .as_ref()
+                .map(|restart| &restart.status),
+            Some(&storage_ballast_helper::cli::update::UpdateServiceRestartStatus::Failed)
+        );
     }
 
     #[test]

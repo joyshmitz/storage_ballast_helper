@@ -112,6 +112,7 @@ pub struct UpdateReport {
     pub steps: Vec<UpdateStep>,
     pub success: bool,
     pub follow_up: Vec<String>,
+    pub service_restart: Option<UpdateServiceRestart>,
 }
 
 /// A single step in the update sequence.
@@ -120,6 +121,76 @@ pub struct UpdateStep {
     pub description: String,
     pub done: bool,
     pub error: Option<String>,
+}
+
+/// Status of the post-update service restart attempt.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateServiceRestartStatus {
+    Restarted,
+    Skipped,
+    Failed,
+}
+
+/// Structured outcome for activating a freshly installed update in the service.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UpdateServiceRestart {
+    pub service_type: String,
+    pub scope: String,
+    pub status: UpdateServiceRestartStatus,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl UpdateServiceRestart {
+    #[must_use]
+    pub fn restarted(service_type: impl Into<String>, scope: impl Into<String>) -> Self {
+        let service_type = service_type.into();
+        let scope = scope.into();
+        Self {
+            message: format!("Restarted {service_type} service ({scope} scope)"),
+            service_type,
+            scope,
+            status: UpdateServiceRestartStatus::Restarted,
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn skipped(
+        service_type: impl Into<String>,
+        scope: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        let service_type = service_type.into();
+        let scope = scope.into();
+        let reason = reason.into();
+        Self {
+            message: format!("Skipped {service_type} service restart ({scope} scope): {reason}"),
+            service_type,
+            scope,
+            status: UpdateServiceRestartStatus::Skipped,
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn failed(
+        service_type: impl Into<String>,
+        scope: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Self {
+        let service_type = service_type.into();
+        let scope = scope.into();
+        Self {
+            message: format!("Restart {service_type} service ({scope} scope)"),
+            service_type,
+            scope,
+            status: UpdateServiceRestartStatus::Failed,
+            error: Some(error.into()),
+        }
+    }
 }
 
 impl UpdateReport {
@@ -138,6 +209,7 @@ impl UpdateReport {
             steps: Vec::new(),
             success: false,
             follow_up: Vec::new(),
+            service_restart: None,
         }
     }
 
@@ -163,6 +235,24 @@ impl UpdateReport {
             done: false,
             error: None,
         });
+    }
+
+    pub fn record_service_restart(&mut self, restart: UpdateServiceRestart) {
+        match restart.status {
+            UpdateServiceRestartStatus::Restarted | UpdateServiceRestartStatus::Skipped => {
+                self.step_ok(restart.message.clone());
+            }
+            UpdateServiceRestartStatus::Failed => {
+                self.step_fail(
+                    restart.message.clone(),
+                    restart
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "service restart failed".to_string()),
+                );
+            }
+        }
+        self.service_restart = Some(restart);
     }
 }
 
@@ -589,11 +679,6 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
             if opts.no_verify { "skip" } else { "sha256" }
         ));
         report.success = true;
-        if opts.notices_enabled {
-            report
-                .follow_up
-                .push("After update, restart the sbh service.".to_string());
-        }
         return report;
     }
 
@@ -727,12 +812,6 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
     report.success = true;
-    if opts.notices_enabled {
-        report.follow_up.push(format!(
-            "Updated {current_tag} -> {}. Restart the sbh service to use the new version.",
-            target.target_tag
-        ));
-    }
     report
 }
 
@@ -1382,6 +1461,31 @@ mod tests {
         r.success = true;
         r.follow_up.push("Restart the service".to_string());
         assert!(format_update_report(&r).contains("Restart the service"));
+    }
+
+    #[test]
+    fn record_service_restart_failure_formats_and_serializes() {
+        let mut r = UpdateReport::new("0.1.0", false, false, true);
+        r.record_service_restart(UpdateServiceRestart::failed(
+            "launchd",
+            "user",
+            "launchctl kickstart failed",
+        ));
+
+        assert_eq!(
+            r.service_restart.as_ref().map(|restart| &restart.status),
+            Some(&UpdateServiceRestartStatus::Failed)
+        );
+        let out = format_update_report(&r);
+        assert!(out.contains("[FAIL] Restart launchd service (user scope)"));
+        assert!(out.contains("launchctl kickstart failed"));
+
+        let value = serde_json::to_value(&r).expect("report should serialize");
+        assert_eq!(value["service_restart"]["status"], "failed");
+        assert_eq!(
+            value["service_restart"]["error"],
+            "launchctl kickstart failed"
+        );
     }
 
     #[test]
