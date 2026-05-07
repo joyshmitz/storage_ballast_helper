@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::monitor::guardrails::{GuardDiagnostics, GuardStatus};
 use crate::monitor::pid::PressureLevel;
+use crate::platform::types::MemoryPressureLevel;
 use crate::scanner::decision_record::{DecisionRecord, DecisionRecordBuilder, PolicyMode};
 use crate::scanner::scoring::{CandidacyScore, DecisionAction};
 
@@ -196,6 +197,240 @@ pub enum Transition {
     Fallback(FallbackReason),
     /// Recovery from fallback to the pre-fallback mode.
     Recover,
+}
+
+// ──────────────────── behavior dispatch ────────────────────
+
+/// Three-level pressure class used by the behavior dispatch matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BehaviorPressureLevel {
+    /// Normal operating range.
+    Normal,
+    /// Warning pressure where work should become more conservative.
+    Warn,
+    /// Critical pressure where survival actions take priority.
+    Critical,
+}
+
+impl BehaviorPressureLevel {
+    /// Normalize the platform memory-pressure signal into the dispatch matrix scale.
+    #[must_use]
+    pub fn from_memory_pressure(level: MemoryPressureLevel) -> Self {
+        match level {
+            MemoryPressureLevel::Normal => Self::Normal,
+            MemoryPressureLevel::Warn | MemoryPressureLevel::Unknown => Self::Warn,
+            MemoryPressureLevel::Critical => Self::Critical,
+        }
+    }
+
+    /// Normalize the PID disk-pressure signal into the dispatch matrix scale.
+    #[must_use]
+    pub fn from_disk_pressure(level: PressureLevel) -> Self {
+        match level {
+            PressureLevel::Green => Self::Normal,
+            PressureLevel::Yellow | PressureLevel::Orange => Self::Warn,
+            PressureLevel::Red | PressureLevel::Critical => Self::Critical,
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Normal => 0,
+            Self::Warn => 1,
+            Self::Critical => 2,
+        }
+    }
+}
+
+/// How much filesystem scanning a pressure cell allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanAggressiveness {
+    /// Default scanner budget and traversal rules.
+    Normal,
+    /// Reduced traversal to avoid memory-heavy walks.
+    Light,
+    /// Increased scanner budget while memory is healthy.
+    Aggressive,
+    /// Only walk paths that can produce very high-confidence candidates.
+    DefiniteOnly,
+    /// Do not start new filesystem scans.
+    Skip,
+}
+
+/// Cleanup posture selected by the behavior dispatch table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupAction {
+    /// No cleanup work should run.
+    None,
+    /// Produce candidate evidence, but do not delete.
+    IdentifyOnly,
+    /// Delete only candidates with high confidence.
+    HighConfidenceCandidates,
+    /// Delete the best-ranked candidates without broad traversal.
+    MostPromisingCandidates,
+    /// Delete candidates that are definite artifacts.
+    DefiniteCandidates,
+    /// Delete any definite artifact candidate available to the planner.
+    AnyDefiniteCandidate,
+}
+
+/// Ballast response selected by the behavior dispatch table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BallastAction {
+    /// Do not release ballast.
+    None,
+    /// Release ballast as part of the selected cleanup plan.
+    Release,
+    /// Release ballast before scanner or cleanup work.
+    ReleaseFirst,
+}
+
+/// Operator notification severity selected by the behavior dispatch table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationPriority {
+    /// Do not notify.
+    None,
+    /// Low-priority advisory.
+    Low,
+    /// Normal pressure notification.
+    Normal,
+    /// High-priority pressure notification.
+    High,
+    /// Emergency notification.
+    Emergency,
+}
+
+/// Action bundle selected for one memory-pressure and disk-pressure cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorMode {
+    /// Scanner posture.
+    pub scan_aggressiveness: ScanAggressiveness,
+    /// Cleanup posture.
+    pub cleanup_action: CleanupAction,
+    /// Ballast response.
+    pub ballast_action: BallastAction,
+    /// Notification severity.
+    pub notification_priority: NotificationPriority,
+}
+
+const DEFAULT_BEHAVIOR_CELLS: [[BehaviorMode; 3]; 3] = [
+    [
+        BehaviorMode {
+            scan_aggressiveness: ScanAggressiveness::Normal,
+            cleanup_action: CleanupAction::None,
+            ballast_action: BallastAction::None,
+            notification_priority: NotificationPriority::None,
+        },
+        BehaviorMode {
+            scan_aggressiveness: ScanAggressiveness::Aggressive,
+            cleanup_action: CleanupAction::IdentifyOnly,
+            ballast_action: BallastAction::None,
+            notification_priority: NotificationPriority::Low,
+        },
+        BehaviorMode {
+            scan_aggressiveness: ScanAggressiveness::Aggressive,
+            cleanup_action: CleanupAction::DefiniteCandidates,
+            ballast_action: BallastAction::Release,
+            notification_priority: NotificationPriority::High,
+        },
+    ],
+    [
+        BehaviorMode {
+            scan_aggressiveness: ScanAggressiveness::Light,
+            cleanup_action: CleanupAction::None,
+            ballast_action: BallastAction::None,
+            notification_priority: NotificationPriority::Low,
+        },
+        BehaviorMode {
+            scan_aggressiveness: ScanAggressiveness::Light,
+            cleanup_action: CleanupAction::HighConfidenceCandidates,
+            ballast_action: BallastAction::Release,
+            notification_priority: NotificationPriority::Normal,
+        },
+        BehaviorMode {
+            scan_aggressiveness: ScanAggressiveness::DefiniteOnly,
+            cleanup_action: CleanupAction::DefiniteCandidates,
+            ballast_action: BallastAction::ReleaseFirst,
+            notification_priority: NotificationPriority::High,
+        },
+    ],
+    [
+        BehaviorMode {
+            scan_aggressiveness: ScanAggressiveness::Skip,
+            cleanup_action: CleanupAction::None,
+            ballast_action: BallastAction::None,
+            notification_priority: NotificationPriority::Normal,
+        },
+        BehaviorMode {
+            scan_aggressiveness: ScanAggressiveness::DefiniteOnly,
+            cleanup_action: CleanupAction::MostPromisingCandidates,
+            ballast_action: BallastAction::Release,
+            notification_priority: NotificationPriority::High,
+        },
+        BehaviorMode {
+            scan_aggressiveness: ScanAggressiveness::DefiniteOnly,
+            cleanup_action: CleanupAction::AnyDefiniteCandidate,
+            ballast_action: BallastAction::ReleaseFirst,
+            notification_priority: NotificationPriority::Emergency,
+        },
+    ],
+];
+
+/// Dispatch table for the 3x3 memory-pressure by disk-pressure behavior matrix.
+///
+/// Rows are memory pressure (`Normal`, `Warn`, `Critical`) and columns are disk
+/// pressure (`Normal`, `Warn`, `Critical`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorDispatchTable {
+    cells: [[BehaviorMode; 3]; 3],
+}
+
+impl BehaviorDispatchTable {
+    /// Build a dispatch table from explicit memory-row by disk-column cells.
+    #[must_use]
+    pub const fn new(cells: [[BehaviorMode; 3]; 3]) -> Self {
+        Self { cells }
+    }
+
+    /// Return the behavior for already-normalized memory and disk pressure levels.
+    #[must_use]
+    pub fn mode_for_levels(
+        &self,
+        memory_pressure: BehaviorPressureLevel,
+        disk_pressure: BehaviorPressureLevel,
+    ) -> BehaviorMode {
+        self.cells[memory_pressure.index()][disk_pressure.index()]
+    }
+
+    /// Normalize native pressure readings and return the matching behavior.
+    #[must_use]
+    pub fn mode_for(
+        &self,
+        memory_pressure: MemoryPressureLevel,
+        disk_pressure: PressureLevel,
+    ) -> BehaviorMode {
+        self.mode_for_levels(
+            BehaviorPressureLevel::from_memory_pressure(memory_pressure),
+            BehaviorPressureLevel::from_disk_pressure(disk_pressure),
+        )
+    }
+
+    /// Return the raw memory-row by disk-column cells for diagnostics/config export.
+    #[must_use]
+    pub fn cells(&self) -> &[[BehaviorMode; 3]; 3] {
+        &self.cells
+    }
+}
+
+impl Default for BehaviorDispatchTable {
+    fn default() -> Self {
+        Self::new(DEFAULT_BEHAVIOR_CELLS)
+    }
 }
 
 // ──────────────────── policy engine ────────────────────
@@ -1024,6 +1259,173 @@ mod tests {
             consecutive_clean: 0,
             reason: "drift detected".to_string(),
         }
+    }
+
+    fn behavior(
+        scan_aggressiveness: ScanAggressiveness,
+        cleanup_action: CleanupAction,
+        ballast_action: BallastAction,
+        notification_priority: NotificationPriority,
+    ) -> BehaviorMode {
+        BehaviorMode {
+            scan_aggressiveness,
+            cleanup_action,
+            ballast_action,
+            notification_priority,
+        }
+    }
+
+    #[test]
+    fn behavior_dispatch_table_encodes_nine_pressure_cells() {
+        let table = BehaviorDispatchTable::default();
+
+        let cases = [
+            (
+                BehaviorPressureLevel::Normal,
+                BehaviorPressureLevel::Normal,
+                behavior(
+                    ScanAggressiveness::Normal,
+                    CleanupAction::None,
+                    BallastAction::None,
+                    NotificationPriority::None,
+                ),
+            ),
+            (
+                BehaviorPressureLevel::Normal,
+                BehaviorPressureLevel::Warn,
+                behavior(
+                    ScanAggressiveness::Aggressive,
+                    CleanupAction::IdentifyOnly,
+                    BallastAction::None,
+                    NotificationPriority::Low,
+                ),
+            ),
+            (
+                BehaviorPressureLevel::Normal,
+                BehaviorPressureLevel::Critical,
+                behavior(
+                    ScanAggressiveness::Aggressive,
+                    CleanupAction::DefiniteCandidates,
+                    BallastAction::Release,
+                    NotificationPriority::High,
+                ),
+            ),
+            (
+                BehaviorPressureLevel::Warn,
+                BehaviorPressureLevel::Normal,
+                behavior(
+                    ScanAggressiveness::Light,
+                    CleanupAction::None,
+                    BallastAction::None,
+                    NotificationPriority::Low,
+                ),
+            ),
+            (
+                BehaviorPressureLevel::Warn,
+                BehaviorPressureLevel::Warn,
+                behavior(
+                    ScanAggressiveness::Light,
+                    CleanupAction::HighConfidenceCandidates,
+                    BallastAction::Release,
+                    NotificationPriority::Normal,
+                ),
+            ),
+            (
+                BehaviorPressureLevel::Warn,
+                BehaviorPressureLevel::Critical,
+                behavior(
+                    ScanAggressiveness::DefiniteOnly,
+                    CleanupAction::DefiniteCandidates,
+                    BallastAction::ReleaseFirst,
+                    NotificationPriority::High,
+                ),
+            ),
+            (
+                BehaviorPressureLevel::Critical,
+                BehaviorPressureLevel::Normal,
+                behavior(
+                    ScanAggressiveness::Skip,
+                    CleanupAction::None,
+                    BallastAction::None,
+                    NotificationPriority::Normal,
+                ),
+            ),
+            (
+                BehaviorPressureLevel::Critical,
+                BehaviorPressureLevel::Warn,
+                behavior(
+                    ScanAggressiveness::DefiniteOnly,
+                    CleanupAction::MostPromisingCandidates,
+                    BallastAction::Release,
+                    NotificationPriority::High,
+                ),
+            ),
+            (
+                BehaviorPressureLevel::Critical,
+                BehaviorPressureLevel::Critical,
+                behavior(
+                    ScanAggressiveness::DefiniteOnly,
+                    CleanupAction::AnyDefiniteCandidate,
+                    BallastAction::ReleaseFirst,
+                    NotificationPriority::Emergency,
+                ),
+            ),
+        ];
+
+        for (memory_level, disk_level, expected) in cases {
+            assert_eq!(
+                table.mode_for_levels(memory_level, disk_level),
+                expected,
+                "unexpected behavior for memory={memory_level:?} disk={disk_level:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn behavior_dispatch_table_normalizes_native_pressure_levels() {
+        assert_eq!(
+            BehaviorPressureLevel::from_memory_pressure(MemoryPressureLevel::Normal),
+            BehaviorPressureLevel::Normal
+        );
+        assert_eq!(
+            BehaviorPressureLevel::from_memory_pressure(MemoryPressureLevel::Warn),
+            BehaviorPressureLevel::Warn
+        );
+        assert_eq!(
+            BehaviorPressureLevel::from_memory_pressure(MemoryPressureLevel::Unknown),
+            BehaviorPressureLevel::Warn
+        );
+        assert_eq!(
+            BehaviorPressureLevel::from_memory_pressure(MemoryPressureLevel::Critical),
+            BehaviorPressureLevel::Critical
+        );
+
+        for disk_level in [PressureLevel::Yellow, PressureLevel::Orange] {
+            assert_eq!(
+                BehaviorPressureLevel::from_disk_pressure(disk_level),
+                BehaviorPressureLevel::Warn
+            );
+        }
+        for disk_level in [PressureLevel::Red, PressureLevel::Critical] {
+            assert_eq!(
+                BehaviorPressureLevel::from_disk_pressure(disk_level),
+                BehaviorPressureLevel::Critical
+            );
+        }
+        assert_eq!(
+            BehaviorPressureLevel::from_disk_pressure(PressureLevel::Green),
+            BehaviorPressureLevel::Normal
+        );
+
+        let table = BehaviorDispatchTable::default();
+        assert_eq!(
+            table.mode_for(MemoryPressureLevel::Unknown, PressureLevel::Green),
+            table.mode_for_levels(BehaviorPressureLevel::Warn, BehaviorPressureLevel::Normal)
+        );
+        assert_eq!(
+            table.mode_for(MemoryPressureLevel::Warn, PressureLevel::Red),
+            table.mode_for_levels(BehaviorPressureLevel::Warn, BehaviorPressureLevel::Critical)
+        );
     }
 
     // ──── mode lifecycle tests ────
