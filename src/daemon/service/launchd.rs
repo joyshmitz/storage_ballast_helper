@@ -6,6 +6,7 @@ use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use plist::{Dictionary, Value};
 
@@ -15,6 +16,67 @@ use crate::platform::pal::ServiceManager;
 
 use super::launchctl::{self, LaunchctlDomain, LaunchctlServiceTarget};
 use super::{LAUNCHD_LABEL, resolve_sbh_binary};
+
+/// Detailed launchd service status for CLI and JSON output.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LaunchdStatusReport {
+    /// Service backend name.
+    pub service_type: &'static str,
+    /// Service scope (`"user"` or `"system"`).
+    pub scope: &'static str,
+    /// Full launchctl service target.
+    pub target: String,
+    /// Whether launchd currently knows about the service.
+    pub loaded: bool,
+    /// Whether the service appears to have a running process.
+    pub running: bool,
+    /// Raw launchd state when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// Running process id when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// Best-effort process elapsed runtime from `ps`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uptime: Option<String>,
+    /// launchd active count when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_count: Option<u32>,
+    /// Last exit status reported by launchd.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_exit_status: Option<i32>,
+    /// Installed plist path.
+    pub plist_path: PathBuf,
+    /// Configured stdout log path.
+    pub stdout_log: PathBuf,
+    /// Configured stderr log path.
+    pub stderr_log: PathBuf,
+    /// Current stdout log file size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout_bytes: Option<u64>,
+    /// Current stderr log file size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_bytes: Option<u64>,
+}
+
+impl LaunchdStatusReport {
+    /// Compact status label matching the `ServiceManager` contract.
+    #[must_use]
+    pub fn status_label(&self) -> String {
+        self.state.as_ref().map_or_else(
+            || {
+                if self.running {
+                    "running".to_string()
+                } else if self.loaded {
+                    "loaded".to_string()
+                } else {
+                    "not loaded".to_string()
+                }
+            },
+            Clone::clone,
+        )
+    }
+}
 
 /// Parameters controlling launchd plist generation and lifecycle commands.
 #[derive(Debug, Clone)]
@@ -43,7 +105,10 @@ impl LaunchdConfig {
                 path: PathBuf::from("/Library/LaunchDaemons"),
             });
         }
+        Self::from_env_unchecked(user_scope)
+    }
 
+    fn from_env_unchecked(user_scope: bool) -> Result<Self> {
         let binary_path = resolve_sbh_binary()?;
         let (stdout_log, stderr_log) = default_launchd_log_paths(user_scope);
         let paths = PathsConfig::default();
@@ -103,6 +168,15 @@ impl LaunchdServiceManager {
         Ok(Self::new(LaunchdConfig::from_env(user_scope)?))
     }
 
+    /// Create a manager for read/control operations.
+    ///
+    /// Unlike installation, status and log inspection may target a system
+    /// LaunchDaemon from a non-root process. Privileged lifecycle operations
+    /// still fail at `launchctl` when the caller lacks permission.
+    pub fn from_env_for_control(user_scope: bool) -> Result<Self> {
+        Ok(Self::new(LaunchdConfig::from_env_unchecked(user_scope)?))
+    }
+
     /// Access the underlying config.
     #[must_use]
     pub fn config(&self) -> &LaunchdConfig {
@@ -120,6 +194,65 @@ impl LaunchdServiceManager {
     pub(crate) fn prepare_log_paths(&self) -> Result<()> {
         prepare_launchd_log_file(&self.config.stdout_log)?;
         prepare_launchd_log_file(&self.config.stderr_log)
+    }
+
+    /// Return a detailed status report for CLI output.
+    pub fn status_report(&self) -> Result<LaunchdStatusReport> {
+        let target = self.service_target();
+        let target_arg = target.as_arg();
+        match launchctl::print(&target) {
+            Ok(status) => {
+                let plist_path = status
+                    .plist_path
+                    .as_ref()
+                    .map_or_else(|| self.config.plist_path(), PathBuf::from);
+                let status_label = status.summary();
+                let running = status.pid.is_some() || status_label == "running";
+                Ok(LaunchdStatusReport {
+                    service_type: "launchd",
+                    scope: if self.config.user_scope {
+                        "user"
+                    } else {
+                        "system"
+                    },
+                    target: status.target,
+                    loaded: status.loaded,
+                    running,
+                    state: status.state,
+                    pid: status.pid,
+                    uptime: status.pid.and_then(process_uptime),
+                    active_count: status.active_count,
+                    last_exit_status: status.last_exit_status,
+                    plist_path,
+                    stdout_log: self.config.stdout_log.clone(),
+                    stderr_log: self.config.stderr_log.clone(),
+                    stdout_bytes: log_file_bytes(&self.config.stdout_log),
+                    stderr_bytes: log_file_bytes(&self.config.stderr_log),
+                })
+            }
+            Err(error) if error.is_not_loaded() => Ok(LaunchdStatusReport {
+                service_type: "launchd",
+                scope: if self.config.user_scope {
+                    "user"
+                } else {
+                    "system"
+                },
+                target: target_arg,
+                loaded: false,
+                running: false,
+                state: None,
+                pid: None,
+                uptime: None,
+                active_count: None,
+                last_exit_status: None,
+                plist_path: self.config.plist_path(),
+                stdout_log: self.config.stdout_log.clone(),
+                stderr_log: self.config.stderr_log.clone(),
+                stdout_bytes: log_file_bytes(&self.config.stdout_log),
+                stderr_bytes: log_file_bytes(&self.config.stderr_log),
+            }),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Generate the launchd plist XML content.
@@ -244,11 +377,7 @@ impl ServiceManager for LaunchdServiceManager {
     }
 
     fn status(&self) -> Result<String> {
-        match launchctl::print(&self.service_target()) {
-            Ok(status) => Ok(status.summary()),
-            Err(error) if error.is_not_loaded() => Ok("not loaded".to_string()),
-            Err(error) => Err(error.into()),
-        }
+        Ok(self.status_report()?.status_label())
     }
 
     fn restart(&self) -> Result<()> {
@@ -288,6 +417,27 @@ fn current_uid() -> u32 {
     #[cfg(not(unix))]
     {
         0
+    }
+}
+
+fn log_file_bytes(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().map(|metadata| metadata.len())
+}
+
+fn process_uptime(pid: u32) -> Option<String> {
+    let pid = pid.to_string();
+    let output = Command::new("ps")
+        .args(["-o", "etime=", "-p", pid.as_str()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let uptime = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if uptime.is_empty() {
+        None
+    } else {
+        Some(uptime)
     }
 }
 

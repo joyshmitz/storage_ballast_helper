@@ -80,6 +80,10 @@ pub struct ParsedStatus {
     pub state: Option<String>,
     /// Running process id when present.
     pub pid: Option<u32>,
+    /// Active reference count when reported by launchd.
+    pub active_count: Option<u32>,
+    /// Plist path reported by launchd.
+    pub plist_path: Option<String>,
     /// Last exit status when present.
     pub last_exit_status: Option<i32>,
 }
@@ -291,6 +295,8 @@ fn parse_print_output(target: String, raw: &str) -> ParsedStatus {
         loaded: true,
         state: parse_string_assignment(raw, "state"),
         pid: parse_u32_assignment(raw, "pid"),
+        active_count: parse_u32_assignment(raw, "active count"),
+        plist_path: parse_string_assignment(raw, "path"),
         last_exit_status: parse_i32_assignment(raw, "last exit code")
             .or_else(|| parse_i32_assignment(raw, "last exit status")),
     }
@@ -376,6 +382,11 @@ gui/501/com.sbh.daemon = {
         assert!(status.loaded);
         assert_eq!(status.state.as_deref(), Some("running"));
         assert_eq!(status.pid, Some(4242));
+        assert_eq!(status.active_count, Some(1));
+        assert_eq!(
+            status.plist_path.as_deref(),
+            Some("/Users/me/Library/LaunchAgents/com.sbh.daemon.plist")
+        );
         assert_eq!(status.last_exit_status, Some(0));
         assert_eq!(status.summary(), "running");
     }

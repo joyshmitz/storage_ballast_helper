@@ -15,7 +15,7 @@ use crate::platform::pal::{NoopServiceManager, Platform, ServiceManager};
 use crate::platform::types::ServiceKind;
 
 pub use launchctl::{LaunchctlDomain, LaunchctlServiceTarget};
-pub use launchd::{LaunchdConfig, LaunchdServiceManager};
+pub use launchd::{LaunchdConfig, LaunchdServiceManager, LaunchdStatusReport};
 pub use systemd::{SystemdConfig, SystemdServiceManager};
 
 /// Unit name for the systemd service.

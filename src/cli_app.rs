@@ -19,7 +19,7 @@ use storage_ballast_helper::daemon::loop_main::{
 };
 use storage_ballast_helper::daemon::self_monitor::DAEMON_STATE_STALE_THRESHOLD_SECS;
 use storage_ballast_helper::daemon::service::{
-    LaunchdServiceManager, ServiceActionResult, SystemdServiceManager,
+    LaunchdServiceManager, LaunchdStatusReport, ServiceActionResult, SystemdServiceManager,
 };
 use storage_ballast_helper::logger::sqlite::SqliteLogger;
 use storage_ballast_helper::logger::stats::{StatsEngine, window_label};
@@ -86,6 +86,8 @@ enum Command {
     Uninstall(UninstallArgs),
     /// Show current health and pressure status.
     Status(StatusArgs),
+    /// Inspect and control the installed service.
+    Service(ServiceArgs),
     /// Show aggregated historical statistics.
     Stats(StatsArgs),
     /// Run a manual scan for reclaim candidates.
@@ -204,6 +206,18 @@ impl ResolvedInstallService {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedServiceControl {
+    kind: ServiceKind,
+    user_scope: bool,
+}
+
+impl ResolvedServiceControl {
+    const fn scope_name(self) -> &'static str {
+        if self.user_scope { "user" } else { "system" }
+    }
+}
+
 #[derive(Debug, Clone, Args, Serialize, Default)]
 #[allow(clippy::struct_excessive_bools)]
 struct UninstallArgs {
@@ -229,6 +243,43 @@ struct StatusArgs {
     /// Continuously refresh status output.
     #[arg(long)]
     watch: bool,
+}
+
+#[derive(Debug, Clone, Args, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
+struct ServiceArgs {
+    /// Use systemd service controls.
+    #[arg(long, conflicts_with = "launchd")]
+    systemd: bool,
+    /// Use launchd service controls.
+    #[arg(long, conflicts_with = "systemd")]
+    launchd: bool,
+    /// Use user service scope (same as --scope user).
+    #[arg(long, conflicts_with = "scope")]
+    user: bool,
+    /// Service scope to inspect/control.
+    #[arg(long, value_enum, value_name = "SCOPE", conflicts_with = "user")]
+    scope: Option<InstallScopeArg>,
+    /// Service operation to run.
+    #[command(subcommand)]
+    command: ServiceCommand,
+}
+
+#[derive(Debug, Clone, Subcommand, Serialize)]
+enum ServiceCommand {
+    /// Show loaded/running state and service metadata.
+    Status,
+    /// Restart the service.
+    Restart,
+    /// Print recent service log lines.
+    Logs(ServiceLogsArgs),
+}
+
+#[derive(Debug, Clone, Args, Serialize)]
+struct ServiceLogsArgs {
+    /// Number of recent log lines to print.
+    #[arg(long, short = 'n', default_value_t = 80, value_name = "N")]
+    tail: usize,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -647,6 +698,7 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Install(args) => run_install(cli, args),
         Command::Uninstall(args) => run_uninstall(cli, args),
         Command::Status(args) => run_status(cli, args),
+        Command::Service(args) => run_service(cli, args),
         Command::Stats(args) => run_stats(cli, args),
         Command::Scan(args) => run_scan(cli, args),
         Command::Clean(args) => run_clean(cli, args),
@@ -867,6 +919,61 @@ fn resolve_install_service(
     }
 
     Ok(Some(ResolvedInstallService { kind, user_scope }))
+}
+
+fn resolve_service_control(
+    args: &ServiceArgs,
+    detected_kind: ServiceKind,
+) -> Result<ResolvedServiceControl, CliError> {
+    if args.systemd && detected_kind != ServiceKind::Systemd {
+        return Err(CliError::User(format!(
+            "Error: --systemd is only supported on Linux/systemd hosts. Detected {} on this platform; omit the service flag for auto-detection.",
+            service_kind_name(detected_kind)
+        )));
+    }
+    if args.launchd && detected_kind != ServiceKind::Launchd {
+        return Err(CliError::User(format!(
+            "Error: --launchd is only supported on macOS/launchd hosts. Detected {} on this platform; omit the service flag for auto-detection.",
+            service_kind_name(detected_kind)
+        )));
+    }
+
+    let kind = if args.systemd {
+        ServiceKind::Systemd
+    } else if args.launchd {
+        ServiceKind::Launchd
+    } else {
+        detected_kind
+    };
+    if kind == ServiceKind::None {
+        return Err(CliError::User(
+            "service controls are not supported on this platform".to_string(),
+        ));
+    }
+
+    let user_scope = match args.scope {
+        Some(InstallScopeArg::User) => true,
+        Some(InstallScopeArg::System) => false,
+        None if args.user => true,
+        None => kind == ServiceKind::Launchd,
+    };
+
+    Ok(ResolvedServiceControl { kind, user_scope })
+}
+
+fn ensure_privileged_service_action(
+    cli: &Cli,
+    service: ResolvedServiceControl,
+    action: &str,
+) -> Result<(), CliError> {
+    if service.user_scope || running_as_root() {
+        return Ok(());
+    }
+    Err(CliError::User(service_system_scope_root_message(
+        action,
+        service.kind,
+        &format_sudo_rerun_command(cli, service.kind),
+    )))
 }
 
 fn resolve_uninstall_user_scope(
@@ -1338,6 +1445,234 @@ fn run_uninstall(cli: &Cli, args: &UninstallArgs) -> Result<(), CliError> {
             Err(CliError::Runtime(format!("uninstall failed: {e}")))
         }
     }
+}
+
+fn run_service(cli: &Cli, args: &ServiceArgs) -> Result<(), CliError> {
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+    let service = resolve_service_control(args, platform.service_kind())?;
+
+    match &args.command {
+        ServiceCommand::Status => run_service_status(cli, service),
+        ServiceCommand::Restart => run_service_restart(cli, service),
+        ServiceCommand::Logs(logs_args) => run_service_logs(cli, service, logs_args),
+    }
+}
+
+fn run_service_status(cli: &Cli, service: ResolvedServiceControl) -> Result<(), CliError> {
+    match service.kind {
+        ServiceKind::Launchd => {
+            let manager = LaunchdServiceManager::from_env_for_control(service.user_scope)
+                .map_err(|e| CliError::Runtime(e.to_string()))?;
+            let report = manager
+                .status_report()
+                .map_err(|e| CliError::Runtime(e.to_string()))?;
+            match output_mode(cli) {
+                OutputMode::Human => print_launchd_status(&report),
+                OutputMode::Json => {
+                    let payload = serde_json::to_value(&report)?;
+                    write_json_line(&payload)?;
+                }
+            }
+            Ok(())
+        }
+        ServiceKind::Systemd => {
+            let manager = SystemdServiceManager::from_env(service.user_scope)
+                .map_err(|e| CliError::Runtime(e.to_string()))?;
+            let status = manager
+                .status()
+                .map_err(|e| CliError::Runtime(e.to_string()))?;
+            let logs_path = manager
+                .logs_path()
+                .map_err(|e| CliError::Runtime(e.to_string()))?;
+            match output_mode(cli) {
+                OutputMode::Human => {
+                    println!("Service: systemd ({})", service.scope_name());
+                    println!("Unit: sbh.service");
+                    println!("Status: {status}");
+                    if let Some(path) = logs_path {
+                        println!("Logs: {}", path.display());
+                    } else if service.user_scope {
+                        println!("Logs: journalctl --user -u sbh.service");
+                    } else {
+                        println!("Logs: journalctl -u sbh.service");
+                    }
+                }
+                OutputMode::Json => {
+                    let payload = json!({
+                        "service_type": "systemd",
+                        "scope": service.scope_name(),
+                        "unit": "sbh.service",
+                        "status": status,
+                        "logs_path": logs_path.map(|path| path.display().to_string()),
+                    });
+                    write_json_line(&payload)?;
+                }
+            }
+            Ok(())
+        }
+        ServiceKind::None => Err(CliError::User(
+            "service controls are not supported on this platform".to_string(),
+        )),
+    }
+}
+
+fn run_service_restart(cli: &Cli, service: ResolvedServiceControl) -> Result<(), CliError> {
+    ensure_privileged_service_action(cli, service, "restart")?;
+    let manager = service_manager_for_control(service)?;
+    manager
+        .restart()
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+
+    match output_mode(cli) {
+        OutputMode::Human => {
+            println!(
+                "Restarted {} service ({} scope).",
+                service_kind_name(service.kind),
+                service.scope_name()
+            );
+        }
+        OutputMode::Json => {
+            let payload = json!({
+                "action": "restart",
+                "service_type": service_kind_name(service.kind),
+                "scope": service.scope_name(),
+                "success": true,
+            });
+            write_json_line(&payload)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_service_logs(
+    cli: &Cli,
+    service: ResolvedServiceControl,
+    args: &ServiceLogsArgs,
+) -> Result<(), CliError> {
+    let manager = service_manager_for_control(service)?;
+    let Some(path) = manager
+        .logs_path()
+        .map_err(|e| CliError::Runtime(e.to_string()))?
+    else {
+        return Err(CliError::User(format!(
+            "{} service logs are available via the platform journal, not a fixed log file",
+            service_kind_name(service.kind)
+        )));
+    };
+
+    let lines = read_plain_tail_lines(&path, args.tail)?;
+    match output_mode(cli) {
+        OutputMode::Human => {
+            if lines.is_empty() {
+                println!("No service log lines in {}", path.display());
+            } else {
+                for line in &lines {
+                    println!("{line}");
+                }
+            }
+        }
+        OutputMode::Json => {
+            let payload = json!({
+                "service_type": service_kind_name(service.kind),
+                "scope": service.scope_name(),
+                "path": path.display().to_string(),
+                "tail": args.tail,
+                "lines": lines,
+            });
+            write_json_line(&payload)?;
+        }
+    }
+    Ok(())
+}
+
+fn service_manager_for_control(
+    service: ResolvedServiceControl,
+) -> Result<Box<dyn ServiceManager>, CliError> {
+    match service.kind {
+        ServiceKind::Launchd => Ok(Box::new(
+            LaunchdServiceManager::from_env_for_control(service.user_scope)
+                .map_err(|e| CliError::Runtime(e.to_string()))?,
+        )),
+        ServiceKind::Systemd => Ok(Box::new(
+            SystemdServiceManager::from_env(service.user_scope)
+                .map_err(|e| CliError::Runtime(e.to_string()))?,
+        )),
+        ServiceKind::None => Err(CliError::User(
+            "service controls are not supported on this platform".to_string(),
+        )),
+    }
+}
+
+fn print_launchd_status(report: &LaunchdStatusReport) {
+    println!("Service: launchd ({})", report.scope);
+    println!("Target: {}", report.target);
+    println!("Loaded: {}", yes_no(report.loaded));
+    println!("Running: {}", yes_no(report.running));
+    println!("State: {}", report.state.as_deref().unwrap_or("unknown"));
+    println!(
+        "PID: {}",
+        report
+            .pid
+            .map_or_else(|| "none".to_string(), |pid| pid.to_string())
+    );
+    println!("Uptime: {}", report.uptime.as_deref().unwrap_or("unknown"));
+    println!(
+        "Active count: {}",
+        report
+            .active_count
+            .map_or_else(|| "unknown".to_string(), |count| count.to_string())
+    );
+    println!(
+        "Last exit: {}",
+        report
+            .last_exit_status
+            .map_or_else(|| "unknown".to_string(), |status| status.to_string())
+    );
+    println!("Plist: {}", report.plist_path.display());
+    println!(
+        "Stdout: {} ({})",
+        report.stdout_log.display(),
+        format_optional_bytes(report.stdout_bytes)
+    );
+    println!(
+        "Stderr: {} ({})",
+        report.stderr_log.display(),
+        format_optional_bytes(report.stderr_bytes)
+    );
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn format_optional_bytes(value: Option<u64>) -> String {
+    value.map_or_else(|| "missing".to_string(), |bytes| format!("{bytes} bytes"))
+}
+
+fn read_plain_tail_lines(path: &Path, count: usize) -> Result<Vec<String>, CliError> {
+    use io::{Read, Seek};
+
+    const MAX_TAIL_BYTES: u64 = 1024 * 1024;
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        CliError::Runtime(format!(
+            "failed to open service log {}: {e}",
+            path.display()
+        ))
+    })?;
+    let len = file
+        .metadata()
+        .map_err(|e| CliError::Runtime(format!("failed to stat service log: {e}")))?
+        .len();
+    let window = len.min(MAX_TAIL_BYTES);
+    file.seek(io::SeekFrom::Start(len.saturating_sub(window)))
+        .map_err(|e| CliError::Runtime(format!("failed to seek service log: {e}")))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .map_err(|e| CliError::Runtime(format!("failed to read service log: {e}")))?;
+    let content = String::from_utf8_lossy(&buf);
+    let lines: Vec<String> = content.lines().map(ToOwned::to_owned).collect();
+    let start = lines.len().saturating_sub(count);
+    Ok(lines[start..].to_vec())
 }
 
 fn run_uninstall_purge(cli: &Cli) -> Result<(), CliError> {
@@ -6345,6 +6680,17 @@ mod tests {
             vec!["sbh", "dashboard", "--new-dashboard"],
             vec!["sbh", "dashboard", "--legacy-dashboard"],
             vec!["sbh", "doctor", "--pal"],
+            vec!["sbh", "service", "status"],
+            vec!["sbh", "service", "--launchd", "--scope", "user", "status"],
+            vec![
+                "sbh",
+                "service",
+                "--systemd",
+                "--scope",
+                "system",
+                "restart",
+            ],
+            vec!["sbh", "service", "logs", "-n", "10"],
             vec!["sbh", "ballast", "status"],
             vec!["sbh", "ballast", "release", "2"],
             vec!["sbh", "config", "path"],
@@ -6356,6 +6702,71 @@ mod tests {
             let parsed = Cli::try_parse_from(case.iter().copied());
             assert!(parsed.is_ok(), "failed to parse case: {case:?}");
         }
+    }
+
+    #[test]
+    fn service_control_defaults_to_launchd_user_scope_on_macos() {
+        let args = ServiceArgs {
+            systemd: false,
+            launchd: false,
+            user: false,
+            scope: None,
+            command: ServiceCommand::Status,
+        };
+
+        let service =
+            resolve_service_control(&args, ServiceKind::Launchd).expect("launchd should resolve");
+
+        assert_eq!(service.kind, ServiceKind::Launchd);
+        assert!(service.user_scope);
+        assert_eq!(service.scope_name(), "user");
+    }
+
+    #[test]
+    fn service_control_defaults_to_systemd_system_scope_on_linux() {
+        let args = ServiceArgs {
+            systemd: false,
+            launchd: false,
+            user: false,
+            scope: None,
+            command: ServiceCommand::Status,
+        };
+
+        let service =
+            resolve_service_control(&args, ServiceKind::Systemd).expect("systemd should resolve");
+
+        assert_eq!(service.kind, ServiceKind::Systemd);
+        assert!(!service.user_scope);
+        assert_eq!(service.scope_name(), "system");
+    }
+
+    #[test]
+    fn service_control_rejects_wrong_explicit_backend() {
+        let args = ServiceArgs {
+            systemd: true,
+            launchd: false,
+            user: false,
+            scope: None,
+            command: ServiceCommand::Status,
+        };
+
+        let err = resolve_service_control(&args, ServiceKind::Launchd)
+            .expect_err("explicit wrong backend should fail");
+
+        assert!(err.to_string().contains("--systemd"));
+        assert!(err.to_string().contains("launchd"));
+    }
+
+    #[test]
+    fn service_logs_tail_reads_recent_plain_lines() {
+        let mut file = tempfile::NamedTempFile::new().expect("temp log should create");
+        writeln!(file, "one").expect("line should write");
+        writeln!(file, "two").expect("line should write");
+        writeln!(file, "three").expect("line should write");
+
+        let lines = read_plain_tail_lines(file.path(), 2).expect("tail should read");
+
+        assert_eq!(lines, vec!["two".to_string(), "three".to_string()]);
     }
 
     #[test]
