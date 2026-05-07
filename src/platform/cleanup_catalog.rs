@@ -86,6 +86,16 @@ impl CleanupRule {
     }
 
     #[must_use]
+    pub const fn is_report_only(&self) -> bool {
+        matches!(self.reclaim_command, ReclaimCommand::ReportOnly)
+    }
+
+    #[must_use]
+    pub const fn is_scan_visible_candidate(&self) -> bool {
+        self.is_path_scanner_candidate() || self.is_report_only()
+    }
+
+    #[must_use]
     pub const fn scanner_label(&self) -> &'static str {
         if str_starts_with(self.name, "user-named-trash") {
             "user-named-trash"
@@ -150,6 +160,27 @@ pub fn match_path_scanner_rule_with_home(
 ) -> Option<&'static CleanupRule> {
     rules.iter().find(|rule| {
         rule.is_path_scanner_candidate() && path_matches_glob_with_home(path, rule.path_glob, home)
+    })
+}
+
+#[must_use]
+pub fn match_scan_visible_rule(
+    path: &Path,
+    rules: &'static [CleanupRule],
+) -> Option<&'static CleanupRule> {
+    rules
+        .iter()
+        .find(|rule| rule.is_scan_visible_candidate() && path_matches_glob(path, rule.path_glob))
+}
+
+#[must_use]
+pub fn match_scan_visible_rule_with_home(
+    path: &Path,
+    rules: &'static [CleanupRule],
+    home: &Path,
+) -> Option<&'static CleanupRule> {
+    rules.iter().find(|rule| {
+        rule.is_scan_visible_candidate() && path_matches_glob_with_home(path, rule.path_glob, home)
     })
 }
 
@@ -413,6 +444,9 @@ mod tests {
         };
 
         assert!(remove.is_path_scanner_candidate());
+        assert!(remove.is_scan_visible_candidate());
         assert!(!report.is_path_scanner_candidate());
+        assert!(report.is_report_only());
+        assert!(report.is_scan_visible_candidate());
     }
 }

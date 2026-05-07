@@ -89,10 +89,10 @@ mod tests {
             assert_eq!(matched.confidence, rule.confidence);
             matched_rule_names.insert(matched.name);
 
-            if rule.is_path_scanner_candidate() {
+            if rule.is_scan_visible_candidate() {
                 let scanner_match =
-                    cleanup_catalog::match_path_scanner_rule_with_home(&path, rules, &fake_home)
-                        .expect("path scanner should find candidate");
+                    cleanup_catalog::match_scan_visible_rule_with_home(&path, rules, &fake_home)
+                        .expect("scan-visible matcher should find candidate");
                 assert_eq!(scanner_match.name, rule.name);
 
                 let signals = structural_signals_for_cleanup_rule(rule);
@@ -113,11 +113,22 @@ mod tests {
                 assert_eq!(label, rule.scanner_label());
                 scanned_labels.insert(label);
                 expected_scanned_labels.insert(rule.scanner_label().to_string());
+
+                if !rule.is_path_scanner_candidate() {
+                    assert!(
+                        cleanup_catalog::match_path_scanner_rule_with_home(
+                            &path, rules, &fake_home
+                        )
+                        .is_none(),
+                        "{} should be scan-visible but not a path-scanner deletion candidate",
+                        rule.name
+                    );
+                }
             } else {
                 assert!(
-                    cleanup_catalog::match_path_scanner_rule_with_home(&path, rules, &fake_home)
+                    cleanup_catalog::match_scan_visible_rule_with_home(&path, rules, &fake_home)
                         .is_none(),
-                    "{} should not be emitted as a path-scanner candidate",
+                    "{} should not be emitted as a scan-visible candidate",
                     rule.name
                 );
             }
@@ -695,6 +706,41 @@ mod tests {
         assert!(!score.vetoed);
         assert_eq!(score.decision.action, DecisionAction::Review);
         assert!(score.ledger.summary.contains("action=Review"));
+    }
+
+    #[test]
+    fn home_trash_report_is_reported_but_hard_kept() {
+        let fake_home = PathBuf::from("/Users/operator");
+        let registry = ArtifactPatternRegistry::default();
+        let engine = default_engine();
+        let path = fake_home.join(".Trash/old-session");
+        let signals = StructuralSignals::default();
+        let classification = classify_macos_with_home(&registry, &path, signals, &fake_home);
+
+        assert_eq!(classification.pattern_name, "home-trash-report");
+        assert_eq!(classification.category, ArtifactCategory::Unknown);
+        assert!(classification.combined_confidence.abs() < f64::EPSILON);
+
+        let score = engine.score_candidate(
+            &CandidateInput {
+                path,
+                size_bytes: 3 * 1_073_741_824,
+                age: Duration::from_secs(0),
+                classification,
+                signals,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            0.95,
+        );
+
+        assert!(score.vetoed);
+        assert_eq!(score.decision.action, DecisionAction::Keep);
+        assert_eq!(
+            score.veto_reason.as_deref(),
+            Some("home-trash-report cleanup rule is report-only")
+        );
     }
 
     #[test]

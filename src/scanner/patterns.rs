@@ -283,8 +283,8 @@ fn cleanup_catalog_path_classification(
     home: Option<&Path>,
 ) -> Option<ArtifactClassification> {
     let rule = home.map_or_else(
-        || cleanup_catalog::match_path_scanner_rule(path, cleanup_rules),
-        |home| cleanup_catalog::match_path_scanner_rule_with_home(path, cleanup_rules, home),
+        || cleanup_catalog::match_scan_visible_rule(path, cleanup_rules),
+        |home| cleanup_catalog::match_scan_visible_rule_with_home(path, cleanup_rules, home),
     )?;
     let confidence = cleanup_rule_name_confidence(rule);
     Some(ArtifactClassification {
@@ -738,8 +738,8 @@ fn extract_pattern_label_with_cleanup_context(
 ) -> String {
     let p = Path::new(path);
     let cleanup_rule = home.map_or_else(
-        || cleanup_catalog::match_path_scanner_rule(p, cleanup_rules),
-        |home| cleanup_catalog::match_path_scanner_rule_with_home(p, cleanup_rules, home),
+        || cleanup_catalog::match_scan_visible_rule(p, cleanup_rules),
+        |home| cleanup_catalog::match_scan_visible_rule_with_home(p, cleanup_rules, home),
     );
     if let Some(rule) = cleanup_rule {
         return rule.scanner_label().to_string();

@@ -5654,6 +5654,52 @@ fn print_scan_trace(entry: &ScoredScanEntry) {
     }
 }
 
+fn truncate_str(value: &str, max_len: usize) -> String {
+    if value.chars().count() <= max_len {
+        return value.to_string();
+    }
+
+    let keep = max_len.saturating_sub(3);
+    let mut truncated = value.chars().take(keep).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn is_report_only_scan_entry(entry: &ScoredScanEntry) -> bool {
+    entry
+        .score
+        .veto_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("cleanup rule is report-only"))
+}
+
+fn scan_entry_json(entry: &ScoredScanEntry, explain: bool) -> Value {
+    let candidate = &entry.score;
+    let mut item = json!({
+        "path": candidate.path.to_string_lossy(),
+        "size_bytes": candidate.size_bytes,
+        "age_seconds": candidate.age.as_secs(),
+        "total_score": candidate.total_score,
+        "category": format!("{:?}", candidate.classification.category),
+        "pattern_name": candidate.classification.pattern_name.as_ref(),
+        "confidence": candidate.classification.combined_confidence,
+        "decision": format!("{:?}", candidate.decision.action),
+        "veto_reason": candidate.veto_reason.as_deref(),
+        "factors": {
+            "location": candidate.factors.location,
+            "name": candidate.factors.name,
+            "age": candidate.factors.age,
+            "size": candidate.factors.size,
+            "structure": candidate.factors.structure,
+            "pressure_multiplier": candidate.factors.pressure_multiplier,
+        },
+    });
+    if explain && let Some(obj) = item.as_object_mut() {
+        obj.insert("explanation".to_string(), scan_trace_json(&entry.trace));
+    }
+    item
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     let config =
@@ -5795,10 +5841,19 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
         candidates.truncate(args.top);
     }
 
+    let mut report_only = scored_entries
+        .iter()
+        .filter(|entry| is_report_only_scan_entry(entry))
+        .collect::<Vec<_>>();
+    report_only.sort_by_key(|entry| std::cmp::Reverse(entry.score.size_bytes));
+    if report_only.len() > args.top {
+        report_only.truncate(args.top);
+    }
+
     let mut rejected = if args.explain {
         scored_entries
             .iter()
-            .filter(|entry| entry.score.vetoed)
+            .filter(|entry| entry.score.vetoed && !is_report_only_scan_entry(entry))
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -5810,6 +5865,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
 
     let elapsed = start.elapsed();
     let total_reclaimable: u64 = candidates.iter().map(|entry| entry.score.size_bytes).sum();
+    let total_reported: u64 = report_only.iter().map(|entry| entry.score.size_bytes).sum();
 
     match output_mode(cli) {
         OutputMode::Human => {
@@ -5853,6 +5909,31 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 println!("  Use 'sbh clean' to delete these candidates.");
             }
 
+            if !report_only.is_empty() {
+                println!("\n  Report-only locations (not auto-deleted):");
+                println!(
+                    "  {:>3}  {:<50}  {:>10}  {:<24}",
+                    "#", "Path", "Size", "Reason"
+                );
+                println!("  {}", "-".repeat(92));
+
+                for (i, entry) in report_only.iter().enumerate() {
+                    let candidate = &entry.score;
+                    let size_str = format_bytes(candidate.size_bytes);
+                    let path_str = truncate_path(&candidate.path, 50);
+                    let reason = candidate.veto_reason.as_deref().unwrap_or("report-only");
+
+                    println!(
+                        "  {:>3}  {:<50}  {:>10}  {:<24}",
+                        i + 1,
+                        path_str,
+                        size_str,
+                        truncate_str(reason, 24),
+                    );
+                }
+                println!("  Report-only total: {}", format_bytes(total_reported));
+            }
+
             if args.explain {
                 if !candidates.is_empty() {
                     println!("\n  Confidence trace:");
@@ -5889,33 +5970,11 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
         OutputMode::Json => {
             let entries_json: Vec<Value> = candidates
                 .iter()
-                .map(|entry| {
-                    let candidate = &entry.score;
-                    let mut item = json!({
-                        "path": candidate.path.to_string_lossy(),
-                        "size_bytes": candidate.size_bytes,
-                        "age_seconds": candidate.age.as_secs(),
-                        "total_score": candidate.total_score,
-                        "category": format!("{:?}", candidate.classification.category),
-                        "pattern_name": candidate.classification.pattern_name,
-                        "confidence": candidate.classification.combined_confidence,
-                        "decision": format!("{:?}", candidate.decision.action),
-                        "factors": {
-                            "location": candidate.factors.location,
-                            "name": candidate.factors.name,
-                            "age": candidate.factors.age,
-                            "size": candidate.factors.size,
-                            "structure": candidate.factors.structure,
-                            "pressure_multiplier": candidate.factors.pressure_multiplier,
-                        },
-                    });
-                    if args.explain
-                        && let Some(obj) = item.as_object_mut()
-                    {
-                        obj.insert("explanation".to_string(), scan_trace_json(&entry.trace));
-                    }
-                    item
-                })
+                .map(|entry| scan_entry_json(entry, args.explain))
+                .collect();
+            let report_only_json: Vec<Value> = report_only
+                .iter()
+                .map(|entry| scan_entry_json(entry, args.explain))
                 .collect();
 
             let mut payload = json!({
@@ -5925,7 +5984,10 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 "min_score": args.min_score,
                 "candidates_count": entries_json.len(),
                 "total_reclaimable_bytes": total_reclaimable,
+                "report_only_count": report_only_json.len(),
+                "report_only_bytes": total_reported,
                 "candidates": entries_json,
+                "report_only": report_only_json,
             });
 
             if args.explain {

@@ -133,6 +133,124 @@ fn json_flag_accepted_by_status() {
     );
 }
 
+#[test]
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_lines)]
+fn scan_reports_home_trash_without_candidate() {
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().canonicalize().expect("canonicalize temp home");
+    let trash_entry = home_path.join(".Trash").join("old-session");
+    fs::create_dir_all(&trash_entry).expect("create synthetic trash entry");
+    fs::write(trash_entry.join("blob.bin"), vec![b'x'; 8192]).expect("write trash payload");
+
+    let state_dir = home_path
+        .join(".local")
+        .join("share")
+        .join("sbh-test-state");
+    fs::create_dir_all(&state_dir).expect("create state directory");
+    let config_path = home_path.join("sbh-test-config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[paths]\nstate_file = \"{}\"\nsqlite_db = \"{}\"\njsonl_log = \"{}\"\nballast_dir = \"{}\"\n\n[scanner]\nroot_paths = [\"{}\"]\n",
+            state_dir.join("state.json").display(),
+            state_dir.join("activity.sqlite3").display(),
+            state_dir.join("activity.jsonl").display(),
+            state_dir.join("ballast").display(),
+            home_path.display(),
+        ),
+    )
+    .expect("write scan test config");
+
+    let home_str = home_path.to_string_lossy().to_string();
+    let config_str = config_path.to_string_lossy().to_string();
+    let result = common::run_cli_case_with_env(
+        "scan_reports_home_trash_without_candidate",
+        &[
+            "--config",
+            &config_str,
+            "--json",
+            "scan",
+            &home_str,
+            "--top",
+            "10",
+        ],
+        &[("HOME", &home_str)],
+    );
+    assert!(
+        result.status.success(),
+        "sbh scan failed; stdout={:?}; stderr={:?}; log={}",
+        result.stdout,
+        result.stderr,
+        result.log_path.display()
+    );
+
+    let payload: Value = serde_json::from_str(result.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "expected scan JSON, parse failed: {err}; stdout={:?}; stderr={:?}; log={}",
+            result.stdout,
+            result.stderr,
+            result.log_path.display()
+        )
+    });
+    assert_eq!(
+        payload["candidates_count"],
+        0,
+        "trash must not become a deletion candidate; payload={payload}; log={}",
+        result.log_path.display()
+    );
+    assert_eq!(
+        payload["total_reclaimable_bytes"],
+        0,
+        "report-only trash bytes must not count as reclaimable; payload={payload}; log={}",
+        result.log_path.display()
+    );
+    assert!(
+        payload["report_only_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "expected report-only trash entry; payload={payload}; log={}",
+        result.log_path.display()
+    );
+    assert!(
+        payload["report_only_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes >= 8192),
+        "expected report-only byte total; payload={payload}; log={}",
+        result.log_path.display()
+    );
+
+    let report_only = payload["report_only"]
+        .as_array()
+        .unwrap_or_else(|| panic!("scan JSON missing report_only array: {payload}"));
+    let row = report_only
+        .iter()
+        .find(|row| row["pattern_name"].as_str() == Some("home-trash-report"))
+        .unwrap_or_else(|| {
+            panic!(
+                "home-trash-report row missing from report_only entries; payload={payload}; log={}",
+                result.log_path.display()
+            )
+        });
+    assert_eq!(row["decision"].as_str(), Some("Keep"));
+    assert!(
+        row["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("/.Trash/old-session")),
+        "unexpected report-only path: {row}"
+    );
+    assert!(
+        row["veto_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("cleanup rule is report-only")),
+        "missing report-only veto reason: {row}"
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn scan_reports_home_trash_without_candidate() {}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_status_json_matches_diskutil_apfs_capacity() {
