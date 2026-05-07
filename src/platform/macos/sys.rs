@@ -4,7 +4,7 @@
 #![allow(missing_docs)]
 
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::io::Cursor;
@@ -30,6 +30,8 @@ const _: [(); 16] = [(); STATFS_TYPE_NAME_BYTES];
 
 const APFS_CACHE_TTL_SECS: u64 = 5 * 60;
 const APFS_CACHE_TTL: Duration = Duration::from_secs(APFS_CACHE_TTL_SECS);
+pub const LOCAL_SNAPSHOT_THIN_AMOUNT_BYTES: u64 = 9_999_999_999_999_999;
+pub const LOCAL_SNAPSHOT_THIN_URGENCY: u8 = 4;
 static APFS_INVENTORY_CACHE: OnceLock<RwLock<Option<(Instant, ApfsInventory)>>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +158,15 @@ pub struct LocalSnapshotInfo {
     pub date: Option<String>,
     pub retained_bytes_estimate: Option<u64>,
     pub mount_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSnapshotThinReport {
+    pub mount_path: PathBuf,
+    pub requested_bytes: u64,
+    pub urgency: u8,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,6 +423,62 @@ pub fn local_time_machine_snapshots(
         mount,
         retained_total_estimate,
     ))
+}
+
+pub fn thin_local_time_machine_snapshots(mount: &Path) -> io::Result<LocalSnapshotThinReport> {
+    thin_local_time_machine_snapshots_with(
+        mount,
+        LOCAL_SNAPSHOT_THIN_AMOUNT_BYTES,
+        LOCAL_SNAPSHOT_THIN_URGENCY,
+    )
+}
+
+pub fn thin_local_time_machine_snapshots_with(
+    mount: &Path,
+    requested_bytes: u64,
+    urgency: u8,
+) -> io::Result<LocalSnapshotThinReport> {
+    let output = Command::new("/usr/bin/tmutil")
+        .args(tmutil_thinlocalsnapshots_args(
+            mount,
+            requested_bytes,
+            urgency,
+        ))
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "tmutil thinlocalsnapshots {} {} {} failed with status {}: {}",
+            mount.display(),
+            requested_bytes,
+            urgency,
+            output.status,
+            stderr.trim()
+        )));
+    }
+
+    Ok(LocalSnapshotThinReport {
+        mount_path: mount.to_path_buf(),
+        requested_bytes,
+        urgency,
+        stdout,
+        stderr,
+    })
+}
+
+#[must_use]
+pub fn tmutil_thinlocalsnapshots_args(
+    mount: &Path,
+    requested_bytes: u64,
+    urgency: u8,
+) -> Vec<OsString> {
+    vec![
+        OsString::from("thinlocalsnapshots"),
+        mount.as_os_str().to_os_string(),
+        OsString::from(requested_bytes.to_string()),
+        OsString::from(urgency.to_string()),
+    ]
 }
 
 pub fn important_usage_available_bytes(mount: &Path) -> io::Result<Option<u64>> {
@@ -1159,14 +1226,16 @@ impl ApfsVolumeRole {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::path::Path;
 
     use super::{
-        ApfsVolumeRole, FirmlinkSource, SwapUsage, SwapUsageInfo, firmlink_map,
+        ApfsVolumeRole, FirmlinkSource, LOCAL_SNAPSHOT_THIN_AMOUNT_BYTES,
+        LOCAL_SNAPSHOT_THIN_URGENCY, SwapUsage, SwapUsageInfo, firmlink_map,
         firmlink_map_from_paths, important_usage_available_bytes, mounted_filesystems,
         parent_apfs_volume_device, parse_apfs_inventory, parse_firmlink_map,
         parse_tmutil_local_snapshots, parse_vm_stat, parse_vm_swapusage, read_vm_stats,
-        resolve_firmlinked_path, statfs, sysctl, vm_swapusage,
+        resolve_firmlinked_path, statfs, sysctl, tmutil_thinlocalsnapshots_args, vm_swapusage,
     };
 
     const fn mib(value: u64) -> u64 {
@@ -1593,5 +1662,24 @@ com.apple.os.update-abc
         let snapshots = parse_tmutil_local_snapshots(raw, Path::new("/"), Some(100));
 
         assert!(snapshots.is_empty());
+    }
+
+    #[test]
+    fn thinlocalsnapshots_args_match_force_thin_contract() {
+        let args = tmutil_thinlocalsnapshots_args(
+            Path::new("/System/Volumes/Data"),
+            LOCAL_SNAPSHOT_THIN_AMOUNT_BYTES,
+            LOCAL_SNAPSHOT_THIN_URGENCY,
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("thinlocalsnapshots"),
+                OsString::from("/System/Volumes/Data"),
+                OsString::from("9999999999999999"),
+                OsString::from("4"),
+            ]
+        );
     }
 }

@@ -48,6 +48,8 @@ use storage_ballast_helper::scanner::walker::{
 
 const LIVE_REFRESH_MIN_MS: u64 = 100;
 const STATUS_WATCH_REFRESH_MS: u64 = 1_000;
+const LOCAL_SNAPSHOT_THIN_AMOUNT_BYTES: u64 = 9_999_999_999_999_999;
+const LOCAL_SNAPSHOT_THIN_URGENCY: u8 = 4;
 
 /// Storage Ballast Helper — prevents disk-full scenarios from coding agent swarms.
 #[derive(Debug, Parser)]
@@ -338,6 +340,12 @@ struct CleanArgs {
     /// Paths to clean (falls back to configured watched paths when omitted).
     #[arg(value_name = "PATH")]
     paths: Vec<PathBuf>,
+    /// Thin macOS Time Machine local snapshots instead of deleting file candidates.
+    #[arg(long)]
+    thin_local_snapshots: bool,
+    /// Mount to pass to tmutil when thinning local snapshots.
+    #[arg(long, value_name = "MOUNT")]
+    local_snapshot_mount: Option<PathBuf>,
     /// Target free percentage to recover.
     #[arg(long, value_name = "PERCENT")]
     target_free: Option<f64>,
@@ -359,6 +367,8 @@ impl Default for CleanArgs {
     fn default() -> Self {
         Self {
             paths: Vec::new(),
+            thin_local_snapshots: false,
+            local_snapshot_mount: None,
             target_free: None,
             min_score: 0.7,
             max_items: None,
@@ -4692,10 +4702,16 @@ fn local_snapshot_warning(capacity: &Capacity) -> Option<String> {
 
 fn local_snapshot_reclaim_command(capacity: &Capacity) -> Option<String> {
     capacity.local_snapshot_bytes.filter(|bytes| *bytes > 0)?;
-    Some(format!(
-        "sudo tmutil thinlocalsnapshots {} 9999999999999999 4",
-        shell_quote(&capacity.mount_point.to_string_lossy())
-    ))
+    Some(local_snapshot_thin_shell_command(&capacity.mount_point))
+}
+
+fn local_snapshot_thin_shell_command(mount: &Path) -> String {
+    format!(
+        "sudo tmutil thinlocalsnapshots {} {} {}",
+        shell_quote(&mount.to_string_lossy()),
+        LOCAL_SNAPSHOT_THIN_AMOUNT_BYTES,
+        LOCAL_SNAPSHOT_THIN_URGENCY
+    )
 }
 
 fn bytes_to_pct(value: u64, total: u64) -> f64 {
@@ -5441,6 +5457,17 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
 fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+
+    if args.local_snapshot_mount.is_some() && !args.thin_local_snapshots {
+        return Err(CliError::User(
+            "--local-snapshot-mount requires --thin-local-snapshots".to_string(),
+        ));
+    }
+
+    if args.thin_local_snapshots {
+        return run_local_snapshot_thin(cli, args);
+    }
+
     let start = std::time::Instant::now();
 
     // Determine scan roots: CLI paths or configured watched paths.
@@ -5688,6 +5715,217 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct LocalSnapshotThinExecution {
+    stdout: String,
+    stderr: String,
+}
+
+fn run_local_snapshot_thin(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
+    if !args.paths.is_empty() {
+        return Err(CliError::User(
+            "--thin-local-snapshots does not accept file cleanup paths".to_string(),
+        ));
+    }
+
+    let mount = args
+        .local_snapshot_mount
+        .as_deref()
+        .unwrap_or_else(|| Path::new("/"));
+    let command = local_snapshot_thin_shell_command(mount);
+    let estimated_reclaimable_bytes = local_snapshot_estimate_for_mount(mount);
+
+    if args.dry_run {
+        match output_mode(cli) {
+            OutputMode::Human => {
+                print_local_snapshot_thin_dry_run(mount, &command, estimated_reclaimable_bytes);
+            }
+            OutputMode::Json => emit_local_snapshot_thin_json(
+                mount,
+                &command,
+                estimated_reclaimable_bytes,
+                true,
+                None,
+                None,
+            )?,
+        }
+        return Ok(());
+    }
+
+    if !local_snapshot_thinning_supported() {
+        return Err(CliError::User(
+            "--thin-local-snapshots is only supported on macOS".to_string(),
+        ));
+    }
+
+    if !running_as_root() {
+        return Err(CliError::User(format!(
+            "Time Machine local snapshot thinning requires sudo/root. Run `sudo sbh clean --thin-local-snapshots --yes` or run `{command}` directly."
+        )));
+    }
+
+    if !io::stdout().is_terminal() && !args.yes {
+        if output_mode(cli) == OutputMode::Json {
+            let payload = json!({
+                "command": "clean",
+                "action": "thin_local_snapshots",
+                "error": "non_interactive_without_yes",
+                "mount": mount.to_string_lossy(),
+                "thin_command": command,
+            });
+            write_json_line(&payload)?;
+        }
+        return Err(CliError::User(
+            "pass --yes to confirm Time Machine local snapshot thinning in non-interactive mode"
+                .to_string(),
+        ));
+    }
+
+    if !args.yes && !confirm_local_snapshot_thinning(mount, &command, estimated_reclaimable_bytes)?
+    {
+        if output_mode(cli) == OutputMode::Human {
+            println!("Skipped Time Machine local snapshot thinning.");
+        }
+        return Ok(());
+    }
+
+    if output_mode(cli) == OutputMode::Human {
+        println!(
+            "Thinning Time Machine local snapshots on {}. This can take 30+ seconds...",
+            mount.display()
+        );
+    }
+    let started = std::time::Instant::now();
+    let execution = execute_local_snapshot_thinning(mount)?;
+    let elapsed = started.elapsed();
+
+    match output_mode(cli) {
+        OutputMode::Human => {
+            println!(
+                "Time Machine local snapshot thinning complete in {:.1}s.",
+                elapsed.as_secs_f64()
+            );
+            print_tmutil_streams(&execution);
+        }
+        OutputMode::Json => emit_local_snapshot_thin_json(
+            mount,
+            &command,
+            estimated_reclaimable_bytes,
+            false,
+            Some(elapsed),
+            Some(&execution),
+        )?,
+    }
+
+    Ok(())
+}
+
+fn print_local_snapshot_thin_dry_run(
+    mount: &Path,
+    command: &str,
+    estimated_reclaimable_bytes: Option<u64>,
+) {
+    println!(
+        "Would thin local Time Machine snapshots on {}.",
+        mount.display()
+    );
+    if let Some(bytes) = estimated_reclaimable_bytes {
+        println!("Estimated reclaimable: {}", format_bytes(bytes));
+    } else {
+        println!("Estimated reclaimable: unknown until macOS reports snapshot retention.");
+    }
+    println!("Command: {command}");
+    println!("This can take 30+ seconds and requires sudo/root for system-wide thinning.");
+}
+
+fn confirm_local_snapshot_thinning(
+    mount: &Path,
+    command: &str,
+    estimated_reclaimable_bytes: Option<u64>,
+) -> Result<bool, CliError> {
+    print_local_snapshot_thin_dry_run(mount, command, estimated_reclaimable_bytes);
+    print!("Proceed with Time Machine snapshot thinning? [y/N] ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn emit_local_snapshot_thin_json(
+    mount: &Path,
+    command: &str,
+    estimated_reclaimable_bytes: Option<u64>,
+    dry_run: bool,
+    elapsed: Option<std::time::Duration>,
+    execution: Option<&LocalSnapshotThinExecution>,
+) -> Result<(), CliError> {
+    let payload = json!({
+        "command": "clean",
+        "action": "thin_local_snapshots",
+        "mount": mount.to_string_lossy(),
+        "dry_run": dry_run,
+        "thin_command": command,
+        "estimated_reclaimable_bytes": estimated_reclaimable_bytes,
+        "requires_sudo": true,
+        "elapsed_seconds": elapsed.map(|duration| duration.as_secs_f64()),
+        "tmutil_stdout": execution.map(|report| report.stdout.as_str()),
+        "tmutil_stderr": execution.map(|report| report.stderr.as_str()),
+    });
+    write_json_line(&payload)
+}
+
+fn print_tmutil_streams(execution: &LocalSnapshotThinExecution) {
+    let stdout = execution.stdout.trim();
+    if !stdout.is_empty() {
+        println!("{stdout}");
+    }
+    let stderr = execution.stderr.trim();
+    if !stderr.is_empty() {
+        eprintln!("{stderr}");
+    }
+}
+
+fn local_snapshot_estimate_for_mount(mount: &Path) -> Option<u64> {
+    detect_platform()
+        .ok()
+        .and_then(|platform| platform.capacity(mount).ok())
+        .and_then(|capacity| capacity.local_snapshot_bytes)
+        .filter(|bytes| *bytes > 0)
+}
+
+#[cfg(target_os = "macos")]
+const fn local_snapshot_thinning_supported() -> bool {
+    true
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn local_snapshot_thinning_supported() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn execute_local_snapshot_thinning(mount: &Path) -> Result<LocalSnapshotThinExecution, CliError> {
+    use storage_ballast_helper::platform::macos::sys;
+
+    let report = sys::thin_local_time_machine_snapshots(mount)
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    Ok(LocalSnapshotThinExecution {
+        stdout: report.stdout,
+        stderr: report.stderr,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn execute_local_snapshot_thinning(_mount: &Path) -> Result<LocalSnapshotThinExecution, CliError> {
+    Err(CliError::User(
+        "--thin-local-snapshots is only supported on macOS".to_string(),
+    ))
 }
 
 /// Print the deletion plan in a numbered table.
@@ -8576,6 +8814,72 @@ mod tests {
         }
         // --yes without --apply should fail.
         assert!(Cli::try_parse_from(["sbh", "tune", "--yes"]).is_err());
+    }
+
+    #[test]
+    fn clean_time_machine_snapshot_flags_parse() {
+        let parsed = Cli::try_parse_from([
+            "sbh",
+            "clean",
+            "--thin-local-snapshots",
+            "--local-snapshot-mount",
+            "/System/Volumes/Data",
+            "--dry-run",
+        ])
+        .expect("Time Machine thinning flags should parse");
+
+        let Command::Clean(args) = parsed.command else {
+            panic!("expected clean command");
+        };
+        assert!(args.thin_local_snapshots);
+        assert_eq!(
+            args.local_snapshot_mount.as_deref(),
+            Some(Path::new("/System/Volumes/Data"))
+        );
+        assert!(args.dry_run);
+    }
+
+    #[test]
+    fn clean_local_snapshot_mount_requires_thin_flag_at_runtime() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[scanner]\nroot_paths = [\"{}\"]\n",
+                tmp.path().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let parsed = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            config_path.to_str().unwrap(),
+            "clean",
+            "--local-snapshot-mount",
+            "/",
+        ])
+        .unwrap();
+
+        let error = run(&parsed).expect_err("mount flag without thinning should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("--local-snapshot-mount requires --thin-local-snapshots")
+        );
+    }
+
+    #[test]
+    fn local_snapshot_thin_shell_command_uses_force_thin_contract() {
+        assert_eq!(
+            local_snapshot_thin_shell_command(Path::new("/System/Volumes/Data")),
+            "sudo tmutil thinlocalsnapshots /System/Volumes/Data 9999999999999999 4"
+        );
+        assert_eq!(
+            local_snapshot_thin_shell_command(Path::new("/Volumes/Build Cache")),
+            "sudo tmutil thinlocalsnapshots '/Volumes/Build Cache' 9999999999999999 4"
+        );
     }
 
     #[test]

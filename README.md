@@ -815,6 +815,18 @@ On macOS, `sbh` recognizes immediate children of `~/Library/Developer/Xcode/Deri
 
 DerivedData cleanup is classified as definite because Xcode regenerates indexes and intermediate build data on the next build. The tradeoff is latency: the first Xcode build after cleanup can be slower while those caches and indexes are rebuilt.
 
+#### macOS Time Machine Local Snapshots
+
+On macOS, `sbh status` estimates bytes retained by local Time Machine snapshots when APFS inventory data exposes a retained-snapshot estimate. The status output includes the exact reclaim command for the affected mount:
+
+```bash
+sudo tmutil thinlocalsnapshots / 9999999999999999 4
+```
+
+`sbh clean --thin-local-snapshots --dry-run` prints the same command, the selected mount, and the current estimated reclaimable bytes when available. `sudo sbh clean --thin-local-snapshots --yes` runs the macOS `tmutil thinlocalsnapshots` wrapper for `/` by default; pass `--local-snapshot-mount <MOUNT>` to target another APFS mount.
+
+Thinning can take 30 seconds or longer. It asks macOS to free up to the estimated retained snapshot bytes, but the exact amount released is controlled by Time Machine and APFS. System-wide thinning requires sudo/root.
+
 ### Progressive Delivery: The Policy Engine
 
 The policy engine controls whether scored deletion decisions are actually executed, using a progressive delivery model borrowed from feature-flag rollout practice.
