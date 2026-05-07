@@ -23,7 +23,8 @@ use storage_ballast_helper::daemon::loop_main::{
 use storage_ballast_helper::daemon::self_monitor::DAEMON_STATE_STALE_THRESHOLD_SECS;
 use storage_ballast_helper::daemon::service::{
     LAUNCHD_LABEL_ENV, LaunchdConfig, LaunchdServiceManager, LaunchdStatusReport,
-    ServiceActionResult, SystemdServiceManager,
+    ServiceActionResult, SystemdServiceManager, launchd_labels_for_discovery,
+    launchd_system_plist_path_for_label, launchd_user_plist_path_for_label,
 };
 use storage_ballast_helper::logger::sqlite::SqliteLogger;
 use storage_ballast_helper::logger::stats::{StatsEngine, window_label};
@@ -806,6 +807,26 @@ fn env_value(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn launchd_uninstall_plist_paths(
+    home: &Path,
+    configured_label: Option<&str>,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let labels = launchd_labels_for_discovery(configured_label);
+    let system_paths = labels
+        .iter()
+        .map(|label| launchd_system_plist_path_for_label(label))
+        .collect();
+    let user_paths = labels
+        .iter()
+        .map(|label| launchd_user_plist_path_for_label(home, label))
+        .collect();
+    (system_paths, user_paths)
+}
+
+fn paths_exist(paths: &[PathBuf]) -> bool {
+    paths.iter().any(|path| path.exists())
+}
+
 fn push_sudo_env(envs: &mut Vec<(&'static str, String)>, name: &'static str, value: String) {
     if !envs.iter().any(|(existing, _)| *existing == name) {
         envs.push((name, value));
@@ -1414,12 +1435,17 @@ fn run_uninstall(cli: &Cli, args: &UninstallArgs) -> Result<(), CliError> {
     }
 
     if args.launchd {
-        // Determine scope: check system plist first, then user agent.
-        let system_plist = PathBuf::from("/Library/LaunchDaemons/com.sbh.daemon.plist");
+        // Determine scope: check system plists first, then user agents. Include
+        // both the production label and a configured CI/test label.
         let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-        let user_plist = home.join("Library/LaunchAgents/com.sbh.daemon.plist");
-        let launchd_user =
-            resolve_uninstall_user_scope(args, system_plist.exists(), user_plist.exists(), true);
+        let (system_plists, user_plists) =
+            launchd_uninstall_plist_paths(&home, env_value(LAUNCHD_LABEL_ENV).as_deref());
+        let launchd_user = resolve_uninstall_user_scope(
+            args,
+            paths_exist(&system_plists),
+            paths_exist(&user_plists),
+            true,
+        );
         if !launchd_user && !running_as_root() {
             return Err(CliError::User(service_system_scope_root_message(
                 "uninstall",
@@ -8411,6 +8437,27 @@ mod tests {
         };
 
         assert!(!resolve_uninstall_user_scope(&args, false, false, false));
+    }
+
+    #[test]
+    fn uninstall_launchd_plist_paths_include_configured_label() {
+        let (system_paths, user_paths) =
+            launchd_uninstall_plist_paths(Path::new("/Users/tester"), Some("com.example.sbh.test"));
+
+        assert_eq!(
+            system_paths,
+            vec![
+                PathBuf::from("/Library/LaunchDaemons/com.sbh.daemon.plist"),
+                PathBuf::from("/Library/LaunchDaemons/com.example.sbh.test.plist")
+            ]
+        );
+        assert_eq!(
+            user_paths,
+            vec![
+                PathBuf::from("/Users/tester/Library/LaunchAgents/com.sbh.daemon.plist"),
+                PathBuf::from("/Users/tester/Library/LaunchAgents/com.example.sbh.test.plist")
+            ]
+        );
     }
 
     #[test]

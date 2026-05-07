@@ -12,6 +12,7 @@ use std::time::SystemTime;
 use serde::Serialize;
 
 use crate::core::config::PathsConfig;
+use crate::daemon::service::{LAUNCHD_LABEL_ENV, launchd_labels_for_discovery};
 
 // ---------------------------------------------------------------------------
 // Uninstall modes
@@ -252,18 +253,38 @@ fn discover_systemd_units(home: Option<&Path>) -> Vec<PathBuf> {
 }
 
 fn discover_launchd_plists(home: Option<&Path>) -> Vec<PathBuf> {
+    let label = configured_launchd_label();
+    let labels = launchd_labels_for_discovery(label.as_deref());
+    let user_dir = home.map(|h| h.join("Library").join("LaunchAgents"));
+    discover_launchd_plists_in_dirs(
+        Path::new("/Library/LaunchDaemons"),
+        user_dir.as_deref(),
+        &labels,
+    )
+}
+
+fn configured_launchd_label() -> Option<String> {
+    std::env::var_os(LAUNCHD_LABEL_ENV).and_then(|label| label.into_string().ok())
+}
+
+fn discover_launchd_plists_in_dirs(
+    system_dir: &Path,
+    user_dir: Option<&Path>,
+    labels: &[String],
+) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    let system_plist = PathBuf::from("/Library/LaunchDaemons/com.sbh.daemon.plist");
-    if system_plist.exists() {
-        paths.push(system_plist);
+    for label in labels {
+        let system_plist = system_dir.join(format!("{label}.plist"));
+        if system_plist.exists() {
+            paths.push(system_plist);
+        }
     }
-    if let Some(h) = home {
-        let user_plist = h
-            .join("Library")
-            .join("LaunchAgents")
-            .join("com.sbh.daemon.plist");
-        if user_plist.exists() {
-            paths.push(user_plist);
+    if let Some(dir) = user_dir {
+        for label in labels {
+            let user_plist = dir.join(format!("{label}.plist"));
+            if user_plist.exists() {
+                paths.push(user_plist);
+            }
         }
     }
     paths
@@ -789,6 +810,24 @@ mod tests {
         assert_eq!(RemovalCategory::Binary.to_string(), "binary");
         assert_eq!(RemovalCategory::ConfigFile.to_string(), "config-file");
         assert_eq!(RemovalCategory::AssetCache.to_string(), "asset-cache");
+    }
+
+    #[test]
+    fn launchd_discovery_includes_configured_label_plists() {
+        let tmp = TempDir::new().unwrap();
+        let system_dir = tmp.path().join("LaunchDaemons");
+        let user_dir = tmp.path().join("LaunchAgents");
+        fs::create_dir_all(&system_dir).unwrap();
+        fs::create_dir_all(&user_dir).unwrap();
+        let default_system = system_dir.join("com.sbh.daemon.plist");
+        let custom_user = user_dir.join("com.example.sbh.test.plist");
+        fs::write(&default_system, "default").unwrap();
+        fs::write(&custom_user, "custom").unwrap();
+
+        let labels = launchd_labels_for_discovery(Some("com.example.sbh.test"));
+        let paths = discover_launchd_plists_in_dirs(&system_dir, Some(&user_dir), &labels);
+
+        assert_eq!(paths, vec![default_system, custom_user]);
     }
 
     #[test]

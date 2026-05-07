@@ -25,6 +25,44 @@ pub const LAUNCHD_LABEL: &str = "com.sbh.daemon";
 /// Environment override for tests and isolated launchd installs.
 pub const LAUNCHD_LABEL_ENV: &str = "SBH_LAUNCHD_LABEL";
 
+/// Return launchd labels that uninstall/discovery flows should inspect.
+///
+/// The default production label is always included. A configured label is added
+/// only when it is a safe plist filename component; lifecycle operations still
+/// perform strict validation and report configuration errors separately.
+#[must_use]
+pub fn launchd_labels_for_discovery(configured_label: Option<&str>) -> Vec<String> {
+    let mut labels = vec![LAUNCHD_LABEL.to_string()];
+    if let Some(label) = configured_label.filter(|label| is_launchd_discovery_label(label))
+        && !labels.iter().any(|existing| existing == label)
+    {
+        labels.push(label.to_string());
+    }
+    labels
+}
+
+/// Build the system launchd plist path for a label.
+#[must_use]
+pub fn launchd_system_plist_path_for_label(label: &str) -> PathBuf {
+    PathBuf::from("/Library/LaunchDaemons").join(format!("{label}.plist"))
+}
+
+/// Build the user launchd plist path for a label and home directory.
+#[must_use]
+pub fn launchd_user_plist_path_for_label(home: &Path, label: &str) -> PathBuf {
+    home.join("Library")
+        .join("LaunchAgents")
+        .join(format!("{label}.plist"))
+}
+
+fn is_launchd_discovery_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.trim() == label
+        && label
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+}
+
 /// Structured result from an install or uninstall operation.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ServiceActionResult {
@@ -847,6 +885,47 @@ mod tests {
         let mgr = service_manager_for_platform(&platform, false);
 
         assert_eq!(mgr.status().unwrap(), "unknown");
+    }
+
+    #[test]
+    fn launchd_discovery_labels_include_default_and_safe_configured_label() {
+        let labels = launchd_labels_for_discovery(Some("com.example.sbh.test"));
+
+        assert_eq!(
+            labels,
+            vec![
+                LAUNCHD_LABEL.to_string(),
+                "com.example.sbh.test".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn launchd_discovery_labels_ignore_unsafe_configured_label() {
+        for label in [
+            "",
+            " com.example.sbh",
+            "com/example/sbh",
+            "com.example.$sbh",
+        ] {
+            assert_eq!(
+                launchd_labels_for_discovery(Some(label)),
+                vec![LAUNCHD_LABEL.to_string()],
+                "label should be ignored for plist discovery: {label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn launchd_plist_path_builders_use_canonical_macos_locations() {
+        assert_eq!(
+            launchd_system_plist_path_for_label("com.example.sbh.test"),
+            PathBuf::from("/Library/LaunchDaemons/com.example.sbh.test.plist")
+        );
+        assert_eq!(
+            launchd_user_plist_path_for_label(Path::new("/Users/tester"), "com.example.sbh.test"),
+            PathBuf::from("/Users/tester/Library/LaunchAgents/com.example.sbh.test.plist")
+        );
     }
 
     #[test]

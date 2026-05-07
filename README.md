@@ -1409,6 +1409,8 @@ Source: `src/cli/mod.rs`, `src/cli/assets.rs`
 Every removal action includes:
 
 - **Category tagging**: Each item is classified (binary, config-file, data-directory, state-file, sqlite-db, jsonl-log, asset-cache, systemd-unit, launchd-plist, shell-completion, shell-profile-entry, ballast-pool, backup-file) for structured reporting.
+- **macOS service teardown**: `sbh uninstall --launchd` calls `launchctl bootout`, removes the matching LaunchAgent or LaunchDaemon plist, and exits successfully when the service is already unloaded or the plist is already absent.
+- **Custom launchd labels**: Uninstall discovery checks both `com.sbh.daemon` and a valid `SBH_LAUNCHD_LABEL`, so isolated CI/test installs clean up the same plist label they installed.
 - **Backup-first semantics**: Items marked with `backup_first: true` are copied to a timestamped backup before removal.
 - **Dry-run support**: `sbh uninstall --dry-run` generates the full removal plan without executing any deletions, showing exactly what would be removed and backed up.
 - **Structured output**: The plan and execution results are available as JSON (`--json`) for automation.
