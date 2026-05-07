@@ -172,6 +172,29 @@ pub struct SwapUsageInfo {
     pub encrypted: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmStats {
+    pub page_size_bytes: u64,
+    pub free_count: u64,
+    pub active_count: u64,
+    pub inactive_count: u64,
+    pub wire_count: u64,
+    pub speculative_count: u64,
+    pub compressor_page_count: u64,
+    pub throttled_count: u64,
+}
+
+impl VmStats {
+    #[must_use]
+    pub fn accounted_pages(&self) -> u64 {
+        self.free_count
+            .saturating_add(self.active_count)
+            .saturating_add(self.inactive_count)
+            .saturating_add(self.wire_count)
+            .saturating_add(self.compressor_page_count)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirmlinkMap {
     pub mappings: Vec<FirmlinkMapping>,
@@ -415,6 +438,21 @@ pub fn vm_swapusage() -> io::Result<SwapUsage> {
     sysctl::read::<String>("vm.swapusage").map(|raw| parse_vm_swapusage(&raw))
 }
 
+// `vm_stat` is backed by the same Mach VM counters we need here. Calling
+// `host_statistics64` directly would require unsafe FFI in this crate, which is
+// forbidden by the root lint.
+pub fn read_vm_stats() -> io::Result<VmStats> {
+    let output = Command::new("/usr/bin/vm_stat").output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "vm_stat failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    parse_vm_stat(&String::from_utf8_lossy(&output.stdout))
+}
+
 pub fn firmlink_map() -> io::Result<FirmlinkMap> {
     firmlink_map_from_paths(
         Path::new("/usr/share/firmlinks"),
@@ -478,6 +516,74 @@ pub fn parse_vm_swapusage(raw: &str) -> SwapUsage {
         free_bytes,
         encrypted: raw.contains("(encrypted)"),
     })
+}
+
+pub fn parse_vm_stat(raw: &str) -> io::Result<VmStats> {
+    let mut values = BTreeMap::<String, u64>::new();
+    let mut page_size_bytes = None;
+
+    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if page_size_bytes.is_none() {
+            page_size_bytes = parse_vm_stat_page_size(line);
+        }
+
+        let Some((label, value_raw)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(value) = parse_vm_stat_count(value_raw) else {
+            continue;
+        };
+        values.insert(vm_stat_label_key(label), value);
+    }
+
+    let page_size_bytes = page_size_bytes.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "vm_stat output did not include a page size",
+        )
+    })?;
+    let required = |label: &str| {
+        values.get(label).copied().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("vm_stat output missing required field: {label}"),
+            )
+        })
+    };
+
+    Ok(VmStats {
+        page_size_bytes,
+        free_count: required("pages free")?,
+        active_count: required("pages active")?,
+        inactive_count: required("pages inactive")?,
+        wire_count: required("pages wired down")?,
+        speculative_count: required("pages speculative")?,
+        compressor_page_count: required("pages occupied by compressor")?,
+        throttled_count: required("pages throttled")?,
+    })
+}
+
+fn parse_vm_stat_page_size(line: &str) -> Option<u64> {
+    let (_, after_prefix) = line.split_once("page size of ")?;
+    let (size, _) = after_prefix.split_once(" bytes")?;
+    size.trim().parse().ok()
+}
+
+fn parse_vm_stat_count(value_raw: &str) -> Option<u64> {
+    let token = value_raw
+        .split_whitespace()
+        .next()?
+        .trim_end_matches('.')
+        .replace(',', "");
+    token.parse().ok()
+}
+
+fn vm_stat_label_key(label: &str) -> String {
+    label
+        .trim()
+        .trim_matches('"')
+        .to_ascii_lowercase()
+        .replace('\t', " ")
 }
 
 fn parse_system_firmlinks(firmlinks: &str) -> impl Iterator<Item = FirmlinkMapping> + '_ {
@@ -1059,8 +1165,8 @@ mod tests {
         ApfsVolumeRole, FirmlinkSource, SwapUsage, SwapUsageInfo, firmlink_map,
         firmlink_map_from_paths, important_usage_available_bytes, mounted_filesystems,
         parent_apfs_volume_device, parse_apfs_inventory, parse_firmlink_map,
-        parse_tmutil_local_snapshots, parse_vm_swapusage, resolve_firmlinked_path, statfs, sysctl,
-        vm_swapusage,
+        parse_tmutil_local_snapshots, parse_vm_stat, parse_vm_swapusage, read_vm_stats,
+        resolve_firmlinked_path, statfs, sysctl, vm_swapusage,
     };
 
     const fn mib(value: u64) -> u64 {
@@ -1262,6 +1368,65 @@ relative-target\tVolumes/External
         };
         assert!(usage.total_bytes >= usage.used_bytes);
         assert!(usage.total_bytes >= usage.free_bytes);
+    }
+
+    #[test]
+    fn live_vm_stats_report_plausible_page_accounting() {
+        let stats = read_vm_stats().expect("vm_stat should report Mach VM counters");
+        let total_bytes = sysctl::read::<u64>("hw.memsize").expect("hw.memsize should be readable");
+        let total_pages = total_bytes / stats.page_size_bytes;
+        let accounted = stats.accounted_pages();
+        let delta = accounted.abs_diff(total_pages);
+        let tolerance = total_pages / 10;
+
+        assert!(stats.page_size_bytes >= 4096);
+        assert!(stats.free_count > 0);
+        assert!(stats.active_count > 0);
+        assert!(stats.inactive_count > 0);
+        assert!(stats.wire_count > 0);
+        assert!(
+            delta <= tolerance,
+            "accounted pages {accounted} should be within {tolerance} pages of total {total_pages}"
+        );
+    }
+
+    #[test]
+    fn parses_vm_stat_output() {
+        let raw = "\
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                              965751.
+Pages active:                            436024.
+Pages inactive:                          601322.
+Pages speculative:                       221523.
+Pages throttled:                              0.
+Pages wired down:                        699748.
+Pages purgeable:                           1488.
+\"Translation faults\":               44529996857.
+Pages occupied by compressor:           1221199.
+";
+
+        let stats = parse_vm_stat(raw).expect("vm_stat output should parse");
+
+        assert_eq!(stats.page_size_bytes, 16_384);
+        assert_eq!(stats.free_count, 965_751);
+        assert_eq!(stats.active_count, 436_024);
+        assert_eq!(stats.inactive_count, 601_322);
+        assert_eq!(stats.speculative_count, 221_523);
+        assert_eq!(stats.throttled_count, 0);
+        assert_eq!(stats.wire_count, 699_748);
+        assert_eq!(stats.compressor_page_count, 1_221_199);
+        assert_eq!(stats.accounted_pages(), 3_924_044);
+    }
+
+    #[test]
+    fn vm_stat_parse_requires_page_size_and_core_counts() {
+        assert!(parse_vm_stat("Pages free: 1.").is_err());
+        assert!(
+            parse_vm_stat(
+                "Mach Virtual Memory Statistics: (page size of 4096 bytes)\nPages free: 1.\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]
