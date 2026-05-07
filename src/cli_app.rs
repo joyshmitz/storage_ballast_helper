@@ -3717,8 +3717,19 @@ struct PalDoctorReport {
     not_implemented: usize,
     failed: usize,
     skipped: usize,
+    checks: Vec<DoctorCheck>,
     methods: Vec<PalDoctorProbe>,
     follow_up: Vec<PalDoctorFollowUp>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorCheck {
+    id: &'static str,
+    title: &'static str,
+    status: &'static str,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remediation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3763,6 +3774,19 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
                 "  implemented={} not_implemented={} failed={} skipped={}",
                 report.implemented, report.not_implemented, report.failed, report.skipped
             );
+            if !report.checks.is_empty() {
+                println!("\nPlatform checks:");
+                for check in &report.checks {
+                    println!(
+                        "  [{:<4}] {:<28} {}",
+                        check.status, check.title, check.message
+                    );
+                    if let Some(remediation) = &check.remediation {
+                        println!("         fix: {remediation}");
+                    }
+                }
+                println!();
+            }
             for method in &report.methods {
                 match (&method.bead, &method.message) {
                     (Some(bead), Some(message)) => {
@@ -3801,11 +3825,28 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
 }
 
 fn pal_doctor_report(platform: &dyn Platform) -> PalDoctorReport {
+    pal_doctor_report_with_command_runner(platform, &run_doctor_command)
+}
+
+fn pal_doctor_report_with_command_runner<F>(
+    platform: &dyn Platform,
+    run_command: &F,
+) -> PalDoctorReport
+where
+    F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
+{
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let current_pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
     let current_exe = std::env::current_exe().unwrap_or_else(|_| cwd.clone());
     let home = platform.user_home();
     let full_disk_access = platform.full_disk_access_status();
+    let checks = macos_doctor_checks(
+        platform,
+        &current_exe,
+        &home,
+        &full_disk_access,
+        run_command,
+    );
     let follow_up = full_disk_access
         .as_ref()
         .ok()
@@ -3873,9 +3914,334 @@ fn pal_doctor_report(platform: &dyn Platform) -> PalDoctorReport {
         not_implemented,
         failed,
         skipped,
+        checks,
         methods,
         follow_up,
     }
+}
+
+#[derive(Debug, Clone)]
+struct DoctorCommandOutcome {
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+fn run_doctor_command(program: &str, args: &[String]) -> std::io::Result<DoctorCommandOutcome> {
+    let output = std::process::Command::new(program).args(args).output()?;
+    Ok(DoctorCommandOutcome {
+        success: output.status.success(),
+        exit_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+fn macos_doctor_checks<F>(
+    platform: &dyn Platform,
+    current_exe: &Path,
+    home: &Path,
+    full_disk_access: &storage_ballast_helper::core::errors::Result<FullDiskAccessStatus>,
+    run_command: &F,
+) -> Vec<DoctorCheck>
+where
+    F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
+{
+    if platform.name() != "macos" {
+        return Vec::new();
+    }
+
+    vec![
+        macos_codesign_check(current_exe, run_command),
+        macos_spctl_check(current_exe, run_command),
+        macos_launchd_check(platform),
+        macos_full_disk_access_check(full_disk_access),
+        macos_apfs_check(platform),
+        macos_state_free_space_check(platform, home),
+    ]
+}
+
+fn doctor_check(
+    id: &'static str,
+    title: &'static str,
+    status: &'static str,
+    message: impl Into<String>,
+    remediation: Option<String>,
+) -> DoctorCheck {
+    DoctorCheck {
+        id,
+        title,
+        status,
+        message: message.into(),
+        remediation,
+    }
+}
+
+fn macos_codesign_check<F>(current_exe: &Path, run_command: &F) -> DoctorCheck
+where
+    F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
+{
+    let args = vec!["-dv".to_string(), current_exe.display().to_string()];
+    match run_command("codesign", &args) {
+        Ok(outcome) if outcome.success => doctor_check(
+            "macos.codesign",
+            "Code signature",
+            "PASS",
+            format!("codesign accepted {}", current_exe.display()),
+            None,
+        ),
+        Ok(outcome) => doctor_check(
+            "macos.codesign",
+            "Code signature",
+            "WARN",
+            format!(
+                "codesign rejected {}: {}",
+                current_exe.display(),
+                command_detail(&outcome)
+            ),
+            Some(
+                "Install a signed release artifact or re-sign the binary before service install."
+                    .to_string(),
+            ),
+        ),
+        Err(error) => doctor_check(
+            "macos.codesign",
+            "Code signature",
+            "FAIL",
+            format!("failed to run codesign: {error}"),
+            Some("Install Xcode Command Line Tools so /usr/bin/codesign is available.".to_string()),
+        ),
+    }
+}
+
+fn macos_spctl_check<F>(current_exe: &Path, run_command: &F) -> DoctorCheck
+where
+    F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
+{
+    let args = vec![
+        "-a".to_string(),
+        "-vv".to_string(),
+        current_exe.display().to_string(),
+    ];
+    match run_command("spctl", &args) {
+        Ok(outcome) if outcome.success => doctor_check(
+            "macos.spctl",
+            "Gatekeeper assessment",
+            "PASS",
+            format!("spctl accepted {}", current_exe.display()),
+            None,
+        ),
+        Ok(outcome) => doctor_check(
+            "macos.spctl",
+            "Gatekeeper assessment",
+            "WARN",
+            format!(
+                "spctl did not accept {}: {}",
+                current_exe.display(),
+                command_detail(&outcome)
+            ),
+            Some("Use a notarized release artifact before distributing this binary.".to_string()),
+        ),
+        Err(error) => doctor_check(
+            "macos.spctl",
+            "Gatekeeper assessment",
+            "FAIL",
+            format!("failed to run spctl: {error}"),
+            Some(
+                "Run on macOS with /usr/sbin/spctl available, or verify notarization separately."
+                    .to_string(),
+            ),
+        ),
+    }
+}
+
+fn macos_launchd_check(platform: &dyn Platform) -> DoctorCheck {
+    if platform.service_kind() != ServiceKind::Launchd {
+        return doctor_check(
+            "macos.launchd",
+            "launchd service",
+            "WARN",
+            format!("platform service kind is {:?}", platform.service_kind()),
+            Some(
+                "Install as a launchd service with sbh install --launchd --scope user.".to_string(),
+            ),
+        );
+    }
+
+    match platform.service_manager().status() {
+        Ok(status) if matches!(status.as_str(), "active" | "loaded" | "running") => doctor_check(
+            "macos.launchd",
+            "launchd service",
+            "PASS",
+            format!("launchctl reports {status}"),
+            None,
+        ),
+        Ok(status) => doctor_check(
+            "macos.launchd",
+            "launchd service",
+            "WARN",
+            format!("launchctl reports {status}"),
+            Some("Bootstrap the service with sbh install --launchd --scope user, then re-run sbh doctor --pal.".to_string()),
+        ),
+        Err(error) => doctor_check(
+            "macos.launchd",
+            "launchd service",
+            "FAIL",
+            format!("launchctl status failed: {error}"),
+            Some("Run sbh service --launchd status for the exact launchctl error and plist path."
+                .to_string()),
+        ),
+    }
+}
+
+fn macos_full_disk_access_check(
+    full_disk_access: &storage_ballast_helper::core::errors::Result<FullDiskAccessStatus>,
+) -> DoctorCheck {
+    match full_disk_access {
+        Ok(status) => match status.state {
+            FullDiskAccessState::Granted => doctor_check(
+                "macos.full_disk_access",
+                "Full Disk Access",
+                "PASS",
+                status.doctor_message(),
+                None,
+            ),
+            FullDiskAccessState::Missing => doctor_check(
+                "macos.full_disk_access",
+                "Full Disk Access",
+                "FAIL",
+                status.doctor_message(),
+                Some("Grant Full Disk Access in System Settings > Privacy & Security, then re-run sbh doctor --pal.".to_string()),
+            ),
+            FullDiskAccessState::NotConfigured
+            | FullDiskAccessState::NotApplicable
+            | FullDiskAccessState::Unknown => doctor_check(
+                "macos.full_disk_access",
+                "Full Disk Access",
+                "WARN",
+                status.doctor_message(),
+                Some("Verify Full Disk Access manually if cleanup scans need protected user data."
+                    .to_string()),
+            ),
+        },
+        Err(error) => doctor_check(
+            "macos.full_disk_access",
+            "Full Disk Access",
+            "FAIL",
+            format!("Full Disk Access probe failed: {error}"),
+            Some("Re-run sbh doctor --pal after checking filesystem permissions.".to_string()),
+        ),
+    }
+}
+
+fn macos_apfs_check(platform: &dyn Platform) -> DoctorCheck {
+    match platform.mounts() {
+        Ok(mounts) => {
+            let primary_apfs = mounts.iter().find(|mount| {
+                mount.fs_type.eq_ignore_ascii_case("apfs")
+                    && (mount.is_apfs_data_volume
+                        || mount.mount_point == Path::new("/")
+                        || mount.mount_point == Path::new("/System/Volumes/Data"))
+            });
+            primary_apfs.map_or_else(
+                || {
+                    doctor_check(
+                        "macos.apfs",
+                        "APFS inventory",
+                        "WARN",
+                        "no primary APFS Data mount was reported",
+                        Some("Run sbh status --json and diskutil apfs list -plist to compare APFS inventory.".to_string()),
+                    )
+                },
+                |mount| {
+                    doctor_check(
+                        "macos.apfs",
+                        "APFS inventory",
+                        "PASS",
+                        format!(
+                            "found APFS mount {} ({})",
+                            mount.mount_point.display(),
+                            mount.container_id.as_deref().unwrap_or("container unknown")
+                        ),
+                        None,
+                    )
+                },
+            )
+        }
+        Err(error) => doctor_check(
+            "macos.apfs",
+            "APFS inventory",
+            "FAIL",
+            format!("APFS mount discovery failed: {error}"),
+            Some("Check diskutil apfs list -plist and filesystem permissions.".to_string()),
+        ),
+    }
+}
+
+fn macos_state_free_space_check(platform: &dyn Platform, home: &Path) -> DoctorCheck {
+    const MIN_STATE_AVAILABLE_BYTES: u64 = 1024 * 1024 * 1024;
+
+    let state_file = platform.default_paths().state_file;
+    let state_dir = state_file.parent().unwrap_or(home);
+    let probe_path = nearest_existing_ancestor(state_dir);
+    match platform.capacity(&probe_path) {
+        Ok(capacity) if capacity.available_bytes >= MIN_STATE_AVAILABLE_BYTES => doctor_check(
+            "macos.state_free_space",
+            "State volume space",
+            "PASS",
+            format!(
+                "{} available for state path {}",
+                format_bytes(capacity.available_bytes),
+                state_dir.display()
+            ),
+            None,
+        ),
+        Ok(capacity) => doctor_check(
+            "macos.state_free_space",
+            "State volume space",
+            "WARN",
+            format!(
+                "only {} available for state path {}",
+                format_bytes(capacity.available_bytes),
+                state_dir.display()
+            ),
+            Some("Free space on the state volume or move sbh paths.state_file to a healthier volume."
+                .to_string()),
+        ),
+        Err(error) => doctor_check(
+            "macos.state_free_space",
+            "State volume space",
+            "FAIL",
+            format!("could not measure state path {}: {error}", state_dir.display()),
+            Some("Create the state directory or fix permissions, then re-run sbh doctor --pal."
+                .to_string()),
+        ),
+    }
+}
+
+fn nearest_existing_ancestor(path: &Path) -> PathBuf {
+    let mut candidate = path.to_path_buf();
+    loop {
+        if candidate.exists() {
+            return candidate;
+        }
+        if !candidate.pop() {
+            return PathBuf::from("/");
+        }
+    }
+}
+
+fn command_detail(outcome: &DoctorCommandOutcome) -> String {
+    let stderr = outcome.stderr.trim();
+    if !stderr.is_empty() {
+        return stderr.to_string();
+    }
+    let stdout = outcome.stdout.trim();
+    if !stdout.is_empty() {
+        return stdout.to_string();
+    }
+    format!("exit {:?}", outcome.exit_code)
 }
 
 fn full_disk_access_follow_up(
@@ -7677,9 +8043,10 @@ fn shell_completion_dir(shell: CompletionShell) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use storage_ballast_helper::core::config::SacredConfig;
-    use storage_ballast_helper::platform::pal::MockPlatform;
+    use storage_ballast_helper::platform::pal::{FsStats, MockPlatform, MountPoint, PlatformPaths};
     use storage_ballast_helper::platform::types::{FullDiskAccessState, FullDiskAccessStatus};
     use tempfile::TempDir;
 
@@ -7856,6 +8223,130 @@ mod tests {
         let report = pal_doctor_report(&platform);
 
         assert!(report.follow_up.is_empty());
+    }
+
+    fn macos_doctor_mock(available_bytes: u64, fda_state: FullDiskAccessState) -> MockPlatform {
+        let mount = PathBuf::from("/");
+        let stats = FsStats {
+            total_bytes: 2 * 1024 * 1024 * 1024,
+            free_bytes: available_bytes,
+            available_bytes,
+            fs_type: "apfs".to_string(),
+            mount_point: mount.clone(),
+            is_readonly: false,
+        };
+        let mut stats_by_mount = HashMap::new();
+        stats_by_mount.insert(mount.clone(), stats);
+        MockPlatform::new(
+            vec![MountPoint {
+                path: mount,
+                device: "/dev/disk3s5".to_string(),
+                fs_type: "apfs".to_string(),
+                is_ram_backed: false,
+            }],
+            stats_by_mount,
+            MemoryInfo {
+                total_bytes: 8 * 1024 * 1024 * 1024,
+                available_bytes: 4 * 1024 * 1024 * 1024,
+                swap_total_bytes: 1024 * 1024 * 1024,
+                swap_free_bytes: 1024 * 1024 * 1024,
+            },
+            PlatformPaths {
+                ballast_dir: PathBuf::from("/Users/me/Library/Application Support/sbh/ballast"),
+                state_file: PathBuf::from("/Users/me/Library/Application Support/sbh/state.json"),
+                sqlite_db: PathBuf::from(
+                    "/Users/me/Library/Application Support/sbh/activity.sqlite3",
+                ),
+                jsonl_log: PathBuf::from(
+                    "/Users/me/Library/Application Support/sbh/activity.jsonl",
+                ),
+            },
+        )
+        .with_name("macos")
+        .with_service_kind(ServiceKind::Launchd)
+        .with_home("/Users/me")
+        .with_full_disk_access_status(FullDiskAccessStatus {
+            state: fda_state,
+            probe_path: Some("/Users/me/Library/Mail/V10/MailData/Envelope Index".into()),
+            detail: "test FDA detail".to_string(),
+            cache_ttl_seconds: 60,
+            cached: false,
+        })
+    }
+
+    fn check_by_id<'a>(report: &'a PalDoctorReport, id: &str) -> &'a DoctorCheck {
+        report
+            .checks
+            .iter()
+            .find(|check| check.id == id)
+            .expect("doctor check should be present")
+    }
+
+    #[test]
+    fn pal_doctor_report_includes_macos_specific_checks() {
+        let platform = macos_doctor_mock(2 * 1024 * 1024 * 1024, FullDiskAccessState::Granted);
+        let passing_command = |_program: &str, _args: &[String]| {
+            Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: "accepted".to_string(),
+                stderr: String::new(),
+            })
+        };
+
+        let report = pal_doctor_report_with_command_runner(&platform, &passing_command);
+
+        assert_eq!(report.checks.len(), 6);
+        assert_eq!(check_by_id(&report, "macos.codesign").status, "PASS");
+        assert_eq!(check_by_id(&report, "macos.spctl").status, "PASS");
+        assert_eq!(
+            check_by_id(&report, "macos.full_disk_access").status,
+            "PASS"
+        );
+        assert_eq!(check_by_id(&report, "macos.apfs").status, "PASS");
+        assert_eq!(
+            check_by_id(&report, "macos.state_free_space").status,
+            "PASS"
+        );
+        assert_eq!(check_by_id(&report, "macos.launchd").status, "WARN");
+        assert!(
+            check_by_id(&report, "macos.launchd")
+                .remediation
+                .as_deref()
+                .is_some_and(|message| message.contains("sbh install --launchd"))
+        );
+    }
+
+    #[test]
+    fn pal_doctor_report_flags_macos_remediation_failures() {
+        let platform = macos_doctor_mock(512 * 1024 * 1024, FullDiskAccessState::Missing);
+        let rejected_command = |_program: &str, _args: &[String]| {
+            Ok(DoctorCommandOutcome {
+                success: false,
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: "rejected".to_string(),
+            })
+        };
+
+        let report = pal_doctor_report_with_command_runner(&platform, &rejected_command);
+
+        assert_eq!(check_by_id(&report, "macos.codesign").status, "WARN");
+        assert_eq!(check_by_id(&report, "macos.spctl").status, "WARN");
+        assert_eq!(
+            check_by_id(&report, "macos.full_disk_access").status,
+            "FAIL"
+        );
+        assert_eq!(
+            check_by_id(&report, "macos.state_free_space").status,
+            "WARN"
+        );
+        assert!(
+            check_by_id(&report, "macos.full_disk_access")
+                .remediation
+                .as_deref()
+                .is_some_and(|message| message.contains("Full Disk Access"))
+        );
     }
 
     #[test]

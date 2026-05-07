@@ -290,7 +290,13 @@ For non-interactive environments (CI, automation), `sbh install --auto` applies 
 | `sbh stats` | Time-window activity/deletion statistics |
 | `sbh blame` | Attribute artifact pressure by process/agent |
 | `sbh dashboard` | Real-time TUI dashboard |
+| `sbh doctor --pal` | Validate platform integration and macOS runtime prerequisites |
 | `sbh explain --id <decision-id>` | Explain policy decision evidence |
+
+On macOS, `sbh doctor --pal` adds PASS/WARN/FAIL checks for the binary signature,
+Gatekeeper assessment, launchd service state, Full Disk Access, APFS inventory,
+and free space on the state volume. Each warning or failure includes the
+remediation command or system setting to check before installing the daemon.
 
 ### Configuration and Lifecycle
 
