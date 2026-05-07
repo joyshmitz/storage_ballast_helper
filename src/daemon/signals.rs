@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use signal_hook::consts::{SIGINT, SIGTERM};
 
+use crate::platform::pal::{NoopServiceManager, ServiceManager};
+
 // ──────────────────── signal handler ────────────────────
 
 /// Thread-safe signal state shared between the signal handler and the main loop.
@@ -167,34 +169,31 @@ impl Default for ShutdownCoordinator {
 /// Systemd watchdog heartbeat tracker.
 ///
 /// Tracks when the last heartbeat was sent so the main loop can call
-/// `maybe_notify()` each iteration. If enough time has elapsed, it sends
-/// `sd_notify(WATCHDOG=1)`.
+/// `maybe_notify()` each iteration. If enough time has elapsed, it delegates
+/// notification to the active service manager.
 pub struct WatchdogHeartbeat {
     /// Interval between heartbeat notifications (typically half of `WatchdogSec`).
     interval: Duration,
     /// Last time a heartbeat was sent.
     last_beat: Instant,
-    /// Whether systemd watchdog integration is enabled.
+    /// Whether service-manager watchdog integration is enabled.
     enabled: bool,
-    /// Cached socket path (NOTIFY_SOCKET) to avoid repeated env lookups.
-    socket_path: Option<String>,
+    /// Platform service manager used to deliver watchdog notifications.
+    service_manager: Box<dyn ServiceManager>,
 }
 
 impl WatchdogHeartbeat {
     /// Create a heartbeat with the given interval.
     ///
-    /// `watchdog_sec` is the full watchdog timeout from systemd. The heartbeat
-    /// will fire at half that interval.
+    /// `watchdog_sec` is the full watchdog timeout from the service manager.
+    /// The heartbeat will fire at half that interval.
     #[must_use]
-    pub fn new(watchdog_sec: u64) -> Self {
-        let socket_path = std::env::var("NOTIFY_SOCKET")
-            .ok()
-            .filter(|s| !s.is_empty());
+    pub fn new(watchdog_sec: u64, service_manager: Box<dyn ServiceManager>) -> Self {
         Self {
             interval: Duration::from_secs(watchdog_sec / 2),
             last_beat: Instant::now(),
-            enabled: watchdog_sec > 0 && socket_path.is_some(),
-            socket_path,
+            enabled: service_manager.watchdog_enabled(watchdog_sec),
+            service_manager,
         }
     }
 
@@ -205,7 +204,7 @@ impl WatchdogHeartbeat {
             interval: Duration::from_secs(30),
             last_beat: Instant::now(),
             enabled: false,
-            socket_path: None,
+            service_manager: Box::<NoopServiceManager>::default(),
         }
     }
 
@@ -222,7 +221,9 @@ impl WatchdogHeartbeat {
         }
 
         self.last_beat = Instant::now();
-        sd_notify_watchdog(status, self.socket_path.as_deref());
+        if let Err(error) = self.service_manager.notify_watchdog(status) {
+            eprintln!("[SBH-WATCHDOG] failed to notify service manager: {error}");
+        }
         true
     }
 
@@ -233,38 +234,15 @@ impl WatchdogHeartbeat {
     }
 }
 
-/// Send `sd_notify(WATCHDOG=1)` + STATUS=<msg> to systemd.
-fn sd_notify_watchdog(status: &str, socket_path: Option<&str>) {
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(path) = socket_path {
-            sd_notify_linux(status, path);
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = status;
-        let _ = socket_path;
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn sd_notify_linux(status: &str, socket_path: &str) {
-    use std::os::unix::net::UnixDatagram;
-
-    let msg = format!("WATCHDOG=1\nSTATUS={status}\n");
-    let Ok(sock) = UnixDatagram::unbound() else {
-        return;
-    };
-
-    let _ = sock.send_to(msg.as_bytes(), socket_path);
-}
-
 // ──────────────────── tests ────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn noop_service_manager() -> Box<dyn ServiceManager> {
+        Box::<NoopServiceManager>::default()
+    }
 
     #[test]
     fn signal_handler_default_state() {
@@ -361,13 +339,19 @@ mod tests {
     }
 
     #[test]
+    fn watchdog_new_uses_service_manager_enablement() {
+        let wd = WatchdogHeartbeat::new(60, noop_service_manager());
+        assert!(!wd.is_enabled());
+    }
+
+    #[test]
     fn watchdog_respects_interval() {
-        // Construct directly with enabled=true — no env var mutation needed.
+        // Construct directly with enabled=true — no environment mutation needed.
         let mut wd = WatchdogHeartbeat {
             interval: Duration::from_mins(1),
             last_beat: Instant::now(),
             enabled: true,
-            socket_path: Some("/tmp/test.sock".to_string()),
+            service_manager: noop_service_manager(),
         };
         // Just beat, so shouldn't fire again immediately.
         assert!(!wd.maybe_notify("test"));
@@ -382,9 +366,9 @@ mod tests {
                 .checked_sub(Duration::from_secs(1))
                 .expect("1s subtraction should be representable"),
             enabled: true,
-            socket_path: Some("/tmp/test.sock".to_string()),
+            service_manager: noop_service_manager(),
         };
-        // Interval has elapsed, should fire (sd_notify handles failure gracefully).
+        // Interval has elapsed, should fire (service manager handles no-op gracefully).
         assert!(wd.maybe_notify("test"));
     }
 }

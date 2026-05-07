@@ -864,11 +864,7 @@ impl MonitoringDaemon {
         let signal_handler = SignalHandler::new();
 
         // 3. Watchdog.
-        let watchdog = if args.watchdog_sec > 0 {
-            WatchdogHeartbeat::new(args.watchdog_sec)
-        } else {
-            WatchdogHeartbeat::disabled()
-        };
+        let watchdog = WatchdogHeartbeat::new(args.watchdog_sec, platform.service_manager());
 
         // 4. Filesystem collector.
         let fs_collector = FsStatsCollector::new(

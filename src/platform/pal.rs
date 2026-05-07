@@ -162,6 +162,16 @@ pub trait ServiceManager: Send + Sync {
     fn uninstall(&self) -> Result<()>;
     fn status(&self) -> Result<String>;
 
+    fn watchdog_enabled(&self, watchdog_sec: u64) -> bool {
+        let _ = watchdog_sec;
+        false
+    }
+
+    fn notify_watchdog(&self, status: &str) -> Result<()> {
+        let _ = status;
+        Ok(())
+    }
+
     fn restart(&self) -> Result<()> {
         pal_not_implemented("service", "restart")
     }

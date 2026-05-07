@@ -613,6 +613,16 @@ mod tests {
     }
 
     #[test]
+    fn launchd_watchdog_notification_is_noop() {
+        let manager = LaunchdServiceManager::new(launchd_user_snapshot_config());
+
+        assert!(!manager.watchdog_enabled(60));
+        manager
+            .notify_watchdog("pressure=green")
+            .expect("launchd watchdog notification should be a no-op");
+    }
+
+    #[test]
     fn launchd_label_validation_accepts_reverse_dns_labels() {
         let label = validate_launchd_label("com.dicklesworthstone.sbh.test.123")
             .expect("reverse-DNS label should validate");

@@ -293,6 +293,18 @@ impl ServiceManager for SystemdServiceManager {
         Ok(state)
     }
 
+    fn watchdog_enabled(&self, watchdog_sec: u64) -> bool {
+        let socket_path = systemd_notify_socket();
+        systemd_watchdog_enabled(watchdog_sec, socket_path.as_deref())
+    }
+
+    fn notify_watchdog(&self, status: &str) -> Result<()> {
+        if let Some(socket_path) = systemd_notify_socket() {
+            sd_notify_watchdog(status, &socket_path);
+        }
+        Ok(())
+    }
+
     fn restart(&self) -> Result<()> {
         self.run_systemctl(&["restart", SYSTEMD_UNIT_NAME])?;
         Ok(())
@@ -309,6 +321,40 @@ impl ServiceManager for SystemdServiceManager {
             "enabled" | "static" | "linked" | "generated" | "transient"
         ))
     }
+}
+
+fn systemd_notify_socket() -> Option<String> {
+    env::var("NOTIFY_SOCKET")
+        .ok()
+        .filter(|path| !path.is_empty())
+}
+
+fn systemd_watchdog_enabled(watchdog_sec: u64, socket_path: Option<&str>) -> bool {
+    watchdog_sec > 0 && socket_path.is_some_and(|path| !path.is_empty())
+}
+
+fn sd_notify_watchdog(status: &str, socket_path: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        sd_notify_linux(status, socket_path);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = status;
+        let _ = socket_path;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sd_notify_linux(status: &str, socket_path: &str) {
+    use std::os::unix::net::UnixDatagram;
+
+    let msg = format!("WATCHDOG=1\nSTATUS={status}\n");
+    let Ok(sock) = UnixDatagram::unbound() else {
+        return;
+    };
+
+    let _ = sock.send_to(msg.as_bytes(), socket_path);
 }
 
 fn default_read_write_paths(user_scope: bool) -> Vec<PathBuf> {
@@ -328,4 +374,17 @@ fn default_read_write_paths(user_scope: bool) -> Vec<PathBuf> {
         paths.push(home.join(".config/sbh"));
     }
     paths
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+
+    #[test]
+    fn systemd_watchdog_requires_timeout_and_notify_socket() {
+        assert!(systemd_watchdog_enabled(60, Some("/run/systemd/notify")));
+        assert!(!systemd_watchdog_enabled(0, Some("/run/systemd/notify")));
+        assert!(!systemd_watchdog_enabled(60, None));
+        assert!(!systemd_watchdog_enabled(60, Some("")));
+    }
 }
