@@ -203,7 +203,7 @@ pub const USER_NAMED_TRASH: CleanupRule = cleanup_rule(
 
 pub const RELEASE_WORK_BUILDROOT: CleanupRule = cleanup_rule(
     "release-work-buildroot",
-    "~/release-work/*-buildroot",
+    "~/release-work/*[-_]buildroot",
     AgeThreshold::from_days(7),
     CheckRequirement::Required,
     ReclaimCommand::RemoveTree,
@@ -562,7 +562,7 @@ mod tests {
         assert_rule(
             RELEASE_WORK_BUILDROOT,
             "release-work-buildroot",
-            "~/release-work/*-buildroot",
+            "~/release-work/*[-_]buildroot",
             CleanupConfidence::Likely,
             ReclaimCommand::RemoveTree,
             AgeThreshold::from_days(7),

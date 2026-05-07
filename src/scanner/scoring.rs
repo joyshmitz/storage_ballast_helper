@@ -233,6 +233,7 @@ const HARD_REFUSE_BUNDLE_EXTENSIONS: &[&str] = &[
     "lrlibrary",
     "aplibrary",
 ];
+const RELEASE_WORK_BUILDROOT_MIN_AGE: Duration = Duration::from_hours(24 * 7);
 
 /// Deterministic score engine with expected-loss decision layer.
 #[derive(Debug, Clone)]
@@ -416,7 +417,10 @@ impl ScoringEngine {
         if is_system_path(&input.path) {
             return Some(Cow::Borrowed("system path is never deletable"));
         }
-        if input.signals.has_cargo_toml && !input.signals.has_strong_signal() {
+        if input.signals.has_cargo_toml
+            && !input.signals.has_strong_signal()
+            && input.classification.pattern_name != "release-work-buildroot"
+        {
             return Some(Cow::Borrowed(
                 "contains Cargo.toml without build-artifact markers",
             ));
@@ -428,6 +432,14 @@ impl ScoringEngine {
         }
         if let Some(reason) = sacred_overlap_veto_reason(sacred_overlaps) {
             return Some(reason);
+        }
+        if input.classification.pattern_name == "release-work-buildroot"
+            && input.age < RELEASE_WORK_BUILDROOT_MIN_AGE
+        {
+            return Some(Cow::Owned(format!(
+                "release-work buildroot age {}s below 604800s",
+                input.age.as_secs()
+            )));
         }
         if input.excluded {
             return Some(Cow::Borrowed("matched user exclusion"));
@@ -1510,6 +1522,36 @@ mod tests {
         );
 
         assert_eq!(action, DecisionAction::Review);
+    }
+
+    #[test]
+    fn release_work_buildroot_younger_than_seven_days_is_kept() {
+        let engine = default_engine();
+        let input = CandidateInput {
+            path: PathBuf::from("/Users/operator/release-work/tool-buildroot"),
+            size_bytes: 39 * 1_073_741_824,
+            age: Duration::from_hours(24 * 6),
+            classification: ArtifactClassification {
+                pattern_name: Cow::Borrowed("release-work-buildroot"),
+                category: ArtifactCategory::BuildOutput,
+                name_confidence: 0.88,
+                structural_confidence: 0.40,
+                combined_confidence: 0.736,
+            },
+            signals: StructuralSignals::default(),
+            active_references: ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        };
+
+        let score = engine.score_candidate(&input, 0.95);
+
+        assert!(score.vetoed);
+        assert_eq!(score.decision.action, DecisionAction::Keep);
+        assert_eq!(
+            score.veto_reason.as_deref(),
+            Some("release-work buildroot age 518400s below 604800s")
+        );
     }
 
     #[test]

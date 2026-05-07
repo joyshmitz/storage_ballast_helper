@@ -301,6 +301,72 @@ mod tests {
     }
 
     #[test]
+    fn stale_release_work_buildroot_is_actionable_even_with_cargo_manifest() {
+        let registry = ArtifactPatternRegistry::default();
+        let engine = default_engine();
+        let path = PathBuf::from("/Users/operator/release-work/mcp_agent_mail_rust_buildroot");
+        let signals = StructuralSignals {
+            has_cargo_toml: true,
+            ..StructuralSignals::default()
+        };
+        let classification = registry.classify(&path, signals);
+
+        assert_eq!(classification.pattern_name, "release-work-buildroot");
+        assert_eq!(classification.category, ArtifactCategory::BuildOutput);
+
+        let score = engine.score_candidate(
+            &CandidateInput {
+                path,
+                size_bytes: 39 * 1_073_741_824,
+                age: Duration::from_hours(24 * 11),
+                classification,
+                signals,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            0.95,
+        );
+
+        assert!(!score.vetoed, "unexpected veto: {:?}", score.veto_reason);
+        assert_eq!(score.decision.action, DecisionAction::Delete);
+    }
+
+    #[test]
+    fn recent_release_work_buildroot_is_kept_until_seven_days_old() {
+        let registry = ArtifactPatternRegistry::default();
+        let engine = default_engine();
+        let path = PathBuf::from("/Users/operator/release-work/mcp_agent_mail_rust_buildroot");
+        let signals = StructuralSignals::default();
+        let classification = registry.classify(&path, signals);
+
+        assert_eq!(classification.pattern_name, "release-work-buildroot");
+
+        let score = engine.score_candidate(
+            &CandidateInput {
+                path,
+                size_bytes: 39 * 1_073_741_824,
+                age: Duration::from_hours(24 * 6),
+                classification,
+                signals,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            0.95,
+        );
+
+        assert!(score.vetoed);
+        assert_eq!(score.decision.action, DecisionAction::Keep);
+        assert!(
+            score
+                .veto_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("below 604800s"))
+        );
+    }
+
+    #[test]
     fn private_tmp_user_named_trash_with_beads_stowaway_is_hard_kept() {
         let dir = TempDirBuilder::new()
             .prefix("sbh-agent-trash-")

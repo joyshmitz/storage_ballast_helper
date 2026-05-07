@@ -840,6 +840,12 @@ On macOS, `sbh` recognizes Electron application cache directories under `~/Libra
 
 These are classified as likely cleanup candidates, not sacred app data. The cache directory still passes through age, active-file, parent, and sacred-overlap checks before deletion, so a running app with open files can keep its active cache out of the deletion plan.
 
+#### macOS Release Work Buildroots
+
+On macOS, `sbh` recognizes stale staging directories that match `~/release-work/*[-_]buildroot` as `release-work-buildroot` candidates after they are at least seven days old. These are operator-created release build roots that are easy to forget after a release or verification run; the 2026-05-03 `~/release-work/mcp_agent_mail_rust_buildroot` incident left a 39 GB buildroot idle for 11 days.
+
+The detector treats the exact `release-work/*[-_]buildroot` shape as a staging artifact even when the directory contains a copied `Cargo.toml`, but it still passes through active-reference, parent, bundle-extension, and sacred-overlap checks before deletion. Newer buildroots are kept until they cross the seven-day age threshold.
+
 #### macOS User-Named Trash Directories
 
 In volatile temporary roots such as `/tmp` and `/private/tmp`, `sbh` recognizes immediate children named `trash`, `trashed`, or `*-trash-*` as `user-named-trash` candidates. These names are ambiguous by design, so they are never auto-promoted straight to deletion; high-pressure scoring can only place them in **Review** unless another hard veto applies.

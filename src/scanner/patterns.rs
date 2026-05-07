@@ -169,7 +169,15 @@ impl ArtifactPatternRegistry {
             }
         }
 
-        if user_named_trash_pattern_name(path).is_some() {
+        if let Some(pattern_name) = release_work_buildroot_pattern_name(path) {
+            best = ArtifactClassification {
+                pattern_name: Cow::Borrowed(pattern_name),
+                category: ArtifactCategory::BuildOutput,
+                name_confidence: 0.88,
+                structural_confidence: 0.0,
+                combined_confidence: 0.88,
+            };
+        } else if user_named_trash_pattern_name(path).is_some() {
             best = ArtifactClassification {
                 pattern_name: Cow::Borrowed("user-named-trash"),
                 category: ArtifactCategory::TempDir,
@@ -239,6 +247,14 @@ fn macos_cleanup_path_classification(path: &Path) -> Option<ArtifactClassificati
             structural_confidence: 0.0,
             combined_confidence: 0.96,
         })
+    } else if let Some(pattern_name) = release_work_buildroot_pattern_name(path) {
+        Some(ArtifactClassification {
+            pattern_name: Cow::Borrowed(pattern_name),
+            category: ArtifactCategory::BuildOutput,
+            name_confidence: 0.88,
+            structural_confidence: 0.0,
+            combined_confidence: 0.88,
+        })
     } else if user_named_trash_pattern_name(path).is_some() {
         Some(ArtifactClassification {
             pattern_name: Cow::Borrowed("user-named-trash"),
@@ -255,6 +271,21 @@ fn macos_cleanup_path_classification(path: &Path) -> Option<ArtifactClassificati
             structural_confidence: 0.0,
             combined_confidence: 0.92,
         })
+    }
+}
+
+fn release_work_buildroot_pattern_name(path: &Path) -> Option<&'static str> {
+    let parent = path.parent()?;
+    if !path_component_eq(parent, "release-work") {
+        return None;
+    }
+
+    let name = path.file_name().and_then(|name| name.to_str())?;
+    let normalized = name.to_ascii_lowercase();
+    if normalized.ends_with("-buildroot") || normalized.ends_with("_buildroot") {
+        Some("release-work-buildroot")
+    } else {
+        None
     }
 }
 
@@ -733,6 +764,9 @@ pub fn extract_pattern_label(path: &str) -> String {
     if is_xcode_derived_data_project_root(p) {
         return "xcode-derived-data".to_string();
     }
+    if release_work_buildroot_pattern_name(p).is_some() {
+        return "release-work-buildroot".to_string();
+    }
     if user_named_trash_pattern_name(p).is_some() {
         return "user-named-trash".to_string();
     }
@@ -990,6 +1024,35 @@ mod tests {
 
         assert_ne!(classification.pattern_name, "electron-cache");
         assert_ne!(classification.pattern_name, "electron-service-worker-cache");
+    }
+
+    #[test]
+    fn release_work_buildroot_shapes_are_classified() {
+        let registry = ArtifactPatternRegistry::default();
+        for path in [
+            "/Users/operator/release-work/mcp_agent_mail_rust_buildroot",
+            "/Users/operator/release-work/mcp-agent-mail-rust-buildroot",
+        ] {
+            let classification = registry.classify(Path::new(path), StructuralSignals::default());
+
+            assert_eq!(classification.pattern_name, "release-work-buildroot");
+            assert_eq!(classification.category, ArtifactCategory::BuildOutput);
+            assert!(classification.combined_confidence > 0.70);
+            assert_eq!(extract_pattern_label(path), "release-work-buildroot");
+        }
+    }
+
+    #[test]
+    fn buildroot_outside_release_work_is_not_the_release_work_pattern() {
+        let registry = ArtifactPatternRegistry::default();
+        for path in [
+            "/Users/operator/projects/app-buildroot",
+            "/Users/operator/projects/app_buildroot",
+        ] {
+            let classification = registry.classify(Path::new(path), StructuralSignals::default());
+
+            assert_ne!(classification.pattern_name, "release-work-buildroot");
+        }
     }
 
     #[test]
