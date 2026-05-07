@@ -1,3 +1,6 @@
+---
+source: src/daemon/service/launchd.rs
+---
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -27,17 +30,17 @@
 	<key>LowPriorityIO</key>
 	<true/>
 	<key>WorkingDirectory</key>
-	<string>/Users/tester/Library/Application Support/sbh</string>
+	<string>/private/var/sbh</string>
 	<key>StandardOutPath</key>
-	<string>/Users/tester/Library/Logs/sbh/sbh.log</string>
+	<string>/var/log/sbh/sbh.log</string>
 	<key>StandardErrorPath</key>
-	<string>/Users/tester/Library/Logs/sbh/sbh.err</string>
+	<string>/var/log/sbh/sbh.err</string>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>SBH_CONFIG_PATH</key>
-		<string>/Users/tester/Library/Application Support/sbh/config.toml</string>
+		<string>/Library/Application Support/sbh/config.toml</string>
 		<key>SBH_CONFIG</key>
-		<string>/Users/tester/Library/Application Support/sbh/config.toml</string>
+		<string>/Library/Application Support/sbh/config.toml</string>
 		<key>RUST_LOG</key>
 		<string>info</string>
 		<key>SBH_LAUNCHD_LABEL</key>

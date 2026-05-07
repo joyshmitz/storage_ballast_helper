@@ -75,6 +75,7 @@ tempfile = "3.17"
 proptest = "1.6"
 filetime = "0.2"
 criterion = "0.8.2"
+insta = { version = "1.47.2", default-features = false }
 [profile.release]
 opt-level = "z"
 lto = true

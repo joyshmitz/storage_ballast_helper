@@ -553,6 +553,65 @@ fn default_launchd_log_paths(user_scope: bool) -> (PathBuf, PathBuf) {
 mod tests {
     use super::*;
 
+    fn launchd_snapshot_settings(assertion: impl FnOnce()) {
+        let mut settings = insta::Settings::clone_current();
+        settings.set_snapshot_path("../../../tests/snapshots");
+        settings.set_prepend_module_to_snapshot(false);
+        settings.set_omit_expression(true);
+        settings.bind(assertion);
+    }
+
+    fn launchd_user_snapshot_config() -> LaunchdConfig {
+        let home = Path::new("/Users/tester");
+        let paths = PathsConfig::macos_native_for_home(home);
+        let working_directory = paths
+            .state_file
+            .parent()
+            .expect("macOS state path has parent")
+            .to_path_buf();
+        LaunchdConfig {
+            label: LAUNCHD_LABEL.to_string(),
+            user_scope: true,
+            binary_path: PathBuf::from("/usr/local/bin/sbh"),
+            stdout_log: home.join("Library/Logs/sbh/sbh.log"),
+            stderr_log: home.join("Library/Logs/sbh/sbh.err"),
+            working_directory,
+            config_path: paths.config_file,
+            rust_log: "info".to_string(),
+        }
+    }
+
+    fn launchd_system_snapshot_config() -> LaunchdConfig {
+        LaunchdConfig {
+            label: LAUNCHD_LABEL.to_string(),
+            user_scope: false,
+            binary_path: PathBuf::from("/usr/local/bin/sbh"),
+            stdout_log: PathBuf::from("/var/log/sbh/sbh.log"),
+            stderr_log: PathBuf::from("/var/log/sbh/sbh.err"),
+            working_directory: PathBuf::from("/private/var/sbh"),
+            config_path: PathBuf::from("/Library/Application Support/sbh/config.toml"),
+            rust_log: "info".to_string(),
+        }
+    }
+
+    #[test]
+    fn launchd_user_plist_matches_snapshot() {
+        let manager = LaunchdServiceManager::new(launchd_user_snapshot_config());
+
+        launchd_snapshot_settings(|| {
+            insta::assert_snapshot!("launchd_user", manager.generate_plist());
+        });
+    }
+
+    #[test]
+    fn launchd_system_plist_matches_snapshot() {
+        let manager = LaunchdServiceManager::new(launchd_system_snapshot_config());
+
+        launchd_snapshot_settings(|| {
+            insta::assert_snapshot!("launchd_system", manager.generate_plist());
+        });
+    }
+
     #[test]
     fn launchd_label_validation_accepts_reverse_dns_labels() {
         let label = validate_launchd_label("com.dicklesworthstone.sbh.test.123")

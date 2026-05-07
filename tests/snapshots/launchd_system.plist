@@ -27,7 +27,7 @@
 	<key>LowPriorityIO</key>
 	<true/>
 	<key>WorkingDirectory</key>
-	<string>/var/lib/sbh</string>
+	<string>/private/var/sbh</string>
 	<key>StandardOutPath</key>
 	<string>/var/log/sbh/sbh.log</string>
 	<key>StandardErrorPath</key>
@@ -35,9 +35,9 @@
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>SBH_CONFIG_PATH</key>
-		<string>/etc/sbh/config.toml</string>
+		<string>/Library/Application Support/sbh/config.toml</string>
 		<key>SBH_CONFIG</key>
-		<string>/etc/sbh/config.toml</string>
+		<string>/Library/Application Support/sbh/config.toml</string>
 		<key>RUST_LOG</key>
 		<string>info</string>
 		<key>SBH_LAUNCHD_LABEL</key>
