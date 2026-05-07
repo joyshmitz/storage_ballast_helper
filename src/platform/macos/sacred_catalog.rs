@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 
 use serde::Deserialize;
 
+use crate::platform::sacred_catalog::cross_platform_sacred_paths;
 use crate::platform::types::{SacredPath, SacredPathSource};
 
 pub const MACOS_SACRED_CATALOG_TOML: &str = include_str!("sacred.toml");
@@ -46,8 +47,17 @@ pub fn macos_sacred_patterns() -> impl Iterator<Item = &'static str> {
 }
 
 #[must_use]
+pub fn platform_macos_sacred_paths() -> Vec<SacredPath> {
+    let mut paths =
+        Vec::with_capacity(cross_platform_sacred_paths().len() + macos_sacred_paths().len());
+    paths.extend_from_slice(cross_platform_sacred_paths());
+    paths.extend_from_slice(macos_sacred_paths());
+    paths
+}
+
+#[must_use]
 pub fn all_macos_sacred_paths_are_builtin() -> bool {
-    macos_sacred_paths()
+    platform_macos_sacred_paths()
         .iter()
         .all(|entry| entry.source == SacredPathSource::Builtin)
 }
@@ -61,6 +71,7 @@ mod tests {
     use super::{
         MACOS_SACRED_CATALOG_TOML, all_macos_sacred_paths_are_builtin, find_macos_sacred_path,
         macos_sacred_paths, macos_sacred_patterns, parse_macos_sacred_catalog,
+        platform_macos_sacred_paths,
     };
 
     #[test]
@@ -132,5 +143,22 @@ mod tests {
         let patterns: Vec<&str> = macos_sacred_patterns().collect();
         assert_eq!(patterns.len(), macos_sacred_paths().len());
         assert!(patterns.contains(&"~/Library/Mobile Documents/com~apple~CloudDocs/*"));
+    }
+
+    #[test]
+    fn platform_catalog_layers_cross_platform_and_macos_rules() {
+        let platform_paths = platform_macos_sacred_paths();
+        assert!(platform_paths.len() > macos_sacred_paths().len());
+        assert!(
+            platform_paths
+                .iter()
+                .any(|entry| entry.pattern == ".git/" && entry.kind == SacredPathKind::ContainsAny)
+        );
+        assert!(
+            platform_paths
+                .iter()
+                .any(|entry| entry.pattern == "~/Pictures/*.photoslibrary"
+                    && entry.kind == SacredPathKind::GlobMatch)
+        );
     }
 }

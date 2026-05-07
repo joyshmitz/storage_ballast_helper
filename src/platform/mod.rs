@@ -4,6 +4,7 @@
 pub mod linux;
 pub mod macos;
 pub mod pal;
+pub mod sacred_catalog;
 pub mod types;
 
 use pal::Platform;
@@ -37,5 +38,20 @@ mod tests {
         assert_eq!(platform.name(), "linux");
         #[cfg(target_os = "macos")]
         assert_eq!(platform.name(), "macos");
+    }
+
+    #[test]
+    fn current_platform_includes_cross_platform_sacred_catalog() {
+        let platform = current();
+        let patterns = platform
+            .sacred_paths()
+            .into_iter()
+            .map(|entry| entry.pattern)
+            .collect::<Vec<_>>();
+
+        assert!(patterns.iter().any(|pattern| pattern == ".git/"));
+        assert!(patterns.iter().any(|pattern| pattern == ".beads/"));
+        assert!(patterns.iter().any(|pattern| pattern == "*.sqlite3"));
+        assert!(patterns.iter().any(|pattern| pattern == "~/.ssh/*"));
     }
 }

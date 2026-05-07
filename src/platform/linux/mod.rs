@@ -12,7 +12,8 @@ use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::{
     FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
 };
-use crate::platform::types::ServiceKind;
+use crate::platform::sacred_catalog::cross_platform_sacred_paths;
+use crate::platform::types::{SacredPath, ServiceKind};
 
 pub mod disk;
 pub mod memory;
@@ -105,6 +106,10 @@ impl Platform for LinuxPal {
 
     fn service_manager(&self) -> Box<dyn ServiceManager> {
         service::service_manager()
+    }
+
+    fn sacred_paths(&self) -> Vec<SacredPath> {
+        cross_platform_sacred_paths().to_vec()
     }
 
     fn service_kind(&self) -> ServiceKind {

@@ -1,0 +1,137 @@
+[[paths]]
+pattern = ".git/"
+kind = "ContainsAny"
+reason = "Git repository state must never be reclaimed as disposable artifacts."
+source = "Builtin"
+
+[[paths]]
+pattern = ".beads/"
+kind = "ContainsAny"
+reason = "Beads tracker state is agent/project memory and must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "beads.db"
+kind = "StowawayMarker"
+reason = "Beads SQLite databases contain agent/project memory."
+source = "Builtin"
+
+[[paths]]
+pattern = "beads.db-wal"
+kind = "StowawayMarker"
+reason = "Beads SQLite WAL files are part of the live issue database."
+source = "Builtin"
+
+[[paths]]
+pattern = "beads.db-shm"
+kind = "StowawayMarker"
+reason = "Beads SQLite shared-memory files are part of the live issue database."
+source = "Builtin"
+
+[[paths]]
+pattern = "*.db"
+kind = "StowawayMarker"
+reason = "Database files commonly hold application or project state."
+source = "Builtin"
+
+[[paths]]
+pattern = "*.db-wal"
+kind = "StowawayMarker"
+reason = "SQLite WAL sidecars are part of database state."
+source = "Builtin"
+
+[[paths]]
+pattern = "*.db-shm"
+kind = "StowawayMarker"
+reason = "SQLite shared-memory sidecars are part of database state."
+source = "Builtin"
+
+[[paths]]
+pattern = "*.sqlite"
+kind = "StowawayMarker"
+reason = "SQLite files commonly hold application or project state."
+source = "Builtin"
+
+[[paths]]
+pattern = "*.sqlite-wal"
+kind = "StowawayMarker"
+reason = "SQLite WAL sidecars are part of database state."
+source = "Builtin"
+
+[[paths]]
+pattern = "*.sqlite-shm"
+kind = "StowawayMarker"
+reason = "SQLite shared-memory sidecars are part of database state."
+source = "Builtin"
+
+[[paths]]
+pattern = "*.sqlite3"
+kind = "StowawayMarker"
+reason = "SQLite files commonly hold application or project state."
+source = "Builtin"
+
+[[paths]]
+pattern = "*.sqlite3-wal"
+kind = "StowawayMarker"
+reason = "SQLite WAL sidecars are part of database state."
+source = "Builtin"
+
+[[paths]]
+pattern = "*.sqlite3-shm"
+kind = "StowawayMarker"
+reason = "SQLite shared-memory sidecars are part of database state."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/.ssh"
+kind = "ExactMatch"
+reason = "SSH credentials and configuration are security-sensitive user data."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/.ssh/*"
+kind = "GlobMatch"
+reason = "SSH credentials and configuration are security-sensitive user data."
+source = "Builtin"
+
+[[paths]]
+pattern = ".ssh/"
+kind = "ContainsAny"
+reason = "Nested SSH credential directories must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/.gnupg"
+kind = "ExactMatch"
+reason = "GnuPG keyrings and trust databases are security-sensitive user data."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/.gnupg/*"
+kind = "GlobMatch"
+reason = "GnuPG keyrings and trust databases are security-sensitive user data."
+source = "Builtin"
+
+[[paths]]
+pattern = ".gnupg/"
+kind = "ContainsAny"
+reason = "Nested GnuPG credential directories must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/.config/age"
+kind = "ExactMatch"
+reason = "age encryption keys are security-sensitive user data."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/.config/age/*"
+kind = "GlobMatch"
+reason = "age encryption keys are security-sensitive user data."
+source = "Builtin"
+
+[[paths]]
+pattern = ".config/age/"
+kind = "ContainsAny"
+reason = "Nested age key directories must never be reclaimed."
+source = "Builtin"

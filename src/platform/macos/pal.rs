@@ -12,7 +12,7 @@ use crate::platform::macos::libproc::{
     proc_listpids_safe, proc_pid_list_fds, proc_pid_region_path, proc_pid_rusage_v4_safe,
     proc_pidfdinfo_vnode_path, proc_pidinfo_task_all, proc_pidpath_safe,
 };
-use crate::platform::macos::sacred_catalog::macos_sacred_paths;
+use crate::platform::macos::sacred_catalog::platform_macos_sacred_paths;
 use crate::platform::macos::sys::{self, ApfsInventory, ApfsVolumeRole, StatfsSnapshot};
 use crate::platform::pal::{
     FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
@@ -197,7 +197,7 @@ impl Platform for MacOsPal {
     }
 
     fn sacred_paths(&self) -> Vec<SacredPath> {
-        macos_sacred_paths().to_vec()
+        platform_macos_sacred_paths()
     }
 
     fn service_kind(&self) -> ServiceKind {
