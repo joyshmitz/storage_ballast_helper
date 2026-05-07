@@ -129,6 +129,120 @@ fn json_flag_accepted_by_status() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_status_json_matches_diskutil_apfs_capacity() {
+    const TOLERANCE_BYTES: u64 = 100 * 1_048_576;
+
+    let result = common::run_cli_case(
+        "macos_status_json_matches_diskutil_apfs_capacity",
+        &["status", "--json"],
+    );
+    assert!(
+        result.status.success(),
+        "status --json failed; stderr={:?}; log={}",
+        result.stderr,
+        result.log_path.display()
+    );
+    let payload: Value = serde_json::from_str(result.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "expected status JSON, parse failed: {err}; stdout={:?}; log={}",
+            result.stdout,
+            result.log_path.display()
+        )
+    });
+    let mounts = payload["pressure"]["mounts"].as_array().unwrap_or_else(|| {
+        panic!(
+            "status JSON missing pressure.mounts array; payload={payload}; log={}",
+            result.log_path.display()
+        )
+    });
+    let data_mount = mounts
+        .iter()
+        .find(|mount| mount["is_primary"].as_bool() == Some(true))
+        .or_else(|| {
+            mounts.iter().find(|mount| {
+                mount["path"]
+                    .as_str()
+                    .is_some_and(|path| path == "/System/Volumes/Data")
+            })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "status JSON did not include primary APFS Data mount; payload={payload}; log={}",
+                result.log_path.display()
+            )
+        });
+
+    let diskutil = std::process::Command::new("/usr/sbin/diskutil")
+        .args(["apfs", "list", "-plist"])
+        .output()
+        .expect("diskutil should execute on macOS");
+    assert!(
+        diskutil.status.success(),
+        "diskutil apfs list -plist failed: status={} stderr={}",
+        diskutil.status,
+        String::from_utf8_lossy(&diskutil.stderr)
+    );
+    let inventory =
+        storage_ballast_helper::platform::macos::sys::parse_apfs_inventory(&diskutil.stdout)
+            .expect("diskutil APFS plist should parse");
+
+    let container_id = data_mount["container_id"]
+        .as_str()
+        .expect("primary APFS mount should report container_id");
+    let diskutil_container = inventory
+        .containers
+        .iter()
+        .find(|container| container.container_id == container_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "status container_id {container_id:?} not found in diskutil inventory; status_mount={data_mount}"
+            )
+        });
+    let diskutil_total = diskutil_container
+        .capacity_total_bytes
+        .expect("diskutil container should include total capacity");
+    let diskutil_available = diskutil_container
+        .capacity_available_bytes
+        .expect("diskutil container should include available capacity");
+
+    assert_eq!(data_mount["free_excludes_purgeable"], true);
+    assert_eq!(data_mount["is_primary"], true);
+    assert_eq!(data_mount["volume_role"].as_str(), Some("Data"));
+
+    assert_json_bytes_close(
+        data_mount,
+        "container_total",
+        diskutil_total,
+        TOLERANCE_BYTES,
+    );
+    assert_json_bytes_close(data_mount, "total", diskutil_total, TOLERANCE_BYTES);
+    assert_json_bytes_close(
+        data_mount,
+        "container_available",
+        diskutil_available,
+        TOLERANCE_BYTES,
+    );
+    assert_json_bytes_close(data_mount, "free", diskutil_available, TOLERANCE_BYTES);
+}
+
+#[cfg(target_os = "macos")]
+fn assert_json_bytes_close(mount: &Value, key: &'static str, expected: u64, tolerance: u64) {
+    let actual = mount[key]
+        .as_u64()
+        .unwrap_or_else(|| panic!("status mount field {key} should be a u64: {mount}"));
+    let delta = actual.abs_diff(expected);
+    assert!(
+        delta <= tolerance,
+        "{key} mismatch exceeded tolerance: status={actual} diskutil={expected} delta={delta} tolerance={tolerance}; status_mount={mount}"
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn macos_status_json_matches_diskutil_apfs_capacity() {}
+
 #[test]
 fn completions_command_generates_shell_script() {
     let result = common::run_cli_case(
