@@ -100,6 +100,24 @@ impl ApfsInventory {
         siblings.dedup();
         siblings
     }
+
+    #[must_use]
+    pub fn unattributed_container_used_bytes(&self, container_id: &str) -> Option<u64> {
+        let container = self
+            .containers
+            .iter()
+            .find(|candidate| candidate.container_id == container_id)?;
+        let total_bytes = container.capacity_total_bytes?;
+        let available_bytes = container.capacity_available_bytes?;
+        let used_bytes = total_bytes.checked_sub(available_bytes)?;
+        let volume_bytes = self
+            .volumes
+            .iter()
+            .filter(|volume| volume.container_id == container_id)
+            .filter_map(|volume| volume.capacity_in_use_bytes)
+            .fold(0_u64, u64::saturating_add);
+        used_bytes.checked_sub(volume_bytes)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +138,14 @@ pub struct ApfsVolume {
     pub capacity_in_use_bytes: Option<u64>,
     pub container_total_bytes: Option<u64>,
     pub container_available_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSnapshotInfo {
+    pub name: String,
+    pub date: Option<String>,
+    pub retained_bytes_estimate: Option<u64>,
+    pub mount_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +246,64 @@ pub fn apfs_inventory() -> io::Result<ApfsInventory> {
     let inventory = parse_apfs_inventory(&output.stdout)?;
     *cache.write() = Some((Instant::now(), inventory.clone()));
     Ok(inventory)
+}
+
+pub fn local_time_machine_snapshots(
+    mount: &Path,
+    inventory: Option<&ApfsInventory>,
+    volume: Option<&ApfsVolume>,
+) -> io::Result<Vec<LocalSnapshotInfo>> {
+    let output = Command::new("/usr/bin/tmutil")
+        .arg("listlocalsnapshots")
+        .arg(mount)
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "tmutil listlocalsnapshots {} failed with status {}: {}",
+            mount.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    let retained_total_estimate = inventory.zip(volume).and_then(|(inventory, volume)| {
+        // APFS does not expose per-snapshot byte counts through tmutil; treat
+        // container usage that is not attributed to mounted volumes as a
+        // retained-by-snapshots estimate.
+        inventory.unattributed_container_used_bytes(&volume.container_id)
+    });
+    Ok(parse_tmutil_local_snapshots(
+        &String::from_utf8_lossy(&output.stdout),
+        mount,
+        retained_total_estimate,
+    ))
+}
+
+#[must_use]
+pub fn parse_tmutil_local_snapshots(
+    raw: &str,
+    mount_path: &Path,
+    retained_total_estimate: Option<u64>,
+) -> Vec<LocalSnapshotInfo> {
+    let names: Vec<String> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with("Snapshots for disk "))
+        .filter(|line| line.starts_with("com.apple.TimeMachine."))
+        .map(ToOwned::to_owned)
+        .collect();
+    let estimates = distribute_snapshot_estimate(retained_total_estimate, names.len());
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| LocalSnapshotInfo {
+            date: local_snapshot_date(&name),
+            name,
+            retained_bytes_estimate: estimates.get(index).copied().flatten(),
+            mount_path: mount_path.to_path_buf(),
+        })
+        .collect()
 }
 
 pub fn parse_apfs_inventory(raw: &[u8]) -> io::Result<ApfsInventory> {
@@ -354,6 +438,40 @@ fn optional_u64(dict: &plist::Dictionary, key: &str) -> Option<u64> {
     dict.get(key).and_then(Value::as_unsigned_integer)
 }
 
+fn distribute_snapshot_estimate(total: Option<u64>, count: usize) -> Vec<Option<u64>> {
+    let Some(total) = total else {
+        return vec![None; count];
+    };
+    if count == 0 {
+        return Vec::new();
+    }
+    let count_u64 = u64::try_from(count).unwrap_or(u64::MAX);
+    let per_snapshot = total / count_u64;
+    let mut remainder = total % count_u64;
+    (0..count)
+        .map(|_| {
+            let extra = u64::from(remainder > 0);
+            remainder = remainder.saturating_sub(extra);
+            Some(per_snapshot.saturating_add(extra))
+        })
+        .collect()
+}
+
+fn local_snapshot_date(name: &str) -> Option<String> {
+    let suffix = name.strip_prefix("com.apple.TimeMachine.")?;
+    let timestamp = suffix.strip_suffix(".local").unwrap_or(suffix);
+    if timestamp.len() >= "YYYY-MM-DD-HHMMSS".len()
+        && timestamp
+            .chars()
+            .take("YYYY-MM-DD-HHMMSS".len())
+            .all(|candidate| candidate.is_ascii_digit() || candidate == '-')
+    {
+        Some(timestamp[.."YYYY-MM-DD-HHMMSS".len()].to_string())
+    } else {
+        None
+    }
+}
+
 fn volume_roles(dict: &plist::Dictionary) -> Vec<ApfsVolumeRole> {
     let mut roles: Vec<ApfsVolumeRole> = dict
         .get("Roles")
@@ -461,7 +579,7 @@ mod tests {
 
     use super::{
         ApfsVolumeRole, mounted_filesystems, parent_apfs_volume_device, parse_apfs_inventory,
-        statfs,
+        parse_tmutil_local_snapshots, statfs,
     };
 
     #[test]
@@ -554,5 +672,38 @@ mod tests {
             Some("/dev/disk3s1")
         );
         assert_eq!(parent_apfs_volume_device("/dev/disk3s1"), None);
+    }
+
+    #[test]
+    fn parses_tmutil_local_snapshot_names_and_distributes_estimate() {
+        let raw = "\
+Snapshots for disk /:
+com.apple.TimeMachine.2026-05-07-010203.local
+com.apple.TimeMachine.2026-05-07-040506.local
+";
+
+        let snapshots = parse_tmutil_local_snapshots(raw, Path::new("/"), Some(101));
+
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(
+            snapshots[0].name,
+            "com.apple.TimeMachine.2026-05-07-010203.local"
+        );
+        assert_eq!(snapshots[0].date.as_deref(), Some("2026-05-07-010203"));
+        assert_eq!(snapshots[0].retained_bytes_estimate, Some(51));
+        assert_eq!(snapshots[1].retained_bytes_estimate, Some(50));
+        assert_eq!(snapshots[0].mount_path, Path::new("/"));
+    }
+
+    #[test]
+    fn tmutil_parser_ignores_header_and_non_time_machine_snapshots() {
+        let raw = "\
+Snapshots for disk /:
+com.apple.os.update-abc
+";
+
+        let snapshots = parse_tmutil_local_snapshots(raw, Path::new("/"), Some(100));
+
+        assert!(snapshots.is_empty());
     }
 }

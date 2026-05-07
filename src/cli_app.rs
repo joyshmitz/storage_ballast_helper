@@ -4134,6 +4134,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
             println!("  {}", "-".repeat(65));
 
             let mut overall_level = "green";
+            let mut snapshot_warnings = Vec::new();
             for mount in &mounts {
                 let Ok(capacity) = platform.capacity(&mount.path) else {
                     continue;
@@ -4151,6 +4152,9 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 if pressure_severity(level) > pressure_severity(overall_level) {
                     overall_level = level;
                 }
+                if let Some(warning) = local_snapshot_warning(&capacity) {
+                    snapshot_warnings.push(warning);
+                }
 
                 let ram_note = if platform.is_ram_backed(&mount.path).unwrap_or(false) {
                     " (tmpfs)"
@@ -4166,6 +4170,13 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     free_pct,
                     level.to_uppercase(),
                 );
+            }
+
+            if !snapshot_warnings.is_empty() {
+                println!("\nLocal Snapshots:");
+                for warning in snapshot_warnings {
+                    println!("  {warning}");
+                }
             }
 
             if let Some(memory) = &memory_info {
@@ -4536,7 +4547,26 @@ fn status_mount_json(capacity: &Capacity, level: &str, free_pct: f64) -> Value {
         "is_primary": capacity.is_primary,
         "purgeable_bytes": capacity.purgeable_bytes,
         "local_snapshot_bytes": capacity.local_snapshot_bytes,
+        "local_snapshot_reclaim_command": local_snapshot_reclaim_command(capacity),
     })
+}
+
+fn local_snapshot_warning(capacity: &Capacity) -> Option<String> {
+    let bytes = capacity.local_snapshot_bytes.filter(|bytes| *bytes > 0)?;
+    Some(format!(
+        "{} has approximately {} retained by local Time Machine snapshots. Reclaim via: {}",
+        capacity.mount_point.display(),
+        format_bytes(bytes),
+        local_snapshot_reclaim_command(capacity)?
+    ))
+}
+
+fn local_snapshot_reclaim_command(capacity: &Capacity) -> Option<String> {
+    capacity.local_snapshot_bytes.filter(|bytes| *bytes > 0)?;
+    Some(format!(
+        "sudo tmutil thinlocalsnapshots {} 9999999999999999 4",
+        shell_quote(&capacity.mount_point.to_string_lossy())
+    ))
 }
 
 fn bytes_to_pct(value: u64, total: u64) -> f64 {
@@ -8627,6 +8657,37 @@ mod tests {
         assert_eq!(payload["is_primary"], true);
         assert_eq!(payload["purgeable_bytes"], 32);
         assert_eq!(payload["local_snapshot_bytes"], 64);
+        assert_eq!(
+            payload["local_snapshot_reclaim_command"],
+            "sudo tmutil thinlocalsnapshots /System/Volumes/Data 9999999999999999 4"
+        );
+    }
+
+    #[test]
+    fn local_snapshot_warning_includes_reclaim_command() {
+        let capacity = Capacity {
+            mount_point: PathBuf::from("/"),
+            fs_type: "apfs".to_string(),
+            total_bytes: 1_000,
+            free_bytes: 250,
+            available_bytes: 250,
+            is_readonly: false,
+            container_id: Some("/dev/disk3".to_string()),
+            container_total_bytes: Some(1_000),
+            container_available_bytes: Some(250),
+            volume_total_bytes: Some(400),
+            volume_available_bytes: Some(100),
+            volume_role: Some("Data".to_string()),
+            shared_volumes: Vec::new(),
+            is_primary: true,
+            purgeable_bytes: None,
+            local_snapshot_bytes: Some(64),
+        };
+
+        let warning = local_snapshot_warning(&capacity).expect("warning should be present");
+
+        assert!(warning.contains("64 B retained by local Time Machine snapshots"));
+        assert!(warning.contains("sudo tmutil thinlocalsnapshots / 9999999999999999 4"));
     }
 
     #[test]

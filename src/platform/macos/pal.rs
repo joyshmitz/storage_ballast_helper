@@ -81,7 +81,10 @@ impl Platform for MacOsPal {
     fn capacity(&self, mount: &Path) -> Result<Capacity> {
         let stats = sys::statfs(mount).map_err(|error| macos_method_error("capacity", &error))?;
         let inventory = sys::apfs_inventory().ok();
-        Ok(statfs_to_capacity(stats, inventory.as_ref()))
+        let local_snapshot_bytes = local_snapshot_bytes_for_capacity(&stats, inventory.as_ref());
+        let mut capacity = statfs_to_capacity(stats, inventory.as_ref());
+        capacity.local_snapshot_bytes = local_snapshot_bytes;
+        Ok(capacity)
     }
 
     fn mounts(&self) -> Result<Vec<MountInfo>> {
@@ -412,6 +415,20 @@ fn statfs_to_capacity(stats: StatfsSnapshot, inventory: Option<&ApfsInventory>) 
         purgeable_bytes: None,
         local_snapshot_bytes: None,
     }
+}
+
+fn local_snapshot_bytes_for_capacity(
+    stats: &StatfsSnapshot,
+    inventory: Option<&ApfsInventory>,
+) -> Option<u64> {
+    let volume = inventory.and_then(|inventory| inventory.volume_for_device(&stats.device));
+    let snapshots =
+        sys::local_time_machine_snapshots(&stats.mount_point, inventory, volume).ok()?;
+    let total = snapshots
+        .iter()
+        .filter_map(|snapshot| snapshot.retained_bytes_estimate)
+        .fold(0_u64, u64::saturating_add);
+    (total > 0).then_some(total)
 }
 
 fn statfs_to_mount_info(stats: StatfsSnapshot, inventory: Option<&ApfsInventory>) -> MountInfo {
