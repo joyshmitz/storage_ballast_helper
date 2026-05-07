@@ -29,7 +29,10 @@ use crate::ballast::release::BallastReleaseController;
 use crate::core::config::Config;
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::notifications::{NotificationEvent, NotificationLevel, NotificationManager};
-use crate::daemon::policy::{ActiveMode, PolicyEngine};
+use crate::daemon::policy::{
+    ActiveMode, BallastAction, BehaviorDispatchTable, BehaviorMode, CleanupAction, PolicyEngine,
+    ScanAggressiveness,
+};
 use crate::daemon::self_monitor::{SelfMonitor, ThreadHeartbeat};
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, spawn_logger};
@@ -44,7 +47,9 @@ use crate::monitor::predictive::{PredictiveAction, PredictiveActionPolicy};
 use crate::monitor::special_locations::SpecialLocationRegistry;
 use crate::monitor::voi_scheduler::VoiScheduler;
 use crate::platform::pal::{MemoryInfo, Platform, detect_platform};
-use crate::platform::types::{FullDiskAccessState, FullDiskAccessStatus};
+use crate::platform::types::{
+    FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureLevel,
+};
 use crate::scanner::deletion::{DeletionConfig, DeletionExecutor};
 use crate::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, StructuralSignals,
@@ -91,6 +96,11 @@ const SWAP_THRASH_MIN_AVAILABLE_RAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const TEMP_FAST_TRACK_MIN_OBSERVED_AGE: Duration = Duration::from_mins(2);
 /// Recheck macOS Full Disk Access grants without adding pressure-loop noise.
 const FULL_DISK_ACCESS_RECHECK_INTERVAL: Duration = Duration::from_mins(5);
+/// Memory pressure callbacks wake the monitor loop instead of waiting for the
+/// next disk-pressure poll.
+const MEMORY_PRESSURE_CHANNEL_CAP: usize = 16;
+/// Maximum time the monitor loop may wait between memory-pressure event checks.
+const MEMORY_PRESSURE_WAKE_INTERVAL: Duration = Duration::from_millis(500);
 
 // ──────────────────── shared executor config ────────────────────
 
@@ -215,6 +225,70 @@ enum WorkerReport {
         bytes_freed: u64,
         failed: u64,
     },
+}
+
+#[derive(Debug, Clone)]
+struct MemoryPressureEvent {
+    pressure: MemoryPressure,
+    received_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BehaviorTransition {
+    from_memory: MemoryPressureLevel,
+    to_memory: MemoryPressureLevel,
+    from_disk: PressureLevel,
+    to_disk: PressureLevel,
+    from_mode: BehaviorMode,
+    to_mode: BehaviorMode,
+}
+
+#[derive(Debug, Clone)]
+struct PressureBehaviorState {
+    table: BehaviorDispatchTable,
+    memory_level: MemoryPressureLevel,
+    disk_level: PressureLevel,
+    mode: BehaviorMode,
+}
+
+impl PressureBehaviorState {
+    fn new(memory_level: MemoryPressureLevel, disk_level: PressureLevel) -> Self {
+        let table = BehaviorDispatchTable::default();
+        let mode = table.mode_for(memory_level, disk_level);
+        Self {
+            table,
+            memory_level,
+            disk_level,
+            mode,
+        }
+    }
+
+    fn update(
+        &mut self,
+        memory_level: MemoryPressureLevel,
+        disk_level: PressureLevel,
+    ) -> Option<BehaviorTransition> {
+        let next_mode = self.table.mode_for(memory_level, disk_level);
+        if self.memory_level == memory_level
+            && self.disk_level == disk_level
+            && self.mode == next_mode
+        {
+            return None;
+        }
+
+        let transition = BehaviorTransition {
+            from_memory: self.memory_level,
+            to_memory: memory_level,
+            from_disk: self.disk_level,
+            to_disk: disk_level,
+            from_mode: self.mode,
+            to_mode: next_mode,
+        };
+        self.memory_level = memory_level;
+        self.disk_level = disk_level;
+        self.mode = next_mode;
+        Some(transition)
+    }
 }
 
 /// Bounded capacity for the worker→monitor results channel.
@@ -442,6 +516,7 @@ pub struct MonitoringDaemon {
     full_disk_access_granted_logged: bool,
     self_monitor: SelfMonitor,
     policy_engine: Arc<Mutex<PolicyEngine>>,
+    behavior_state: PressureBehaviorState,
     shared_guard_diagnostics: Arc<RwLock<Option<GuardDiagnostics>>>,
     scanner_heartbeat: Arc<ThreadHeartbeat>,
     executor_heartbeat: Arc<ThreadHeartbeat>,
@@ -743,6 +818,42 @@ fn full_disk_access_status_log_message(
     }
 }
 
+fn behavior_allows_scan(mode: BehaviorMode) -> bool {
+    mode.scan_aggressiveness != ScanAggressiveness::Skip
+}
+
+fn behavior_allows_delete_dispatch(mode: BehaviorMode) -> bool {
+    !matches!(
+        mode.cleanup_action,
+        CleanupAction::None | CleanupAction::IdentifyOnly
+    )
+}
+
+fn behavior_delete_batch_limit(mode: BehaviorMode, configured_limit: usize) -> usize {
+    if behavior_allows_delete_dispatch(mode) {
+        configured_limit
+    } else {
+        0
+    }
+}
+
+fn behavior_should_release_ballast(mode: BehaviorMode) -> bool {
+    matches!(
+        mode.ballast_action,
+        BallastAction::Release | BallastAction::ReleaseFirst
+    )
+}
+
+fn behavior_mode_summary(mode: BehaviorMode) -> String {
+    format!(
+        "scan={:?} cleanup={:?} ballast={:?} notify={:?}",
+        mode.scan_aggressiveness,
+        mode.cleanup_action,
+        mode.ballast_action,
+        mode.notification_priority
+    )
+}
+
 impl MonitoringDaemon {
     /// Build and initialize the daemon from configuration.
     #[allow(clippy::too_many_lines)]
@@ -830,6 +941,8 @@ impl MonitoringDaemon {
         // 14. Policy engine (progressive delivery gates for deletion pipeline).
         let policy_engine = Arc::new(Mutex::new(PolicyEngine::new(config.policy.clone())));
         let shared_guard_diagnostics = Arc::new(RwLock::new(None));
+        let behavior_state =
+            PressureBehaviorState::new(MemoryPressureLevel::Unknown, PressureLevel::Green);
 
         let cached_primary_path = compute_primary_path(&config);
         let prediction_config = config.pressure.prediction.clone();
@@ -881,6 +994,7 @@ impl MonitoringDaemon {
             last_full_disk_access_state: None,
             full_disk_access_granted_logged: false,
             self_monitor,
+            behavior_state,
             scanner_heartbeat,
             executor_heartbeat,
             shared_guard_diagnostics,
@@ -924,6 +1038,121 @@ impl MonitoringDaemon {
         }
     }
 
+    fn start_memory_pressure_subscription(
+        &self,
+        tx: Sender<MemoryPressureEvent>,
+    ) -> Option<crate::platform::types::SubscriptionHandle> {
+        let callback = Box::new(move |pressure: MemoryPressure| {
+            let event = MemoryPressureEvent {
+                pressure,
+                received_at: Instant::now(),
+            };
+            let _ = tx.try_send(event);
+        });
+
+        match self.platform.subscribe_memory_pressure(callback) {
+            Ok(handle) => {
+                self.logger_handle.send(ActivityEvent::Info {
+                    message: format!("memory pressure subscription active: {}", handle.source),
+                });
+                Some(handle)
+            }
+            Err(error) => {
+                self.logger_handle.send(ActivityEvent::Error {
+                    code: "SBH-1101".to_string(),
+                    message: format!("memory pressure subscription unavailable: {error}"),
+                });
+                None
+            }
+        }
+    }
+
+    fn seed_memory_pressure_behavior(&mut self, disk_level: PressureLevel) {
+        let memory_level = match self.platform.memory_pressure() {
+            Ok(pressure) => pressure.level,
+            Err(error) => {
+                self.logger_handle.send(ActivityEvent::Error {
+                    code: "SBH-1101".to_string(),
+                    message: format!("initial memory pressure read failed: {error}"),
+                });
+                MemoryPressureLevel::Unknown
+            }
+        };
+        self.update_behavior_mode(memory_level, disk_level, "startup", Duration::ZERO);
+    }
+
+    fn update_behavior_mode(
+        &mut self,
+        memory_level: MemoryPressureLevel,
+        disk_level: PressureLevel,
+        source: &str,
+        latency: Duration,
+    ) {
+        if let Some(transition) = self.behavior_state.update(memory_level, disk_level) {
+            let message = format!(
+                "behavior mode changed source={source} latency_ms={} memory={:?}->{:?} \
+                 disk={:?}->{:?} mode=({}) -> ({})",
+                latency.as_millis(),
+                transition.from_memory,
+                transition.to_memory,
+                transition.from_disk,
+                transition.to_disk,
+                behavior_mode_summary(transition.from_mode),
+                behavior_mode_summary(transition.to_mode)
+            );
+            eprintln!("[SBH-DAEMON] {message}");
+            self.logger_handle.send(ActivityEvent::Info { message });
+        }
+    }
+
+    fn drain_memory_pressure_events(
+        &mut self,
+        rx: &Receiver<MemoryPressureEvent>,
+        disk_level: PressureLevel,
+    ) {
+        while let Ok(event) = rx.try_recv() {
+            self.update_behavior_mode(
+                event.pressure.level,
+                disk_level,
+                "memory_pressure",
+                event.received_at.elapsed(),
+            );
+        }
+    }
+
+    fn sleep_with_memory_pressure_events(
+        &mut self,
+        rx: &Receiver<MemoryPressureEvent>,
+        disk_level: PressureLevel,
+        interval: Duration,
+    ) {
+        let deadline = Instant::now() + interval;
+        loop {
+            let now = Instant::now();
+            let Some(remaining) = deadline.checked_duration_since(now) else {
+                break;
+            };
+            if remaining.is_zero() {
+                break;
+            }
+
+            let wait = remaining.min(MEMORY_PRESSURE_WAKE_INTERVAL);
+            match rx.recv_timeout(wait) {
+                Ok(event) => {
+                    self.update_behavior_mode(
+                        event.pressure.level,
+                        disk_level,
+                        "memory_pressure",
+                        event.received_at.elapsed(),
+                    );
+                    self.drain_memory_pressure_events(rx, disk_level);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
     /// Run the monitoring loop until shutdown is requested.
     ///
     /// This is the main entry point for `sbh daemon`.
@@ -953,6 +1182,12 @@ impl MonitoringDaemon {
                 initial_response.level, initial_response.urgency
             );
         }
+
+        let (memory_pressure_tx, memory_pressure_rx) =
+            bounded::<MemoryPressureEvent>(MEMORY_PRESSURE_CHANNEL_CAP);
+        self.seed_memory_pressure_behavior(initial_response.level);
+        let _memory_pressure_subscription =
+            self.start_memory_pressure_subscription(memory_pressure_tx);
 
         // Create inter-thread channels.
         let (scan_tx, scan_rx) = bounded::<ScanRequest>(SCANNER_CHANNEL_CAP);
@@ -1004,7 +1239,11 @@ impl MonitoringDaemon {
                         message: format!("pressure check failed: {e}"),
                     });
                     // On error, sleep and retry.
-                    thread::sleep(Duration::from_secs(1));
+                    self.sleep_with_memory_pressure_events(
+                        &memory_pressure_rx,
+                        self.last_pressure_level,
+                        Duration::from_secs(1),
+                    );
                     continue;
                 }
             };
@@ -1036,6 +1275,14 @@ impl MonitoringDaemon {
                 }
                 self.last_pressure_level = response.level;
             }
+
+            self.update_behavior_mode(
+                self.behavior_state.memory_level,
+                response.level,
+                "disk_pressure",
+                Duration::ZERO,
+            );
+            self.drain_memory_pressure_events(&memory_pressure_rx, response.level);
 
             // 5. Handle pressure response.
             self.handle_pressure(&response, &scan_tx, &scan_rx);
@@ -1274,8 +1521,14 @@ impl MonitoringDaemon {
                 self.last_summary_report = Instant::now();
             }
 
-            // 11. Sleep for the PID-adjusted interval.
-            thread::sleep(response.scan_interval);
+            // 11. Sleep for the PID-adjusted interval, but wake immediately
+            // for memory-pressure transitions so behavior changes are not
+            // delayed until the next disk-pressure poll.
+            self.sleep_with_memory_pressure_events(
+                &memory_pressure_rx,
+                response.level,
+                response.scan_interval,
+            );
         }
 
         // ──────── shutdown sequence ────────
@@ -1518,6 +1771,10 @@ impl MonitoringDaemon {
             .set_min_score(self.config.scoring.min_score);
         self.check_predictive_warning(response);
 
+        let behavior = self.behavior_state.mode;
+        let scan_allowed = behavior_allows_scan(behavior);
+        let release_ballast = behavior_should_release_ballast(behavior);
+
         // Determine scan targets: routine maintenance (Green) scans everything;
         // elevated pressure targets only the causing volume to maximize ROI.
         let scan_paths = if response.level == PressureLevel::Green {
@@ -1613,7 +1870,7 @@ impl MonitoringDaemon {
                 // pressure so that guard windows can update and recovery can
                 // trigger. Without this, FallbackSafe at green is permanent.
                 let in_fallback = self.policy_engine.lock().mode() == ActiveMode::FallbackSafe;
-                if needs_scan || in_fallback {
+                if scan_allowed && (needs_scan || in_fallback) {
                     self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
                     if needs_scan {
                         self.last_tick_cleanup_ran = true;
@@ -1623,29 +1880,43 @@ impl MonitoringDaemon {
             PressureLevel::Yellow => {
                 // Increase scan frequency (handled by PID interval).
                 // Light scanning.
-                if response.release_ballast_files > 0 {
+                if release_ballast {
                     let _ = self.release_ballast(&response.causing_mount, response);
                 }
-                self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
-                self.last_tick_cleanup_ran = true;
+                if scan_allowed {
+                    self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
+                    self.last_tick_cleanup_ran = true;
+                }
             }
             PressureLevel::Orange => {
                 // Start scanning + gentle cleanup + early ballast release.
-                let _ = self.release_ballast(&response.causing_mount, response);
-                self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
-                self.last_tick_cleanup_ran = true;
+                if release_ballast {
+                    let _ = self.release_ballast(&response.causing_mount, response);
+                }
+                if scan_allowed {
+                    self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
+                    self.last_tick_cleanup_ran = true;
+                }
             }
             PressureLevel::Red => {
                 // Release ballast + aggressive scan + delete.
-                let _ = self.release_ballast(&response.causing_mount, response);
-                self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
-                self.last_tick_cleanup_ran = true;
+                if release_ballast {
+                    let _ = self.release_ballast(&response.causing_mount, response);
+                }
+                if scan_allowed {
+                    self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
+                    self.last_tick_cleanup_ran = true;
+                }
             }
             PressureLevel::Critical => {
                 // Emergency: release all ballast + delete everything safe.
-                let _ = self.release_ballast(&response.causing_mount, response);
-                self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
-                self.last_tick_cleanup_ran = true;
+                if release_ballast {
+                    let _ = self.release_ballast(&response.causing_mount, response);
+                }
+                if scan_allowed {
+                    self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
+                    self.last_tick_cleanup_ran = true;
+                }
 
                 let primary = self.primary_path();
                 let actual_free_pct = self
@@ -1716,7 +1987,10 @@ impl MonitoringDaemon {
             paths,
             urgency: response.urgency,
             pressure_level: response.level,
-            max_delete_batch: response.max_delete_batch,
+            max_delete_batch: behavior_delete_batch_limit(
+                self.behavior_state.mode,
+                response.max_delete_batch,
+            ),
             config_update: None,
         };
 
@@ -2298,6 +2572,10 @@ fn dispatch_top_candidates(
     if scored.is_empty() {
         return true;
     }
+    if request.max_delete_batch == 0 {
+        scored.clear();
+        return true;
+    }
 
     scored.sort_by(|a, b| {
         b.total_score
@@ -2719,16 +2997,23 @@ fn scanner_thread_main(
                     .partial_cmp(&a.total_score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            let batch = DeletionBatch {
-                candidates: priority_candidates,
-                pressure_level: request.pressure_level,
-                urgency: request.urgency,
-            };
-            if del_tx.try_send(batch).is_ok() {
+            if request.max_delete_batch == 0 {
                 candidates_found += count;
                 eprintln!(
-                    "[SBH-SCANNER] priority pre-scan dispatched {count} candidates ({breakdown_str})"
+                    "[SBH-SCANNER] priority pre-scan identified {count} candidates without cleanup ({breakdown_str})"
                 );
+            } else {
+                let batch = DeletionBatch {
+                    candidates: priority_candidates,
+                    pressure_level: request.pressure_level,
+                    urgency: request.urgency,
+                };
+                if del_tx.try_send(batch).is_ok() {
+                    candidates_found += count;
+                    eprintln!(
+                        "[SBH-SCANNER] priority pre-scan dispatched {count} candidates ({breakdown_str})"
+                    );
+                }
             }
         }
 
@@ -3492,6 +3777,63 @@ mod tests {
                 summary: "test".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn behavior_state_updates_memory_and_disk_matrix_cells() {
+        let mut state =
+            PressureBehaviorState::new(MemoryPressureLevel::Normal, PressureLevel::Green);
+        assert_eq!(state.mode.scan_aggressiveness, ScanAggressiveness::Normal);
+
+        let memory_transition = state
+            .update(MemoryPressureLevel::Warn, PressureLevel::Green)
+            .expect("warn memory should change behavior");
+        assert_eq!(memory_transition.from_memory, MemoryPressureLevel::Normal);
+        assert_eq!(memory_transition.to_memory, MemoryPressureLevel::Warn);
+        assert_eq!(state.mode.scan_aggressiveness, ScanAggressiveness::Light);
+        assert_eq!(state.mode.cleanup_action, CleanupAction::None);
+
+        let disk_transition = state
+            .update(MemoryPressureLevel::Warn, PressureLevel::Red)
+            .expect("red disk should change behavior");
+        assert_eq!(disk_transition.from_disk, PressureLevel::Green);
+        assert_eq!(disk_transition.to_disk, PressureLevel::Red);
+        assert_eq!(state.mode.cleanup_action, CleanupAction::DefiniteCandidates);
+        assert_eq!(state.mode.ballast_action, BallastAction::ReleaseFirst);
+    }
+
+    #[test]
+    fn behavior_delete_batch_limit_blocks_identify_only_cleanup() {
+        let table = BehaviorDispatchTable::default();
+        let identify_only = table.mode_for(MemoryPressureLevel::Normal, PressureLevel::Yellow);
+        assert_eq!(identify_only.cleanup_action, CleanupAction::IdentifyOnly);
+        assert_eq!(behavior_delete_batch_limit(identify_only, 5), 0);
+
+        let cleanup = table.mode_for(MemoryPressureLevel::Warn, PressureLevel::Red);
+        assert_eq!(cleanup.cleanup_action, CleanupAction::DefiniteCandidates);
+        assert_eq!(behavior_delete_batch_limit(cleanup, 20), 20);
+    }
+
+    #[test]
+    fn dispatch_top_candidates_identifies_without_deletion_when_batch_limit_is_zero() {
+        let (del_tx, del_rx) = bounded::<DeletionBatch>(1);
+        let request = ScanRequest {
+            paths: vec![PathBuf::from("/tmp")],
+            urgency: 0.5,
+            pressure_level: PressureLevel::Yellow,
+            max_delete_batch: 0,
+            config_update: None,
+        };
+        let mut scored = vec![test_candidate("/tmp/a", 0.4), test_candidate("/tmp/b", 0.6)];
+
+        assert!(dispatch_top_candidates(&mut scored, &request, &del_tx));
+        assert!(scored.is_empty());
+        assert!(del_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn memory_pressure_wake_interval_meets_transition_latency_budget() {
+        assert!(MEMORY_PRESSURE_WAKE_INTERVAL <= Duration::from_millis(500));
     }
 
     #[test]
