@@ -967,6 +967,35 @@ mod tests {
     }
 
     #[test]
+    fn core_simulator_caches_are_classified_but_devices_are_not() {
+        let registry = ArtifactPatternRegistry::default();
+        let cache_path =
+            Path::new("/Users/operator/Library/Developer/CoreSimulator/Caches/device-cache");
+        let cache_classification =
+            classify_macos(&registry, cache_path, StructuralSignals::default());
+
+        assert_eq!(cache_classification.pattern_name, "core-simulator-caches");
+        assert_eq!(cache_classification.category, ArtifactCategory::CacheDir);
+        assert!(cache_classification.combined_confidence > 0.75);
+        assert_eq!(
+            extract_macos_pattern_label(cache_path.to_str().unwrap()),
+            "core-simulator-caches"
+        );
+
+        let device_path = Path::new(
+            "/Users/operator/Library/Developer/CoreSimulator/Devices/ABCDEF/data/Library/Caches",
+        );
+        let device_classification =
+            classify_macos(&registry, device_path, StructuralSignals::default());
+
+        assert_ne!(device_classification.pattern_name, "core-simulator-caches");
+        assert_ne!(
+            extract_macos_pattern_label(device_path.to_str().unwrap()),
+            "core-simulator-caches"
+        );
+    }
+
+    #[test]
     fn electron_application_support_cache_shapes_are_classified() {
         let registry = ArtifactPatternRegistry::default();
         let cases = [

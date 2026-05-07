@@ -531,6 +531,60 @@ mod tests {
     }
 
     #[test]
+    fn core_simulator_cache_entry_is_actionable_but_devices_are_kept() {
+        let registry = ArtifactPatternRegistry::default();
+        let engine = default_engine();
+        let cache_path =
+            PathBuf::from("/Users/operator/Library/Developer/CoreSimulator/Caches/device-cache");
+        let cache_signals = StructuralSignals::default();
+        let cache_classification = classify_macos(&registry, &cache_path, cache_signals);
+
+        assert_eq!(cache_classification.pattern_name, "core-simulator-caches");
+        assert_eq!(cache_classification.category, ArtifactCategory::CacheDir);
+
+        let cache_score = engine.score_candidate(
+            &CandidateInput {
+                path: cache_path,
+                size_bytes: 2 * 1_073_741_824,
+                age: Duration::from_hours(48),
+                classification: cache_classification,
+                signals: cache_signals,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            0.95,
+        );
+
+        assert!(!cache_score.vetoed);
+        assert_eq!(cache_score.decision.action, DecisionAction::Delete);
+
+        let device_path = PathBuf::from(
+            "/Users/operator/Library/Developer/CoreSimulator/Devices/ABCDEF/data/Library/Caches",
+        );
+        let device_signals = StructuralSignals::default();
+        let device_classification = classify_macos(&registry, &device_path, device_signals);
+
+        assert_ne!(device_classification.pattern_name, "core-simulator-caches");
+
+        let device_score = engine.score_candidate(
+            &CandidateInput {
+                path: device_path,
+                size_bytes: 2 * 1_073_741_824,
+                age: Duration::from_hours(48),
+                classification: device_classification,
+                signals: device_signals,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            0.95,
+        );
+
+        assert_eq!(device_score.decision.action, DecisionAction::Keep);
+    }
+
+    #[test]
     fn electron_service_worker_cache_is_actionable_cache_dir() {
         let registry = ArtifactPatternRegistry::default();
         let engine = default_engine();

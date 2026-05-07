@@ -353,6 +353,7 @@ const fn sacred_rule(name: &'static str, path_glob: &'static str) -> CleanupRule
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::path::Path;
     use std::time::Duration;
 
     use super::{
@@ -365,6 +366,7 @@ mod tests {
         TIME_MACHINE_LOCAL_SNAPSHOTS, TMP_DASH_TARGET, TMP_TARGET_UNDERSCORE_PREFIX,
         TMP_UNDERSCORE_TARGET, USER_LOGS, USER_NAMED_TRASH, USER_NAMED_TRASH_EXACT,
         USER_NAMED_TRASHED_EXACT, XCODE_DERIVED_DATA, cleanup_rules, find_rule,
+        match_path_scanner_rule, match_rule,
     };
 
     #[test]
@@ -457,6 +459,27 @@ mod tests {
             ReclaimCommand::RemoveTree,
             AgeThreshold::from_hours(24),
         );
+    }
+
+    #[test]
+    fn core_simulator_devices_are_not_cleanup_candidates() {
+        for path in [
+            Path::new("/Users/operator/Library/Developer/CoreSimulator/Devices"),
+            Path::new(
+                "/Users/operator/Library/Developer/CoreSimulator/Devices/ABCDEF/data/Library/Caches",
+            ),
+        ] {
+            assert!(
+                match_rule(path).is_none(),
+                "CoreSimulator device state must not match a cleanup rule: {}",
+                path.display()
+            );
+            assert!(
+                match_path_scanner_rule(path).is_none(),
+                "CoreSimulator device state must not become a path-scanner candidate: {}",
+                path.display()
+            );
+        }
     }
 
     #[test]
