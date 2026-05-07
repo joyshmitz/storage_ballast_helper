@@ -5,7 +5,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use storage_ballast_helper::core::config::ScoringConfig;
-    use storage_ballast_helper::scanner::patterns::{ArtifactPatternRegistry, StructuralSignals};
+    use storage_ballast_helper::scanner::patterns::{
+        ArtifactCategory, ArtifactPatternRegistry, StructuralSignals,
+    };
     use storage_ballast_helper::scanner::scoring::{
         ActiveReferenceSummary, CandidateInput, DecisionAction, ScoringEngine,
     };
@@ -135,5 +137,39 @@ mod tests {
             score.veto_reason.as_deref(),
             Some("contains Cargo.toml without build-artifact markers")
         );
+    }
+
+    #[test]
+    fn xcode_derived_data_project_dir_is_actionable_build_output() {
+        let registry = ArtifactPatternRegistry::default();
+        let engine = default_engine();
+        let path =
+            PathBuf::from("/Users/operator/Library/Developer/Xcode/DerivedData/sbh-demo-abc123");
+        let signals = StructuralSignals {
+            has_build: true,
+            mostly_object_files: true,
+            ..StructuralSignals::default()
+        };
+        let classification = registry.classify(&path, signals);
+
+        assert_eq!(classification.pattern_name, "xcode-derived-data");
+        assert_eq!(classification.category, ArtifactCategory::BuildOutput);
+
+        let score = engine.score_candidate(
+            &CandidateInput {
+                path,
+                size_bytes: 3 * 1_073_741_824,
+                age: Duration::from_hours(24 * 8),
+                classification,
+                signals,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            0.8,
+        );
+
+        assert!(!score.vetoed);
+        assert_eq!(score.decision.action, DecisionAction::Delete);
     }
 }

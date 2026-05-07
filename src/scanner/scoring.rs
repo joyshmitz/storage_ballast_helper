@@ -520,6 +520,8 @@ fn factor_location(path: &Path) -> f64 {
         0.85
     } else if text.contains("/data/projects/") && text.contains("/target") {
         0.80
+    } else if text.contains("/Library/Developer/Xcode/DerivedData/") {
+        0.90
     } else if text.contains("/.cache/") {
         0.60
     } else if text.contains("/projects/") {

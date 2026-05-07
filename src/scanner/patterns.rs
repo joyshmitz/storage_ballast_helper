@@ -139,7 +139,8 @@ impl ArtifactPatternRegistry {
         };
         let normalized = name_os.to_string_lossy().to_lowercase();
 
-        let mut best = ArtifactClassification::unknown();
+        let mut best =
+            macos_cleanup_path_classification(path).unwrap_or_else(ArtifactClassification::unknown);
         for pattern in &self.builtins {
             if matches_builtin(pattern.kind, &normalized)
                 && pattern.confidence > best.name_confidence
@@ -217,6 +218,46 @@ fn matches_builtin(kind: MatchKind, normalized: &str) -> bool {
         MatchKind::Suffix(token) => normalized.ends_with(token),
         MatchKind::Contains(token) => normalized.contains(token),
     }
+}
+
+fn macos_cleanup_path_classification(path: &Path) -> Option<ArtifactClassification> {
+    if is_xcode_derived_data_project_root(path) {
+        Some(ArtifactClassification {
+            pattern_name: Cow::Borrowed("xcode-derived-data"),
+            category: ArtifactCategory::BuildOutput,
+            name_confidence: 0.96,
+            structural_confidence: 0.0,
+            combined_confidence: 0.96,
+        })
+    } else {
+        None
+    }
+}
+
+fn is_xcode_derived_data_project_root(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    path.file_name().is_some()
+        && path_component_eq(parent, "DerivedData")
+        && parent
+            .parent()
+            .is_some_and(|xcode| path_component_eq(xcode, "Xcode"))
+        && parent
+            .parent()
+            .and_then(Path::parent)
+            .is_some_and(|developer| path_component_eq(developer, "Developer"))
+        && parent
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .is_some_and(|library| path_component_eq(library, "Library"))
+}
+
+fn path_component_eq(path: &Path, expected: &str) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(expected))
 }
 
 fn structural_score(category: ArtifactCategory, signals: StructuralSignals) -> f64 {
@@ -601,6 +642,10 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
 /// Returns a simplified pattern string like "target/" or ".target*".
 pub fn extract_pattern_label(path: &str) -> String {
     let p = Path::new(path);
+    if is_xcode_derived_data_project_root(p) {
+        return "xcode-derived-data".to_string();
+    }
+
     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
 
     // Match known artifact patterns.
@@ -693,7 +738,10 @@ pub fn extract_pattern_label(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArtifactCategory, ArtifactPatternRegistry, CustomPattern, StructuralSignals};
+    use super::{
+        ArtifactCategory, ArtifactPatternRegistry, CustomPattern, StructuralSignals,
+        extract_pattern_label,
+    };
     use std::path::Path;
 
     #[test]
@@ -742,6 +790,39 @@ mod tests {
         assert_eq!(classification.pattern_name, "my-cache");
         assert_eq!(classification.category, ArtifactCategory::CacheDir);
         assert!(classification.combined_confidence > 0.60);
+    }
+
+    #[test]
+    fn xcode_derived_data_project_root_is_build_output() {
+        let registry = ArtifactPatternRegistry::default();
+        let path = Path::new("/Users/operator/Library/Developer/Xcode/DerivedData/sbh-demo-abc123");
+        let classification = registry.classify(
+            path,
+            StructuralSignals {
+                has_build: true,
+                mostly_object_files: true,
+                ..StructuralSignals::default()
+            },
+        );
+
+        assert_eq!(classification.pattern_name, "xcode-derived-data");
+        assert_eq!(classification.category, ArtifactCategory::BuildOutput);
+        assert!(classification.combined_confidence > 0.80);
+        assert_eq!(
+            extract_pattern_label(path.to_str().unwrap()),
+            "xcode-derived-data"
+        );
+    }
+
+    #[test]
+    fn xcode_derived_data_root_itself_is_not_the_cleanup_candidate() {
+        let registry = ArtifactPatternRegistry::default();
+        let classification = registry.classify(
+            Path::new("/Users/operator/Library/Developer/Xcode/DerivedData"),
+            StructuralSignals::default(),
+        );
+
+        assert_ne!(classification.pattern_name, "xcode-derived-data");
     }
 
     #[test]

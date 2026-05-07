@@ -809,6 +809,12 @@ High uncertainty inflates the deletion loss more than the keep loss, making the 
 
 When uncertainty is too high to decide, the artifact is placed in a **Review** category rather than being silently kept or deleted. Review items are surfaced in `sbh scan` output and dashboard displays.
 
+#### macOS Xcode DerivedData
+
+On macOS, `sbh` recognizes immediate children of `~/Library/Developer/Xcode/DerivedData/` as `xcode-derived-data` cleanup candidates. The DerivedData root itself is not deleted as one broad target; per-project subdirectories are ranked independently and still pass through age, active-file, parent, and sacred-overlap checks.
+
+DerivedData cleanup is classified as definite because Xcode regenerates indexes and intermediate build data on the next build. The tradeoff is latency: the first Xcode build after cleanup can be slower while those caches and indexes are rebuilt.
+
 ### Progressive Delivery: The Policy Engine
 
 The policy engine controls whether scored deletion decisions are actually executed, using a progressive delivery model borrowed from feature-flag rollout practice.
@@ -861,13 +867,14 @@ Two protection mechanisms prevent cleanup of important directories:
 
 #### Layer 2: Pre-Flight Safety Checks
 
-Before any deletion is executed, a five-point pre-flight check must pass:
+Before any deletion is executed, a six-point pre-flight check must pass:
 
 1. **Path still exists**: Uses `symlink_metadata()` (doesn't follow symlinks) to verify the target hasn't been removed by another process since scoring.
 2. **Not a symlink**: Symlinks are rejected because `remove_dir_all` follows symlinks into the target, which could destroy data outside watched directories.
 3. **Parent is writable**: Checks effective write permission via `access(W_OK)` to catch read-only mounts and permission changes since scan time.
 4. **No `.git/` directory**: A final safety net that prevents deletion of any directory containing a Git repository, even if all other signals suggest it's an artifact.
-5. **Not open by any process**: On Linux, scans `/proc/*/fd` symlinks to check if any file within the target directory tree is currently held open. Collects up to 20,000 inodes via depth-first traversal and checks each against the process file descriptor table.
+5. **Not a Cargo source root**: A direct `Cargo.toml` without Cargo build-output markers vetoes deletion, even when a directory name matches `target`, `*_target`, or `*-target`.
+6. **Not open by any process**: On Linux, scans `/proc/*/fd` symlinks to check if any file within the target directory tree is currently held open. Collects up to 20,000 inodes via depth-first traversal and checks each against the process file descriptor table.
 
 Any single check failure causes the candidate to be skipped (not failed), so it doesn't trip the circuit breaker.
 
