@@ -61,6 +61,10 @@ fn resolve_bin_path() -> PathBuf {
     }
 }
 
+pub fn sbh_bin_path() -> PathBuf {
+    resolve_bin_path()
+}
+
 fn run_cli_case_with_env_inner(
     case_name: &str,
     args: &[&str],

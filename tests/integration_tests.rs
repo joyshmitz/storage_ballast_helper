@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use proptest::prelude::*;
@@ -701,6 +701,201 @@ fn wait_for_file(path: &Path, timeout: Duration, mut poll: impl FnMut()) {
             Instant::now() < deadline,
             "timed out waiting for {}",
             path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_foreground_daemon_handles_term_hup_and_siginfo() {
+    let dir = tempfile::Builder::new()
+        .prefix("sbh_signal_test_")
+        .tempdir_in("/private/tmp")
+        .expect("create signal test directory");
+    let scan_root = dir.path().join("scan-root");
+    let state_dir = dir.path().join("state");
+    let ballast_dir = dir.path().join("ballast");
+    fs::create_dir(&scan_root).expect("create scan root");
+    fs::create_dir(&state_dir).expect("create state dir");
+    fs::create_dir(&ballast_dir).expect("create ballast dir");
+
+    let config_path = dir.path().join("config.toml");
+    let stderr_path = dir.path().join("daemon.stderr");
+    write_signal_test_config(&config_path, &scan_root, &state_dir, &ballast_dir, 5);
+
+    let mut daemon = ChildGuard::new(spawn_signal_test_daemon(&config_path, &stderr_path));
+    std::thread::sleep(Duration::from_secs(3));
+    assert_child_still_running(&mut daemon.child, "daemon exited during startup");
+
+    write_signal_test_config(&config_path, &scan_root, &state_dir, &ballast_dir, 6);
+    send_signal(daemon.child.id(), "HUP");
+    wait_for_stderr_contains(
+        &stderr_path,
+        "config reloaded successfully",
+        Duration::from_secs(20),
+        &mut daemon.child,
+    );
+
+    send_signal(daemon.child.id(), "INFO");
+    let stderr = wait_for_stderr_contains(
+        &stderr_path,
+        "\"event\":\"siginfo_status\"",
+        Duration::from_secs(15),
+        &mut daemon.child,
+    );
+    let status_dump = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|payload| payload["event"] == "siginfo_status")
+        .unwrap_or_else(|| panic!("missing valid SIGINFO status JSON in stderr:\n{stderr}"));
+    assert!(
+        status_dump["pressure"]["causing_mount"]
+            .as_str()
+            .is_some_and(|mount| !mount.is_empty())
+    );
+    assert!(status_dump["pressure"]["overall"].is_string());
+    assert!(
+        status_dump["threads"]
+            .as_array()
+            .is_some_and(|rows| rows.len() >= 2)
+    );
+
+    send_signal(daemon.child.id(), "TERM");
+    let status = wait_for_child_exit(&mut daemon.child, Duration::from_secs(5));
+    assert!(
+        status.success(),
+        "SIGTERM should exit cleanly, got {status}"
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn macos_foreground_daemon_handles_term_hup_and_siginfo() {}
+
+#[cfg(target_os = "macos")]
+fn write_signal_test_config(
+    config_path: &Path,
+    scan_root: &Path,
+    state_dir: &Path,
+    ballast_dir: &Path,
+    min_file_age_minutes: u64,
+) {
+    let state_file = state_dir.join("state.json");
+    let sqlite_db = state_dir.join("activity.sqlite3");
+    let jsonl_log = state_dir.join("activity.jsonl");
+    let config = format!(
+        r#"[paths]
+state_file = "{}"
+sqlite_db = "{}"
+jsonl_log = "{}"
+ballast_dir = "{}"
+
+[pressure]
+poll_interval_ms = 100
+
+[scanner]
+root_paths = ["{}"]
+min_file_age_minutes = {}
+max_depth = 2
+parallelism = 1
+dry_run = true
+
+[ballast]
+file_count = 1
+file_size_bytes = 4096
+"#,
+        toml_path(&state_file),
+        toml_path(&sqlite_db),
+        toml_path(&jsonl_log),
+        toml_path(ballast_dir),
+        toml_path(scan_root),
+        min_file_age_minutes,
+    );
+    fs::write(config_path, config).expect("write daemon signal test config");
+}
+
+#[cfg(target_os = "macos")]
+fn toml_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_signal_test_daemon(config_path: &Path, stderr_path: &Path) -> Child {
+    let stderr = fs::File::create(stderr_path).expect("create daemon stderr log");
+    Command::new(common::sbh_bin_path())
+        .arg("--config")
+        .arg(config_path)
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .expect("spawn foreground daemon")
+}
+
+#[cfg(target_os = "macos")]
+fn send_signal(pid: u32, signal: &str) {
+    let status = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .status()
+        .expect("run kill command");
+    assert!(status.success(), "kill -{signal} {pid} failed: {status}");
+}
+
+#[cfg(target_os = "macos")]
+fn assert_child_still_running(child: &mut Child, context: &str) {
+    if let Ok(Some(status)) = child.try_wait() {
+        panic!("{context}: {status}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_stderr_contains(
+    stderr_path: &Path,
+    needle: &str,
+    timeout: Duration,
+    child: &mut Child,
+) -> String {
+    wait_for_file_contains(stderr_path, needle, timeout, child)
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_file_contains(
+    path: &Path,
+    needle: &str,
+    timeout: Duration,
+    child: &mut Child,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let content = fs::read_to_string(path).unwrap_or_default();
+        if content.contains(needle) {
+            return content;
+        }
+        assert_child_still_running(child, "daemon exited before expected file output");
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {needle:?} in {}; content:\n{content}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("poll daemon child status") {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for child exit"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
