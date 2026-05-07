@@ -68,6 +68,7 @@ libc = "0.2"
 libproc = "0.14.11"
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue"] }
 proc_pidinfo = "0.1.4"
+sysctl = "0.6.0"
 whichdisk = "0.4.0"
 [dev-dependencies]
 tempfile = "3.17"

@@ -300,6 +300,178 @@ pub fn important_usage_available_bytes(mount: &Path) -> io::Result<Option<u64>> 
     Ok(Some(number.unsignedLongLongValue()))
 }
 
+pub mod sysctl {
+    use std::io;
+
+    use ::sysctl::{Ctl, CtlType, CtlValue, Sysctl};
+
+    pub trait ReadableValue: Sized {
+        fn read_type() -> (CtlType, &'static str);
+        fn from_ctl_value(name: &str, value: CtlValue) -> io::Result<Self>;
+    }
+
+    pub fn read<T: ReadableValue>(name: &str) -> io::Result<T> {
+        let (mut ctl_type, mut format) = T::read_type();
+        if name == "vm.swapusage" && ctl_type == CtlType::String {
+            ctl_type = CtlType::Struct;
+            format = "";
+        }
+        let ctl = Ctl::new_with_type(name, ctl_type, format)
+            .map_err(|error| sysctl_error(name, &error))?;
+        let value = ctl.value().map_err(|error| sysctl_error(name, &error))?;
+        T::from_ctl_value(name, value)
+    }
+
+    pub fn read_mib<T: ReadableValue>(mib: &[libc::c_int]) -> io::Result<T> {
+        if mib.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sysctl MIB must not be empty",
+            ));
+        }
+
+        let label = format!("MIB {mib:?}");
+        let ctl = Ctl::Oid(mib.to_vec());
+        let value = ctl.value().map_err(|error| sysctl_error(&label, &error))?;
+        T::from_ctl_value(&label, value)
+    }
+
+    impl ReadableValue for i32 {
+        fn read_type() -> (CtlType, &'static str) {
+            (CtlType::Int, "I")
+        }
+
+        fn from_ctl_value(name: &str, value: CtlValue) -> io::Result<Self> {
+            match value {
+                CtlValue::Int(value) | CtlValue::S32(value) => Ok(value),
+                CtlValue::Uint(value) | CtlValue::U32(value) => Self::try_from(value)
+                    .map_err(|_| sysctl_type_error(name, "i32", "unsigned value exceeds i32")),
+                other => Err(sysctl_type_error(
+                    name,
+                    "i32",
+                    &format!("got {}", ctl_value_label(&other)),
+                )),
+            }
+        }
+    }
+
+    impl ReadableValue for u64 {
+        fn read_type() -> (CtlType, &'static str) {
+            (CtlType::Int, "LU")
+        }
+
+        fn from_ctl_value(name: &str, value: CtlValue) -> io::Result<Self> {
+            match value {
+                CtlValue::U64(value) | CtlValue::Ulong(value) => Ok(value),
+                CtlValue::Uint(value) | CtlValue::U32(value) => Ok(Self::from(value)),
+                CtlValue::Int(value) | CtlValue::S32(value) if value >= 0 => Self::try_from(value)
+                    .map_err(|_| sysctl_type_error(name, "u64", "signed value is negative")),
+                CtlValue::Long(value) | CtlValue::S64(value) if value >= 0 => Self::try_from(value)
+                    .map_err(|_| sysctl_type_error(name, "u64", "signed value is negative")),
+                other => Err(sysctl_type_error(
+                    name,
+                    "u64",
+                    &format!("got {}", ctl_value_label(&other)),
+                )),
+            }
+        }
+    }
+
+    impl ReadableValue for String {
+        fn read_type() -> (CtlType, &'static str) {
+            (CtlType::String, "")
+        }
+
+        fn from_ctl_value(name: &str, value: CtlValue) -> io::Result<Self> {
+            match value {
+                CtlValue::String(value) => Ok(value),
+                CtlValue::Struct(value) if name == "vm.swapusage" => {
+                    format_swapusage_struct(&value)
+                }
+                other => Err(sysctl_type_error(
+                    name,
+                    "String",
+                    &format!("got {}", ctl_value_label(&other)),
+                )),
+            }
+        }
+    }
+
+    fn format_swapusage_struct(raw: &[u8]) -> io::Result<String> {
+        let total = native_u64(raw.get(0..8))
+            .ok_or_else(|| malformed_struct_error("vm.swapusage", "missing total bytes"))?;
+        let free = native_u64(raw.get(8..16))
+            .ok_or_else(|| malformed_struct_error("vm.swapusage", "missing free bytes"))?;
+        let used = native_u64(raw.get(16..24))
+            .ok_or_else(|| malformed_struct_error("vm.swapusage", "missing used bytes"))?;
+        let encrypted = native_u32(raw.get(28..32))
+            .ok_or_else(|| malformed_struct_error("vm.swapusage", "missing encryption flag"))?
+            != 0;
+        let encrypted_label = if encrypted { "  (encrypted)" } else { "" };
+
+        Ok(format!(
+            "total = {}M  used = {}M  free = {}M{encrypted_label}",
+            bytes_to_mib_decimal(total),
+            bytes_to_mib_decimal(used),
+            bytes_to_mib_decimal(free)
+        ))
+    }
+
+    fn native_u64(bytes: Option<&[u8]>) -> Option<u64> {
+        bytes
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+            .map(u64::from_ne_bytes)
+    }
+
+    fn native_u32(bytes: Option<&[u8]>) -> Option<u32> {
+        bytes
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map(u32::from_ne_bytes)
+    }
+
+    fn bytes_to_mib_decimal(bytes: u64) -> String {
+        let centimib = u128::from(bytes).saturating_mul(100) / 1_048_576;
+        format!("{}.{:02}", centimib / 100, centimib % 100)
+    }
+
+    fn malformed_struct_error(name: &str, detail: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("sysctl {name} returned malformed struct: {detail}"),
+        )
+    }
+
+    fn sysctl_error(name: &str, error: &::sysctl::SysctlError) -> io::Error {
+        io::Error::other(format!("sysctl {name} failed: {error}"))
+    }
+
+    fn sysctl_type_error(name: &str, expected: &str, detail: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("sysctl {name} did not return {expected}: {detail}"),
+        )
+    }
+
+    fn ctl_value_label(value: &CtlValue) -> &'static str {
+        match value {
+            CtlValue::None => "none",
+            CtlValue::Node(_) => "node",
+            CtlValue::Int(_) | CtlValue::S32(_) => "i32",
+            CtlValue::String(_) => "string",
+            CtlValue::S64(_) => "i64",
+            CtlValue::Struct(_) => "struct",
+            CtlValue::Uint(_) | CtlValue::U32(_) => "u32",
+            CtlValue::Long(_) => "long",
+            CtlValue::Ulong(_) => "ulong",
+            CtlValue::U64(_) => "u64",
+            CtlValue::U8(_) => "u8",
+            CtlValue::U16(_) => "u16",
+            CtlValue::S8(_) => "i8",
+            CtlValue::S16(_) => "i16",
+        }
+    }
+}
+
 #[must_use]
 pub fn parse_tmutil_local_snapshots(
     raw: &str,
@@ -601,6 +773,7 @@ mod tests {
     use super::{
         ApfsVolumeRole, important_usage_available_bytes, mounted_filesystems,
         parent_apfs_volume_device, parse_apfs_inventory, parse_tmutil_local_snapshots, statfs,
+        sysctl,
     };
 
     #[test]
@@ -631,6 +804,34 @@ mod tests {
             .expect("Foundation should report root capacity");
 
         assert!(capacity.is_some_and(|bytes| bytes > 0));
+    }
+
+    #[test]
+    fn sysctl_by_name_reads_plausible_hw_values() {
+        let memsize = sysctl::read::<u64>("hw.memsize").expect("hw.memsize should be readable");
+        let physical_cpus =
+            sysctl::read::<i32>("hw.physicalcpu").expect("hw.physicalcpu should be readable");
+
+        assert!(memsize >= 1_073_741_824);
+        assert!((1..=1024).contains(&physical_cpus));
+    }
+
+    #[test]
+    fn sysctl_by_name_reads_swapusage_string() {
+        let swapusage =
+            sysctl::read::<String>("vm.swapusage").expect("vm.swapusage should be readable");
+
+        assert!(swapusage.contains("total = "));
+        assert!(swapusage.contains("used = "));
+        assert!(swapusage.contains("free = "));
+    }
+
+    #[test]
+    fn sysctl_mib_reads_hw_memsize() {
+        let memsize = sysctl::read_mib::<u64>(&[libc::CTL_HW, libc::HW_MEMSIZE])
+            .expect("CTL_HW/HW_MEMSIZE should be readable");
+
+        assert!(memsize >= 1_073_741_824);
     }
 
     #[test]
