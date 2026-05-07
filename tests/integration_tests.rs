@@ -7,6 +7,8 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use proptest::prelude::*;
@@ -530,6 +532,179 @@ fn wait_for_available_bytes_at_least(
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn macos_apfs_ballast_preallocates_and_releases_space() {}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_synthetic_writer_surfaces_in_blame_top_rows() {
+    const MIN_VISIBLE_WRITER_BYTES: u64 = 100 * 1_048_576;
+    const WRITER_MIB: u64 = 112;
+
+    let perl = Path::new("/usr/bin/perl");
+    if !perl.exists() {
+        eprintln!("skipping sbh blame writer test because /usr/bin/perl is unavailable");
+        return;
+    }
+
+    let dir = tempfile::Builder::new()
+        .prefix("sbh_blame_test_")
+        .tempdir_in("/private/tmp")
+        .expect("create blame test directory in /private/tmp");
+    let data_path = dir.path().join("writer.bin");
+    let ready_path = dir.path().join("writer.ready");
+    let config_path = dir.path().join("config.toml");
+    let state_dir = dir.path().join("state");
+    fs::create_dir(&state_dir).expect("create blame state dir");
+    fs::create_dir(state_dir.join("ballast")).expect("create blame ballast dir");
+    fs::write(
+        &config_path,
+        format!(
+            "[paths]\nstate_file = \"{}\"\nsqlite_db = \"{}\"\njsonl_log = \"{}\"\nballast_dir = \"{}\"\n\n[scanner]\nroot_paths = [\"{}\"]\n",
+            state_dir.join("state.json").display(),
+            state_dir.join("activity.sqlite3").display(),
+            state_dir.join("activity.jsonl").display(),
+            state_dir.join("ballast").display(),
+            dir.path().display(),
+        ),
+    )
+    .expect("write blame test config");
+
+    let mut writer = ChildGuard::new(spawn_blame_writer(
+        perl,
+        &data_path,
+        &ready_path,
+        WRITER_MIB,
+    ));
+    wait_for_file(&ready_path, Duration::from_secs(15), || {
+        if let Ok(Some(status)) = writer.child.try_wait() {
+            panic!("synthetic writer exited before ready marker: {status}");
+        }
+    });
+
+    let config = config_path
+        .to_str()
+        .expect("config path should be valid UTF-8");
+    let result = common::run_cli_case(
+        "macos_synthetic_writer_surfaces_in_blame_top_rows",
+        &[
+            "--config", config, "--json", "blame", "--top", "10", "--since", "1m",
+        ],
+    );
+    assert!(
+        result.status.success(),
+        "sbh blame failed; stdout={:?}; stderr={:?}; log={}",
+        result.stdout,
+        result.stderr,
+        result.log_path.display()
+    );
+
+    let payload: Value = serde_json::from_str(result.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "expected blame JSON, parse failed: {err}; stdout={:?}; stderr={:?}; log={}",
+            result.stdout,
+            result.stderr,
+            result.log_path.display()
+        )
+    });
+    let rows = payload["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("blame JSON missing rows array: {payload}"));
+    let writer_pid = i64::from(writer.child.id());
+    let row = rows
+        .iter()
+        .find(|row| row["pid"].as_i64() == Some(writer_pid))
+        .unwrap_or_else(|| {
+            panic!(
+                "synthetic writer pid {writer_pid} missing from blame rows; payload={payload}; log={}",
+                result.log_path.display()
+            )
+        });
+    let written = row["recent_bytes_written"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("writer row missing recent_bytes_written: {row}"));
+    assert!(
+        written >= MIN_VISIBLE_WRITER_BYTES,
+        "writer row under-reported writes: written={written} expected_at_least={MIN_VISIBLE_WRITER_BYTES}; row={row}; payload={payload}"
+    );
+    let open_files = row["open_files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("writer row missing open_files array: {row}"));
+    assert!(
+        open_files.iter().any(|path| path
+            .as_str()
+            .is_some_and(|path| path == data_path.to_string_lossy())),
+        "writer row did not report open test file {}; row={row}; payload={payload}",
+        data_path.display()
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn macos_synthetic_writer_surfaces_in_blame_top_rows() {}
+
+#[cfg(target_os = "macos")]
+struct ChildGuard {
+    child: Child,
+}
+
+#[cfg(target_os = "macos")]
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_blame_writer(perl: &Path, data_path: &Path, ready_path: &Path, writer_mib: u64) -> Child {
+    Command::new(perl)
+        .arg("-MIO::Handle")
+        .arg("-e")
+        .arg(
+            r#"
+my ($data_path, $ready_path, $mib) = @ARGV;
+open(my $fh, ">", $data_path) or die "open data: $!";
+binmode($fh) or die "binmode data: $!";
+my $buf = "\0" x 1048576;
+for (my $i = 0; $i < $mib; $i++) {
+    print {$fh} $buf or die "write data: $!";
+}
+$fh->flush();
+open(my $ready, ">", $ready_path) or die "open ready: $!";
+print {$ready} "ready\n" or die "write ready: $!";
+close($ready) or die "close ready: $!";
+sleep 30;
+"#,
+        )
+        .arg(data_path)
+        .arg(ready_path)
+        .arg(writer_mib.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn synthetic blame writer")
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_file(path: &Path, timeout: Duration, mut poll: impl FnMut()) {
+    let deadline = Instant::now() + timeout;
+    while !path.exists() {
+        poll();
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
 
 #[test]
 fn completions_command_generates_shell_script() {
