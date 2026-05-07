@@ -4,6 +4,9 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+use plist::{Dictionary, Value};
+
+use crate::core::config::PathsConfig;
 use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::ServiceManager;
 
@@ -21,6 +24,12 @@ pub struct LaunchdConfig {
     pub stdout_log: PathBuf,
     /// Path to stderr log file.
     pub stderr_log: PathBuf,
+    /// Directory launchd should use as the daemon working directory.
+    pub working_directory: PathBuf,
+    /// Config path exported to the daemon environment.
+    pub config_path: PathBuf,
+    /// RUST_LOG value exported to the daemon environment.
+    pub rust_log: String,
 }
 
 impl LaunchdConfig {
@@ -39,11 +48,23 @@ impl LaunchdConfig {
 
         let binary_path = resolve_sbh_binary()?;
         let (stdout_log, stderr_log) = default_launchd_log_paths(effective_user_scope);
+        let paths = PathsConfig::default();
+        let working_directory = paths
+            .state_file
+            .parent()
+            .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+        let config_path = env::var_os("SBH_CONFIG_PATH")
+            .or_else(|| env::var_os("SBH_CONFIG"))
+            .map_or(paths.config_file, PathBuf::from);
+        let rust_log = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
         Ok(Self {
             user_scope: effective_user_scope,
             binary_path,
             stdout_log,
             stderr_log,
+            working_directory,
+            config_path,
+            rust_log,
         })
     }
 
@@ -101,43 +122,70 @@ impl LaunchdServiceManager {
     /// Generate the launchd plist XML content.
     #[must_use]
     pub fn generate_plist(&self) -> String {
-        let binary = escape_xml(&self.config.binary_path.to_string_lossy());
-        let stdout_log = escape_xml(&self.config.stdout_log.to_string_lossy());
-        let stderr_log = escape_xml(&self.config.stderr_log.to_string_lossy());
+        let mut bytes = Vec::new();
+        self.plist_value()
+            .to_writer_xml(&mut bytes)
+            .expect("writing launchd plist to memory should not fail");
+        String::from_utf8(bytes).expect("plist crate must emit UTF-8 XML")
+    }
 
-        format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{LAUNCHD_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{binary}</string>
-        <string>daemon</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-    <key>ThrottleInterval</key>
-    <integer>10</integer>
-    <key>Nice</key>
-    <integer>19</integer>
-    <key>LowPriorityIO</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>{stdout_log}</string>
-    <key>StandardErrorPath</key>
-    <string>{stderr_log}</string>
-</dict>
-</plist>
-"#
-        )
+    fn plist_value(&self) -> Value {
+        let mut keep_alive = Dictionary::new();
+        keep_alive.insert("SuccessfulExit".to_string(), Value::Boolean(false));
+        keep_alive.insert("Crashed".to_string(), Value::Boolean(true));
+
+        let mut env_vars = Dictionary::new();
+        env_vars.insert(
+            "SBH_CONFIG_PATH".to_string(),
+            Value::String(self.config.config_path.to_string_lossy().into_owned()),
+        );
+        env_vars.insert(
+            "SBH_CONFIG".to_string(),
+            Value::String(self.config.config_path.to_string_lossy().into_owned()),
+        );
+        env_vars.insert(
+            "RUST_LOG".to_string(),
+            Value::String(self.config.rust_log.clone()),
+        );
+
+        let mut root = Dictionary::new();
+        root.insert(
+            "Label".to_string(),
+            Value::String(LAUNCHD_LABEL.to_string()),
+        );
+        root.insert(
+            "ProgramArguments".to_string(),
+            Value::Array(vec![
+                Value::String(self.config.binary_path.to_string_lossy().into_owned()),
+                Value::String("daemon".to_string()),
+            ]),
+        );
+        root.insert("RunAtLoad".to_string(), Value::Boolean(true));
+        root.insert("KeepAlive".to_string(), Value::Dictionary(keep_alive));
+        root.insert("ThrottleInterval".to_string(), Value::Integer(60.into()));
+        root.insert("Nice".to_string(), Value::Integer(19.into()));
+        root.insert(
+            "ProcessType".to_string(),
+            Value::String("Background".to_string()),
+        );
+        root.insert("LowPriorityIO".to_string(), Value::Boolean(true));
+        root.insert(
+            "WorkingDirectory".to_string(),
+            Value::String(self.config.working_directory.to_string_lossy().into_owned()),
+        );
+        root.insert(
+            "StandardOutPath".to_string(),
+            Value::String(self.config.stdout_log.to_string_lossy().into_owned()),
+        );
+        root.insert(
+            "StandardErrorPath".to_string(),
+            Value::String(self.config.stderr_log.to_string_lossy().into_owned()),
+        );
+        root.insert(
+            "EnvironmentVariables".to_string(),
+            Value::Dictionary(env_vars),
+        );
+        Value::Dictionary(root)
     }
 }
 
@@ -221,21 +269,6 @@ impl ServiceManager for LaunchdServiceManager {
             Err(error) => Err(error.into()),
         }
     }
-}
-
-fn escape_xml(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '&' => out.push_str("&amp;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 fn is_running_as_root() -> bool {

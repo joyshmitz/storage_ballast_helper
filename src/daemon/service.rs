@@ -800,6 +800,8 @@ mod legacy_inline {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
     use crate::platform::pal::MockPlatform;
 
@@ -978,12 +980,35 @@ mod tests {
     // -- Launchd tests ----------------------------------------------------
 
     fn test_launchd_config(user_scope: bool) -> LaunchdConfig {
+        let home = PathBuf::from("/Users/tester");
+        let (stdout_log, stderr_log, working_directory, config_path) = if user_scope {
+            (
+                home.join("Library/Logs/sbh/sbh.log"),
+                home.join("Library/Logs/sbh/sbh.err"),
+                home.join(".local/share/sbh"),
+                home.join(".config/sbh/config.toml"),
+            )
+        } else {
+            (
+                PathBuf::from("/usr/local/var/log/sbh/sbh.log"),
+                PathBuf::from("/usr/local/var/log/sbh/sbh.err"),
+                PathBuf::from("/var/lib/sbh"),
+                PathBuf::from("/etc/sbh/config.toml"),
+            )
+        };
         LaunchdConfig {
             user_scope,
             binary_path: PathBuf::from("/usr/local/bin/sbh"),
-            stdout_log: PathBuf::from("/usr/local/var/log/sbh/sbh.log"),
-            stderr_log: PathBuf::from("/usr/local/var/log/sbh/sbh.err"),
+            stdout_log,
+            stderr_log,
+            working_directory,
+            config_path,
+            rust_log: "info".to_string(),
         }
+    }
+
+    fn parse_plist(xml: &str) -> plist::Value {
+        plist::Value::from_reader(Cursor::new(xml.as_bytes())).expect("plist should parse")
     }
 
     #[test]
@@ -1023,6 +1048,7 @@ mod tests {
 
         assert!(plist.contains("<key>KeepAlive</key>"));
         assert!(plist.contains("<key>SuccessfulExit</key>"));
+        assert!(plist.contains("<key>Crashed</key>"));
     }
 
     #[test]
@@ -1042,7 +1068,7 @@ mod tests {
         let plist = mgr.generate_plist();
 
         assert!(plist.contains("<key>ThrottleInterval</key>"));
-        assert!(plist.contains("<integer>10</integer>"));
+        assert!(plist.contains("<integer>60</integer>"));
     }
 
     #[test]
@@ -1062,6 +1088,61 @@ mod tests {
         assert!(plist.contains("<key>StandardErrorPath</key>"));
         assert!(plist.contains("/usr/local/var/log/sbh/sbh.log"));
         assert!(plist.contains("/usr/local/var/log/sbh/sbh.err"));
+    }
+
+    #[test]
+    fn plist_has_working_directory_process_type_and_environment() {
+        let mgr = LaunchdServiceManager::new(test_launchd_config(false));
+        let value = parse_plist(&mgr.generate_plist());
+        let dict = value.as_dictionary().expect("plist root should be a dict");
+        let env = dict
+            .get("EnvironmentVariables")
+            .and_then(plist::Value::as_dictionary)
+            .expect("EnvironmentVariables should be a dict");
+
+        assert_eq!(
+            dict.get("WorkingDirectory")
+                .and_then(plist::Value::as_string),
+            Some("/var/lib/sbh")
+        );
+        assert_eq!(
+            dict.get("ProcessType").and_then(plist::Value::as_string),
+            Some("Background")
+        );
+        assert_eq!(
+            env.get("SBH_CONFIG_PATH").and_then(plist::Value::as_string),
+            Some("/etc/sbh/config.toml")
+        );
+        assert_eq!(
+            env.get("SBH_CONFIG").and_then(plist::Value::as_string),
+            Some("/etc/sbh/config.toml")
+        );
+        assert_eq!(
+            env.get("RUST_LOG").and_then(plist::Value::as_string),
+            Some("info")
+        );
+    }
+
+    #[test]
+    fn plist_matches_system_snapshot() {
+        let mgr = LaunchdServiceManager::new(test_launchd_config(false));
+        let expected = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/snapshots/launchd_system.plist"
+        ));
+
+        assert_eq!(parse_plist(&mgr.generate_plist()), parse_plist(expected));
+    }
+
+    #[test]
+    fn plist_matches_user_snapshot() {
+        let mgr = LaunchdServiceManager::new(test_launchd_config(true));
+        let expected = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/snapshots/launchd_user.plist"
+        ));
+
+        assert_eq!(parse_plist(&mgr.generate_plist()), parse_plist(expected));
     }
 
     #[test]
