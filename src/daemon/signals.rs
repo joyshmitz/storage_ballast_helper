@@ -1,5 +1,6 @@
 //! Signal handling: SIGTERM/SIGINT graceful shutdown, SIGHUP config reload,
-//! SIGUSR1 immediate scan trigger, and systemd watchdog heartbeat.
+//! SIGUSR1 immediate scan trigger, macOS SIGINFO status dump, and service
+//! watchdog heartbeat.
 //!
 //! Uses the `signal-hook` crate for safe signal registration. The main loop
 //! polls `SignalHandler` flags each iteration rather than blocking on signals.
@@ -26,6 +27,7 @@ pub struct SignalHandler {
     shutdown_flag: Arc<AtomicBool>,
     reload_flag: Arc<AtomicBool>,
     scan_flag: Arc<AtomicBool>,
+    status_dump_flag: Arc<AtomicBool>,
 }
 
 impl SignalHandler {
@@ -39,6 +41,7 @@ impl SignalHandler {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             reload_flag: Arc::new(AtomicBool::new(false)),
             scan_flag: Arc::new(AtomicBool::new(false)),
+            status_dump_flag: Arc::new(AtomicBool::new(false)),
         };
 
         handler.register_signals();
@@ -63,6 +66,12 @@ impl SignalHandler {
         self.scan_flag.swap(false, Ordering::Relaxed)
     }
 
+    /// Check (and clear) whether a foreground status dump has been requested.
+    #[must_use]
+    pub fn should_dump_status(&self) -> bool {
+        self.status_dump_flag.swap(false, Ordering::Relaxed)
+    }
+
     /// Programmatically request shutdown (e.g., from watchdog timeout or error escalation).
     pub fn request_shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::Relaxed);
@@ -76,6 +85,11 @@ impl SignalHandler {
     /// Programmatically request an immediate scan.
     pub fn request_scan(&self) {
         self.scan_flag.store(true, Ordering::Relaxed);
+    }
+
+    /// Programmatically request a foreground status dump.
+    pub fn request_status_dump(&self) {
+        self.status_dump_flag.store(true, Ordering::Relaxed);
     }
 
     fn register_signals(&self) {
@@ -102,6 +116,17 @@ impl SignalHandler {
             use signal_hook::consts::SIGUSR1;
             if let Err(e) = signal_hook::flag::register(SIGUSR1, Arc::clone(&self.scan_flag)) {
                 eprintln!("[SBH-SIGNAL] failed to register SIGUSR1: {e}");
+            }
+        }
+
+        // SIGINFO -> status dump (macOS only). On Linux signal 30 is SIGPWR,
+        // so this must never be registered under a broad Unix cfg.
+        #[cfg(target_os = "macos")]
+        {
+            use signal_hook::consts::SIGINFO;
+            if let Err(e) = signal_hook::flag::register(SIGINFO, Arc::clone(&self.status_dump_flag))
+            {
+                eprintln!("[SBH-SIGNAL] failed to register SIGINFO: {e}");
             }
         }
     }
@@ -250,11 +275,13 @@ mod tests {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             reload_flag: Arc::new(AtomicBool::new(false)),
             scan_flag: Arc::new(AtomicBool::new(false)),
+            status_dump_flag: Arc::new(AtomicBool::new(false)),
         };
 
         assert!(!handler.should_shutdown());
         assert!(!handler.should_reload());
         assert!(!handler.should_scan());
+        assert!(!handler.should_dump_status());
     }
 
     #[test]
@@ -263,6 +290,7 @@ mod tests {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             reload_flag: Arc::new(AtomicBool::new(false)),
             scan_flag: Arc::new(AtomicBool::new(false)),
+            status_dump_flag: Arc::new(AtomicBool::new(false)),
         };
 
         assert!(!handler.should_shutdown());
@@ -276,6 +304,7 @@ mod tests {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             reload_flag: Arc::new(AtomicBool::new(false)),
             scan_flag: Arc::new(AtomicBool::new(false)),
+            status_dump_flag: Arc::new(AtomicBool::new(false)),
         };
 
         handler.request_reload();
@@ -289,6 +318,7 @@ mod tests {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             reload_flag: Arc::new(AtomicBool::new(false)),
             scan_flag: Arc::new(AtomicBool::new(false)),
+            status_dump_flag: Arc::new(AtomicBool::new(false)),
         };
 
         handler.request_scan();
@@ -297,11 +327,41 @@ mod tests {
     }
 
     #[test]
+    fn status_dump_flag_clears_on_read() {
+        let handler = SignalHandler {
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            reload_flag: Arc::new(AtomicBool::new(false)),
+            scan_flag: Arc::new(AtomicBool::new(false)),
+            status_dump_flag: Arc::new(AtomicBool::new(false)),
+        };
+
+        handler.request_status_dump();
+        assert!(handler.should_dump_status());
+        assert!(!handler.should_dump_status());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn siginfo_sets_status_dump_flag_on_macos() {
+        let handler = SignalHandler::new();
+
+        signal_hook::low_level::raise(signal_hook::consts::SIGINFO)
+            .expect("raise SIGINFO for signal handler test");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !handler.should_dump_status() {
+            assert!(Instant::now() < deadline, "SIGINFO did not set status flag");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!handler.should_dump_status());
+    }
+
+    #[test]
     fn handler_is_clone_and_send() {
         let handler = SignalHandler {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             reload_flag: Arc::new(AtomicBool::new(false)),
             scan_flag: Arc::new(AtomicBool::new(false)),
+            status_dump_flag: Arc::new(AtomicBool::new(false)),
         };
         let h2 = handler.clone();
 
