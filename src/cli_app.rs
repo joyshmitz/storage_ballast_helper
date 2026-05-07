@@ -22,8 +22,8 @@ use storage_ballast_helper::daemon::loop_main::{
 };
 use storage_ballast_helper::daemon::self_monitor::DAEMON_STATE_STALE_THRESHOLD_SECS;
 use storage_ballast_helper::daemon::service::{
-    LAUNCHD_LABEL_ENV, LaunchdServiceManager, LaunchdStatusReport, ServiceActionResult,
-    SystemdServiceManager,
+    LAUNCHD_LABEL_ENV, LaunchdConfig, LaunchdServiceManager, LaunchdStatusReport,
+    ServiceActionResult, SystemdServiceManager,
 };
 use storage_ballast_helper::logger::sqlite::SqliteLogger;
 use storage_ballast_helper::logger::stats::{StatsEngine, window_label};
@@ -935,6 +935,71 @@ fn resolve_install_service(
     Ok(Some(ResolvedInstallService { kind, user_scope }))
 }
 
+fn macos_install_dir_for_service(service: Option<ResolvedInstallService>) -> PathBuf {
+    if service.is_some_and(|service| !service.user_scope) {
+        return PathBuf::from("/usr/local/bin");
+    }
+
+    std::env::var_os("HOME").map_or_else(
+        || PathBuf::from("/usr/local/bin"),
+        |home| PathBuf::from(home).join(".local/bin"),
+    )
+}
+
+fn build_macos_release_install_options(
+    args: &InstallArgs,
+    config: &Config,
+    service: Option<ResolvedInstallService>,
+) -> storage_ballast_helper::cli::update::UpdateOptions {
+    storage_ballast_helper::cli::update::UpdateOptions {
+        check_only: false,
+        pinned_version: None,
+        force: true,
+        install_dir: macos_install_dir_for_service(service),
+        no_verify: false,
+        dry_run: args.dry_run,
+        max_backups: 5,
+        metadata_cache_file: config.update.metadata_cache_file.clone(),
+        metadata_cache_ttl: std::time::Duration::from_secs(
+            config.update.metadata_cache_ttl_seconds,
+        ),
+        refresh_cache: false,
+        notices_enabled: config.update.notices_enabled,
+        offline_bundle_manifest: args.offline.clone(),
+    }
+}
+
+fn run_macos_release_binary_install(
+    cli: &Cli,
+    args: &InstallArgs,
+    config: &Config,
+    service: Option<ResolvedInstallService>,
+) -> Result<Option<PathBuf>, CliError> {
+    use storage_ballast_helper::cli::update::{format_update_report, run_update_sequence};
+
+    let opts = build_macos_release_install_options(args, config, service);
+    let report = run_update_sequence(&opts);
+    let install_path = report.install_path.clone();
+
+    match output_mode(cli) {
+        OutputMode::Human => {
+            print!("{}", format_update_report(&report));
+        }
+        OutputMode::Json => {
+            let payload = serde_json::to_value(&report)?;
+            write_json_line(&payload)?;
+        }
+    }
+
+    if report.success {
+        Ok(install_path)
+    } else {
+        Err(CliError::Runtime(
+            "macOS release binary install failed".to_string(),
+        ))
+    }
+}
+
 fn resolve_service_control(
     args: &ServiceArgs,
     detected_kind: ServiceKind,
@@ -1080,6 +1145,12 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     let service_kind = platform.service_kind();
     let sudo_command = format_sudo_rerun_command(cli, service_kind);
     let service = resolve_install_service(args, service_kind, running_as_root(), &sudo_command)?;
+    let config = Config::load(cli.config.as_deref()).unwrap_or_default();
+    let macos_binary_path = if service_kind == ServiceKind::Launchd && !args.from_source {
+        run_macos_release_binary_install(cli, args, &config, service)?
+    } else {
+        None
+    };
 
     // -- from-source build ----------------------------------------------------
     if args.from_source {
@@ -1145,7 +1216,6 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     }
 
     // -- install orchestration (data dir, config, ballast) ----------------------
-    let config = Config::load(cli.config.as_deref()).unwrap_or_default();
     {
         use storage_ballast_helper::cli::install::{
             InstallOptions, format_install_report, run_install_sequence_with_bundle,
@@ -1195,8 +1265,12 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     };
 
     if service.kind == ServiceKind::Launchd {
-        let mgr = LaunchdServiceManager::from_env(service.user_scope)
+        let mut launchd_config = LaunchdConfig::from_env(service.user_scope)
             .map_err(|e| CliError::Runtime(e.to_string()))?;
+        if let Some(binary_path) = macos_binary_path {
+            launchd_config.binary_path = binary_path;
+        }
+        let mgr = LaunchdServiceManager::new(launchd_config);
         let plist_path = mgr.config().plist_path();
         let scope = service.scope_name();
 
@@ -7769,6 +7843,43 @@ mod tests {
         assert_eq!(service.kind, ServiceKind::Launchd);
         assert!(service.user_scope);
         assert_eq!(service.scope_name(), "user");
+    }
+
+    #[test]
+    fn macos_release_install_defaults_to_user_local_bin() {
+        let args = InstallArgs::default();
+        let mut config = Config::default();
+        config.update.metadata_cache_ttl_seconds = 42;
+        config.update.metadata_cache_file = PathBuf::from("/tmp/sbh-install-cache.json");
+        let service = Some(ResolvedInstallService {
+            kind: ServiceKind::Launchd,
+            user_scope: true,
+        });
+
+        let opts = build_macos_release_install_options(&args, &config, service);
+
+        assert!(opts.force);
+        assert!(!opts.no_verify);
+        assert_eq!(opts.metadata_cache_ttl, std::time::Duration::from_secs(42));
+        assert_eq!(
+            opts.metadata_cache_file,
+            PathBuf::from("/tmp/sbh-install-cache.json")
+        );
+        assert!(opts.install_dir.ends_with(".local/bin"));
+    }
+
+    #[test]
+    fn macos_release_install_system_scope_uses_usr_local_bin() {
+        let args = InstallArgs::default();
+        let config = Config::default();
+        let service = Some(ResolvedInstallService {
+            kind: ServiceKind::Launchd,
+            user_scope: false,
+        });
+
+        let opts = build_macos_release_install_options(&args, &config, service);
+
+        assert_eq!(opts.install_dir, PathBuf::from("/usr/local/bin"));
     }
 
     #[test]

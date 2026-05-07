@@ -360,6 +360,8 @@ impl ServiceManager for LaunchdServiceManager {
             }
             Err(error) => return Err(error.into()),
         }
+        launchctl::kickstart(&self.service_target(), true)?;
+        launchctl::print(&self.service_target())?;
 
         Ok(())
     }
@@ -563,5 +565,25 @@ mod tests {
                 "label should be rejected: {label:?}"
             );
         }
+    }
+
+    #[test]
+    fn service_target_uses_configured_label() {
+        let config = LaunchdConfig {
+            label: "com.dicklesworthstone.sbh.test.123".to_string(),
+            user_scope: false,
+            binary_path: PathBuf::from("/usr/local/bin/sbh"),
+            stdout_log: PathBuf::from("/var/log/sbh/sbh.log"),
+            stderr_log: PathBuf::from("/var/log/sbh/sbh.err"),
+            working_directory: PathBuf::from("/var/lib/sbh"),
+            config_path: PathBuf::from("/etc/sbh/config.toml"),
+            rust_log: "info".to_string(),
+        };
+        let manager = LaunchdServiceManager::new(config);
+
+        assert_eq!(
+            manager.service_target().as_arg(),
+            "system/com.dicklesworthstone.sbh.test.123"
+        );
     }
 }
