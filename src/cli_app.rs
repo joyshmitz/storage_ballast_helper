@@ -715,10 +715,110 @@ fn running_as_root() -> bool {
     }
 }
 
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+
+    if value.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '@' | '%' | '+')
+    }) {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn env_value(name: &str) -> Option<String> {
+    std::env::var_os(name)
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn push_sudo_env(envs: &mut Vec<(&'static str, String)>, name: &'static str, value: String) {
+    if !envs.iter().any(|(existing, _)| *existing == name) {
+        envs.push((name, value));
+    }
+}
+
+fn sudo_env_assignments(cli: &Cli, kind: ServiceKind) -> Vec<(&'static str, String)> {
+    let mut envs = Vec::new();
+
+    if kind == ServiceKind::Launchd
+        && let Some(home) = env_value("HOME")
+    {
+        push_sudo_env(&mut envs, "HOME", home);
+    }
+
+    if let Some(config) = &cli.config {
+        let config_path = config.to_string_lossy().into_owned();
+        push_sudo_env(&mut envs, "SBH_CONFIG", config_path.clone());
+        push_sudo_env(&mut envs, "SBH_CONFIG_PATH", config_path);
+    } else {
+        if let Some(config) = env_value("SBH_CONFIG") {
+            push_sudo_env(&mut envs, "SBH_CONFIG", config);
+        }
+        if let Some(config_path) = env_value("SBH_CONFIG_PATH") {
+            push_sudo_env(&mut envs, "SBH_CONFIG_PATH", config_path);
+        }
+    }
+
+    if let Some(rust_log) = env_value("RUST_LOG") {
+        push_sudo_env(&mut envs, "RUST_LOG", rust_log);
+    }
+
+    envs
+}
+
+fn format_sudo_rerun_command_from_args(cli: &Cli, kind: ServiceKind, argv: &[String]) -> String {
+    let mut parts = vec!["sudo".to_string()];
+    let envs = sudo_env_assignments(cli, kind);
+
+    if !envs.is_empty() {
+        parts.push("env".to_string());
+        for (name, value) in envs {
+            parts.push(format!("{name}={}", shell_quote(&value)));
+        }
+    }
+
+    if argv.is_empty() {
+        parts.push("sbh".to_string());
+    } else {
+        parts.extend(argv.iter().map(|arg| shell_quote(arg)));
+    }
+
+    parts.join(" ")
+}
+
+fn format_sudo_rerun_command(cli: &Cli, kind: ServiceKind) -> String {
+    let argv: Vec<String> = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    format_sudo_rerun_command_from_args(cli, kind, &argv)
+}
+
+fn service_system_scope_root_message(
+    action: &str,
+    kind: ServiceKind,
+    sudo_command: &str,
+) -> String {
+    let service_name = service_kind_name(kind);
+    let user_scope_hint = match action {
+        "install" => "For a user service instead, run `sbh install --scope user` without sudo.",
+        "uninstall" => "For a user service instead, run `sbh uninstall --scope user` without sudo.",
+        _ => "For user-scope service work, pass `--scope user` without sudo.",
+    };
+
+    format!(
+        "Error: system-scope {service_name} {action} requires root.\nRun:\n  {sudo_command}\n{user_scope_hint}"
+    )
+}
+
 fn resolve_install_service(
     args: &InstallArgs,
     detected_kind: ServiceKind,
     is_root: bool,
+    sudo_command: &str,
 ) -> Result<Option<ResolvedInstallService>, CliError> {
     if !install_requests_service(args) {
         return Ok(None);
@@ -759,18 +859,11 @@ fn resolve_install_service(
     };
 
     if !user_scope && !is_root {
-        let message = match kind {
-            ServiceKind::Systemd => {
-                "Error: system-scope systemd installation requires root. \
-                 Use `sudo sbh install --systemd --scope system` or `sbh install --scope user`."
-            }
-            ServiceKind::Launchd => {
-                "Error: system-scope launchd installation requires root. \
-                 Use `sudo sbh install --launchd --scope system` or `sbh install --scope user` for a LaunchAgent."
-            }
-            ServiceKind::None => unreachable!("ServiceKind::None was rejected above"),
-        };
-        return Err(CliError::User(message.to_string()));
+        return Err(CliError::User(service_system_scope_root_message(
+            "install",
+            kind,
+            sudo_command,
+        )));
     }
 
     Ok(Some(ResolvedInstallService { kind, user_scope }))
@@ -839,7 +932,9 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     // Validate service flags against the current platform BEFORE any expensive
     // work (config loading, ballast provisioning, from-source builds).
     let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
-    let service = resolve_install_service(args, platform.service_kind(), running_as_root())?;
+    let service_kind = platform.service_kind();
+    let sudo_command = format_sudo_rerun_command(cli, service_kind);
+    let service = resolve_install_service(args, service_kind, running_as_root(), &sudo_command)?;
 
     // -- from-source build ----------------------------------------------------
     if args.from_source {
@@ -1096,6 +1191,13 @@ fn run_uninstall(cli: &Cli, args: &UninstallArgs) -> Result<(), CliError> {
         let user_plist = home.join("Library/LaunchAgents/com.sbh.daemon.plist");
         let launchd_user =
             resolve_uninstall_user_scope(args, system_plist.exists(), user_plist.exists(), true);
+        if !launchd_user && !running_as_root() {
+            return Err(CliError::User(service_system_scope_root_message(
+                "uninstall",
+                ServiceKind::Launchd,
+                &format_sudo_rerun_command(cli, ServiceKind::Launchd),
+            )));
+        }
 
         let mgr = LaunchdServiceManager::from_env(launchd_user)
             .map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -1172,6 +1274,13 @@ fn run_uninstall(cli: &Cli, args: &UninstallArgs) -> Result<(), CliError> {
     let user_path = home.join(".config/systemd/user/sbh.service");
     let user_scope =
         resolve_uninstall_user_scope(args, system_path.exists(), user_path.exists(), false);
+    if !user_scope && !running_as_root() {
+        return Err(CliError::User(service_system_scope_root_message(
+            "uninstall",
+            ServiceKind::Systemd,
+            &format_sudo_rerun_command(cli, ServiceKind::Systemd),
+        )));
+    }
 
     let mgr = SystemdServiceManager::from_env(user_scope)
         .map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -6400,9 +6509,14 @@ mod tests {
     #[test]
     fn install_auto_selects_launchd_user_scope_on_macos() {
         let args = InstallArgs::default();
-        let service = resolve_install_service(&args, ServiceKind::Launchd, false)
-            .expect("plain install should resolve")
-            .expect("plain install should request service");
+        let service = resolve_install_service(
+            &args,
+            ServiceKind::Launchd,
+            false,
+            "sudo sbh install --scope system",
+        )
+        .expect("plain install should resolve")
+        .expect("plain install should request service");
 
         assert_eq!(service.kind, ServiceKind::Launchd);
         assert!(service.user_scope);
@@ -6412,9 +6526,14 @@ mod tests {
     #[test]
     fn install_auto_selects_systemd_system_scope_on_linux() {
         let args = InstallArgs::default();
-        let service = resolve_install_service(&args, ServiceKind::Systemd, true)
-            .expect("plain install should resolve")
-            .expect("plain install should request service");
+        let service = resolve_install_service(
+            &args,
+            ServiceKind::Systemd,
+            true,
+            "sudo sbh install --scope system",
+        )
+        .expect("plain install should resolve")
+        .expect("plain install should request service");
 
         assert_eq!(service.kind, ServiceKind::Systemd);
         assert!(!service.user_scope);
@@ -6429,9 +6548,14 @@ mod tests {
         };
 
         assert!(
-            resolve_install_service(&args, ServiceKind::Launchd, false)
-                .expect("from-source-only should resolve")
-                .is_none()
+            resolve_install_service(
+                &args,
+                ServiceKind::Launchd,
+                false,
+                "sudo sbh install --scope system",
+            )
+            .expect("from-source-only should resolve")
+            .is_none()
         );
     }
 
@@ -6442,9 +6566,14 @@ mod tests {
             scope: Some(InstallScopeArg::User),
             ..InstallArgs::default()
         };
-        let service = resolve_install_service(&args, ServiceKind::Launchd, false)
-            .expect("scoped from-source install should resolve")
-            .expect("scope should request service");
+        let service = resolve_install_service(
+            &args,
+            ServiceKind::Launchd,
+            false,
+            "sudo sbh install --scope system",
+        )
+        .expect("scoped from-source install should resolve")
+        .expect("scope should request service");
 
         assert_eq!(service.kind, ServiceKind::Launchd);
         assert!(service.user_scope);
@@ -6456,8 +6585,13 @@ mod tests {
             systemd: true,
             ..InstallArgs::default()
         };
-        let err = resolve_install_service(&args, ServiceKind::Launchd, true)
-            .expect_err("--systemd should fail on launchd hosts");
+        let err = resolve_install_service(
+            &args,
+            ServiceKind::Launchd,
+            true,
+            "sudo sbh install --scope system",
+        )
+        .expect_err("--systemd should fail on launchd hosts");
 
         assert!(err.to_string().contains("--systemd"));
         assert!(err.to_string().contains("launchd"));
@@ -6469,11 +6603,70 @@ mod tests {
             scope: Some(InstallScopeArg::System),
             ..InstallArgs::default()
         };
-        let err = resolve_install_service(&args, ServiceKind::Launchd, false)
-            .expect_err("system-scope launchd should require root");
+        let err = resolve_install_service(
+            &args,
+            ServiceKind::Launchd,
+            false,
+            "sudo sbh install --scope system",
+        )
+        .expect_err("system-scope launchd should require root");
 
         assert!(err.to_string().contains("requires root"));
         assert!(err.to_string().contains("--scope user"));
+        assert!(err.to_string().contains("sudo sbh install --scope system"));
+    }
+
+    #[test]
+    fn sudo_rerun_command_preserves_launchd_config_env_and_argv() {
+        let config_path = "/Users/jane/Library/Application Support/sbh/config.toml";
+        let cli = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            config_path,
+            "install",
+            "--launchd",
+            "--scope",
+            "system",
+        ])
+        .expect("scoped install should parse");
+        let argv = [
+            "sbh",
+            "--config",
+            config_path,
+            "install",
+            "--launchd",
+            "--scope",
+            "system",
+        ]
+        .map(ToString::to_string);
+        let command = format_sudo_rerun_command_from_args(&cli, ServiceKind::Launchd, &argv);
+
+        assert!(command.starts_with("sudo env "));
+        assert!(
+            command
+                .contains("SBH_CONFIG='/Users/jane/Library/Application Support/sbh/config.toml'")
+        );
+        assert!(
+            command.contains(
+                "SBH_CONFIG_PATH='/Users/jane/Library/Application Support/sbh/config.toml'"
+            )
+        );
+        assert!(command.contains(
+            "sbh --config '/Users/jane/Library/Application Support/sbh/config.toml' install --launchd --scope system"
+        ));
+    }
+
+    #[test]
+    fn system_scope_uninstall_root_message_includes_sudo_rerun() {
+        let message = service_system_scope_root_message(
+            "uninstall",
+            ServiceKind::Launchd,
+            "sudo env HOME=/Users/jane sbh uninstall --launchd --scope system",
+        );
+
+        assert!(message.contains("system-scope launchd uninstall requires root"));
+        assert!(message.contains("sudo env HOME=/Users/jane sbh uninstall"));
+        assert!(message.contains("sbh uninstall --scope user"));
     }
 
     #[test]

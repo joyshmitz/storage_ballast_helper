@@ -34,20 +34,15 @@ pub struct LaunchdConfig {
 
 impl LaunchdConfig {
     /// Build a config from the current environment.
-    ///
-    /// If `user_scope` is false but the current process is not running as root,
-    /// automatically escalates to user-scope to avoid permission errors when
-    /// creating log directories under `/usr/local/var/log/`.
     pub fn from_env(user_scope: bool) -> Result<Self> {
-        let effective_user_scope = if !user_scope && !is_running_as_root() {
-            eprintln!("[SBH] Not running as root - defaulting to user-scope launchd installation");
-            true
-        } else {
-            user_scope
-        };
+        if !user_scope && !is_running_as_root() {
+            return Err(SbhError::PermissionDenied {
+                path: PathBuf::from("/Library/LaunchDaemons"),
+            });
+        }
 
         let binary_path = resolve_sbh_binary()?;
-        let (stdout_log, stderr_log) = default_launchd_log_paths(effective_user_scope);
+        let (stdout_log, stderr_log) = default_launchd_log_paths(user_scope);
         let paths = PathsConfig::default();
         let working_directory = paths
             .state_file
@@ -58,7 +53,7 @@ impl LaunchdConfig {
             .map_or(paths.config_file, PathBuf::from);
         let rust_log = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
         Ok(Self {
-            user_scope: effective_user_scope,
+            user_scope,
             binary_path,
             stdout_log,
             stderr_log,
