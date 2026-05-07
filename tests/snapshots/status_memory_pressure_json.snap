@@ -1,0 +1,15 @@
+---
+source: src/cli_app.rs
+---
+{
+  "compressor_used_bytes": 987654321,
+  "free_bytes": 5054464,
+  "free_pages": 1234,
+  "level": "warn",
+  "linux_psi_avg10": null,
+  "page_size_bytes": 4096,
+  "swap_total_bytes": 2147483648,
+  "swap_used_bytes": 1073741824,
+  "used_bytes": 23257088,
+  "used_pages": 5678
+}

@@ -33,7 +33,8 @@ use storage_ballast_helper::platform::pal::{
     MemoryInfo, Platform, ServiceManager, detect_platform,
 };
 use storage_ballast_helper::platform::types::{
-    Capacity, FullDiskAccessState, FullDiskAccessStatus, ServiceKind,
+    Capacity, FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureLevel,
+    ServiceKind,
 };
 use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionPlan};
 use storage_ballast_helper::scanner::patterns::{ArtifactCategory, ArtifactPatternRegistry};
@@ -4600,6 +4601,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
         None
     };
     let memory_info = platform.memory_info().ok();
+    let memory_pressure = platform.memory_pressure().ok();
 
     match output_mode(cli) {
         OutputMode::Human => {
@@ -4834,6 +4836,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                         "swap_thrash_risk": is_swap_thrash_risk(memory),
                     })
                 }),
+                "memory_pressure": memory_pressure.as_ref().map(status_memory_pressure_json),
                 "recent_hour": recent,
                 "policy_mode": daemon_state.as_ref().and_then(|s| s.get("policy_mode")).and_then(|v| v.as_str()),
             });
@@ -5149,6 +5152,30 @@ fn is_swap_thrash_risk(memory: &MemoryInfo) -> bool {
     // available RAM, swap usage alone doesn't indicate thrashing — the kernel
     // simply swapped out cold pages, which is normal Linux behavior.
     memory.available_bytes < MIN_AVAILABLE_RAM_BYTES
+}
+
+fn status_memory_pressure_json(pressure: &MemoryPressure) -> Value {
+    json!({
+        "level": memory_pressure_level_label(pressure.level),
+        "free_pages": pressure.free_pages,
+        "used_pages": pressure.used_pages,
+        "page_size_bytes": pressure.page_size_bytes,
+        "free_bytes": pressure.free_pages.zip(pressure.page_size_bytes).map(|(pages, page_size)| pages.saturating_mul(page_size)),
+        "used_bytes": pressure.used_pages.zip(pressure.page_size_bytes).map(|(pages, page_size)| pages.saturating_mul(page_size)),
+        "compressor_used_bytes": pressure.compressor_used_bytes,
+        "swap_total_bytes": pressure.swap_total_bytes,
+        "swap_used_bytes": pressure.swap_used_bytes,
+        "linux_psi_avg10": pressure.linux_psi_avg10,
+    })
+}
+
+fn memory_pressure_level_label(level: MemoryPressureLevel) -> &'static str {
+    match level {
+        MemoryPressureLevel::Normal => "normal",
+        MemoryPressureLevel::Warn => "warn",
+        MemoryPressureLevel::Critical => "critical",
+        MemoryPressureLevel::Unknown => "unknown",
+    }
 }
 
 fn ballast_total_pool_bytes(file_count: usize, file_size_bytes: u64) -> u64 {
@@ -9765,6 +9792,34 @@ mod tests {
         assert_eq!(apfs["purgeable_bytes"], 32);
         assert_eq!(apfs["local_snapshot_bytes"], 64);
         assert_eq!(apfs["free_excludes_purgeable"], true);
+    }
+
+    fn cli_app_snapshot_settings(assertion: impl FnOnce()) {
+        let mut settings = insta::Settings::clone_current();
+        settings.set_snapshot_path("../tests/snapshots");
+        settings.set_prepend_module_to_snapshot(false);
+        settings.set_omit_expression(true);
+        settings.bind(assertion);
+    }
+
+    #[test]
+    fn status_memory_pressure_json_matches_snapshot() {
+        let pressure = MemoryPressure {
+            level: MemoryPressureLevel::Warn,
+            free_pages: Some(1_234),
+            used_pages: Some(5_678),
+            page_size_bytes: Some(4_096),
+            compressor_used_bytes: Some(987_654_321),
+            swap_total_bytes: Some(2_147_483_648),
+            swap_used_bytes: Some(1_073_741_824),
+            linux_psi_avg10: None,
+        };
+        let payload = status_memory_pressure_json(&pressure);
+        let rendered = serde_json::to_string_pretty(&payload).expect("snapshot JSON renders");
+
+        cli_app_snapshot_settings(|| {
+            insta::assert_snapshot!("status_memory_pressure_json", rendered);
+        });
     }
 
     #[test]
