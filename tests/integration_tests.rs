@@ -365,6 +365,54 @@ fn sacred_overlap_stowaway_beads_inside_trash_keeps_candidate() {
     assert_sacred_keep(&score, ".beads/");
 }
 
+#[test]
+fn mac_bundle_extension_refuse_list_keeps_old_large_candidates() {
+    let tree = common::SyntheticMacTree::new();
+    let engine = ScoringEngine::from_config(&ScoringConfig::default(), 30);
+
+    for (name, extension) in [
+        ("Photos Library", "photoslibrary"),
+        ("Cut", "fcpbundle"),
+        ("Movie", "imovielibrary"),
+        ("Runner", "app"),
+        ("RenderKit", "framework"),
+        ("Editor", "bundle"),
+        ("Codec", "plugin"),
+        ("Driver", "kext"),
+        ("Lightroom Catalog", "lrcat"),
+        ("Lightroom Library", "lrlibrary"),
+        ("Aperture Library", "aplibrary"),
+    ] {
+        let candidate = tree.private_tmp.join(format!("{name}.{extension}"));
+        fs::create_dir_all(&candidate).expect("create synthetic bundle candidate");
+
+        let input = synthetic_cleanup_candidate(&candidate);
+        let score = engine.score_candidate(&input, 1.0);
+
+        assert!(score.vetoed, ".{extension} candidate should be kept");
+        assert_eq!(score.decision.action, DecisionAction::Keep);
+        let expected_reason = format!("protected bundle/project extension .{extension}");
+        assert_eq!(score.veto_reason.as_deref(), Some(expected_reason.as_str()));
+    }
+
+    let nested_candidate = tree
+        .private_tmp
+        .join("Runner.app")
+        .join("Contents")
+        .join("MacOS")
+        .join("cache-target");
+    fs::create_dir_all(&nested_candidate).expect("create synthetic nested app candidate");
+
+    let input = synthetic_cleanup_candidate(&nested_candidate);
+    let score = engine.score_candidate(&input, 1.0);
+
+    assert!(score.vetoed, "candidate inside .app should be kept");
+    assert_eq!(
+        score.veto_reason.as_deref(),
+        Some("protected bundle/project extension .app")
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 32,

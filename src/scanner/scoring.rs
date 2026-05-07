@@ -220,6 +220,20 @@ pub struct CandidateInput {
     pub excluded: bool,
 }
 
+const HARD_REFUSE_BUNDLE_EXTENSIONS: &[&str] = &[
+    "photoslibrary",
+    "fcpbundle",
+    "imovielibrary",
+    "app",
+    "framework",
+    "bundle",
+    "plugin",
+    "kext",
+    "lrcat",
+    "lrlibrary",
+    "aplibrary",
+];
+
 /// Deterministic score engine with expected-loss decision layer.
 #[derive(Debug, Clone)]
 pub struct ScoringEngine {
@@ -404,6 +418,11 @@ impl ScoringEngine {
                 "contains Cargo.toml without build-artifact markers",
             ));
         }
+        if let Some(extension) = hard_refuse_bundle_extension(&input.path) {
+            return Some(Cow::Owned(format!(
+                "protected bundle/project extension .{extension}"
+            )));
+        }
         if let Some(reason) = sacred_overlap_veto_reason(sacred_overlaps) {
             return Some(reason);
         }
@@ -467,6 +486,18 @@ fn sacred_overlap_veto_reason(overlaps: &[SacredOverlap]) -> Option<Cow<'static,
         let _ = write!(reason, "; and {extra} more sacred overlap(s)");
     }
     Some(Cow::Owned(reason))
+}
+
+fn hard_refuse_bundle_extension(path: &Path) -> Option<&'static str> {
+    path.ancestors().find_map(path_bundle_extension)
+}
+
+fn path_bundle_extension(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_string_lossy();
+    HARD_REFUSE_BUNDLE_EXTENSIONS
+        .iter()
+        .copied()
+        .find(|protected| extension.eq_ignore_ascii_case(protected))
 }
 
 fn factor_location(path: &Path) -> f64 {
@@ -853,7 +884,10 @@ fn is_system_path(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActiveReferenceSummary, CandidateInput, DecisionAction, ScoringEngine};
+    use super::{
+        ActiveReferenceSummary, CandidateInput, DecisionAction, HARD_REFUSE_BUNDLE_EXTENSIONS,
+        ScoringEngine,
+    };
     use crate::core::config::ScoringConfig;
     use crate::platform::types::SacredPathSource;
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
@@ -1155,6 +1189,105 @@ mod tests {
         assert_eq!(
             score.veto_reason.as_deref(),
             Some("contains Cargo.toml without build-artifact markers")
+        );
+    }
+
+    #[test]
+    fn protected_bundle_extensions_are_hard_vetoed_even_when_artifact_like() {
+        let engine = default_engine();
+
+        for extension in HARD_REFUSE_BUNDLE_EXTENSIONS {
+            let path = PathBuf::from(format!("/private/tmp/sbh-old-trash/Important.{extension}"));
+            let score = engine.score_candidate(
+                &CandidateInput {
+                    path,
+                    size_bytes: 80 * 1_073_741_824,
+                    age: Duration::from_hours(24 * 90),
+                    classification: classification(0.98, ArtifactCategory::RustTarget),
+                    signals: StructuralSignals {
+                        has_incremental: true,
+                        has_deps: true,
+                        has_build: true,
+                        has_fingerprint: true,
+                        mostly_object_files: true,
+                        ..StructuralSignals::default()
+                    },
+                    active_references: ActiveReferenceSummary::default(),
+                    is_open: false,
+                    excluded: false,
+                },
+                1.0,
+            );
+
+            assert!(score.vetoed, ".{extension} should be hard-refused");
+            assert!(score.total_score.abs() <= f64::EPSILON);
+            assert_eq!(score.decision.action, DecisionAction::Keep);
+            let expected_reason = format!("protected bundle/project extension .{extension}");
+            assert_eq!(score.veto_reason.as_deref(), Some(expected_reason.as_str()));
+        }
+    }
+
+    #[test]
+    fn protected_bundle_extension_match_is_case_insensitive() {
+        let engine = default_engine();
+        let score = engine.score_candidate(
+            &CandidateInput {
+                path: PathBuf::from("/private/tmp/sbh-old-trash/Runner.APP"),
+                size_bytes: 5 * 1_073_741_824,
+                age: Duration::from_hours(24 * 30),
+                classification: classification(0.98, ArtifactCategory::RustTarget),
+                signals: StructuralSignals {
+                    has_incremental: true,
+                    has_deps: true,
+                    has_build: true,
+                    has_fingerprint: true,
+                    mostly_object_files: true,
+                    ..StructuralSignals::default()
+                },
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            1.0,
+        );
+
+        assert!(score.vetoed);
+        assert_eq!(
+            score.veto_reason.as_deref(),
+            Some("protected bundle/project extension .app")
+        );
+    }
+
+    #[test]
+    fn protected_bundle_extension_vetoes_descendants() {
+        let engine = default_engine();
+        let score = engine.score_candidate(
+            &CandidateInput {
+                path: PathBuf::from(
+                    "/private/tmp/sbh-old-trash/Runner.app/Contents/MacOS/cache-target",
+                ),
+                size_bytes: 5 * 1_073_741_824,
+                age: Duration::from_hours(24 * 30),
+                classification: classification(0.98, ArtifactCategory::RustTarget),
+                signals: StructuralSignals {
+                    has_incremental: true,
+                    has_deps: true,
+                    has_build: true,
+                    has_fingerprint: true,
+                    mostly_object_files: true,
+                    ..StructuralSignals::default()
+                },
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            1.0,
+        );
+
+        assert!(score.vetoed);
+        assert_eq!(
+            score.veto_reason.as_deref(),
+            Some("protected bundle/project extension .app")
         );
     }
 
