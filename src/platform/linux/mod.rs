@@ -25,8 +25,8 @@ use crate::platform::pal::{
 use crate::platform::sacred_catalog::cross_platform_sacred_paths;
 #[cfg(target_os = "linux")]
 use crate::platform::types::{
-    MemoryPressure, MemoryPressureCallback, PalError, SacredPath, SelfStats, ServiceKind,
-    SubscriptionHandle,
+    MemoryPressure, MemoryPressureCallback, PalError, ProcessInfo, ProcessIo, SacredPath,
+    SelfStats, ServiceKind, SubscriptionHandle,
 };
 
 #[cfg(target_os = "linux")]
@@ -135,6 +135,14 @@ impl Platform for LinuxPal {
         callback: MemoryPressureCallback,
     ) -> Result<SubscriptionHandle> {
         memory::subscribe_memory_pressure(callback)
+    }
+
+    fn process_list(&self) -> Result<Vec<ProcessInfo>> {
+        process::read_process_list()
+    }
+
+    fn process_io(&self, pid: i32) -> Result<ProcessIo> {
+        process::read_process_io(pid)
     }
 
     fn self_stats(&self) -> Result<SelfStats> {

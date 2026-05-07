@@ -5,6 +5,8 @@
 pub mod loop_main;
 pub mod notifications;
 pub mod policy;
+#[cfg(feature = "daemon")]
+pub mod process_io_history;
 pub mod self_monitor;
 pub mod service;
 #[cfg(feature = "daemon")]

@@ -33,6 +33,7 @@ use crate::daemon::policy::{
     ActiveMode, BallastAction, BehaviorDispatchTable, BehaviorMode, CleanupAction, PolicyEngine,
     ScanAggressiveness,
 };
+use crate::daemon::process_io_history::ProcessIoHistory;
 use crate::daemon::self_monitor::{SelfMonitor, ThreadHeartbeat};
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, spawn_logger};
@@ -514,6 +515,7 @@ pub struct MonitoringDaemon {
     last_full_disk_access_check: Option<Instant>,
     last_full_disk_access_state: Option<FullDiskAccessState>,
     full_disk_access_granted_logged: bool,
+    process_io_history: ProcessIoHistory,
     self_monitor: SelfMonitor,
     policy_engine: Arc<Mutex<PolicyEngine>>,
     behavior_state: PressureBehaviorState,
@@ -913,6 +915,9 @@ impl MonitoringDaemon {
 
         // 11. Self-monitor (writes state.json for CLI, tracks health).
         let self_monitor = SelfMonitor::new(config.paths.state_file.clone(), Arc::clone(&platform));
+        let process_io_history = ProcessIoHistory::load_or_new(
+            ProcessIoHistory::snapshot_path_for_state_file(&config.paths.state_file),
+        );
 
         // 12. Thread heartbeats for worker health detection.
         let scanner_heartbeat = ThreadHeartbeat::new("sbh-scanner");
@@ -976,6 +981,7 @@ impl MonitoringDaemon {
             last_full_disk_access_check: None,
             last_full_disk_access_state: None,
             full_disk_access_granted_logged: false,
+            process_io_history,
             self_monitor,
             behavior_state,
             scanner_heartbeat,
@@ -1018,6 +1024,23 @@ impl MonitoringDaemon {
                     message: format!("Full Disk Access recheck failed: {error}"),
                 });
             }
+        }
+    }
+
+    fn sample_process_io_history(&mut self) {
+        let platform = Arc::clone(&self.platform);
+        let (report, error) = self
+            .process_io_history
+            .maybe_sample(platform.as_ref(), Instant::now());
+        if !report.sampled {
+            return;
+        }
+
+        if let Some(error) = error {
+            self.logger_handle.send(ActivityEvent::Error {
+                code: "SBH-1102".to_string(),
+                message: format!("process I/O history sample failed: {error}"),
+            });
         }
     }
 
@@ -1266,6 +1289,7 @@ impl MonitoringDaemon {
                 Duration::ZERO,
             );
             self.drain_memory_pressure_events(&memory_pressure_rx, response.level);
+            self.sample_process_io_history();
 
             // 5. Handle pressure response.
             self.handle_pressure(&response, &scan_tx, &scan_rx);
