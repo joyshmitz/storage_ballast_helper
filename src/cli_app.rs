@@ -205,6 +205,7 @@ impl ResolvedInstallService {
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct UninstallArgs {
     /// Remove systemd service units (Linux).
     #[arg(long, conflicts_with = "launchd")]
@@ -212,6 +213,12 @@ struct UninstallArgs {
     /// Remove launchd service plist (macOS).
     #[arg(long, conflicts_with = "systemd")]
     launchd: bool,
+    /// Remove from user service scope (same as --scope user).
+    #[arg(long, conflicts_with = "scope")]
+    user: bool,
+    /// Service scope for systemd or launchd removal.
+    #[arg(long, value_enum, value_name = "SCOPE", conflicts_with = "user")]
+    scope: Option<InstallScopeArg>,
     /// Remove all generated state and logs.
     #[arg(long)]
     purge: bool,
@@ -769,6 +776,22 @@ fn resolve_install_service(
     Ok(Some(ResolvedInstallService { kind, user_scope }))
 }
 
+fn resolve_uninstall_user_scope(
+    args: &UninstallArgs,
+    system_artifact_exists: bool,
+    user_artifact_exists: bool,
+    absent_default_user_scope: bool,
+) -> bool {
+    match args.scope {
+        Some(InstallScopeArg::User) => true,
+        Some(InstallScopeArg::System) => false,
+        None if args.user => true,
+        None if system_artifact_exists => false,
+        None if user_artifact_exists => true,
+        None => absent_default_user_scope,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     // -- wizard / auto mode ---------------------------------------------------
@@ -1069,19 +1092,20 @@ fn run_uninstall(cli: &Cli, args: &UninstallArgs) -> Result<(), CliError> {
     if args.launchd {
         // Determine scope: check system plist first, then user agent.
         let system_plist = PathBuf::from("/Library/LaunchDaemons/com.sbh.daemon.plist");
-        let launchd_user = if system_plist.exists() {
-            false
-        } else {
-            let home =
-                std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-            let user_plist = home.join("Library/LaunchAgents/com.sbh.daemon.plist");
-            user_plist.exists()
-        };
+        let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+        let user_plist = home.join("Library/LaunchAgents/com.sbh.daemon.plist");
+        let launchd_user =
+            resolve_uninstall_user_scope(args, system_plist.exists(), user_plist.exists(), true);
 
         let mgr = LaunchdServiceManager::from_env(launchd_user)
             .map_err(|e| CliError::Runtime(e.to_string()))?;
         let plist_path = mgr.config().plist_path();
-        let scope = if launchd_user { "user" } else { "system" };
+        let plist_existed = plist_path.exists();
+        let scope = if mgr.config().user_scope {
+            "user"
+        } else {
+            "system"
+        };
 
         match mgr.uninstall() {
             Ok(()) => {
@@ -1097,7 +1121,11 @@ fn run_uninstall(cli: &Cli, args: &UninstallArgs) -> Result<(), CliError> {
                 match output_mode(cli) {
                     OutputMode::Human => {
                         println!("Uninstalled launchd service ({scope} scope).");
-                        println!("  Removed: {}", plist_path.display());
+                        if plist_existed {
+                            println!("  Removed: {}", plist_path.display());
+                        } else {
+                            println!("  Already absent: {}", plist_path.display());
+                        }
                     }
                     OutputMode::Json => {
                         let payload = serde_json::to_value(&result)?;
@@ -1140,14 +1168,10 @@ fn run_uninstall(cli: &Cli, args: &UninstallArgs) -> Result<(), CliError> {
     // System scope is the default unless the system unit doesn't exist and
     // a user-scope one does.
     let system_path = std::path::PathBuf::from("/etc/systemd/system/sbh.service");
-    let user_scope = if system_path.exists() {
-        false
-    } else {
-        // Check if user-scope unit exists.
-        let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-        let user_path = home.join(".config/systemd/user/sbh.service");
-        user_path.exists()
-    };
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+    let user_path = home.join(".config/systemd/user/sbh.service");
+    let user_scope =
+        resolve_uninstall_user_scope(args, system_path.exists(), user_path.exists(), false);
 
     let mgr = SystemdServiceManager::from_env(user_scope)
         .map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -6450,6 +6474,67 @@ mod tests {
 
         assert!(err.to_string().contains("requires root"));
         assert!(err.to_string().contains("--scope user"));
+    }
+
+    #[test]
+    fn uninstall_command_parses_scope_flags() {
+        for case in [
+            vec!["sbh", "uninstall", "--launchd"],
+            vec!["sbh", "uninstall", "--launchd", "--scope", "user"],
+            vec!["sbh", "uninstall", "--launchd", "--scope", "system"],
+            vec!["sbh", "uninstall", "--systemd", "--user"],
+            vec!["sbh", "uninstall", "--systemd", "--purge"],
+        ] {
+            let parsed = Cli::try_parse_from(case.iter().copied());
+            assert!(parsed.is_ok(), "failed to parse uninstall case: {case:?}");
+        }
+
+        assert!(
+            Cli::try_parse_from(["sbh", "uninstall", "--launchd", "--user", "--scope", "user"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["sbh", "uninstall", "--systemd", "--launchd"]).is_err());
+    }
+
+    #[test]
+    fn uninstall_launchd_defaults_to_user_when_no_plist_exists() {
+        let args = UninstallArgs {
+            launchd: true,
+            ..UninstallArgs::default()
+        };
+
+        assert!(resolve_uninstall_user_scope(&args, false, false, true));
+    }
+
+    #[test]
+    fn uninstall_scope_prefers_existing_system_artifact() {
+        let args = UninstallArgs {
+            launchd: true,
+            ..UninstallArgs::default()
+        };
+
+        assert!(!resolve_uninstall_user_scope(&args, true, true, true));
+    }
+
+    #[test]
+    fn uninstall_explicit_scope_overrides_artifact_detection() {
+        let args = UninstallArgs {
+            launchd: true,
+            scope: Some(InstallScopeArg::System),
+            ..UninstallArgs::default()
+        };
+
+        assert!(!resolve_uninstall_user_scope(&args, false, true, true));
+    }
+
+    #[test]
+    fn uninstall_systemd_defaults_to_system_when_no_unit_exists() {
+        let args = UninstallArgs {
+            systemd: true,
+            ..UninstallArgs::default()
+        };
+
+        assert!(!resolve_uninstall_user_scope(&args, false, false, false));
     }
 
     #[test]
