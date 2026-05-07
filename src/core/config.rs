@@ -13,6 +13,9 @@ use crate::core::errors::{Result, SbhError};
 use crate::daemon::notifications::NotificationConfig;
 use crate::daemon::policy::PolicyConfig;
 
+/// Supplemental protection file written by `sbh protect`.
+pub const SACRED_CONFIG_FILENAME: &str = "sacred.toml";
+
 /// Full SBH configuration model.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -325,6 +328,43 @@ pub struct PathsConfig {
     pub jsonl_log: PathBuf,
 }
 
+/// User-managed protection paths kept separate from the generated main config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SacredConfig {
+    #[serde(alias = "paths")]
+    pub protected_paths: Vec<String>,
+}
+
+impl SacredConfig {
+    pub fn normalize(&mut self) {
+        let mut normalized = Vec::new();
+        for path in self.protected_paths.drain(..) {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() && !normalized.iter().any(|known| known == trimmed) {
+                normalized.push(trimmed.to_string());
+            }
+        }
+        self.protected_paths = normalized;
+    }
+
+    pub fn add_protected_path(&mut self, path: impl Into<String>) -> bool {
+        let path = path.into();
+        if self.protected_paths.iter().any(|known| known == &path) {
+            false
+        } else {
+            self.protected_paths.push(path);
+            true
+        }
+    }
+
+    pub fn remove_protected_path(&mut self, path: &str) -> bool {
+        let before = self.protected_paths.len();
+        self.protected_paths.retain(|known| known != path);
+        before != self.protected_paths.len()
+    }
+}
+
 impl Default for PressureConfig {
     fn default() -> Self {
         Self {
@@ -558,6 +598,7 @@ impl Config {
 
         cfg.paths.config_file = effective_path;
         cfg.apply_env_overrides()?;
+        cfg.merge_sacred_config()?;
         cfg.normalize_paths();
         cfg.validate()?;
         Ok(cfg)
@@ -1079,6 +1120,68 @@ impl Config {
 
         Ok(())
     }
+
+    fn merge_sacred_config(&mut self) -> Result<()> {
+        let sacred_path = sacred_config_path_for(&self.paths.config_file);
+        let sacred = load_sacred_config(&sacred_path)?;
+        for protected_path in sacred.protected_paths {
+            if !self
+                .scanner
+                .protected_paths
+                .iter()
+                .any(|known| known == &protected_path)
+            {
+                self.scanner.protected_paths.push(protected_path);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[must_use]
+pub fn sacred_config_path_for(config_file: &Path) -> PathBuf {
+    config_file.parent().map_or_else(
+        || PathBuf::from(SACRED_CONFIG_FILENAME),
+        |dir| dir.join(SACRED_CONFIG_FILENAME),
+    )
+}
+
+pub fn load_sacred_config(path: &Path) -> Result<SacredConfig> {
+    if !path.exists() {
+        return Ok(SacredConfig::default());
+    }
+
+    let raw = fs::read_to_string(path).map_err(|source| SbhError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut sacred: SacredConfig = toml::from_str(&raw)?;
+    sacred.normalize();
+    Ok(sacred)
+}
+
+pub fn write_sacred_config(path: &Path, sacred: &SacredConfig) -> Result<()> {
+    let mut normalized = sacred.clone();
+    normalized.normalize();
+    let raw = toml::to_string_pretty(&normalized).map_err(|source| SbhError::Serialization {
+        context: "toml",
+        details: source.to_string(),
+    })?;
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|source| SbhError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+
+    fs::write(path, raw).map_err(|source| SbhError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn validate_prob(name: &str, value: f64) -> Result<()> {
@@ -1155,9 +1258,13 @@ fn strip_trailing_separator(s: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, SbhError};
+    use super::{
+        Config, SacredConfig, SbhError, load_sacred_config, sacred_config_path_for,
+        write_sacred_config,
+    };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
 
     fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -1495,6 +1602,53 @@ mod tests {
             "/home/*/projects".to_string(),
         ];
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn sacred_config_round_trips_and_deduplicates_paths() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("sacred.toml");
+        let sacred = SacredConfig {
+            protected_paths: vec![
+                "/data/projects/critical".to_string(),
+                "/data/projects/critical".to_string(),
+                "  /Users/jemanuel/Pictures/*.photoslibrary  ".to_string(),
+            ],
+        };
+
+        write_sacred_config(&path, &sacred).unwrap();
+        let loaded = load_sacred_config(&path).unwrap();
+
+        assert_eq!(
+            loaded.protected_paths,
+            vec![
+                "/data/projects/critical".to_string(),
+                "/Users/jemanuel/Pictures/*.photoslibrary".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_merges_sacred_config_protected_paths() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[scanner]\nprotected_paths = [\"/data/base\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sacred_config_path_for(&config_path),
+            "protected_paths = [\"/data/critical\", \"/data/base\"]\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load(Some(&config_path)).unwrap();
+
+        assert_eq!(
+            loaded.scanner.protected_paths,
+            vec!["/data/base".to_string(), "/data/critical".to_string()]
+        );
     }
 
     #[test]

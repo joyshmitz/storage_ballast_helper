@@ -14,7 +14,9 @@ use thiserror::Error;
 
 use storage_ballast_helper::ballast::manager::BallastManager;
 use storage_ballast_helper::cli::update::{UpdateReport, UpdateServiceRestart};
-use storage_ballast_helper::core::config::Config;
+use storage_ballast_helper::core::config::{
+    Config, load_sacred_config, sacred_config_path_for, write_sacred_config,
+};
 use storage_ballast_helper::daemon::loop_main::{
     DaemonArgs as RuntimeDaemonArgs, MonitoringDaemon,
 };
@@ -31,7 +33,7 @@ use storage_ballast_helper::platform::pal::{
 };
 use storage_ballast_helper::platform::types::ServiceKind;
 use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionPlan};
-use storage_ballast_helper::scanner::patterns::ArtifactPatternRegistry;
+use storage_ballast_helper::scanner::patterns::{ArtifactCategory, ArtifactPatternRegistry};
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
 use storage_ballast_helper::scanner::scoring::{
     ActiveReferenceSummary, CandidacyScore, CandidateInput, ScoringEngine,
@@ -245,6 +247,9 @@ struct StatusArgs {
     /// Continuously refresh status output.
     #[arg(long)]
     watch: bool,
+    /// Show protected paths, sacred catalog entries, and current sacred overlap counts.
+    #[arg(long)]
+    sacred: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize)]
@@ -3772,12 +3777,199 @@ fn pal_probe_result<T>(
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct SacredProtectionView {
+    path: String,
+    source: String,
+    metadata: Option<protection::ProtectionMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SacredStatusReport {
+    command: &'static str,
+    action: &'static str,
+    sacred_config_path: String,
+    protection_count: usize,
+    marker_count: usize,
+    config_pattern_count: usize,
+    sacred_catalog_count: usize,
+    scan_candidate_count: usize,
+    sacred_overlap_candidate_count: usize,
+    protections: Vec<SacredProtectionView>,
+}
+
 fn run_status(cli: &Cli, args: &StatusArgs) -> Result<(), CliError> {
-    if args.watch {
+    if args.sacred {
+        if args.watch {
+            return Err(CliError::User(
+                "status --sacred does not support --watch; run a snapshot status instead"
+                    .to_string(),
+            ));
+        }
+        render_sacred_status(cli)
+    } else if args.watch {
         run_live_status_loop(cli, STATUS_WATCH_REFRESH_MS, "status --watch", true)
     } else {
         render_status(cli)
     }
+}
+
+fn render_sacred_status(cli: &Cli) -> Result<(), CliError> {
+    let config =
+        Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let report = collect_sacred_status_report(&config)?;
+
+    match output_mode(cli) {
+        OutputMode::Human => {
+            println!("Sacred Protection Status");
+            println!("  Config: {}", report.sacred_config_path);
+            println!("  Active protections: {}", report.protection_count);
+            println!("    Markers: {}", report.marker_count);
+            println!("    Config patterns: {}", report.config_pattern_count);
+            println!("  Sacred catalog entries: {}", report.sacred_catalog_count);
+            println!(
+                "  Current scan candidates overlapping sacred paths: {} / {}",
+                report.sacred_overlap_candidate_count, report.scan_candidate_count
+            );
+
+            if report.protections.is_empty() {
+                println!("\n  No protections configured.");
+            } else {
+                println!("\n  Protected paths:");
+                for entry in &report.protections {
+                    match &entry.metadata {
+                        Some(meta) if meta.reason.is_some() => println!(
+                            "    {} ({}, reason: {})",
+                            entry.path,
+                            entry.source,
+                            meta.reason.as_deref().unwrap_or_default()
+                        ),
+                        _ => println!("    {} ({})", entry.path, entry.source),
+                    }
+                }
+            }
+        }
+        OutputMode::Json => {
+            let payload = serde_json::to_value(&report)?;
+            write_json_line(&payload)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_sacred_status_report(config: &Config) -> Result<SacredStatusReport, CliError> {
+    let sacred_config_path = sacred_config_path_for(&config.paths.config_file);
+    let protection_patterns = if config.scanner.protected_paths.is_empty() {
+        None
+    } else {
+        Some(config.scanner.protected_paths.as_slice())
+    };
+    let mut registry = ProtectionRegistry::new(protection_patterns)
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+
+    let root_paths = canonical_scan_roots(config);
+    for root in &root_paths {
+        let _ = registry.discover_markers(root, 3);
+    }
+
+    let protections = registry.list_protections();
+    let marker_count = protections
+        .iter()
+        .filter(|entry| matches!(entry.source, protection::ProtectionSource::MarkerFile))
+        .count();
+    let config_pattern_count = protections.len().saturating_sub(marker_count);
+    let protection_views = protections
+        .iter()
+        .map(protection_entry_view)
+        .collect::<Vec<_>>();
+
+    let sacred_paths = detect_platform()
+        .map_err(|e| CliError::Runtime(e.to_string()))?
+        .sacred_paths();
+    let (scan_candidate_count, sacred_overlap_candidate_count) =
+        count_sacred_scan_overlaps(config, root_paths, registry, &sacred_paths)?;
+
+    Ok(SacredStatusReport {
+        command: "status",
+        action: "sacred",
+        sacred_config_path: sacred_config_path.to_string_lossy().to_string(),
+        protection_count: protection_views.len(),
+        marker_count,
+        config_pattern_count,
+        sacred_catalog_count: sacred_paths.len(),
+        scan_candidate_count,
+        sacred_overlap_candidate_count,
+        protections: protection_views,
+    })
+}
+
+fn canonical_scan_roots(config: &Config) -> Vec<PathBuf> {
+    config
+        .scanner
+        .root_paths
+        .iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect()
+}
+
+fn protection_entry_view(entry: &protection::ProtectionEntry) -> SacredProtectionView {
+    let source = match &entry.source {
+        protection::ProtectionSource::MarkerFile => "marker".to_string(),
+        protection::ProtectionSource::ConfigPattern(pattern) => format!("config:{pattern}"),
+    };
+    SacredProtectionView {
+        path: entry.path.to_string_lossy().to_string(),
+        source,
+        metadata: entry.metadata.clone(),
+    }
+}
+
+fn count_sacred_scan_overlaps(
+    config: &Config,
+    root_paths: Vec<PathBuf>,
+    registry: ProtectionRegistry,
+    sacred_paths: &[storage_ballast_helper::platform::types::SacredPath],
+) -> Result<(usize, usize), CliError> {
+    if root_paths.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let walker_config = WalkerConfig {
+        root_paths,
+        max_depth: config.scanner.max_depth,
+        follow_symlinks: config.scanner.follow_symlinks,
+        cross_devices: config.scanner.cross_devices,
+        parallelism: config.scanner.parallelism,
+        excluded_paths: config
+            .scanner
+            .excluded_paths
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>(),
+    };
+    let walker = DirectoryWalker::new(walker_config, registry);
+    let entries = walker
+        .walk()
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    let patterns = ArtifactPatternRegistry::default();
+
+    let mut candidate_count = 0usize;
+    let mut overlap_count = 0usize;
+    for entry in entries.iter().filter(|entry| entry.metadata.is_dir) {
+        let classification = patterns.classify(&entry.path, entry.structural_signals);
+        if classification.category == ArtifactCategory::Unknown {
+            continue;
+        }
+        candidate_count += 1;
+        let overlaps = protection::find_sacred_overlaps(&entry.path, sacred_paths)
+            .map_err(|e| CliError::Runtime(e.to_string()))?;
+        if !overlaps.is_empty() {
+            overlap_count += 1;
+        }
+    }
+
+    Ok((candidate_count, overlap_count))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4293,100 +4485,161 @@ fn ballast_total_pool_bytes(file_count: usize, file_size_bytes: u64) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn default_protection_metadata() -> protection::ProtectionMetadata {
+    protection::ProtectionMetadata {
+        reason: None,
+        protected_by: std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .ok()
+            .filter(|name| !name.trim().is_empty()),
+        protected_at: Some(chrono::Utc::now().to_rfc3339()),
+    }
+}
+
+fn add_sacred_protected_path(config: &Config, path: &Path) -> Result<(PathBuf, bool), CliError> {
+    let sacred_config_path = sacred_config_path_for(&config.paths.config_file);
+    let mut sacred =
+        load_sacred_config(&sacred_config_path).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let changed = sacred.add_protected_path(path.to_string_lossy().to_string());
+    if changed || !sacred_config_path.exists() {
+        write_sacred_config(&sacred_config_path, &sacred)
+            .map_err(|e| CliError::Runtime(e.to_string()))?;
+    }
+    Ok((sacred_config_path, changed))
+}
+
+fn remove_sacred_protected_path(config: &Config, path: &Path) -> Result<(PathBuf, bool), CliError> {
+    let sacred_config_path = sacred_config_path_for(&config.paths.config_file);
+    if !sacred_config_path.exists() {
+        return Ok((sacred_config_path, false));
+    }
+
+    let mut sacred =
+        load_sacred_config(&sacred_config_path).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let protected_path = path.to_string_lossy().to_string();
+    let removed = sacred.remove_protected_path(&protected_path);
+    if removed {
+        write_sacred_config(&sacred_config_path, &sacred)
+            .map_err(|e| CliError::Runtime(e.to_string()))?;
+    }
+    Ok((sacred_config_path, removed))
+}
+
 fn run_protect(cli: &Cli, args: &ProtectArgs) -> Result<(), CliError> {
     if args.list {
-        // List all protections (markers + config patterns).
-        let config =
-            Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+        run_protect_list(cli)
+    } else if let Some(path) = &args.path {
+        run_protect_create(cli, path)
+    } else {
+        Ok(())
+    }
+}
 
-        let protection_patterns = if config.scanner.protected_paths.is_empty() {
-            None
-        } else {
-            Some(config.scanner.protected_paths.as_slice())
-        };
-        let mut registry = ProtectionRegistry::new(protection_patterns)
-            .map_err(|e| CliError::Runtime(e.to_string()))?;
+fn run_protect_list(cli: &Cli) -> Result<(), CliError> {
+    let config =
+        Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
 
-        // Discover markers in configured root paths.
-        for root in &config.scanner.root_paths {
-            let _ = registry.discover_markers(root, 3);
-        }
+    let protection_patterns = if config.scanner.protected_paths.is_empty() {
+        None
+    } else {
+        Some(config.scanner.protected_paths.as_slice())
+    };
+    let mut registry = ProtectionRegistry::new(protection_patterns)
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
 
-        let protections = registry.list_protections();
+    for root in &config.scanner.root_paths {
+        let _ = registry.discover_markers(root, 3);
+    }
 
-        match output_mode(cli) {
-            OutputMode::Human => {
-                if protections.is_empty() {
-                    println!("No protections configured.");
-                } else {
-                    println!("Protected paths ({}):\n", protections.len());
-                    for entry in &protections {
-                        let source = match &entry.source {
-                            protection::ProtectionSource::MarkerFile => "marker",
-                            protection::ProtectionSource::ConfigPattern(p) => p.as_str(),
-                        };
-                        println!("  {} ({})", entry.path.display(), source);
-                    }
+    let protections = registry.list_protections();
+
+    match output_mode(cli) {
+        OutputMode::Human => {
+            if protections.is_empty() {
+                println!("No protections configured.");
+            } else {
+                println!("Protected paths ({}):\n", protections.len());
+                for entry in &protections {
+                    let source = match &entry.source {
+                        protection::ProtectionSource::MarkerFile => "marker",
+                        protection::ProtectionSource::ConfigPattern(p) => p.as_str(),
+                    };
+                    println!("  {} ({})", entry.path.display(), source);
                 }
             }
-            OutputMode::Json => {
-                let entries: Vec<Value> = protections
-                    .iter()
-                    .map(|e| {
-                        let source = match &e.source {
-                            protection::ProtectionSource::MarkerFile => "marker".to_string(),
-                            protection::ProtectionSource::ConfigPattern(p) => {
-                                format!("config:{p}")
-                            }
-                        };
-                        json!({
-                            "path": e.path.to_string_lossy(),
-                            "source": source,
-                        })
+        }
+        OutputMode::Json => {
+            let entries: Vec<Value> = protections
+                .iter()
+                .map(|entry| {
+                    let view = protection_entry_view(entry);
+                    json!({
+                        "path": view.path,
+                        "source": view.source,
+                        "metadata": view.metadata,
                     })
-                    .collect();
-                let payload = json!({
-                    "command": "protect",
-                    "action": "list",
-                    "protections": entries,
-                });
-                write_json_line(&payload)?;
-            }
+                })
+                .collect();
+            let payload = json!({
+                "command": "protect",
+                "action": "list",
+                "protections": entries,
+            });
+            write_json_line(&payload)?;
         }
-    } else if let Some(path) = &args.path {
-        // Canonicalize to resolve symlinks and relative components before creating
-        // the marker, preventing symlink-based traversal attacks.
-        let canonical = path
-            .canonicalize()
-            .map_err(|e| CliError::User(format!("cannot resolve path {}: {e}", path.display())))?;
+    }
 
-        if !canonical.is_dir() {
-            return Err(CliError::User(format!(
-                "path is not a directory: {}",
+    Ok(())
+}
+
+fn run_protect_create(cli: &Cli, path: &Path) -> Result<(), CliError> {
+    let config =
+        Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| CliError::User(format!("cannot resolve path {}: {e}", path.display())))?;
+
+    if !canonical.is_dir() {
+        return Err(CliError::User(format!(
+            "path is not a directory: {}",
+            canonical.display(),
+        )));
+    }
+
+    let metadata = default_protection_metadata();
+    protection::create_marker(&canonical, Some(&metadata))
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    let (sacred_config_path, sacred_added) = add_sacred_protected_path(&config, &canonical)?;
+
+    match output_mode(cli) {
+        OutputMode::Human => {
+            println!(
+                "Protected: {} (created {})",
                 canonical.display(),
-            )));
-        }
-
-        protection::create_marker(&canonical, None)
-            .map_err(|e| CliError::Runtime(e.to_string()))?;
-
-        match output_mode(cli) {
-            OutputMode::Human => {
+                canonical.join(protection::MARKER_FILENAME).display(),
+            );
+            if sacred_added {
                 println!(
-                    "Protected: {} (created {})",
-                    canonical.display(),
-                    canonical.join(protection::MARKER_FILENAME).display(),
+                    "  Added persistent protection: {}",
+                    sacred_config_path.display()
+                );
+            } else {
+                println!(
+                    "  Persistent protection already present: {}",
+                    sacred_config_path.display()
                 );
             }
-            OutputMode::Json => {
-                let payload = json!({
-                    "command": "protect",
-                    "action": "create",
-                    "path": canonical.to_string_lossy(),
-                    "marker": canonical.join(protection::MARKER_FILENAME).to_string_lossy(),
-                });
-                write_json_line(&payload)?;
-            }
+        }
+        OutputMode::Json => {
+            let payload = json!({
+                "command": "protect",
+                "action": "create",
+                "path": canonical.to_string_lossy(),
+                "marker": canonical.join(protection::MARKER_FILENAME).to_string_lossy(),
+                "sacred_config": sacred_config_path.to_string_lossy(),
+                "sacred_config_added": sacred_added,
+            });
+            write_json_line(&payload)?;
         }
     }
 
@@ -4394,6 +4647,9 @@ fn run_protect(cli: &Cli, args: &ProtectArgs) -> Result<(), CliError> {
 }
 
 fn run_unprotect(cli: &Cli, args: &UnprotectArgs) -> Result<(), CliError> {
+    let config =
+        Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+
     // Canonicalize to resolve symlinks and relative components.
     let canonical = args
         .path
@@ -4402,6 +4658,7 @@ fn run_unprotect(cli: &Cli, args: &UnprotectArgs) -> Result<(), CliError> {
 
     let removed =
         protection::remove_marker(&canonical).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let (sacred_config_path, sacred_removed) = remove_sacred_protected_path(&config, &canonical)?;
 
     match output_mode(cli) {
         OutputMode::Human => {
@@ -4413,12 +4670,25 @@ fn run_unprotect(cli: &Cli, args: &UnprotectArgs) -> Result<(), CliError> {
                     canonical.join(protection::MARKER_FILENAME).display(),
                 );
             }
+            if sacred_removed {
+                println!(
+                    "  Removed persistent protection: {}",
+                    sacred_config_path.display()
+                );
+            } else {
+                println!(
+                    "  No persistent protection found in {}",
+                    sacred_config_path.display()
+                );
+            }
         }
         OutputMode::Json => {
             let payload = json!({
                 "command": "unprotect",
                 "path": canonical.to_string_lossy(),
                 "removed": removed,
+                "sacred_config": sacred_config_path.to_string_lossy(),
+                "sacred_config_removed": sacred_removed,
             });
             write_json_line(&payload)?;
         }
@@ -6848,6 +7118,8 @@ fn shell_completion_dir(shell: CompletionShell) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use storage_ballast_helper::core::config::SacredConfig;
+    use tempfile::TempDir;
 
     struct FakeServiceManager {
         loaded: std::result::Result<bool, &'static str>,
@@ -7685,6 +7957,113 @@ mod tests {
         assert!(Cli::try_parse_from(["sbh", "protect", "--list"]).is_ok());
         assert!(Cli::try_parse_from(["sbh", "protect", "/tmp/work"]).is_ok());
         assert!(Cli::try_parse_from(["sbh", "protect", "/tmp/work", "--list"]).is_err());
+        assert!(Cli::try_parse_from(["sbh", "status", "--sacred"]).is_ok());
+    }
+
+    #[test]
+    fn protect_command_writes_marker_and_sacred_config() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let protected = tmp.path().join("critical-build");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[scanner]\nroot_paths = [\"{}\"]\n",
+                tmp.path().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let cli = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            config_path.to_str().unwrap(),
+            "protect",
+            protected.to_str().unwrap(),
+        ])
+        .unwrap();
+        run(&cli).unwrap();
+
+        let marker_path = protected.join(protection::MARKER_FILENAME);
+        assert!(marker_path.exists());
+        let marker = std::fs::read_to_string(&marker_path).unwrap();
+        assert!(marker.contains("protected_at"));
+
+        let sacred_path = sacred_config_path_for(&config_path);
+        let sacred = load_sacred_config(&sacred_path).unwrap();
+        assert_eq!(
+            sacred.protected_paths,
+            vec![protected.to_string_lossy().to_string()]
+        );
+
+        let loaded = Config::load(Some(&config_path)).unwrap();
+        assert!(
+            loaded
+                .scanner
+                .protected_paths
+                .contains(&protected.to_string_lossy().to_string())
+        );
+    }
+
+    #[test]
+    fn unprotect_command_removes_marker_and_sacred_config_entry() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let protected = tmp.path().join("critical-build");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[scanner]\nroot_paths = [\"{}\"]\n",
+                tmp.path().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let sacred_path = sacred_config_path_for(&config_path);
+        let mut sacred = SacredConfig::default();
+        sacred.add_protected_path(protected.to_string_lossy().to_string());
+        write_sacred_config(&sacred_path, &sacred).unwrap();
+        protection::create_marker(&protected, None).unwrap();
+
+        let cli = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            config_path.to_str().unwrap(),
+            "unprotect",
+            protected.to_str().unwrap(),
+        ])
+        .unwrap();
+        run(&cli).unwrap();
+
+        assert!(!protected.join(protection::MARKER_FILENAME).exists());
+        let sacred = load_sacred_config(&sacred_path).unwrap();
+        assert!(sacred.protected_paths.is_empty());
+    }
+
+    #[test]
+    fn sacred_status_report_lists_config_protections() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let protected = tmp.path().join("critical-build");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[scanner]\nroot_paths = [\"{}\"]\nprotected_paths = [\"{}\"]\n",
+                tmp.path().to_string_lossy(),
+                protected.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load(Some(&config_path)).unwrap();
+        let report = collect_sacred_status_report(&config).unwrap();
+
+        assert_eq!(report.protection_count, 1);
+        assert_eq!(report.config_pattern_count, 1);
+        assert!(report.sacred_catalog_count > 0);
     }
 
     #[test]
