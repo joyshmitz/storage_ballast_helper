@@ -206,6 +206,23 @@ impl VmStats {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachTaskUsage {
+    pub rss_bytes: u64,
+    pub virtual_memory_bytes: u64,
+    pub cpu_user_micros: u64,
+    pub cpu_system_micros: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachThreadBasicInfo {
+    pub user_time_micros: u64,
+    pub system_time_micros: u64,
+    pub cpu_usage_scaled: i32,
+    pub run_state: i32,
+    pub flags: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirmlinkMap {
     pub mappings: Vec<FirmlinkMapping>,
@@ -518,6 +535,29 @@ pub fn read_vm_stats() -> io::Result<VmStats> {
         )));
     }
     parse_vm_stat(&String::from_utf8_lossy(&output.stdout))
+}
+
+pub fn current_mach_task_usage() -> io::Result<MachTaskUsage> {
+    sbh_mach::current_task_usage()
+        .map(|usage| MachTaskUsage {
+            rss_bytes: usage.rss_bytes,
+            virtual_memory_bytes: usage.virtual_memory_bytes,
+            cpu_user_micros: usage.cpu_user_micros,
+            cpu_system_micros: usage.cpu_system_micros,
+        })
+        .map_err(mach_error)
+}
+
+pub fn current_mach_thread_basic_info() -> io::Result<MachThreadBasicInfo> {
+    sbh_mach::current_thread_basic_info()
+        .map(|info| MachThreadBasicInfo {
+            user_time_micros: info.user_time_micros,
+            system_time_micros: info.system_time_micros,
+            cpu_usage_scaled: info.cpu_usage_scaled,
+            run_state: info.run_state,
+            flags: info.flags,
+        })
+        .map_err(mach_error)
 }
 
 pub fn firmlink_map() -> io::Result<FirmlinkMap> {
@@ -1083,6 +1123,10 @@ fn nix_error(error: nix::errno::Errno) -> io::Error {
     io::Error::from_raw_os_error(error as i32)
 }
 
+fn mach_error(error: sbh_mach::MachError) -> io::Error {
+    io::Error::other(error)
+}
+
 fn required_device_id(dict: &plist::Dictionary, key: &'static str) -> io::Result<String> {
     optional_device_id(dict, key).ok_or_else(|| {
         io::Error::new(
@@ -1474,6 +1518,24 @@ relative-target\tVolumes/External
             delta <= tolerance,
             "accounted pages {accounted} should be within {tolerance} pages of total {total_pages}"
         );
+    }
+
+    #[test]
+    fn current_mach_task_usage_reports_plausible_memory() {
+        let usage = super::current_mach_task_usage().expect("Mach task usage should be readable");
+        let total_bytes = sysctl::read::<u64>("hw.memsize").expect("hw.memsize should be readable");
+
+        assert!(usage.rss_bytes > 1_048_576);
+        assert!(usage.rss_bytes < total_bytes);
+        assert!(usage.virtual_memory_bytes >= usage.rss_bytes);
+    }
+
+    #[test]
+    fn current_mach_thread_basic_info_reports_run_state() {
+        let info = super::current_mach_thread_basic_info()
+            .expect("Mach current thread info should be readable");
+
+        assert!((1..=5).contains(&info.run_state));
     }
 
     #[test]
