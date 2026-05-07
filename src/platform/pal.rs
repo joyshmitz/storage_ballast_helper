@@ -311,10 +311,7 @@ impl MockPlatform {
             paths,
             memory_pressure: default_mock_memory_pressure(),
             full_disk_access: FullDiskAccessStatus::not_applicable("mock"),
-            subscription: SubscriptionHandle {
-                source: "mock".to_string(),
-                active: true,
-            },
+            subscription: SubscriptionHandle::active("mock"),
             processes: Vec::new(),
             process_io: HashMap::new(),
             open_files: Vec::new(),

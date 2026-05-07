@@ -4,6 +4,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -224,21 +225,51 @@ impl FullDiskAccessStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionHandle {
     pub source: String,
     pub active: bool,
+    #[serde(skip)]
+    _liveness: Option<Arc<()>>,
 }
 
 impl SubscriptionHandle {
+    #[must_use]
+    pub fn active(source: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            active: true,
+            _liveness: None,
+        }
+    }
+
+    #[must_use]
+    #[cfg(target_os = "macos")]
+    pub(crate) fn active_with_liveness(source: impl Into<String>, liveness: Arc<()>) -> Self {
+        Self {
+            source: source.into(),
+            active: true,
+            _liveness: Some(liveness),
+        }
+    }
+
     #[must_use]
     pub fn inactive(source: impl Into<String>) -> Self {
         Self {
             source: source.into(),
             active: false,
+            _liveness: None,
         }
     }
 }
+
+impl PartialEq for SubscriptionHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source && self.active == other.active
+    }
+}
+
+impl Eq for SubscriptionHandle {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProcessInfo {

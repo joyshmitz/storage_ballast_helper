@@ -6,7 +6,7 @@
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::core::errors::Result;
@@ -32,6 +32,7 @@ use parking_lot::RwLock;
 
 const FDA_CACHE_TTL_SECS: u64 = 60;
 const FDA_CACHE_TTL: Duration = Duration::from_secs(FDA_CACHE_TTL_SECS);
+const MEMORY_PRESSURE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 static FDA_STATUS_CACHE: OnceLock<RwLock<Option<(Instant, FullDiskAccessStatus)>>> =
     OnceLock::new();
 
@@ -120,12 +121,7 @@ impl Platform for MacOsPal {
     }
 
     fn memory_pressure(&self) -> Result<MemoryPressure> {
-        let total_bytes = macos_total_memory_bytes("memory_pressure")?;
-        let stats =
-            sys::read_vm_stats().map_err(|error| macos_method_error("memory_pressure", &error))?;
-        let swap =
-            sys::vm_swapusage().map_err(|error| macos_method_error("memory_pressure", &error))?;
-        Ok(memory_pressure_from_vm_stats(total_bytes, stats, &swap))
+        read_current_memory_pressure("memory_pressure")
     }
 
     fn full_disk_access_status(&self) -> Result<FullDiskAccessStatus> {
@@ -134,9 +130,17 @@ impl Platform for MacOsPal {
 
     fn subscribe_memory_pressure(
         &self,
-        _callback: MemoryPressureCallback,
+        callback: MemoryPressureCallback,
     ) -> Result<SubscriptionHandle> {
-        macos_not_implemented("bd-68ik.1", "subscribe_memory_pressure")
+        // Direct GCD memory-pressure sources require unsafe dispatch_source_create
+        // bindings. Keep this PAL implementation inside the crate's no-unsafe
+        // policy by polling the same pressure snapshot used by memory_pressure().
+        spawn_memory_pressure_subscription(
+            "macos-memory-pressure-poll",
+            MEMORY_PRESSURE_POLL_INTERVAL,
+            callback,
+            || read_current_memory_pressure("subscribe_memory_pressure"),
+        )
     }
 
     fn process_list(&self) -> Result<Vec<ProcessInfo>> {
@@ -310,6 +314,50 @@ fn memory_pressure_from_vm_stats(
         swap_used_bytes,
         linux_psi_avg10: None,
     }
+}
+
+fn read_current_memory_pressure(method: &'static str) -> Result<MemoryPressure> {
+    let total_bytes = macos_total_memory_bytes(method)?;
+    let stats = sys::read_vm_stats().map_err(|error| macos_method_error(method, &error))?;
+    let swap = sys::vm_swapusage().map_err(|error| macos_method_error(method, &error))?;
+    Ok(memory_pressure_from_vm_stats(total_bytes, stats, &swap))
+}
+
+fn spawn_memory_pressure_subscription<F>(
+    source: &'static str,
+    interval: Duration,
+    callback: MemoryPressureCallback,
+    sampler: F,
+) -> Result<SubscriptionHandle>
+where
+    F: Fn() -> Result<MemoryPressure> + Send + 'static,
+{
+    let initial = sampler()?;
+    let liveness = Arc::new(());
+    let weak_liveness = Arc::downgrade(&liveness);
+    let thread_name = format!("sbh-{source}");
+    let thread = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let mut last_level = initial.level;
+            loop {
+                std::thread::sleep(interval);
+                if weak_liveness.upgrade().is_none() {
+                    break;
+                }
+                let Ok(pressure) = sampler() else {
+                    continue;
+                };
+                if pressure.level != last_level {
+                    last_level = pressure.level;
+                    callback(pressure);
+                }
+            }
+        })
+        .map_err(|error| macos_method_error("subscribe_memory_pressure", &error))?;
+    drop(thread);
+
+    Ok(SubscriptionHandle::active_with_liveness(source, liveness))
 }
 
 fn total_pages(total_bytes: u64, page_size_bytes: u64) -> u64 {
@@ -811,16 +859,19 @@ fn region_protection(bits: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::io::Write;
     use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
 
     use crate::platform::macos::sys::{
         ApfsContainer, ApfsInventory, ApfsVolume, ApfsVolumeRole, StatfsSnapshot, SwapUsage,
         SwapUsageInfo, VmStats,
     };
     use crate::platform::pal::Platform;
-    use crate::platform::types::MemoryPressureLevel;
+    use crate::platform::types::{MemoryPressure, MemoryPressureLevel};
 
     use super::MacOsPal;
 
@@ -943,6 +994,49 @@ mod tests {
     }
 
     #[test]
+    fn memory_pressure_subscription_reports_level_transitions() {
+        let samples = Arc::new(Mutex::new(VecDeque::from([
+            test_memory_pressure(MemoryPressureLevel::Normal),
+            test_memory_pressure(MemoryPressureLevel::Warn),
+            test_memory_pressure(MemoryPressureLevel::Warn),
+            test_memory_pressure(MemoryPressureLevel::Critical),
+        ])));
+        let sampler_samples = Arc::clone(&samples);
+        let (tx, rx) = mpsc::channel();
+
+        let handle = super::spawn_memory_pressure_subscription(
+            "test-memory-pressure",
+            Duration::from_millis(1),
+            Box::new(move |pressure| {
+                tx.send(pressure.level).expect("receiver should be alive");
+            }),
+            move || {
+                let mut samples = sampler_samples
+                    .lock()
+                    .expect("sample lock should not poison");
+                Ok(samples
+                    .pop_front()
+                    .unwrap_or_else(|| test_memory_pressure(MemoryPressureLevel::Critical)))
+            },
+        )
+        .expect("subscription should start");
+
+        assert!(handle.active);
+        assert_eq!(handle.source, "test-memory-pressure");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("warn transition"),
+            MemoryPressureLevel::Warn,
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("critical transition"),
+            MemoryPressureLevel::Critical,
+        );
+        drop(handle);
+    }
+
+    #[test]
     fn macos_pal_memory_methods_return_live_data() {
         let platform = MacOsPal::new();
         let memory = platform
@@ -958,6 +1052,19 @@ mod tests {
         assert!(pressure.free_pages.is_some());
         assert!(pressure.used_pages.is_some());
         assert_eq!(pressure.linux_psi_avg10, None);
+    }
+
+    fn test_memory_pressure(level: MemoryPressureLevel) -> MemoryPressure {
+        MemoryPressure {
+            level,
+            free_pages: None,
+            used_pages: None,
+            page_size_bytes: Some(4096),
+            compressor_used_bytes: None,
+            swap_total_bytes: None,
+            swap_used_bytes: None,
+            linux_psi_avg10: None,
+        }
     }
 
     #[test]
