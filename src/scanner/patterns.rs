@@ -169,6 +169,16 @@ impl ArtifactPatternRegistry {
             }
         }
 
+        if user_named_trash_pattern_name(path).is_some() {
+            best = ArtifactClassification {
+                pattern_name: Cow::Borrowed("user-named-trash"),
+                category: ArtifactCategory::TempDir,
+                name_confidence: 0.56,
+                structural_confidence: 0.0,
+                combined_confidence: 0.56,
+            };
+        }
+
         // Structural rescue path: name is ambiguous but layout screams "Rust target".
         // Graduated confidence based on how many cargo-specific markers are present:
         // only cargo build output directories have .fingerprint + deps + incremental +
@@ -229,6 +239,14 @@ fn macos_cleanup_path_classification(path: &Path) -> Option<ArtifactClassificati
             structural_confidence: 0.0,
             combined_confidence: 0.96,
         })
+    } else if user_named_trash_pattern_name(path).is_some() {
+        Some(ArtifactClassification {
+            pattern_name: Cow::Borrowed("user-named-trash"),
+            category: ArtifactCategory::TempDir,
+            name_confidence: 0.56,
+            structural_confidence: 0.0,
+            combined_confidence: 0.56,
+        })
     } else {
         electron_cache_pattern_name(path).map(|pattern_name| ArtifactClassification {
             pattern_name: Cow::Borrowed(pattern_name),
@@ -238,6 +256,30 @@ fn macos_cleanup_path_classification(path: &Path) -> Option<ArtifactClassificati
             combined_confidence: 0.92,
         })
     }
+}
+
+fn user_named_trash_pattern_name(path: &Path) -> Option<&'static str> {
+    let parent = path.parent()?;
+    if !is_volatile_temp_root(parent) {
+        return None;
+    }
+
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())?
+        .to_ascii_lowercase();
+    if name == "trash" || name == "trashed" || name.contains("-trash-") {
+        Some("user-named-trash")
+    } else {
+        None
+    }
+}
+
+fn is_volatile_temp_root(path: &Path) -> bool {
+    matches!(
+        path.to_string_lossy().as_ref(),
+        "/tmp" | "/private/tmp" | "/var/tmp" | "/data/tmp" | "/dev/shm"
+    )
 }
 
 fn is_xcode_derived_data_project_root(path: &Path) -> bool {
@@ -691,6 +733,9 @@ pub fn extract_pattern_label(path: &str) -> String {
     if is_xcode_derived_data_project_root(p) {
         return "xcode-derived-data".to_string();
     }
+    if user_named_trash_pattern_name(p).is_some() {
+        return "user-named-trash".to_string();
+    }
     if let Some(pattern_name) = electron_cache_pattern_name(p) {
         return pattern_name.to_string();
     }
@@ -945,6 +990,37 @@ mod tests {
 
         assert_ne!(classification.pattern_name, "electron-cache");
         assert_ne!(classification.pattern_name, "electron-service-worker-cache");
+    }
+
+    #[test]
+    fn volatile_user_named_trash_shapes_are_review_candidates() {
+        let registry = ArtifactPatternRegistry::default();
+        for path in [
+            "/private/tmp/trash",
+            "/private/tmp/trashed",
+            "/private/tmp/frankenterm-trash-20260503",
+            "/tmp/agent-trash-20260507",
+        ] {
+            let classification = registry.classify(Path::new(path), StructuralSignals::default());
+
+            assert_eq!(
+                classification.pattern_name, "user-named-trash",
+                "unexpected pattern for {path}"
+            );
+            assert_eq!(classification.category, ArtifactCategory::TempDir);
+            assert_eq!(extract_pattern_label(path), "user-named-trash");
+        }
+    }
+
+    #[test]
+    fn project_trash_name_is_not_a_cleanup_pattern() {
+        let registry = ArtifactPatternRegistry::default();
+        let classification = registry.classify(
+            Path::new("/data/projects/app/trash"),
+            StructuralSignals::default(),
+        );
+
+        assert_ne!(classification.pattern_name, "user-named-trash");
     }
 
     #[test]

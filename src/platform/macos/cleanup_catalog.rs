@@ -174,6 +174,24 @@ pub const TMP_TARGET_UNDERSCORE_PREFIX: CleanupRule = cleanup_rule(
     CleanupConfidence::Likely,
 );
 
+pub const USER_NAMED_TRASH_EXACT: CleanupRule = cleanup_rule(
+    "user-named-trash-exact",
+    "/private/tmp/trash",
+    AgeThreshold::NONE,
+    CheckRequirement::Required,
+    ReclaimCommand::PromptBeforeRemove,
+    CleanupConfidence::Unclear,
+);
+
+pub const USER_NAMED_TRASHED_EXACT: CleanupRule = cleanup_rule(
+    "user-named-trashed-exact",
+    "/private/tmp/trashed",
+    AgeThreshold::NONE,
+    CheckRequirement::Required,
+    ReclaimCommand::PromptBeforeRemove,
+    CleanupConfidence::Unclear,
+);
+
 pub const USER_NAMED_TRASH: CleanupRule = cleanup_rule(
     "user-named-trash",
     "/private/tmp/*-trash-*",
@@ -271,6 +289,8 @@ pub const MAC_CLEANUP_RULES: &[CleanupRule] = &[
     TMP_DASH_TARGET,
     TMP_UNDERSCORE_TARGET,
     TMP_TARGET_UNDERSCORE_PREFIX,
+    USER_NAMED_TRASH_EXACT,
+    USER_NAMED_TRASHED_EXACT,
     USER_NAMED_TRASH,
     RELEASE_WORK_BUILDROOT,
     USER_LOGS,
@@ -341,8 +361,8 @@ mod tests {
         MAIL_LIBRARY_SACRED, MESSAGES_LIBRARY_SACRED, PHOTOS_LIBRARY_SACRED,
         RELEASE_WORK_BUILDROOT, ReclaimCommand, SPOTLIGHT_INDEX_REPORT,
         TIME_MACHINE_LOCAL_SNAPSHOTS, TMP_DASH_TARGET, TMP_TARGET_UNDERSCORE_PREFIX,
-        TMP_UNDERSCORE_TARGET, USER_LOGS, USER_NAMED_TRASH, XCODE_DERIVED_DATA, cleanup_rules,
-        find_rule,
+        TMP_UNDERSCORE_TARGET, USER_LOGS, USER_NAMED_TRASH, USER_NAMED_TRASH_EXACT,
+        USER_NAMED_TRASHED_EXACT, XCODE_DERIVED_DATA, cleanup_rules, find_rule,
     };
 
     #[test]
@@ -508,15 +528,33 @@ mod tests {
 
     #[test]
     fn user_named_trash_rule_prompts_and_checks_fds() {
-        assert_rule(
-            USER_NAMED_TRASH,
-            "user-named-trash",
-            "/private/tmp/*-trash-*",
-            CleanupConfidence::Unclear,
-            ReclaimCommand::PromptBeforeRemove,
-            AgeThreshold::NONE,
-        );
-        assert_eq!(USER_NAMED_TRASH.fd_check, CheckRequirement::Required);
+        for (rule, name, path_glob) in [
+            (
+                USER_NAMED_TRASH_EXACT,
+                "user-named-trash-exact",
+                "/private/tmp/trash",
+            ),
+            (
+                USER_NAMED_TRASHED_EXACT,
+                "user-named-trashed-exact",
+                "/private/tmp/trashed",
+            ),
+            (
+                USER_NAMED_TRASH,
+                "user-named-trash",
+                "/private/tmp/*-trash-*",
+            ),
+        ] {
+            assert_rule(
+                rule,
+                name,
+                path_glob,
+                CleanupConfidence::Unclear,
+                ReclaimCommand::PromptBeforeRemove,
+                AgeThreshold::NONE,
+            );
+            assert_eq!(rule.fd_check, CheckRequirement::Required);
+        }
     }
 
     #[test]

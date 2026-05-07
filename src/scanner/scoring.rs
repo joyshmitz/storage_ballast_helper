@@ -338,15 +338,18 @@ impl ScoringEngine {
             uncertainty,
         );
 
-        let action = decide_action(
-            total,
-            self.min_score,
-            expected_loss_keep,
-            expected_loss_delete,
-            posterior_abandoned,
-            calibration,
-            fallback_active,
-            uncertainty,
+        let action = manual_review_override(
+            &input.classification,
+            decide_action(
+                total,
+                self.min_score,
+                expected_loss_keep,
+                expected_loss_delete,
+                posterior_abandoned,
+                calibration,
+                fallback_active,
+                uncertainty,
+            ),
         );
 
         let ledger = build_ledger(
@@ -748,6 +751,17 @@ fn decide_action(
         }
     } else {
         DecisionAction::Keep
+    }
+}
+
+fn manual_review_override(
+    classification: &ArtifactClassification,
+    action: DecisionAction,
+) -> DecisionAction {
+    if action == DecisionAction::Delete && classification.pattern_name == "user-named-trash" {
+        DecisionAction::Review
+    } else {
+        action
     }
 }
 
@@ -1479,6 +1493,22 @@ mod tests {
     fn decision_boundary_reviews_when_advantage_ratio_is_too_weak_for_risk() {
         let u = super::epistemic_uncertainty(0.90, 0.55);
         let action = super::decide_action(1.6, 0.45, 30.0, 20.0, 0.90, 0.55, false, u);
+        assert_eq!(action, DecisionAction::Review);
+    }
+
+    #[test]
+    fn user_named_trash_requires_manual_review_even_when_score_is_high() {
+        let action = super::manual_review_override(
+            &ArtifactClassification {
+                pattern_name: Cow::Borrowed("user-named-trash"),
+                category: ArtifactCategory::TempDir,
+                name_confidence: 0.56,
+                structural_confidence: 0.40,
+                combined_confidence: 0.51,
+            },
+            DecisionAction::Delete,
+        );
+
         assert_eq!(action, DecisionAction::Review);
     }
 

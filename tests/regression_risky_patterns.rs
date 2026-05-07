@@ -2,15 +2,19 @@
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;
     use storage_ballast_helper::core::config::ScoringConfig;
+    use storage_ballast_helper::platform::sacred_catalog::cross_platform_sacred_paths;
     use storage_ballast_helper::scanner::patterns::{
         ArtifactCategory, ArtifactPatternRegistry, StructuralSignals,
     };
+    use storage_ballast_helper::scanner::protection::find_sacred_overlaps;
     use storage_ballast_helper::scanner::scoring::{
         ActiveReferenceSummary, CandidateInput, DecisionAction, ScoringEngine,
     };
+    use tempfile::Builder as TempDirBuilder;
 
     fn default_engine() -> ScoringEngine {
         ScoringEngine::from_config(&ScoringConfig::default(), 4) // 4 hours min age
@@ -264,5 +268,85 @@ mod tests {
 
         assert!(!score.vetoed);
         assert_eq!(score.decision.action, DecisionAction::Delete);
+    }
+
+    #[test]
+    fn private_tmp_user_named_trash_requires_review_not_delete() {
+        let registry = ArtifactPatternRegistry::default();
+        let engine = default_engine();
+        let path = PathBuf::from("/tmp/frankenterm-trash-20260503");
+        let signals = StructuralSignals::default();
+        let classification = registry.classify(&path, signals);
+
+        assert_eq!(classification.pattern_name, "user-named-trash");
+        assert_eq!(classification.category, ArtifactCategory::TempDir);
+
+        let score = engine.score_candidate(
+            &CandidateInput {
+                path,
+                size_bytes: 8 * 1_073_741_824,
+                age: Duration::from_hours(336),
+                classification,
+                signals,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            0.95,
+        );
+
+        assert!(!score.vetoed);
+        assert_eq!(score.decision.action, DecisionAction::Review);
+        assert!(score.ledger.summary.contains("action=Review"));
+    }
+
+    #[test]
+    fn private_tmp_user_named_trash_with_beads_stowaway_is_hard_kept() {
+        let dir = TempDirBuilder::new()
+            .prefix("sbh-agent-trash-")
+            .tempdir_in("/tmp")
+            .expect("create tmp trash candidate");
+        let candidate_path = dir.path().to_path_buf();
+        fs::create_dir_all(candidate_path.join("nested").join(".beads"))
+            .expect("create beads stowaway");
+        fs::write(
+            candidate_path
+                .join("nested")
+                .join(".beads")
+                .join("beads.db"),
+            b"project state",
+        )
+        .expect("write beads stowaway");
+
+        let registry = ArtifactPatternRegistry::default();
+        let engine = default_engine();
+        let signals = StructuralSignals::default();
+        let classification = registry.classify(&candidate_path, signals);
+        let overlaps = find_sacred_overlaps(&candidate_path, cross_platform_sacred_paths())
+            .expect("scan stowaways");
+
+        assert_eq!(classification.pattern_name, "user-named-trash");
+        assert!(overlaps.iter().any(|overlap| overlap.pattern == ".beads/"));
+
+        let score = engine.score_candidate_with_sacred_overlaps(
+            &CandidateInput {
+                path: candidate_path,
+                size_bytes: 8 * 1_073_741_824,
+                age: Duration::from_hours(336),
+                classification,
+                signals,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            0.95,
+            &overlaps,
+        );
+
+        assert!(score.vetoed);
+        assert_eq!(score.decision.action, DecisionAction::Keep);
+        assert!(score.veto_reason.as_deref().is_some_and(|reason| {
+            reason.contains("sacred path overlap") && reason.contains(".beads/")
+        }));
     }
 }

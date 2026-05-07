@@ -840,6 +840,12 @@ On macOS, `sbh` recognizes Electron application cache directories under `~/Libra
 
 These are classified as likely cleanup candidates, not sacred app data. The cache directory still passes through age, active-file, parent, and sacred-overlap checks before deletion, so a running app with open files can keep its active cache out of the deletion plan.
 
+#### macOS User-Named Trash Directories
+
+In volatile temporary roots such as `/tmp` and `/private/tmp`, `sbh` recognizes immediate children named `trash`, `trashed`, or `*-trash-*` as `user-named-trash` candidates. These names are ambiguous by design, so they are never auto-promoted straight to deletion; high-pressure scoring can only place them in **Review** unless another hard veto applies.
+
+Before any review recommendation is surfaced, `sbh` scans three levels inside the candidate for stowaway state markers such as `.git/`, `.beads/`, `beads.db`, `*.db`, `*.sqlite`, and `*.sqlite3`. If one is found, the candidate is kept with an explicit sacred-overlap explanation instead of being treated as disposable trash.
+
 ### Progressive Delivery: The Policy Engine
 
 The policy engine controls whether scored deletion decisions are actually executed, using a progressive delivery model borrowed from feature-flag rollout practice.
@@ -899,7 +905,8 @@ Before any deletion is executed, a six-point pre-flight check must pass:
 3. **Parent is writable**: Checks effective write permission via `access(W_OK)` to catch read-only mounts and permission changes since scan time.
 4. **No `.git/` directory**: A final safety net that prevents deletion of any directory containing a Git repository, even if all other signals suggest it's an artifact.
 5. **Not a Cargo source root**: A direct `Cargo.toml` without Cargo build-output markers vetoes deletion, even when a directory name matches `target`, `target_*`, `*_target`, or `*-target`. Broad target-like names outside temporary storage also require Cargo build-output markers before they can become deletion candidates; `/private/tmp` target caches still require open-file checks.
-6. **Not open by any process**: On Linux, scans `/proc/*/fd` symlinks to check if any file within the target directory tree is currently held open. Collects up to 20,000 inodes via depth-first traversal and checks each against the process file descriptor table.
+6. **No stowaway sacred state**: Depth-limited scans reject cleanup candidates that contain protected marker directories or database state such as `.git/`, `.beads/`, `*.db`, `*.sqlite`, or `*.sqlite3`.
+7. **Not open by any process**: On Linux, scans `/proc/*/fd` symlinks to check if any file within the target directory tree is currently held open. Collects up to 20,000 inodes via depth-first traversal and checks each against the process file descriptor table.
 
 Any single check failure causes the candidate to be skipped (not failed), so it doesn't trip the circuit breaker.
 
