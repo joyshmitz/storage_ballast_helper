@@ -28,6 +28,8 @@ use storage_ballast_helper::monitor::guardrails::{
 };
 use storage_ballast_helper::monitor::pid::{PidPressureController, PressureLevel, PressureReading};
 use storage_ballast_helper::monitor::predictive::{PredictiveActionPolicy, PredictiveConfig};
+#[cfg(target_os = "macos")]
+use storage_ballast_helper::platform::pal::Platform;
 use storage_ballast_helper::platform::sacred_catalog::cross_platform_sacred_paths;
 use storage_ballast_helper::platform::types::{SacredPath, SacredPathKind, SacredPathSource};
 use storage_ballast_helper::scanner::decision_record::{
@@ -330,6 +332,204 @@ fn macos_check_json_matches_diskutil_apfs_capacity() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn macos_check_json_matches_diskutil_apfs_capacity() {}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_apfs_ballast_preallocates_and_releases_space() {
+    const BALLAST_BYTES: u64 = 1024 * 1024 * 1024;
+    const MIN_AVAILABLE_BYTES: u64 = 3 * BALLAST_BYTES;
+    const RECOVERY_FLOOR_BYTES: u64 = BALLAST_BYTES / 2;
+
+    if std::env::var_os("CI").is_none() && std::env::var_os("SBH_RUN_APFS_BALLAST_TEST").is_none() {
+        eprintln!(
+            "skipping APFS ballast integration test outside CI; set SBH_RUN_APFS_BALLAST_TEST=1 to run locally"
+        );
+        return;
+    }
+
+    let platform = storage_ballast_helper::platform::current();
+    let dir = tempfile::Builder::new()
+        .prefix("sbh-apfs-ballast-")
+        .tempdir()
+        .expect("create APFS ballast test directory");
+    let Some(before_provision) =
+        apfs_ballast_start_available_or_skip(&platform, dir.path(), MIN_AVAILABLE_BYTES)
+    else {
+        return;
+    };
+
+    let mut manager = BallastManager::new(
+        dir.path().to_path_buf(),
+        BallastConfig {
+            file_count: 1,
+            file_size_bytes: BALLAST_BYTES,
+            replenish_cooldown_minutes: 0,
+            auto_provision: true,
+            overrides: std::collections::BTreeMap::new(),
+        },
+    )
+    .expect("create ballast manager");
+    let provision = manager
+        .provision(None)
+        .expect("provision 1 GiB APFS ballast");
+    assert_eq!(provision.files_created, 1);
+    assert!(
+        provision.errors.is_empty(),
+        "provision errors: {:?}",
+        provision.errors
+    );
+
+    let ballast_path = dir.path().join("SBH_BALLAST_FILE_00001.dat");
+    assert_eq!(
+        fs::metadata(&ballast_path)
+            .expect("ballast file metadata")
+            .len(),
+        BALLAST_BYTES
+    );
+    let allocated_bytes = platform
+        .file_block_count(&ballast_path)
+        .expect("read ballast block count")
+        .checked_mul(512)
+        .expect("block count should not overflow");
+    assert!(
+        allocated_bytes >= BALLAST_BYTES,
+        "APFS ballast file is underallocated: allocated={allocated_bytes} expected={BALLAST_BYTES}"
+    );
+
+    let after_provision = platform
+        .capacity(dir.path())
+        .expect("read capacity after provision")
+        .available_bytes;
+    let release = manager.release(1).expect("release APFS ballast");
+    assert_eq!(release.files_released, 1);
+    assert_eq!(release.bytes_freed, BALLAST_BYTES);
+    assert!(
+        release.errors.is_empty(),
+        "release errors: {:?}",
+        release.errors
+    );
+    assert!(
+        !ballast_path.exists(),
+        "released APFS ballast file should be removed"
+    );
+
+    assert_apfs_available_bytes_recovers(
+        &platform,
+        dir.path(),
+        before_provision,
+        after_provision,
+        allocated_bytes,
+        RECOVERY_FLOOR_BYTES,
+        &release.warnings,
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn apfs_ballast_start_available_or_skip(
+    platform: &impl Platform,
+    path: &Path,
+    min_available_bytes: u64,
+) -> Option<u64> {
+    let capacity = platform
+        .capacity(path)
+        .expect("read capacity for APFS ballast tempdir");
+    if !capacity.fs_type.eq_ignore_ascii_case("apfs") {
+        eprintln!(
+            "skipping APFS ballast integration test on non-APFS filesystem {} at {}",
+            capacity.fs_type,
+            capacity.mount_point.display()
+        );
+        return None;
+    }
+    if capacity.available_bytes < min_available_bytes {
+        eprintln!(
+            "skipping APFS ballast integration test: {} available bytes is below {} byte safety floor",
+            capacity.available_bytes, min_available_bytes
+        );
+        return None;
+    }
+    let snapshots = match platform.local_time_machine_snapshots(&capacity.mount_point) {
+        Ok(snapshots) => snapshots,
+        Err(error) => {
+            eprintln!(
+                "skipping APFS ballast integration test because local snapshot inspection failed on {}: {error}",
+                capacity.mount_point.display()
+            );
+            return None;
+        }
+    };
+    if !snapshots.is_empty() {
+        eprintln!(
+            "skipping APFS ballast integration test because {} local Time Machine snapshots are present on {}",
+            snapshots.len(),
+            capacity.mount_point.display()
+        );
+        return None;
+    }
+    Some(capacity.available_bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn assert_apfs_available_bytes_recovers(
+    platform: &impl Platform,
+    path: &Path,
+    before_provision: u64,
+    after_provision: u64,
+    allocated_bytes: u64,
+    recovery_floor_bytes: u64,
+    release_warnings: &[String],
+) {
+    let allocation_visible =
+        before_provision.saturating_sub(after_provision) >= recovery_floor_bytes;
+    if !allocation_visible {
+        eprintln!(
+            "APFS available bytes did not visibly decrease after preallocating ballast; before={before_provision} after_provision={after_provision} allocated_bytes={allocated_bytes}. Skipping free-space recovery subcheck."
+        );
+        return;
+    }
+
+    let target_available = after_provision.saturating_add(recovery_floor_bytes);
+    let after_release = wait_for_available_bytes_at_least(
+        platform,
+        path,
+        target_available,
+        Duration::from_secs(10),
+    )
+    .unwrap_or_else(|| {
+        platform
+            .capacity(path)
+            .expect("read final APFS capacity")
+            .available_bytes
+    });
+    assert!(
+        after_release >= target_available,
+        "APFS free space did not recover after ballast release: after_provision={after_provision} after_release={after_release} target={target_available} release_warnings={release_warnings:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_available_bytes_at_least(
+    platform: &impl Platform,
+    path: &Path,
+    target_available: u64,
+    timeout: Duration,
+) -> Option<u64> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let available = platform.capacity(path).ok()?.available_bytes;
+        if available >= target_available {
+            return Some(available);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn macos_apfs_ballast_preallocates_and_releases_space() {}
 
 #[test]
 fn completions_command_generates_shell_script() {
