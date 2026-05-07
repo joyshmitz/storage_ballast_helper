@@ -129,6 +129,15 @@ pub const ELECTRON_GPU_CACHE: CleanupRule = cleanup_rule(
     CleanupConfidence::Likely,
 );
 
+pub const ELECTRON_INDEXED_DB: CleanupRule = cleanup_rule(
+    "electron-indexed-db",
+    "~/Library/Application Support/*/IndexedDB/*",
+    AgeThreshold::from_hours(1),
+    CheckRequirement::Required,
+    ReclaimCommand::RemoveTree,
+    CleanupConfidence::Likely,
+);
+
 pub const ELECTRON_VM_BUNDLES: CleanupRule = cleanup_rule(
     "electron-vm-bundles",
     "~/Library/Application Support/*/vm_bundles/*",
@@ -248,6 +257,7 @@ pub const MAC_CLEANUP_RULES: &[CleanupRule] = &[
     ELECTRON_SERVICE_WORKER_CACHE,
     ELECTRON_CODE_CACHE,
     ELECTRON_GPU_CACHE,
+    ELECTRON_INDEXED_DB,
     ELECTRON_VM_BUNDLES,
     TMP_DASH_TARGET,
     TMP_UNDERSCORE_TARGET,
@@ -315,10 +325,11 @@ mod tests {
 
     use super::{
         AgeThreshold, CORE_SIMULATOR_CACHES, CheckRequirement, CleanupConfidence, CleanupRule,
-        ELECTRON_CACHE, ELECTRON_CODE_CACHE, ELECTRON_GPU_CACHE, ELECTRON_SERVICE_WORKER_CACHE,
-        ELECTRON_VM_BUNDLES, FINAL_CUT_LIBRARY_SACRED, HOME_TRASH_REPORT, ICLOUD_TRASH_REPORT,
-        IPSW_SOFTWARE_UPDATES, MAC_CLEANUP_RULES, MAIL_LIBRARY_SACRED, MESSAGES_LIBRARY_SACRED,
-        PHOTOS_LIBRARY_SACRED, RELEASE_WORK_BUILDROOT, ReclaimCommand, SPOTLIGHT_INDEX_REPORT,
+        ELECTRON_CACHE, ELECTRON_CODE_CACHE, ELECTRON_GPU_CACHE, ELECTRON_INDEXED_DB,
+        ELECTRON_SERVICE_WORKER_CACHE, ELECTRON_VM_BUNDLES, FINAL_CUT_LIBRARY_SACRED,
+        HOME_TRASH_REPORT, ICLOUD_TRASH_REPORT, IPSW_SOFTWARE_UPDATES, MAC_CLEANUP_RULES,
+        MAIL_LIBRARY_SACRED, MESSAGES_LIBRARY_SACRED, PHOTOS_LIBRARY_SACRED,
+        RELEASE_WORK_BUILDROOT, ReclaimCommand, SPOTLIGHT_INDEX_REPORT,
         TIME_MACHINE_LOCAL_SNAPSHOTS, TMP_DASH_TARGET, TMP_UNDERSCORE_TARGET, USER_LOGS,
         USER_NAMED_TRASH, XCODE_DERIVED_DATA, cleanup_rules, find_rule,
     };
@@ -437,6 +448,11 @@ mod tests {
                 ELECTRON_GPU_CACHE,
                 "~/Library/Application Support/*/GPUCache/*",
                 "electron-gpu-cache",
+            ),
+            (
+                ELECTRON_INDEXED_DB,
+                "~/Library/Application Support/*/IndexedDB/*",
+                "electron-indexed-db",
             ),
             (
                 ELECTRON_VM_BUNDLES,

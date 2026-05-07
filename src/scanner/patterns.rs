@@ -230,7 +230,13 @@ fn macos_cleanup_path_classification(path: &Path) -> Option<ArtifactClassificati
             combined_confidence: 0.96,
         })
     } else {
-        None
+        electron_cache_pattern_name(path).map(|pattern_name| ArtifactClassification {
+            pattern_name: Cow::Borrowed(pattern_name),
+            category: ArtifactCategory::CacheDir,
+            name_confidence: 0.92,
+            structural_confidence: 0.0,
+            combined_confidence: 0.92,
+        })
     }
 }
 
@@ -258,6 +264,40 @@ fn path_component_eq(path: &Path, expected: &str) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.eq_ignore_ascii_case(expected))
+}
+
+fn electron_cache_pattern_name(path: &Path) -> Option<&'static str> {
+    let components = path
+        .iter()
+        .filter_map(|component| component.to_str())
+        .collect::<Vec<_>>();
+    let app_support = components.windows(2).position(|window| {
+        window[0].eq_ignore_ascii_case("Library")
+            && window[1].eq_ignore_ascii_case("Application Support")
+    })?;
+    let app_component = app_support + 2;
+    let relative = components.get(app_component + 1..)?;
+    let first = relative.first()?;
+
+    if first.eq_ignore_ascii_case("Cache") {
+        Some("electron-cache")
+    } else if first.eq_ignore_ascii_case("Code Cache") {
+        Some("electron-code-cache")
+    } else if first.eq_ignore_ascii_case("GPUCache") {
+        Some("electron-gpu-cache")
+    } else if first.eq_ignore_ascii_case("IndexedDB") {
+        Some("electron-indexed-db")
+    } else if first.eq_ignore_ascii_case("vm_bundles") {
+        Some("electron-vm-bundles")
+    } else if first.eq_ignore_ascii_case("Service Worker")
+        && relative
+            .get(1)
+            .is_some_and(|component| component.eq_ignore_ascii_case("CacheStorage"))
+    {
+        Some("electron-service-worker-cache")
+    } else {
+        None
+    }
 }
 
 fn structural_score(category: ArtifactCategory, signals: StructuralSignals) -> f64 {
@@ -645,6 +685,9 @@ pub fn extract_pattern_label(path: &str) -> String {
     if is_xcode_derived_data_project_root(p) {
         return "xcode-derived-data".to_string();
     }
+    if let Some(pattern_name) = electron_cache_pattern_name(p) {
+        return pattern_name.to_string();
+    }
 
     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
 
@@ -823,6 +866,60 @@ mod tests {
         );
 
         assert_ne!(classification.pattern_name, "xcode-derived-data");
+    }
+
+    #[test]
+    fn electron_application_support_cache_shapes_are_classified() {
+        let registry = ArtifactPatternRegistry::default();
+        let cases = [
+            (
+                "/Users/operator/Library/Application Support/Claude/Cache",
+                "electron-cache",
+            ),
+            (
+                "/Users/operator/Library/Application Support/Slack/Service Worker/CacheStorage/session",
+                "electron-service-worker-cache",
+            ),
+            (
+                "/Users/operator/Library/Application Support/Code/Code Cache/js",
+                "electron-code-cache",
+            ),
+            (
+                "/Users/operator/Library/Application Support/Discord/GPUCache",
+                "electron-gpu-cache",
+            ),
+            (
+                "/Users/operator/Library/Application Support/Cursor/IndexedDB",
+                "electron-indexed-db",
+            ),
+            (
+                "/Users/operator/Library/Application Support/Claude/vm_bundles/claudevm.bundle",
+                "electron-vm-bundles",
+            ),
+        ];
+
+        for (path, expected_pattern) in cases {
+            let classification = registry.classify(Path::new(path), StructuralSignals::default());
+            assert_eq!(
+                classification.pattern_name, expected_pattern,
+                "unexpected pattern for {path}"
+            );
+            assert_eq!(classification.category, ArtifactCategory::CacheDir);
+            assert!(classification.combined_confidence > 0.70);
+            assert_eq!(extract_pattern_label(path), expected_pattern);
+        }
+    }
+
+    #[test]
+    fn application_support_app_root_is_not_an_electron_cache_candidate() {
+        let registry = ArtifactPatternRegistry::default();
+        let classification = registry.classify(
+            Path::new("/Users/operator/Library/Application Support/Claude"),
+            StructuralSignals::default(),
+        );
+
+        assert_ne!(classification.pattern_name, "electron-cache");
+        assert_ne!(classification.pattern_name, "electron-service-worker-cache");
     }
 
     #[test]

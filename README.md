@@ -827,6 +827,19 @@ sudo tmutil thinlocalsnapshots / 9999999999999999 4
 
 Thinning can take 30 seconds or longer. It asks macOS to free up to the estimated retained snapshot bytes, but the exact amount released is controlled by Time Machine and APFS. System-wide thinning requires sudo/root.
 
+#### macOS Electron App Caches
+
+On macOS, `sbh` recognizes Electron application cache directories under `~/Library/Application Support/<app>/`. This covers common regenerated cache shapes used by Cursor, Claude Desktop, VS Code, Slack, Discord, and similar apps:
+
+- `Cache/`
+- `Service Worker/CacheStorage/`
+- `Code Cache/`
+- `GPUCache/`
+- `IndexedDB/`
+- `vm_bundles/`
+
+These are classified as likely cleanup candidates, not sacred app data. The cache directory still passes through age, active-file, parent, and sacred-overlap checks before deletion, so a running app with open files can keep its active cache out of the deletion plan.
+
 ### Progressive Delivery: The Policy Engine
 
 The policy engine controls whether scored deletion decisions are actually executed, using a progressive delivery model borrowed from feature-flag rollout practice.

@@ -522,6 +522,8 @@ fn factor_location(path: &Path) -> f64 {
         0.80
     } else if text.contains("/Library/Developer/Xcode/DerivedData/") {
         0.90
+    } else if is_macos_application_support_cache_path(&text) {
+        0.82
     } else if text.contains("/.cache/") {
         0.60
     } else if text.contains("/projects/") {
@@ -533,6 +535,16 @@ fn factor_location(path: &Path) -> f64 {
     } else {
         0.30
     }
+}
+
+fn is_macos_application_support_cache_path(text: &str) -> bool {
+    contains_ci(text, "/Library/Application Support/")
+        && (contains_ci(text, "/Cache")
+            || contains_ci(text, "/Code Cache")
+            || contains_ci(text, "/GPUCache")
+            || contains_ci(text, "/IndexedDB")
+            || contains_ci(text, "/vm_bundles")
+            || (contains_ci(text, "/Service Worker/") && contains_ci(text, "/CacheStorage")))
 }
 
 fn factor_name(path: &Path, classification: &ArtifactClassification) -> f64 {

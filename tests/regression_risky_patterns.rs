@@ -172,4 +172,35 @@ mod tests {
         assert!(!score.vetoed);
         assert_eq!(score.decision.action, DecisionAction::Delete);
     }
+
+    #[test]
+    fn electron_service_worker_cache_is_actionable_cache_dir() {
+        let registry = ArtifactPatternRegistry::default();
+        let engine = default_engine();
+        let path = PathBuf::from(
+            "/Users/operator/Library/Application Support/Claude/Service Worker/CacheStorage/session-1",
+        );
+        let signals = StructuralSignals::default();
+        let classification = registry.classify(&path, signals);
+
+        assert_eq!(classification.pattern_name, "electron-service-worker-cache");
+        assert_eq!(classification.category, ArtifactCategory::CacheDir);
+
+        let score = engine.score_candidate(
+            &CandidateInput {
+                path,
+                size_bytes: 2 * 1_073_741_824,
+                age: Duration::from_hours(12),
+                classification,
+                signals,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            0.8,
+        );
+
+        assert!(!score.vetoed);
+        assert_eq!(score.decision.action, DecisionAction::Delete);
+    }
 }
