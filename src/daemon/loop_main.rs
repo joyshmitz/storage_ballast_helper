@@ -48,7 +48,7 @@ use crate::scanner::deletion::{DeletionConfig, DeletionExecutor};
 use crate::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, StructuralSignals,
 };
-use crate::scanner::protection::ProtectionRegistry;
+use crate::scanner::protection::{self, ProtectionRegistry};
 use crate::scanner::scoring::{ActiveReferenceSummary, CandidacyScore, ScoringEngine};
 use crate::scanner::walker::{
     ActiveReferenceIndex, ActiveReferenceScanConfig, DirectoryWalker, WalkerConfig,
@@ -2418,6 +2418,7 @@ fn scanner_thread_main(
         );
         let mut open_files_joined: Option<std::collections::HashSet<std::path::PathBuf>> = None;
         let mut active_reference_joined: Option<ActiveReferenceIndex> = None;
+        let sacred_paths = platform.sacred_paths();
 
         // ── Priority pre-scan pass ──
         // Before the general walker, do a shallow (depth 1-2) scan of each root
@@ -2582,7 +2583,27 @@ fn scanner_thread_main(
                                 is_open,
                                 excluded: false,
                             };
-                            let score = prescan_engine.score_candidate(&input, request.urgency);
+                            let sacred_overlaps = match protection::find_sacred_overlaps(
+                                &candidate_path,
+                                &sacred_paths,
+                            ) {
+                                Ok(overlaps) => overlaps,
+                                Err(err) => {
+                                    logger.send(ActivityEvent::Error {
+                                        code: err.code().to_string(),
+                                        message: format!(
+                                            "sacred overlap check failed for {}: {err}",
+                                            candidate_path.display()
+                                        ),
+                                    });
+                                    continue;
+                                }
+                            };
+                            let score = prescan_engine.score_candidate_with_sacred_overlaps(
+                                &input,
+                                request.urgency,
+                                &sacred_overlaps,
+                            );
                             if score.decision.action
                                 == crate::scanner::scoring::DecisionAction::Delete
                             {
@@ -2856,7 +2877,25 @@ fn scanner_thread_main(
                 excluded: false, // Walker already filters excluded paths.
             };
 
-            let score = engine.score_candidate(&input, request.urgency);
+            let sacred_overlaps = match protection::find_sacred_overlaps(&entry.path, &sacred_paths)
+            {
+                Ok(overlaps) => overlaps,
+                Err(err) => {
+                    logger.send(ActivityEvent::Error {
+                        code: err.code().to_string(),
+                        message: format!(
+                            "sacred overlap check failed for {}: {err}",
+                            entry.path.display()
+                        ),
+                    });
+                    continue;
+                }
+            };
+            let score = engine.score_candidate_with_sacred_overlaps(
+                &input,
+                request.urgency,
+                &sacred_overlaps,
+            );
 
             // Attribute to root.
             let root_path = request.paths.iter().find(|r| entry.path.starts_with(r));

@@ -4452,6 +4452,7 @@ fn build_scan_trace(
     score: &CandidacyScore,
     min_file_age_seconds: u64,
     active_reference_checked: bool,
+    sacred_overlaps: &[protection::SacredOverlap],
 ) -> ScanTrace {
     let open_fd_count = input
         .active_references
@@ -4514,17 +4515,36 @@ fn build_scan_trace(
         } else {
             "clear".to_string()
         },
-        sacred_overlap_check: if input.excluded {
-            "matched protection or exclusion".to_string()
-        } else if input.signals.has_git {
-            "contains .git".to_string()
-        } else {
-            "clear".to_string()
-        },
+        sacred_overlap_check: sacred_overlap_check_trace(input, sacred_overlaps),
         final_confidence: score.decision.posterior_abandoned,
         final_action: format!("{:?}", score.decision.action),
         veto_reason: score.veto_reason.as_ref().map(ToString::to_string),
     }
+}
+
+fn sacred_overlap_check_trace(
+    input: &CandidateInput,
+    sacred_overlaps: &[protection::SacredOverlap],
+) -> String {
+    sacred_overlaps.first().map_or_else(
+        || {
+            if input.excluded {
+                "matched protection or exclusion".to_string()
+            } else if input.signals.has_git {
+                "contains .git".to_string()
+            } else {
+                "clear".to_string()
+            }
+        },
+        |overlap| {
+            let extra = sacred_overlaps.len().saturating_sub(1);
+            if extra == 0 {
+                overlap.summary()
+            } else {
+                format!("{}; and {extra} more sacred overlap(s)", overlap.summary())
+            }
+        },
+    )
 }
 
 fn scan_trace_json(trace: &ScanTrace) -> Value {
@@ -4628,6 +4648,8 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     // Classify and score each entry with active-reference evidence attached.
     let registry = ArtifactPatternRegistry::default();
     let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+    let sacred_paths = platform.sacred_paths();
     let now = SystemTime::now();
     let active_reference_scan = active_reference_scan_config(&config);
     let mut open_paths = None;
@@ -4665,12 +4687,24 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 is_open,
                 excluded: false,
             };
-            let score = engine.score_candidate(&candidate, 0.0); // No pressure urgency for manual scan.
+            let (score, sacred_overlaps) =
+                match protection::find_sacred_overlaps(&entry.path, &sacred_paths) {
+                    Ok(overlaps) => {
+                        let score =
+                            engine.score_candidate_with_sacred_overlaps(&candidate, 0.0, &overlaps);
+                        (score, overlaps)
+                    }
+                    Err(err) => (
+                        engine.hard_veto(&candidate, format!("sacred overlap check failed: {err}")),
+                        Vec::new(),
+                    ),
+                };
             let trace = build_scan_trace(
                 &candidate,
                 &score,
                 min_file_age_seconds,
                 active_reference_checked,
+                &sacred_overlaps,
             );
             ScoredScanEntry { score, trace }
         })
@@ -4939,6 +4973,8 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     let mut scoring_config = config.scoring.clone();
     scoring_config.min_score = args.min_score;
     let engine = ScoringEngine::from_config(&scoring_config, config.scanner.min_file_age_minutes);
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+    let sacred_paths = platform.sacred_paths();
     let now = SystemTime::now();
     let active_reference_scan = active_reference_scan_config(&config);
     let mut open_paths = None;
@@ -4975,7 +5011,14 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                 is_open,
                 excluded: false,
             };
-            engine.score_candidate(&candidate, 0.0)
+            match protection::find_sacred_overlaps(&entry.path, &sacred_paths) {
+                Ok(overlaps) => {
+                    engine.score_candidate_with_sacred_overlaps(&candidate, 0.0, &overlaps)
+                }
+                Err(err) => {
+                    engine.hard_veto(&candidate, format!("sacred overlap check failed: {err}"))
+                }
+            }
         })
         .filter(|score| !score.vetoed && score.total_score >= args.min_score)
         .collect();
@@ -5669,6 +5712,8 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     // Classify and score using default weights.
     let registry = ArtifactPatternRegistry::default();
     let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+    let sacred_paths = platform.sacred_paths();
     let now = SystemTime::now();
 
     let scored: Vec<CandidacyScore> = entries
@@ -5702,8 +5747,15 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
                 is_open,
                 excluded: false,
             };
-            // High urgency (0.8) for emergency mode — aggressive scoring.
-            engine.score_candidate(&candidate, 0.8)
+            match protection::find_sacred_overlaps(&entry.path, &sacred_paths) {
+                Ok(overlaps) => {
+                    // High urgency (0.8) for emergency mode — aggressive scoring.
+                    engine.score_candidate_with_sacred_overlaps(&candidate, 0.8, &overlaps)
+                }
+                Err(err) => {
+                    engine.hard_veto(&candidate, format!("sacred overlap check failed: {err}"))
+                }
+            }
         })
         .filter(|score| !score.vetoed)
         .collect();
@@ -7125,7 +7177,7 @@ mod tests {
             30,
         );
         let score = engine.score_candidate(&input, 0.0);
-        let trace = build_scan_trace(&input, &score, 1_800, true);
+        let trace = build_scan_trace(&input, &score, 1_800, true, &[]);
 
         assert_eq!(trace.fd_check, "1 open file descriptor(s)");
         assert_eq!(trace.exec_check, "1 running executable(s)");
@@ -7157,7 +7209,7 @@ mod tests {
             30,
         );
         let score = engine.score_candidate(&input, 0.0);
-        let trace = build_scan_trace(&input, &score, 1_800, false);
+        let trace = build_scan_trace(&input, &score, 1_800, false, &[]);
 
         assert_eq!(
             trace.fd_check,
@@ -7197,7 +7249,7 @@ mod tests {
             30,
         );
         let score = engine.score_candidate(&input, 0.0);
-        let trace = build_scan_trace(&input, &score, 1_800, true);
+        let trace = build_scan_trace(&input, &score, 1_800, true, &[]);
 
         assert_eq!(
             trace.fd_check,

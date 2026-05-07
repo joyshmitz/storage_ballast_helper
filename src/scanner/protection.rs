@@ -76,6 +76,38 @@ pub struct StowawayMatch {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SacredOverlapKind {
+    ExactMatch,
+    GlobMatch,
+    ChildOfSacred,
+    ParentOfSacred,
+    ContainsSacred,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SacredOverlap {
+    pub candidate_path: PathBuf,
+    pub matched_path: PathBuf,
+    pub pattern: String,
+    pub kind: SacredOverlapKind,
+    pub source: SacredPathSource,
+    pub reason: String,
+}
+
+impl SacredOverlap {
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!(
+            "{}: pattern {} matched {} ({})",
+            sacred_overlap_kind_label(self.kind),
+            self.pattern,
+            self.matched_path.display(),
+            self.reason
+        )
+    }
+}
+
 /// Compiled glob pattern for path matching.
 #[derive(Debug, Clone)]
 struct GlobPattern {
@@ -339,6 +371,54 @@ pub fn scan_stowaways(root: &Path, catalog: &[SacredPath]) -> Result<Vec<Stowawa
     scan_stowaways_with_config(root, catalog, StowawayScanConfig::default())
 }
 
+pub fn find_sacred_overlaps(
+    candidate: &Path,
+    catalog: &[SacredPath],
+) -> Result<Vec<SacredOverlap>> {
+    find_sacred_overlaps_with_config(candidate, catalog, StowawayScanConfig::default())
+}
+
+pub fn find_sacred_overlaps_with_config(
+    candidate: &Path,
+    catalog: &[SacredPath],
+    stowaway_config: StowawayScanConfig,
+) -> Result<Vec<SacredOverlap>> {
+    let candidate_path = normalize_path_for_protection(candidate);
+    let mut overlaps = Vec::new();
+
+    for entry in catalog {
+        overlaps.extend(direct_sacred_overlaps(&candidate_path, entry)?);
+    }
+
+    for matched in scan_stowaways_with_config(&candidate_path, catalog, stowaway_config)? {
+        overlaps.push(SacredOverlap {
+            candidate_path: candidate_path.clone(),
+            matched_path: matched.path,
+            pattern: matched.pattern,
+            kind: SacredOverlapKind::ContainsSacred,
+            source: matched.source,
+            reason: matched.reason,
+        });
+    }
+
+    overlaps.sort_by(|left, right| {
+        left.matched_path
+            .cmp(&right.matched_path)
+            .then_with(|| left.pattern.cmp(&right.pattern))
+            .then_with(|| {
+                sacred_overlap_kind_label(left.kind).cmp(sacred_overlap_kind_label(right.kind))
+            })
+    });
+    overlaps.dedup_by(|left, right| {
+        left.matched_path == right.matched_path
+            && left.pattern == right.pattern
+            && left.kind == right.kind
+            && left.source == right.source
+    });
+
+    Ok(overlaps)
+}
+
 pub fn scan_stowaways_with_config(
     root: &Path,
     catalog: &[SacredPath],
@@ -483,6 +563,127 @@ fn normalize_path_for_protection(path: &Path) -> PathBuf {
     crate::core::paths::resolve_absolute_path(path)
 }
 
+fn direct_sacred_overlaps(candidate: &Path, entry: &SacredPath) -> Result<Vec<SacredOverlap>> {
+    match entry.kind {
+        SacredPathKind::ExactMatch => Ok(exact_sacred_overlaps(candidate, entry)),
+        SacredPathKind::GlobMatch => glob_sacred_overlaps(candidate, entry),
+        SacredPathKind::ContainsAny | SacredPathKind::StowawayMarker => Ok(Vec::new()),
+    }
+}
+
+fn exact_sacred_overlaps(candidate: &Path, entry: &SacredPath) -> Vec<SacredOverlap> {
+    let sacred_path =
+        normalize_path_for_protection(&PathBuf::from(expand_home_pattern(&entry.pattern)));
+    path_overlap_kind(candidate, &sacred_path).map_or_else(Vec::new, |kind| {
+        vec![SacredOverlap {
+            candidate_path: candidate.to_path_buf(),
+            matched_path: sacred_path,
+            pattern: entry.pattern.clone(),
+            kind,
+            source: entry.source,
+            reason: entry.reason.clone(),
+        }]
+    })
+}
+
+fn glob_sacred_overlaps(candidate: &Path, entry: &SacredPath) -> Result<Vec<SacredOverlap>> {
+    let expanded = expand_home_pattern(&entry.pattern);
+    let normalized = expanded.replace('\\', "/");
+    let regex = glob_to_regex(&normalized)?;
+    let candidate_text = normalize_path_for_matching(candidate);
+    let mut overlaps = Vec::new();
+
+    if regex.is_match(&candidate_text) {
+        overlaps.push(SacredOverlap {
+            candidate_path: candidate.to_path_buf(),
+            matched_path: candidate.to_path_buf(),
+            pattern: entry.pattern.clone(),
+            kind: SacredOverlapKind::GlobMatch,
+            source: entry.source,
+            reason: entry.reason.clone(),
+        });
+    }
+
+    let mut ancestor = candidate.parent();
+    while let Some(path) = ancestor {
+        if regex.is_match(&normalize_path_for_matching(path)) {
+            overlaps.push(SacredOverlap {
+                candidate_path: candidate.to_path_buf(),
+                matched_path: path.to_path_buf(),
+                pattern: entry.pattern.clone(),
+                kind: SacredOverlapKind::ChildOfSacred,
+                source: entry.source,
+                reason: entry.reason.clone(),
+            });
+            break;
+        }
+        ancestor = path.parent();
+    }
+
+    if let Some(prefix) = literal_glob_prefix_path(&normalized) {
+        let sacred_parent = normalize_path_for_protection(&prefix);
+        if sacred_parent.starts_with(candidate) {
+            overlaps.push(SacredOverlap {
+                candidate_path: candidate.to_path_buf(),
+                matched_path: sacred_parent,
+                pattern: entry.pattern.clone(),
+                kind: SacredOverlapKind::ParentOfSacred,
+                source: entry.source,
+                reason: entry.reason.clone(),
+            });
+        }
+    }
+
+    Ok(overlaps)
+}
+
+fn path_overlap_kind(candidate: &Path, sacred_path: &Path) -> Option<SacredOverlapKind> {
+    if candidate == sacred_path {
+        Some(SacredOverlapKind::ExactMatch)
+    } else if candidate.starts_with(sacred_path) {
+        Some(SacredOverlapKind::ChildOfSacred)
+    } else if sacred_path.starts_with(candidate) {
+        Some(SacredOverlapKind::ParentOfSacred)
+    } else {
+        None
+    }
+}
+
+fn expand_home_pattern(pattern: &str) -> String {
+    let Some(home) = std::env::var_os("HOME") else {
+        return pattern.to_string();
+    };
+    let home = PathBuf::from(home).to_string_lossy().replace('\\', "/");
+    if pattern == "~" {
+        home
+    } else if let Some(rest) = pattern.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else {
+        pattern.to_string()
+    }
+}
+
+fn literal_glob_prefix_path(pattern: &str) -> Option<PathBuf> {
+    let glob_index = pattern.find(['*', '?'])?;
+    let prefix = &pattern[..glob_index];
+    let parent = prefix.rsplit_once('/').map_or("", |(parent, _)| parent);
+    if parent.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(parent))
+    }
+}
+
+fn sacred_overlap_kind_label(kind: SacredOverlapKind) -> &'static str {
+    match kind {
+        SacredOverlapKind::ExactMatch => "exact sacred path",
+        SacredOverlapKind::GlobMatch => "sacred glob match",
+        SacredOverlapKind::ChildOfSacred => "inside sacred path",
+        SacredOverlapKind::ParentOfSacred => "contains sacred path",
+        SacredOverlapKind::ContainsSacred => "contains sacred marker",
+    }
+}
+
 #[derive(Debug)]
 struct StowawayRule {
     pattern: String,
@@ -582,6 +783,7 @@ fn path_suffix_matches(path: &str, suffix: &str) -> bool {
 mod tests {
     use super::*;
     use crate::platform::sacred_catalog::cross_platform_sacred_paths;
+    use crate::platform::types::{SacredPath, SacredPathKind, SacredPathSource};
     use std::fs;
     use tempfile::TempDir;
 
@@ -1093,5 +1295,69 @@ mod tests {
         .unwrap();
 
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn sacred_overlaps_cover_exact_parent_and_child_relationships() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("Users").join("operator");
+        let sacred = home.join("Library").join("Messages");
+        fs::create_dir_all(sacred.join("Archive")).unwrap();
+        let catalog = vec![SacredPath {
+            pattern: sacred.to_string_lossy().to_string(),
+            kind: SacredPathKind::ExactMatch,
+            reason: "Messages history is user data".to_string(),
+            source: SacredPathSource::Builtin,
+        }];
+
+        let exact = find_sacred_overlaps(&sacred, &catalog).unwrap();
+        assert_eq!(exact[0].kind, SacredOverlapKind::ExactMatch);
+
+        let child = find_sacred_overlaps(&sacred.join("Archive"), &catalog).unwrap();
+        assert_eq!(child[0].kind, SacredOverlapKind::ChildOfSacred);
+
+        let parent = find_sacred_overlaps(&home, &catalog).unwrap();
+        assert_eq!(parent[0].kind, SacredOverlapKind::ParentOfSacred);
+    }
+
+    #[test]
+    fn sacred_overlaps_cover_glob_match_child_and_parent_relationships() {
+        let tmp = TempDir::new().unwrap();
+        let pictures = tmp.path().join("Pictures");
+        let library = pictures.join("Family.photoslibrary");
+        let database = library.join("database").join("Photos.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"sqlite").unwrap();
+        let catalog = vec![SacredPath {
+            pattern: pictures
+                .join("*.photoslibrary")
+                .to_string_lossy()
+                .to_string(),
+            kind: SacredPathKind::GlobMatch,
+            reason: "Photos libraries are user data".to_string(),
+            source: SacredPathSource::Builtin,
+        }];
+
+        let exact = find_sacred_overlaps(&library, &catalog).unwrap();
+        assert_eq!(exact[0].kind, SacredOverlapKind::GlobMatch);
+
+        let child = find_sacred_overlaps(&database, &catalog).unwrap();
+        assert_eq!(child[0].kind, SacredOverlapKind::ChildOfSacred);
+
+        let parent = find_sacred_overlaps(&pictures, &catalog).unwrap();
+        assert_eq!(parent[0].kind, SacredOverlapKind::ParentOfSacred);
+    }
+
+    #[test]
+    fn sacred_overlaps_include_stowaway_matches() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("old-cache");
+        fs::create_dir_all(candidate.join("nested").join(".beads")).unwrap();
+
+        let overlaps = find_sacred_overlaps(&candidate, cross_platform_sacred_paths()).unwrap();
+
+        assert_eq!(overlaps.len(), 1);
+        assert_eq!(overlaps[0].kind, SacredOverlapKind::ContainsSacred);
+        assert_eq!(overlaps[0].pattern, ".beads/");
     }
 }

@@ -6,11 +6,13 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::core::config::ScoringConfig;
 use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
+use crate::scanner::protection::SacredOverlap;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScoringWeights {
@@ -251,7 +253,36 @@ impl ScoringEngine {
     /// Score one candidate deterministically.
     #[must_use]
     pub fn score_candidate(&self, input: &CandidateInput, urgency: f64) -> CandidacyScore {
-        if let Some(reason) = self.veto_reason(input) {
+        self.score_candidate_inner(input, urgency, &[])
+    }
+
+    /// Score one candidate after applying sacred-path overlap evidence.
+    #[must_use]
+    pub fn score_candidate_with_sacred_overlaps(
+        &self,
+        input: &CandidateInput,
+        urgency: f64,
+        sacred_overlaps: &[SacredOverlap],
+    ) -> CandidacyScore {
+        self.score_candidate_inner(input, urgency, sacred_overlaps)
+    }
+
+    #[must_use]
+    pub fn hard_veto(
+        &self,
+        input: &CandidateInput,
+        reason: impl Into<Cow<'static, str>>,
+    ) -> CandidacyScore {
+        self.vetoed(input, reason.into())
+    }
+
+    fn score_candidate_inner(
+        &self,
+        input: &CandidateInput,
+        urgency: f64,
+        sacred_overlaps: &[SacredOverlap],
+    ) -> CandidacyScore {
+        if let Some(reason) = self.veto_reason(input, sacred_overlaps) {
             return self.vetoed(input, reason);
         }
 
@@ -357,7 +388,11 @@ impl ScoringEngine {
         scores
     }
 
-    fn veto_reason(&self, input: &CandidateInput) -> Option<Cow<'static, str>> {
+    fn veto_reason(
+        &self,
+        input: &CandidateInput,
+        sacred_overlaps: &[SacredOverlap],
+    ) -> Option<Cow<'static, str>> {
         if has_git_component(&input.path) || input.signals.has_git {
             return Some(Cow::Borrowed("path contains .git"));
         }
@@ -368,6 +403,9 @@ impl ScoringEngine {
             return Some(Cow::Borrowed(
                 "contains Cargo.toml without build-artifact markers",
             ));
+        }
+        if let Some(reason) = sacred_overlap_veto_reason(sacred_overlaps) {
+            return Some(reason);
         }
         if input.age < self.min_file_age {
             return Some(Cow::Owned(format!(
@@ -419,6 +457,16 @@ impl ScoringEngine {
             },
         }
     }
+}
+
+fn sacred_overlap_veto_reason(overlaps: &[SacredOverlap]) -> Option<Cow<'static, str>> {
+    let first = overlaps.first()?;
+    let extra = overlaps.len().saturating_sub(1);
+    let mut reason = format!("sacred path overlap: {}", first.summary());
+    if extra > 0 {
+        let _ = write!(reason, "; and {extra} more sacred overlap(s)");
+    }
+    Some(Cow::Owned(reason))
 }
 
 fn factor_location(path: &Path) -> f64 {
@@ -807,7 +855,9 @@ fn is_system_path(path: &Path) -> bool {
 mod tests {
     use super::{ActiveReferenceSummary, CandidateInput, DecisionAction, ScoringEngine};
     use crate::core::config::ScoringConfig;
+    use crate::platform::types::SacredPathSource;
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
+    use crate::scanner::protection::{SacredOverlap, SacredOverlapKind};
     use std::borrow::Cow;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -1105,6 +1155,51 @@ mod tests {
         assert_eq!(
             score.veto_reason.as_deref(),
             Some("contains Cargo.toml without build-artifact markers")
+        );
+    }
+
+    #[test]
+    fn sacred_overlap_hard_vetoes_candidate() {
+        let engine = default_engine();
+        let path = PathBuf::from("/tmp/old-cache");
+        let input = CandidateInput {
+            path: path.clone(),
+            size_bytes: 5 * 1_073_741_824,
+            age: Duration::from_hours(336),
+            classification: classification(0.95, ArtifactCategory::RustTarget),
+            signals: StructuralSignals {
+                has_incremental: true,
+                has_deps: true,
+                has_build: true,
+                has_fingerprint: true,
+                mostly_object_files: true,
+                ..StructuralSignals::default()
+            },
+            active_references: ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        };
+        let overlap = SacredOverlap {
+            candidate_path: path.clone(),
+            matched_path: path.join(".beads"),
+            pattern: ".beads/".to_string(),
+            kind: SacredOverlapKind::ContainsSacred,
+            source: SacredPathSource::Builtin,
+            reason: "Beads issue state is project data".to_string(),
+        };
+
+        let score = engine.score_candidate_with_sacred_overlaps(&input, 0.95, &[overlap]);
+
+        assert!(score.vetoed);
+        assert!(score.total_score.abs() <= f64::EPSILON);
+        assert_eq!(score.decision.action, DecisionAction::Keep);
+        assert!(score.decision.calibration_score.abs() <= f64::EPSILON);
+        assert!(score.decision.fallback_active);
+        assert!(
+            score
+                .veto_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("sacred path overlap"))
         );
     }
 
