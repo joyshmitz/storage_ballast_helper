@@ -848,6 +848,8 @@ sudo tmutil thinlocalsnapshots / 9999999999999999 4
 
 Thinning can take 30 seconds or longer. It asks macOS to free up to the estimated retained snapshot bytes, but the exact amount released is controlled by Time Machine and APFS. System-wide thinning requires sudo/root.
 
+This matters for ballast release. If a local Time Machine snapshot references the ballast files, `sbh ballast release` can unlink those files immediately but `df` may not show the recovered space until the snapshots that still reference those blocks are thinned or expire. On default Time Machine settings that retention window is commonly about 24 hours. When `sbh` reports retained local snapshots, run the thin command above before relying on ballast release as visible free space.
+
 #### macOS Electron App Caches
 
 On macOS, `sbh` recognizes Electron application cache directories under `~/Library/Application Support/<app>/`. This covers common regenerated cache shapes used by Cursor, Claude Desktop, VS Code, Slack, Discord, and similar apps:
@@ -999,6 +1001,13 @@ The PID controller's pressure response directly determines how many ballast file
 - **Emergency** (> 0.9): Release all remaining files. Maximum immediate relief.
 
 Release is instant (just `unlink()`), providing space recovery in milliseconds rather than the seconds-to-minutes required for scanning and deletion.
+
+On macOS/APFS, local Time Machine snapshots can retain the released ballast blocks. In that case the release operation succeeds, but apparent free space in `df`, Finder, and some system APIs may not increase until one of these happens:
+
+- The relevant local snapshots are thinned with `sudo tmutil thinlocalsnapshots <mount> 9999999999999999 4`.
+- The snapshot retention window expires, commonly about 24 hours with default Time Machine behavior.
+
+When local snapshots are present, `sbh ballast release` emits a warning for the affected mount. Treat that warning as part of the incident workflow: thin snapshots, then re-run `sbh status` or `df -h` to confirm that APFS made the released blocks visible as free space.
 
 #### Replenishment
 
