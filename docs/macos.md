@@ -233,6 +233,29 @@ published, a manually installed or from-source binary can still live in one of
 the standard Homebrew prefixes as long as the launchd plist points at the
 actual binary path.
 
+## Code Signing And Hardened Runtime
+
+macOS CI and release builds sign `sbh` with Hardened Runtime enabled. The
+entitlements file is intentionally minimal:
+
+```text
+.github/macos/sbh.entitlements.plist
+```
+
+That file contains an empty entitlement dictionary. `sbh` does not need JIT,
+library-validation bypasses, camera, microphone, or network-server entitlements.
+CI signs the release binary with:
+
+```bash
+codesign --force --sign - --options runtime --timestamp=none \
+  --entitlements .github/macos/sbh.entitlements.plist target/release/sbh
+```
+
+Tagged macOS release archives are signed the same way before packaging. The
+ad-hoc identity used in CI is only for build validation; Developer ID signing
+and notarization use the same entitlement file once release credentials are
+available.
+
 ## Watched Paths
 
 The install wizard auto-detects watched paths from:

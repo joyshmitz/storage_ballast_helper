@@ -334,12 +334,20 @@ jobs:
         run: |
           set -euo pipefail
           bin="./target/release/sbh"
+          entitlements=".github/macos/sbh.entitlements.plist"
           test -x "${bin}"
+          plutil -lint "${entitlements}" 2>&1 | tee macos-entitlements-lint-output.txt
           {
-            codesign --force --sign - --timestamp=none "${bin}"
+            codesign --force --sign - --options runtime --timestamp=none --entitlements "${entitlements}" "${bin}"
             codesign --verify --strict --verbose=2 "${bin}"
             codesign --display --verbose=4 "${bin}"
           } 2>&1 | tee macos-codesign-output.txt
+          codesign --display --entitlements :- "${bin}" > macos-codesign-entitlements.plist
+          plutil -lint macos-codesign-entitlements.plist 2>&1 | tee macos-codesign-entitlements-lint-output.txt
+          if grep -E 'com\.apple\.security\.(cs\.allow-jit|cs\.disable-library-validation|network\.server|device\.camera|device\.microphone)' macos-codesign-entitlements.plist; then
+            echo "::error::sbh release binary was signed with a forbidden entitlement"
+            exit 1
+          fi
       - name: Exercise launchd user service lifecycle
         if: matrix.os == 'macos-latest'
         shell: bash
@@ -403,6 +411,8 @@ jobs:
             macos-release-build-output.txt
             macos-energy-*.txt
             macos-codesign-output.txt
+            macos-codesign-entitlements.plist
+            macos-*entitlements*-output.txt
             macos-launchd-*.txt
             macos-launchd-*.jsonl
             macos-e2e-smoke-output.txt

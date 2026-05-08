@@ -68,6 +68,25 @@ jobs:
             cargo build $CI_FEATURES --release --target ${{ matrix.target }}
           fi
 
+      - name: Sign macOS release binary with hardened runtime
+        if: contains(matrix.target, 'apple-darwin')
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/sbh"
+          entitlements=".github/macos/sbh.entitlements.plist"
+          test -x "${bin}"
+          plutil -lint "${entitlements}"
+          codesign --force --sign - --options runtime --timestamp=none --entitlements "${entitlements}" "${bin}"
+          codesign --verify --strict --verbose=2 "${bin}"
+          codesign --display --verbose=4 "${bin}"
+          codesign --display --entitlements :- "${bin}" > "sbh-${{ matrix.target }}-entitlements.plist"
+          plutil -lint "sbh-${{ matrix.target }}-entitlements.plist"
+          if grep -E 'com\.apple\.security\.(cs\.allow-jit|cs\.disable-library-validation|network\.server|device\.camera|device\.microphone)' "sbh-${{ matrix.target }}-entitlements.plist"; then
+            echo "::error::sbh release binary was signed with a forbidden entitlement"
+            exit 1
+          fi
+
       - name: Package archive
         run: |
           cd target/${{ matrix.target }}/release

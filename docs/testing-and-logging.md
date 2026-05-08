@@ -201,7 +201,7 @@ Use `--local` to skip rch. CI workflows run locally (no rch available).
 | integration | `integration-output.txt` | 14 days |
 | decision-plane | `proof-harness-output.txt`, `decision-plane-e2e-output.txt` | 30 days |
 | e2e | `e2e-output.txt`, per-case logs | 14 days |
-| macos-platform | `macos-*-output.txt`, `macos-runner-info.txt`, `macos-toolchain-output.txt`, `macos-codesign-output.txt`, `sbh-completions.zsh` | 14 days |
+| macos-platform | `macos-*-output.txt`, `macos-runner-info.txt`, `macos-toolchain-output.txt`, `macos-codesign-output.txt`, `macos-codesign-entitlements.plist`, `sbh-completions.zsh` | 14 days |
 | macos-coverage | `current-coverage.json`, `current-lcov.info`, `coverage-summary.json`, optional PR `base-coverage.json` | 30 days |
 | macos-benchmarks | `current-summary.json`, `current-output.txt`, `benchmark-summary.json`, optional PR `base-summary.json` | 30 days |
 | stress | `stress-output.txt` | 14 days |

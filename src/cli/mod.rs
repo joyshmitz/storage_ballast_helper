@@ -1243,6 +1243,59 @@ mod tests {
     }
 
     #[test]
+    fn macos_hardened_runtime_entitlements_are_minimal() {
+        let entitlements = include_str!("../../.github/macos/sbh.entitlements.plist");
+        assert!(entitlements.contains("<dict/>"));
+
+        for forbidden in [
+            "com.apple.security.cs.allow-jit",
+            "com.apple.security.cs.disable-library-validation",
+            "com.apple.security.network.server",
+            "com.apple.security.device.camera",
+            "com.apple.security.device.microphone",
+        ] {
+            assert!(
+                !entitlements.contains(forbidden),
+                "minimal sbh entitlements must not include {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn workflows_sign_macos_binaries_with_hardened_runtime_entitlements() {
+        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
+        let release_workflow = include_str!("../../.github/workflows/release.yml");
+
+        for (name, workflow) in [("ci", ci_workflow), ("release", release_workflow)] {
+            assert!(
+                workflow.contains("entitlements=\".github/macos/sbh.entitlements.plist\""),
+                "{name} workflow must use the canonical sbh entitlements file"
+            );
+            assert!(
+                workflow.contains("--options runtime"),
+                "{name} workflow must enable Hardened Runtime during codesign"
+            );
+            assert!(
+                workflow.contains("--entitlements \"${entitlements}\""),
+                "{name} workflow must pass the canonical entitlements file to codesign"
+            );
+            assert!(
+                workflow.contains("codesign --display --entitlements :-"),
+                "{name} workflow must inspect the entitlements that were embedded"
+            );
+            assert!(
+                workflow.contains("com\\.apple\\.security\\."),
+                "{name} workflow must reject forbidden entitlement keys"
+            );
+        }
+
+        assert!(
+            release_workflow.contains("if: contains(matrix.target, 'apple-darwin')"),
+            "release workflow must restrict codesign to macOS target triples"
+        );
+    }
+
+    #[test]
     fn ci_release_targets_resolve_to_valid_contracts() {
         // Every CI target triple must produce a valid ReleaseArtifactContract
         // with the expected asset naming scheme: sbh-{tag}-{target}.tar.xz
