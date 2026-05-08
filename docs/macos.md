@@ -343,6 +343,17 @@ See `docs/cleanup-rules-macos.md` for the exhaustive macOS cleanup contract and
 `docs/sacred-paths.md` for the built-in sacred catalog and the reasoning for
 every protected pattern.
 
+## Migrating From Visual Cleanup Tools
+
+If you already use CleanMyMac, OmniDiskSweeper, DaisyDisk, or GrandPerspective,
+keep those tools for visual review and personal-file decisions. Add `sbh` for
+continuous pressure monitoring, ballast headroom, dry-run artifact cleanup,
+protected-path vetoes, APFS/Time Machine snapshot warnings, and audit output
+that can run under launchd.
+
+See `docs/migrating-from-other-tools.md` for the migration checklist and the
+side-by-side comparison.
+
 ## macOS Cleanup Safety Model
 
 macOS cleanup rules are specific and conservative. This section is a summary;

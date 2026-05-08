@@ -1452,6 +1452,47 @@ mod tests {
     }
 
     #[test]
+    fn macos_migration_doc_covers_common_cleanup_tools() {
+        let doc = include_str!("../../docs/migrating-from-other-tools.md");
+        let readme = include_str!("../../README.md");
+        let macos_guide = include_str!("../../docs/macos.md");
+
+        for required in [
+            "CleanMyMac",
+            "OmniDiskSweeper",
+            "DaisyDisk",
+            "GrandPerspective",
+            "continuous disk-pressure guard",
+            "ballast",
+            "protected paths",
+            ".sbh-protect",
+            "scanner.protected_paths",
+            "visual treemap",
+            "app maintenance suite",
+            "sbh install --auto",
+            "sbh doctor --pal",
+            "sbh clean /Users/me/Projects --dry-run",
+            "sbh clean --thin-local-snapshots --dry-run",
+            "docs/cleanup-rules-macos.md",
+            "docs/sacred-paths.md",
+            "docs/macos-full-disk-access.md",
+            "docs/launchd-troubleshooting.md",
+        ] {
+            assert!(
+                doc.contains(required),
+                "macOS migration doc must include comparison/setup fragment: {required}"
+            );
+        }
+
+        for linked_doc in [readme, macos_guide] {
+            assert!(
+                linked_doc.contains("docs/migrating-from-other-tools.md"),
+                "macOS migration doc must be discoverable from README and macOS guide"
+            );
+        }
+    }
+
+    #[test]
     fn changelog_unreleased_macos_entries_include_concrete_savings_examples() {
         let changelog = include_str!("../../CHANGELOG.md");
         let unreleased = changelog
