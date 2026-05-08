@@ -534,7 +534,8 @@ Configure via command palette (`:` then type `pref`) or directly in the preferen
 ## Operator Docs
 
 - Installer/update parity contract and security policy: `docs/installer-dx-parity-matrix.md`
-- macOS Full Disk Access grant guide: `docs/macos-full-disk-access.md`
+- macOS Full Disk Access grant guide and screenshot refresh manifest:
+  `docs/macos-full-disk-access.md`, `docs/images/macos/README.md`
 - macOS operations guide: `docs/macos.md`
 - macOS incident case study with the 264 GB trash staging dir, 9.8 GB Claude
   cache, and active build-target footprint: `docs/macos-incident-case-study.md`

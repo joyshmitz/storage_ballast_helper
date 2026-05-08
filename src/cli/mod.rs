@@ -1520,6 +1520,42 @@ mod tests {
     }
 
     #[test]
+    fn macos_full_disk_access_walkthrough_has_screenshot_refresh_policy() {
+        let fda_doc = include_str!("../../docs/macos-full-disk-access.md");
+        let image_manifest = include_str!("../../docs/images/macos/README.md");
+        let readme = include_str!("../../README.md");
+
+        for required in [
+            "text walkthrough is authoritative",
+            "Do not generate or mock screenshots",
+            "macOS major release",
+            "within 30 days",
+            "full-disk-access-privacy-security.png",
+            "full-disk-access-pane.png",
+            "full-disk-access-sbh-enabled.png",
+            "required alt text",
+            "docs/images/macos/README.md",
+        ] {
+            assert!(
+                fda_doc.contains(required) || image_manifest.contains(required),
+                "Full Disk Access screenshot policy must include fragment: {required}"
+            );
+        }
+
+        for required in [
+            "sbh doctor --pal",
+            "full_disk_access_status",
+            "docs/macos-full-disk-access.md",
+            "docs/images/macos/README.md",
+        ] {
+            assert!(
+                fda_doc.contains(required) || readme.contains(required),
+                "Full Disk Access walkthrough must remain discoverable and verifiable: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn macos_cleanup_rules_doc_covers_catalog_contract() {
         let doc = include_str!("../../docs/cleanup-rules-macos.md");
 

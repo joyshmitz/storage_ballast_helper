@@ -32,6 +32,22 @@ missing grant.
 Apple's security guide is the upstream visual reference for the current macOS
 privacy settings flow: <https://support.apple.com/guide/security/secddd1d86a6/web>.
 
+## Screenshot Maintenance
+
+The text walkthrough is authoritative. Screenshots are optional supporting
+artifacts, and maintainers must not generate or mock screenshots for this guide.
+When real screenshots are captured, store them under
+`docs/images/macos/README.md`'s manifest with these stable filenames:
+
+- `full-disk-access-privacy-security.png`
+- `full-disk-access-pane.png`
+- `full-disk-access-sbh-enabled.png`
+
+Review the screenshots once per macOS major release and within 30 days of the
+public release date. Refresh them only when System Settings labels or the Full
+Disk Access flow changes; otherwise keep the text steps current and avoid image
+churn. Each image reference must include the manifest's required alt text.
+
 ## Daemon Rechecks
 
 The daemon checks Full Disk Access at startup and then rechecks about every
