@@ -228,10 +228,23 @@ layouts under `/opt/homebrew` and `/usr/local`. That lets `sbh bootstrap` detect
 stale binaries, stale launchd plists, and legacy footprints after a move
 between manual and Homebrew-style locations.
 
-Homebrew tap publishing is release-engineering work. Until a formula is
-published, a manually installed or from-source binary can still live in one of
-the standard Homebrew prefixes as long as the launchd plist points at the
-actual binary path.
+The tap skeleton lives in:
+
+```text
+packaging/homebrew/Formula/sbh.rb
+```
+
+Copy that file into `Dicklesworthstone/homebrew-sbh/Formula/sbh.rb` during tap
+publishing. Release automation must replace the placeholder SHA-256 values with
+the per-architecture checksums for the released `sbh-v<version>-<target>.tar.xz`
+archives. The formula installs the prebuilt `sbh` binary, runs
+`sbh setup --verify --bin-dir <keg>/bin` as a post-install sanity check, defines
+a `brew services` daemon entry, and prints the Full Disk Access reminder in its
+caveats.
+
+Until the external tap is published, a manually installed or from-source binary
+can still live in one of the standard Homebrew prefixes as long as the launchd
+plist points at the actual binary path.
 
 ## Code Signing And Hardened Runtime
 

@@ -1356,6 +1356,35 @@ mod tests {
     }
 
     #[test]
+    fn homebrew_formula_skeleton_tracks_release_asset_contract() {
+        let formula = include_str!("../../packaging/homebrew/Formula/sbh.rb");
+
+        for required in [
+            "class Sbh < Formula",
+            "version \"0.4.7\"",
+            "on_macos do",
+            "on_arm do",
+            "on_intel do",
+            "sbh-v#{version}-aarch64-apple-darwin.tar.xz",
+            "sbh-v#{version}-x86_64-apple-darwin.tar.xz",
+            "REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256",
+            "REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256",
+            "system bin/\"sbh\", \"setup\", \"--verify\", \"--bin-dir\", bin",
+            "run [opt_bin/\"sbh\", \"daemon\"]",
+            "keep_alive crashed: true",
+            "process_type :background",
+            "throttle_interval 60",
+            "brew services start sbh",
+            "Full Disk Access",
+        ] {
+            assert!(
+                formula.contains(required),
+                "Homebrew formula skeleton must include contract fragment: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn release_workflow_notarizes_macos_binaries_asynchronously() {
         let release_workflow = include_str!("../../.github/workflows/release.yml");
 
