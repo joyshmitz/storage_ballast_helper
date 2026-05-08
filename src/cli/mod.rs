@@ -1317,6 +1317,45 @@ mod tests {
     }
 
     #[test]
+    fn ci_workflow_spot_checks_macos_release_builds_without_notarization() {
+        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
+        let release_workflow = include_str!("../../.github/workflows/release.yml");
+
+        for required in [
+            "pull_request:",
+            "macOS Platform Tests (${{ matrix.runner }})",
+            "Build release binary",
+            "cargo build $CI_FEATURES --release 2>&1 | tee macos-release-build-output.txt",
+            "macos-release-build-output.txt",
+        ] {
+            assert!(
+                ci_workflow.contains(required),
+                "CI workflow must spot-check macOS release builds on PRs: {required}"
+            );
+        }
+
+        for forbidden in [
+            "notarytool",
+            "APPLE_APP_SPECIFIC_PASSWORD",
+            "Notarize macOS release binary",
+        ] {
+            assert!(
+                !ci_workflow.contains(forbidden),
+                "PR CI must not run release-only notarization behavior: {forbidden}"
+            );
+        }
+
+        assert!(
+            release_workflow.contains("tags:") && release_workflow.contains("- 'v*'"),
+            "full release workflow must remain tag-triggered"
+        );
+        assert!(
+            !release_workflow.contains("pull_request:"),
+            "full release workflow must not run on PRs"
+        );
+    }
+
+    #[test]
     fn release_workflow_notarizes_macos_binaries_asynchronously() {
         let release_workflow = include_str!("../../.github/workflows/release.yml");
 
