@@ -156,9 +156,12 @@ sudo sbh install --launchd --scope system --auto
 sudo sbh doctor --pal
 ```
 
-Homebrew is supported by the packaged formula skeleton. Until the external tap
-is published, the source of truth is `packaging/homebrew/Formula/sbh.rb`; once
-published, the intended operator path is:
+Homebrew is supported by the packaged formula skeleton and the
+`Dicklesworthstone/homebrew-sbh` tap. Tagged releases copy
+`packaging/homebrew/Formula/sbh.rb` into the tap, replace the per-architecture
+SHA-256 placeholders from the release artifacts, and open a formula update PR
+using the `HOMEBREW_TAP_TOKEN` release secret. After that PR is merged, the
+operator path is:
 
 ```bash
 brew tap Dicklesworthstone/sbh

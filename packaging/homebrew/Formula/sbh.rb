@@ -4,8 +4,8 @@ class Sbh < Formula
   version "0.4.7"
   license "MIT"
 
-  # Release automation in Dicklesworthstone/homebrew-sbh must replace both
-  # placeholder checksums when copying this skeleton into the tap.
+  # Release automation copies this skeleton into Dicklesworthstone/homebrew-sbh
+  # and replaces both placeholder checksums before opening the tap PR.
   on_macos do
     on_arm do
       url "https://github.com/Dicklesworthstone/storage_ballast_helper/releases/download/v#{version}/" \

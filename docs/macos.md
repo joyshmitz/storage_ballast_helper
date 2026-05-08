@@ -234,10 +234,13 @@ The tap skeleton lives in:
 packaging/homebrew/Formula/sbh.rb
 ```
 
-Copy that file into `Dicklesworthstone/homebrew-sbh/Formula/sbh.rb` during tap
-publishing. Release automation must replace the placeholder SHA-256 values with
-the per-architecture checksums for the released `sbh-v<version>-<target>.tar.xz`
-archives. The formula installs the prebuilt `sbh` binary, runs
+Tagged releases copy that file into
+`Dicklesworthstone/homebrew-sbh/Formula/sbh.rb`, replace the placeholder SHA-256
+values with the per-architecture checksums for the released
+`sbh-v<version>-<target>.tar.xz` archives, push an `update-sbh-v*` branch to the
+tap, and open or update a formula update PR. The release workflow requires a
+`HOMEBREW_TAP_TOKEN` secret with write access to the tap repository. The formula
+installs the prebuilt `sbh` binary, runs
 `sbh setup --verify --bin-dir <keg>/bin` as a post-install sanity check, defines
 a `brew services` daemon entry, and prints the Full Disk Access reminder in its
 caveats.

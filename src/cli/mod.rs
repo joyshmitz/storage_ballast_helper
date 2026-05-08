@@ -1438,6 +1438,49 @@ mod tests {
     }
 
     #[test]
+    fn release_workflow_updates_homebrew_tap_by_pr() {
+        let release_workflow = include_str!("../../.github/workflows/release.yml");
+        let readme = include_str!("../../README.md");
+        let macos_guide = include_str!("../../docs/macos.md");
+
+        for required in [
+            "homebrew-tap:",
+            "Update Homebrew Tap",
+            "HOMEBREW_TAP_REPOSITORY: Dicklesworthstone/homebrew-sbh",
+            "GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}",
+            "repository: ${{ env.HOMEBREW_TAP_REPOSITORY }}",
+            "sbh-source/packaging/homebrew/Formula/sbh.rb",
+            "homebrew-sbh/Formula/sbh.rb",
+            "REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256",
+            "REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256",
+            "grep -q 'REPLACE_WITH_' homebrew-sbh/Formula/sbh.rb",
+            "branch=\"update-sbh-${GITHUB_REF_NAME}\"",
+            "gh pr list",
+            "gh pr create",
+            "--base main",
+        ] {
+            assert!(
+                release_workflow.contains(required),
+                "release workflow must automate Homebrew tap PR updates: {required}"
+            );
+        }
+
+        for doc in [readme, macos_guide] {
+            for required in [
+                "Dicklesworthstone/homebrew-sbh",
+                "packaging/homebrew/Formula/sbh.rb",
+                "HOMEBREW_TAP_TOKEN",
+                "formula update PR",
+            ] {
+                assert!(
+                    doc.contains(required),
+                    "Homebrew tap docs must explain release automation fragment: {required}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn macos_cleanup_rules_doc_covers_catalog_contract() {
         let doc = include_str!("../../docs/cleanup-rules-macos.md");
 
