@@ -4470,7 +4470,7 @@ mod tests {
     use crate::monitor::special_locations::{
         SpecialKind, SpecialLocation, SpecialLocationRegistry,
     };
-    use crate::platform::pal::MemoryInfo;
+    use crate::platform::pal::{MemoryInfo, MockPlatform};
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification};
     use crate::scanner::scoring::{DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::path::Path;
@@ -4656,6 +4656,92 @@ mod tests {
             protected.exists(),
             "protected candidate must remain present after executor preflight"
         );
+    }
+
+    #[test]
+    fn scanner_prescan_does_not_dispatch_protected_rust_fuzz_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("scan-root");
+        let repo = root.join("asupersync_ansi_c");
+        let tools = repo.join("tools");
+        let candidate = tools.join("rust_fuzz_target");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(candidate.join("src")).unwrap();
+        protection::create_marker(&tools, None).unwrap();
+
+        let mut config = Config::default();
+        config.scanner.root_paths = vec![root.clone()];
+        config.scanner.protected_paths = vec![
+            tools.to_string_lossy().to_string(),
+            candidate.to_string_lossy().to_string(),
+        ];
+        config.scanner.min_file_age_minutes = 0;
+        config.scanner.active_reference_min_size_bytes = u64::MAX;
+
+        let log_path = temp.path().join("activity.jsonl");
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: crate::logger::jsonl::JsonlConfig {
+                path: log_path,
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 64,
+        })
+        .unwrap();
+        let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+        let (del_tx, del_rx) = bounded::<DeletionBatch>(1);
+        let (report_tx, report_rx) = bounded::<WorkerReport>(1);
+        let heartbeat = Arc::new(ThreadHeartbeat::new("test-scanner"));
+        let shared_scoring_config = Arc::new(RwLock::new(config.scoring));
+        let shared_scanner_config = Arc::new(RwLock::new(config.scanner));
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+
+        scan_tx
+            .send(ScanRequest {
+                paths: vec![root],
+                urgency: 0.9,
+                pressure_level: PressureLevel::Orange,
+                max_delete_batch: 10,
+                config_update: None,
+            })
+            .unwrap();
+        drop(scan_tx);
+
+        scanner_thread_main(
+            &scan_rx,
+            &del_tx,
+            &logger,
+            &shared_scoring_config,
+            &shared_scanner_config,
+            &platform,
+            &heartbeat,
+            &report_tx,
+        );
+
+        assert!(
+            del_rx.try_recv().is_err(),
+            "protected rust_fuzz_target must not be dispatched by daemon priority pre-scan"
+        );
+        assert!(
+            candidate.exists(),
+            "scanner pre-scan must leave protected rust_fuzz_target on disk"
+        );
+        let report = report_rx
+            .try_recv()
+            .expect("scanner should report completion");
+        match report {
+            WorkerReport::ScanCompleted { candidates, .. } => assert_eq!(
+                candidates, 0,
+                "protected rust_fuzz_target must not count as a daemon deletion candidate"
+            ),
+            WorkerReport::DeletionCompleted { .. } => panic!("expected scanner completion report"),
+        }
+
+        logger.shutdown();
+        logger_join.join().unwrap();
     }
 
     #[test]
