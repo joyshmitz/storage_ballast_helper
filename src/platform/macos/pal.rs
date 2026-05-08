@@ -807,8 +807,8 @@ fn process_info_from_task_all(pid: i32, raw: ProcTaskAllInfo) -> ProcessInfo {
         start_time_unix_ms: start_time_unix_ms(raw.pbsd.pbi_start_tvsec, raw.pbsd.pbi_start_tvusec),
         virtual_memory_bytes: Some(raw.ptinfo.pti_virtual_size),
         resident_memory_bytes: Some(raw.ptinfo.pti_resident_size),
-        cpu_user_micros: None,
-        cpu_system_micros: None,
+        cpu_user_micros: Some(nanos_to_micros(raw.ptinfo.pti_total_user)),
+        cpu_system_micros: Some(nanos_to_micros(raw.ptinfo.pti_total_system)),
     }
 }
 
@@ -843,6 +843,10 @@ fn start_time_unix_ms(seconds: u64, micros: u64) -> Option<i64> {
         .checked_mul(1000)?
         .checked_add(micros.checked_div(1000)?)?;
     i64::try_from(millis).ok()
+}
+
+fn nanos_to_micros(nanos: u64) -> u64 {
+    nanos / 1_000
 }
 
 fn executable_is_under(process: &ProcessInfo, root: &Path) -> bool {
@@ -1522,6 +1526,8 @@ mod tests {
 
         assert_eq!(process.pid, current);
         assert!(!process.command_line.is_empty());
+        assert!(process.cpu_user_micros.is_some());
+        assert!(process.cpu_system_micros.is_some());
     }
 
     #[test]

@@ -4489,6 +4489,14 @@ struct SacredStatusReport {
     protections: Vec<SacredProtectionView>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+struct ProcessAttributionVisibility {
+    scope: &'static str,
+    all_processes: bool,
+    requires_root_for_all_users: bool,
+    detail: &'static str,
+}
+
 fn run_status(cli: &Cli, args: &StatusArgs) -> Result<(), CliError> {
     if args.sacred {
         if args.watch {
@@ -4728,6 +4736,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
     };
     let memory_info = platform.memory_info().ok();
     let memory_pressure = platform.memory_pressure().ok();
+    let process_visibility = process_attribution_visibility(platform.name());
 
     match output_mode(cli) {
         OutputMode::Human => {
@@ -4838,6 +4847,11 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 } else {
                     println!("  Swap: disabled");
                 }
+            }
+
+            if let Some(visibility) = process_visibility {
+                println!("\nProcess Attribution:");
+                println!("  Visibility: {}", visibility.detail);
             }
 
             // Rate estimates from daemon state.
@@ -4963,6 +4977,9 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     })
                 }),
                 "memory_pressure": memory_pressure.as_ref().map(status_memory_pressure_json),
+                "process_attribution": {
+                    "visibility": process_visibility.as_ref().map(process_attribution_visibility_json),
+                },
                 "recent_hour": recent,
                 "policy_mode": daemon_state.as_ref().and_then(|s| s.get("policy_mode")).and_then(|v| v.as_str()),
             });
@@ -5199,6 +5216,54 @@ fn capacity_platform_json(capacity: &Capacity) -> Value {
                 "free_excludes_purgeable": true,
             }
         }
+    })
+}
+
+fn process_attribution_visibility(platform_name: &str) -> Option<ProcessAttributionVisibility> {
+    process_attribution_visibility_for(platform_name, effective_user_is_root())
+}
+
+fn process_attribution_visibility_for(
+    platform_name: &str,
+    is_root: bool,
+) -> Option<ProcessAttributionVisibility> {
+    if !platform_name.eq_ignore_ascii_case("macos") {
+        return None;
+    }
+
+    if is_root {
+        Some(ProcessAttributionVisibility {
+            scope: "all_processes",
+            all_processes: true,
+            requires_root_for_all_users: false,
+            detail: "all processes (running as root/LaunchDaemon)",
+        })
+    } else {
+        Some(ProcessAttributionVisibility {
+            scope: "own_user_processes",
+            all_processes: false,
+            requires_root_for_all_users: true,
+            detail: "own-user processes only; run sbh as a root LaunchDaemon for all-user process I/O attribution",
+        })
+    }
+}
+
+#[cfg(unix)]
+fn effective_user_is_root() -> bool {
+    nix::unistd::Uid::effective().is_root()
+}
+
+#[cfg(not(unix))]
+fn effective_user_is_root() -> bool {
+    false
+}
+
+fn process_attribution_visibility_json(visibility: &ProcessAttributionVisibility) -> Value {
+    json!({
+        "scope": visibility.scope,
+        "all_processes": visibility.all_processes,
+        "requires_root_for_all_users": visibility.requires_root_for_all_users,
+        "detail": visibility.detail,
     })
 }
 
@@ -10141,6 +10206,49 @@ mod tests {
         assert_eq!(apfs["purgeable_bytes"], 32);
         assert_eq!(apfs["local_snapshot_bytes"], 64);
         assert_eq!(apfs["free_excludes_purgeable"], true);
+    }
+
+    #[test]
+    fn macos_process_attribution_visibility_reports_user_scope_without_root() {
+        let visibility = process_attribution_visibility_for("macos", false)
+            .expect("macOS should report process attribution visibility");
+        let payload = process_attribution_visibility_json(&visibility);
+
+        assert_eq!(visibility.scope, "own_user_processes");
+        assert!(!visibility.all_processes);
+        assert!(visibility.requires_root_for_all_users);
+        assert_eq!(payload["scope"], "own_user_processes");
+        assert_eq!(payload["all_processes"], false);
+        assert_eq!(payload["requires_root_for_all_users"], true);
+        assert!(
+            payload["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("own-user processes only"))
+        );
+    }
+
+    #[test]
+    fn macos_process_attribution_visibility_reports_all_processes_as_root() {
+        let visibility = process_attribution_visibility_for("macos", true)
+            .expect("macOS should report process attribution visibility");
+        let payload = process_attribution_visibility_json(&visibility);
+
+        assert_eq!(visibility.scope, "all_processes");
+        assert!(visibility.all_processes);
+        assert!(!visibility.requires_root_for_all_users);
+        assert_eq!(payload["scope"], "all_processes");
+        assert_eq!(payload["all_processes"], true);
+        assert_eq!(payload["requires_root_for_all_users"], false);
+        assert!(
+            payload["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("root/LaunchDaemon"))
+        );
+    }
+
+    #[test]
+    fn process_attribution_visibility_is_macos_specific() {
+        assert!(process_attribution_visibility_for("linux", false).is_none());
     }
 
     fn cli_app_snapshot_settings(assertion: impl FnOnce()) {
