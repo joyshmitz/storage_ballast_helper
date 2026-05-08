@@ -1296,6 +1296,41 @@ mod tests {
     }
 
     #[test]
+    fn release_workflow_notarizes_macos_binaries_asynchronously() {
+        let release_workflow = include_str!("../../.github/workflows/release.yml");
+
+        for required in [
+            "Notarize macOS release binary",
+            "if: contains(matrix.target, 'apple-darwin')",
+            "APPLE_ID: ${{ secrets.APPLE_ID }}",
+            "APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}",
+            "APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}",
+            "Authority=Developer ID Application",
+            "ditto -c -k --keepParent \"${bin}\" \"${upload}\"",
+            "xcrun notarytool submit \"${upload}\"",
+            "plutil -extract id raw -o - \"${submit_plist}\"",
+            "xcrun notarytool info \"${submission_id}\"",
+            "plutil -extract status raw -o - \"${info_plist}\"",
+            "sleep 30",
+            "xcrun notarytool log \"${submission_id}\"",
+            "notarization timed out after 30 minutes",
+            "sbh-*-notary-*.plist",
+            "sbh-*-notary-*.json",
+            "sbh-*-codesign-authority.txt",
+        ] {
+            assert!(
+                release_workflow.contains(required),
+                "release workflow must include notarization contract fragment: {required}"
+            );
+        }
+
+        assert!(
+            !release_workflow.contains("notarytool submit \"${upload}\" --wait"),
+            "release workflow must keep submit and polling as separate audited phases"
+        );
+    }
+
+    #[test]
     fn ci_release_targets_resolve_to_valid_contracts() {
         // Every CI target triple must produce a valid ReleaseArtifactContract
         // with the expected asset naming scheme: sbh-{tag}-{target}.tar.xz

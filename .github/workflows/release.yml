@@ -87,6 +87,95 @@ jobs:
             exit 1
           fi
 
+      - name: Notarize macOS release binary
+        if: contains(matrix.target, 'apple-darwin')
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/sbh"
+          upload="sbh-${{ matrix.target }}-notary.zip"
+          submit_plist="sbh-${{ matrix.target }}-notary-submit.plist"
+          info_plist="sbh-${{ matrix.target }}-notary-info.plist"
+          log_json="sbh-${{ matrix.target }}-notary-log.json"
+
+          for secret_name in APPLE_ID APPLE_TEAM_ID APPLE_APP_SPECIFIC_PASSWORD; do
+            if [ -z "${!secret_name:-}" ]; then
+              echo "::error::${secret_name} is required for macOS notarization"
+              exit 1
+            fi
+          done
+
+          test -x "${bin}"
+          codesign --display --verbose=4 "${bin}" > "sbh-${{ matrix.target }}-codesign-authority.txt" 2>&1
+          cat "sbh-${{ matrix.target }}-codesign-authority.txt"
+          if ! grep -q 'Authority=Developer ID Application' "sbh-${{ matrix.target }}-codesign-authority.txt"; then
+            echo "::error::Developer ID Application signing is required before notarization"
+            exit 1
+          fi
+
+          ditto -c -k --keepParent "${bin}" "${upload}"
+          xcrun notarytool submit "${upload}" \
+            --apple-id "${APPLE_ID}" \
+            --team-id "${APPLE_TEAM_ID}" \
+            --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
+            --output-format plist > "${submit_plist}"
+
+          submission_id="$(plutil -extract id raw -o - "${submit_plist}")"
+          if [ -z "${submission_id}" ]; then
+            echo "::error::notarytool did not return a submission id"
+            cat "${submit_plist}"
+            exit 1
+          fi
+
+          deadline=$((SECONDS + 1800))
+          status=""
+          while [ "${SECONDS}" -lt "${deadline}" ]; do
+            xcrun notarytool info "${submission_id}" \
+              --apple-id "${APPLE_ID}" \
+              --team-id "${APPLE_TEAM_ID}" \
+              --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
+              --output-format plist > "${info_plist}"
+            status="$(plutil -extract status raw -o - "${info_plist}")"
+            case "${status}" in
+              Accepted)
+                break
+                ;;
+              Invalid|Rejected)
+                xcrun notarytool log "${submission_id}" \
+                  --apple-id "${APPLE_ID}" \
+                  --team-id "${APPLE_TEAM_ID}" \
+                  --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
+                  "${log_json}" || true
+                cat "${log_json}" || true
+                echo "::error::notarization ${status} for ${submission_id}"
+                exit 1
+                ;;
+            esac
+            sleep 30
+          done
+
+          if [ "${status}" != "Accepted" ]; then
+            xcrun notarytool log "${submission_id}" \
+              --apple-id "${APPLE_ID}" \
+              --team-id "${APPLE_TEAM_ID}" \
+              --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
+              "${log_json}" || true
+            cat "${log_json}" || true
+            echo "::error::notarization timed out after 30 minutes for ${submission_id}"
+            exit 1
+          fi
+
+          xcrun notarytool log "${submission_id}" \
+            --apple-id "${APPLE_ID}" \
+            --team-id "${APPLE_TEAM_ID}" \
+            --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
+            "${log_json}" || true
+          cat "${log_json}" || true
+
       - name: Package archive
         run: |
           cd target/${{ matrix.target }}/release
@@ -108,6 +197,9 @@ jobs:
           path: |
             sbh-*.tar.xz
             sbh-*.sha256
+            sbh-*-notary-*.plist
+            sbh-*-notary-*.json
+            sbh-*-codesign-authority.txt
 
   release:
     name: Publish Release

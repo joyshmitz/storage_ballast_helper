@@ -256,6 +256,35 @@ ad-hoc identity used in CI is only for build validation; Developer ID signing
 and notarization use the same entitlement file once release credentials are
 available.
 
+Tagged macOS releases also run an explicit notarization phase. Apple accepts
+notary uploads as ZIP archives, disk images, or signed flat packages, while the
+existing release artifact remains `sbh-{tag}-{target}.tar.xz`; the workflow
+therefore creates a temporary ZIP around the signed `sbh` binary for Apple's
+scanner and keeps the tarball naming contract unchanged.
+
+The release workflow uses these GitHub secrets:
+
+```text
+APPLE_ID
+APPLE_TEAM_ID
+APPLE_APP_SPECIFIC_PASSWORD
+```
+
+If any secret is missing, the macOS release job fails before packaging. When
+all credentials are present, the workflow first verifies that the binary was
+signed by a `Developer ID Application` authority, then submits the temporary ZIP
+with `xcrun notarytool submit`, extracts the submission id, polls `xcrun
+notarytool info` every 30 seconds for up to 30 minutes, and downloads `xcrun
+notarytool log` output on both success and failure. `Invalid`, `Rejected`, and
+timeout states fail the release with the notary log printed into the Actions
+output.
+
+The current CLI tarball flow does not staple a ticket because `stapler` supports
+app bundles, disk images, and signed flat packages rather than the `.tar.xz`
+artifact. Gatekeeper can still find the online notary ticket for the signed
+binary. A future `.pkg` or `.dmg` distribution path should staple and validate
+that package after notarization.
+
 ## Watched Paths
 
 The install wizard auto-detects watched paths from:
