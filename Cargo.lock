@@ -1542,6 +1542,7 @@ dependencies = [
 name = "sbh_mach"
 version = "0.1.0"
 dependencies = [
+ "dispatch2",
  "libc",
  "mach2",
 ]

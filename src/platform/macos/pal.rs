@@ -162,15 +162,16 @@ impl Platform for MacOsPal {
         &self,
         callback: MemoryPressureCallback,
     ) -> Result<SubscriptionHandle> {
-        // Direct GCD memory-pressure sources require unsafe dispatch_source_create
-        // bindings. Keep this PAL implementation inside the crate's no-unsafe
-        // policy by polling the same pressure snapshot used by memory_pressure().
-        spawn_memory_pressure_subscription(
-            "macos-memory-pressure-poll",
-            MEMORY_PRESSURE_POLL_INTERVAL,
-            callback,
-            || read_current_memory_pressure("subscribe_memory_pressure"),
-        )
+        let callback: Arc<dyn Fn(MemoryPressure) + Send + Sync + 'static> = Arc::from(callback);
+        spawn_native_memory_pressure_subscription(Arc::clone(&callback)).or_else(|_| {
+            let callback = Arc::clone(&callback);
+            spawn_memory_pressure_subscription(
+                "macos-memory-pressure-poll",
+                MEMORY_PRESSURE_POLL_INTERVAL,
+                Box::new(move |pressure| callback(pressure)),
+                || read_current_memory_pressure("subscribe_memory_pressure"),
+            )
+        })
     }
 
     fn process_list(&self) -> Result<Vec<ProcessInfo>> {
@@ -419,6 +420,54 @@ fn read_current_memory_pressure(method: &'static str) -> Result<MemoryPressure> 
     let stats = sys::read_vm_stats().map_err(|error| macos_method_error(method, &error))?;
     let swap = sys::vm_swapusage().map_err(|error| macos_method_error(method, &error))?;
     Ok(memory_pressure_from_vm_stats(total_bytes, stats, &swap))
+}
+
+fn spawn_native_memory_pressure_subscription(
+    callback: Arc<dyn Fn(MemoryPressure) + Send + Sync + 'static>,
+) -> Result<SubscriptionHandle> {
+    let source = sbh_mach::subscribe_memory_pressure_events(move |event| {
+        callback(memory_pressure_from_dispatch_event(event));
+    })
+    .map_err(|error| macos_method_error("subscribe_memory_pressure", &error))?;
+
+    Ok(SubscriptionHandle::active_with_resource(
+        "macos-memory-pressure-dispatch",
+        source,
+    ))
+}
+
+fn memory_pressure_from_dispatch_event(event: sbh_mach::MemoryPressureEvent) -> MemoryPressure {
+    let dispatch_level = memory_pressure_level_from_dispatch_event(event);
+    let mut pressure = read_current_memory_pressure("subscribe_memory_pressure.dispatch")
+        .unwrap_or_else(|_| empty_dispatch_memory_pressure(dispatch_level));
+    if dispatch_level != MemoryPressureLevel::Unknown {
+        pressure.level = dispatch_level;
+    }
+    pressure
+}
+
+fn memory_pressure_level_from_dispatch_event(
+    event: sbh_mach::MemoryPressureEvent,
+) -> MemoryPressureLevel {
+    match event {
+        sbh_mach::MemoryPressureEvent::Normal => MemoryPressureLevel::Normal,
+        sbh_mach::MemoryPressureEvent::Warn => MemoryPressureLevel::Warn,
+        sbh_mach::MemoryPressureEvent::Critical => MemoryPressureLevel::Critical,
+        sbh_mach::MemoryPressureEvent::Unknown(_) => MemoryPressureLevel::Unknown,
+    }
+}
+
+fn empty_dispatch_memory_pressure(level: MemoryPressureLevel) -> MemoryPressure {
+    MemoryPressure {
+        level,
+        free_pages: None,
+        used_pages: None,
+        page_size_bytes: None,
+        compressor_used_bytes: None,
+        swap_total_bytes: None,
+        swap_used_bytes: None,
+        linux_psi_avg10: None,
+    }
 }
 
 fn spawn_memory_pressure_subscription<F>(
@@ -1104,6 +1153,41 @@ mod tests {
         assert_eq!(pressure.level, MemoryPressureLevel::Unknown);
         assert_eq!(pressure.swap_total_bytes, None);
         assert_eq!(pressure.swap_used_bytes, None);
+    }
+
+    #[test]
+    fn dispatch_memory_pressure_events_map_to_pal_levels() {
+        assert_eq!(
+            super::memory_pressure_level_from_dispatch_event(sbh_mach::MemoryPressureEvent::Normal),
+            MemoryPressureLevel::Normal
+        );
+        assert_eq!(
+            super::memory_pressure_level_from_dispatch_event(sbh_mach::MemoryPressureEvent::Warn),
+            MemoryPressureLevel::Warn
+        );
+        assert_eq!(
+            super::memory_pressure_level_from_dispatch_event(
+                sbh_mach::MemoryPressureEvent::Critical
+            ),
+            MemoryPressureLevel::Critical
+        );
+        assert_eq!(
+            super::memory_pressure_level_from_dispatch_event(
+                sbh_mach::MemoryPressureEvent::Unknown(0)
+            ),
+            MemoryPressureLevel::Unknown
+        );
+    }
+
+    #[test]
+    fn native_memory_pressure_subscription_constructs() {
+        let callback: Arc<dyn Fn(MemoryPressure) + Send + Sync + 'static> = Arc::new(|_| {});
+        let handle = super::spawn_native_memory_pressure_subscription(callback)
+            .expect("native dispatch memory-pressure source should construct");
+
+        assert!(handle.active);
+        assert_eq!(handle.source, "macos-memory-pressure-dispatch");
+        drop(handle);
     }
 
     #[test]

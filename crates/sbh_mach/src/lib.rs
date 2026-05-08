@@ -5,10 +5,17 @@
 
 #![cfg(target_os = "macos")]
 
+use std::ffi::c_void;
 use std::fmt;
 use std::mem::{MaybeUninit, size_of};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
+use dispatch2::{
+    _dispatch_source_type_memorypressure, DispatchObject, DispatchQoS, DispatchQueue,
+    DispatchRetained, DispatchSource, GlobalQueueIdentifier,
+    dispatch_source_memorypressure_flags_t,
+};
 use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
 use mach2::mach_init::{mach_host_self, mach_thread_self};
 use mach2::mach_port::mach_port_deallocate;
@@ -151,6 +158,71 @@ pub struct VmStats {
     pub compressor_page_count: u64,
     /// Throttled pages.
     pub throttled_count: u64,
+}
+
+/// Memory-pressure transition delivered by macOS Grand Central Dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryPressureEvent {
+    /// System memory pressure returned to normal.
+    Normal,
+    /// System memory pressure reached the warning level.
+    Warn,
+    /// System memory pressure reached the critical level.
+    Critical,
+    /// Dispatch delivered an unrecognized bitmask.
+    Unknown(usize),
+}
+
+impl MemoryPressureEvent {
+    /// Map a raw `dispatch_source_get_data()` bitmask to the strongest event.
+    pub fn from_dispatch_data(data: usize) -> Self {
+        if data & memory_pressure_flag(
+            dispatch_source_memorypressure_flags_t::DISPATCH_MEMORYPRESSURE_CRITICAL,
+        ) != 0
+        {
+            Self::Critical
+        } else if data
+            & memory_pressure_flag(
+                dispatch_source_memorypressure_flags_t::DISPATCH_MEMORYPRESSURE_WARN,
+            )
+            != 0
+        {
+            Self::Warn
+        } else if data
+            & memory_pressure_flag(
+                dispatch_source_memorypressure_flags_t::DISPATCH_MEMORYPRESSURE_NORMAL,
+            )
+            != 0
+        {
+            Self::Normal
+        } else {
+            Self::Unknown(data)
+        }
+    }
+}
+
+/// Active native macOS memory-pressure dispatch source.
+#[derive(Debug)]
+pub struct MemoryPressureSource {
+    source: DispatchRetained<DispatchSource>,
+}
+
+impl MemoryPressureSource {
+    /// Whether the underlying dispatch source has been canceled.
+    pub fn is_canceled(&self) -> bool {
+        self.source.testcancel() != 0
+    }
+}
+
+impl Drop for MemoryPressureSource {
+    fn drop(&mut self) {
+        self.source.cancel();
+    }
+}
+
+struct MemoryPressureState {
+    source: *const DispatchSource,
+    callback: Box<dyn Fn(MemoryPressureEvent) + Send + Sync + 'static>,
 }
 
 impl VmStats {
@@ -301,6 +373,40 @@ pub fn host_vm_stats() -> Result<VmStats, MachError> {
     })
 }
 
+/// Subscribe to native `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` events.
+pub fn subscribe_memory_pressure_events<F>(callback: F) -> Result<MemoryPressureSource, MachError>
+where
+    F: Fn(MemoryPressureEvent) + Send + Sync + 'static,
+{
+    let queue = DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
+        DispatchQoS::Utility,
+    ));
+    let mask = memory_pressure_event_mask();
+    let source = unsafe {
+        DispatchSource::new(
+            ptr::addr_of!(_dispatch_source_type_memorypressure).cast_mut(),
+            0,
+            mask,
+            Some(&queue),
+        )
+    };
+
+    let state = Box::new(MemoryPressureState {
+        source: &*source,
+        callback: Box::new(callback),
+    });
+    let state_ptr = Box::into_raw(state).cast::<c_void>();
+
+    unsafe {
+        source.set_context(state_ptr);
+    }
+    source.set_event_handler_f(memory_pressure_event_handler);
+    source.set_cancel_handler_f(memory_pressure_cancel_handler);
+    source.activate();
+
+    Ok(MemoryPressureSource { source })
+}
+
 fn thread_basic_info_for_port(thread: thread_act_t) -> Result<ThreadBasicInfo, MachError> {
     let mut info = MaybeUninit::<MachThreadBasicInfoRaw>::zeroed();
     let mut count = THREAD_BASIC_INFO_COUNT;
@@ -379,11 +485,44 @@ fn natural_to_u64(value: libc::natural_t) -> u64 {
     u64::from(value)
 }
 
+const fn memory_pressure_flag(flag: dispatch_source_memorypressure_flags_t) -> usize {
+    flag.0 as usize
+}
+
+const fn memory_pressure_event_mask() -> usize {
+    memory_pressure_flag(dispatch_source_memorypressure_flags_t::DISPATCH_MEMORYPRESSURE_NORMAL)
+        | memory_pressure_flag(dispatch_source_memorypressure_flags_t::DISPATCH_MEMORYPRESSURE_WARN)
+        | memory_pressure_flag(
+            dispatch_source_memorypressure_flags_t::DISPATCH_MEMORYPRESSURE_CRITICAL,
+        )
+}
+
+extern "C" fn memory_pressure_event_handler(context: *mut c_void) {
+    if context.is_null() {
+        return;
+    }
+
+    let state = unsafe { &*context.cast::<MemoryPressureState>() };
+    let source = unsafe { &*state.source };
+    let event = MemoryPressureEvent::from_dispatch_data(source.data());
+    let _ = catch_unwind(AssertUnwindSafe(|| (state.callback)(event)));
+}
+
+extern "C" fn memory_pressure_cancel_handler(context: *mut c_void) {
+    if context.is_null() {
+        return;
+    }
+
+    unsafe {
+        drop(Box::from_raw(context.cast::<MemoryPressureState>()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         current_task_basic_info, current_task_thread_times, current_task_usage, host_vm_stats,
-        current_thread_basic_info,
+        current_thread_basic_info, subscribe_memory_pressure_events, MemoryPressureEvent,
     };
 
     #[test]
@@ -421,5 +560,36 @@ mod tests {
         assert!(stats.page_size_bytes >= 4096);
         assert!(stats.accounted_pages() > 0);
         assert!(stats.active_count.saturating_add(stats.wire_count) > 0);
+    }
+
+    #[test]
+    fn memory_pressure_event_mapping_prefers_strongest_flag() {
+        assert_eq!(
+            MemoryPressureEvent::from_dispatch_data(0x1),
+            MemoryPressureEvent::Normal
+        );
+        assert_eq!(
+            MemoryPressureEvent::from_dispatch_data(0x2),
+            MemoryPressureEvent::Warn
+        );
+        assert_eq!(
+            MemoryPressureEvent::from_dispatch_data(0x4),
+            MemoryPressureEvent::Critical
+        );
+        assert_eq!(
+            MemoryPressureEvent::from_dispatch_data(0x1 | 0x2 | 0x4),
+            MemoryPressureEvent::Critical
+        );
+        assert_eq!(
+            MemoryPressureEvent::from_dispatch_data(0x8),
+            MemoryPressureEvent::Unknown(0x8)
+        );
+    }
+
+    #[test]
+    fn memory_pressure_source_constructs_and_cancels() {
+        let source = subscribe_memory_pressure_events(|_| {}).expect("dispatch source should start");
+        assert!(!source.is_canceled());
+        drop(source);
     }
 }

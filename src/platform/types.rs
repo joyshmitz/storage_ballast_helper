@@ -2,6 +2,7 @@
 
 #![allow(missing_docs)]
 
+use std::any::Any;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -233,12 +234,12 @@ impl FullDiskAccessStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SubscriptionHandle {
     pub source: String,
     pub active: bool,
     #[serde(skip)]
-    _liveness: Option<Arc<()>>,
+    resource: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl SubscriptionHandle {
@@ -247,16 +248,30 @@ impl SubscriptionHandle {
         Self {
             source: source.into(),
             active: true,
-            _liveness: None,
+            resource: None,
         }
     }
 
     #[must_use]
     pub(crate) fn active_with_liveness(source: impl Into<String>, liveness: Arc<()>) -> Self {
+        let resource: Arc<dyn Any + Send + Sync> = liveness;
         Self {
             source: source.into(),
             active: true,
-            _liveness: Some(liveness),
+            resource: Some(resource),
+        }
+    }
+
+    #[must_use]
+    #[cfg(target_os = "macos")]
+    pub(crate) fn active_with_resource<T>(source: impl Into<String>, resource: T) -> Self
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        Self {
+            source: source.into(),
+            active: true,
+            resource: Some(Arc::new(resource)),
         }
     }
 
@@ -265,8 +280,19 @@ impl SubscriptionHandle {
         Self {
             source: source.into(),
             active: false,
-            _liveness: None,
+            resource: None,
         }
+    }
+}
+
+impl fmt::Debug for SubscriptionHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SubscriptionHandle")
+            .field("source", &self.source)
+            .field("active", &self.active)
+            .field("has_resource", &self.resource.is_some())
+            .finish()
     }
 }
 
