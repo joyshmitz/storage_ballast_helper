@@ -339,12 +339,14 @@ protected_paths = [
 ]
 ```
 
-See `docs/sacred-paths.md` for the built-in sacred catalog and the reasoning
-for every protected pattern.
+See `docs/cleanup-rules-macos.md` for the exhaustive macOS cleanup contract and
+`docs/sacred-paths.md` for the built-in sacred catalog and the reasoning for
+every protected pattern.
 
 ## macOS Cleanup Safety Model
 
-macOS cleanup rules are specific and conservative:
+macOS cleanup rules are specific and conservative. This section is a summary;
+the exhaustive operator trust document is `docs/cleanup-rules-macos.md`.
 
 - Xcode DerivedData cleanup targets immediate children of
   `~/Library/Developer/Xcode/DerivedData/`, not the root as one broad delete.

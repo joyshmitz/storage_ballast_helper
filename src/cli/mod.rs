@@ -1385,6 +1385,73 @@ mod tests {
     }
 
     #[test]
+    fn macos_cleanup_rules_doc_covers_catalog_contract() {
+        let doc = include_str!("../../docs/cleanup-rules-macos.md");
+
+        for required in [
+            "xcode-derived-data",
+            "~/Library/Developer/Xcode/DerivedData/*",
+            "core-simulator-caches",
+            "~/Library/Developer/CoreSimulator/Caches/*",
+            "electron-cache",
+            "electron-cache-root",
+            "electron-service-worker-cache",
+            "electron-service-worker-cache-root",
+            "electron-code-cache",
+            "electron-code-cache-root",
+            "electron-gpu-cache",
+            "electron-gpu-cache-root",
+            "electron-indexed-db",
+            "electron-indexed-db-root",
+            "electron-vm-bundles",
+            "electron-vm-bundles-root",
+            "tmp-dash-target",
+            "/private/tmp/*-target",
+            "tmp-underscore-target",
+            "/private/tmp/*_target",
+            "tmp-target-underscore-prefix",
+            "/private/tmp/target_*",
+            "user-named-trash-exact",
+            "user-named-trashed-exact",
+            "user-named-trash",
+            "release-work-buildroot",
+            "~/release-work/*[-_]buildroot",
+            "user-logs",
+            "~/Library/Logs/*",
+            "ipsw-software-updates",
+            "~/Library/iTunes/iPhone Software Updates/*.ipsw",
+            "home-trash-report",
+            "icloud-trash-report",
+            "time-machine-local-snapshots",
+            "spotlight-index-report",
+            "photos-library-sacred",
+            "mail-library-sacred",
+            "messages-library-sacred",
+            "final-cut-library-sacred",
+            "RemoveTree",
+            "RemoveMatchingFiles",
+            "ThinLocalSnapshots",
+            "PromptBeforeRemove",
+            "ReportOnly",
+            "Refuse",
+            "Definite",
+            "Likely",
+            "Unclear",
+            "Sacred",
+            ".sbh-protect",
+            "scanner.protected_paths",
+            "docs/sacred-paths.md",
+            "sbh scan /private/tmp --show-protected",
+            "sbh protect --list",
+        ] {
+            assert!(
+                doc.contains(required),
+                "macOS cleanup rules trust doc must include catalog/safety fragment: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn release_workflow_notarizes_macos_binaries_asynchronously() {
         let release_workflow = include_str!("../../.github/workflows/release.yml");
 
