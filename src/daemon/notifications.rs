@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::monitor::pid::PressureLevel;
 
+const DEFAULT_NOTIFY_INTERVAL_SECS: u64 = 60;
+const DEFAULT_URGENT_NOTIFY_INTERVAL_SECS: u64 = 300;
+
 // ──────────────────── notification level ────────────────────
 
 /// Severity level for notification filtering. Maps 1:1 with pressure levels
@@ -89,6 +92,12 @@ pub enum NotificationEvent {
     BallastReplenished {
         mount: String,
         files_replenished: usize,
+    },
+    BehaviorEmergency {
+        source: String,
+        memory_level: String,
+        disk_level: String,
+        action: String,
     },
     DaemonStarted {
         version: String,
@@ -176,6 +185,8 @@ impl NotificationEvent {
 
             Self::BallastReleased { .. } => NotificationLevel::Orange,
 
+            Self::BehaviorEmergency { .. } => NotificationLevel::Critical,
+
             Self::Error { .. } => NotificationLevel::Red,
         }
     }
@@ -189,6 +200,7 @@ impl NotificationEvent {
             Self::CleanupCompleted { .. } => "cleanup_completed",
             Self::BallastReleased { .. } => "ballast_released",
             Self::BallastReplenished { .. } => "ballast_replenished",
+            Self::BehaviorEmergency { .. } => "behavior_emergency",
             Self::DaemonStarted { .. } => "daemon_started",
             Self::DaemonStopped { .. } => "daemon_stopped",
             Self::Error { .. } => "error",
@@ -235,6 +247,16 @@ impl NotificationEvent {
                 mount,
                 files_replenished,
             } => format!("Replenished {files_replenished} ballast files on {mount}"),
+            Self::BehaviorEmergency {
+                source,
+                memory_level,
+                disk_level,
+                action,
+            } => {
+                format!(
+                    "Emergency pressure response from {source}: memory={memory_level} disk={disk_level} ({action})"
+                )
+            }
             Self::DaemonStarted {
                 version,
                 volumes_monitored,
@@ -263,8 +285,11 @@ pub struct NotificationConfig {
     /// Which channel names to activate.
     pub channels: Vec<String>,
     /// Minimum seconds between notifications (0 = no throttle).
-    /// Red/Critical events bypass this throttle.
+    /// Red/Critical events use `urgent_notify_interval_secs` instead.
     pub min_notify_interval_secs: u64,
+    /// Minimum seconds between Red/Critical notifications of the same category.
+    /// The default is five minutes so emergency desktop alerts remain useful.
+    pub urgent_notify_interval_secs: u64,
     pub desktop: DesktopConfig,
     pub webhook: WebhookConfig,
     pub file: FileConfig,
@@ -276,7 +301,8 @@ impl Default for NotificationConfig {
         Self {
             enabled: true,
             channels: vec!["journal".to_string(), "file".to_string()],
-            min_notify_interval_secs: 60,
+            min_notify_interval_secs: DEFAULT_NOTIFY_INTERVAL_SECS,
+            urgent_notify_interval_secs: DEFAULT_URGENT_NOTIFY_INTERVAL_SECS,
             desktop: DesktopConfig::default(),
             webhook: WebhookConfig::default(),
             file: FileConfig::default(),
@@ -393,6 +419,15 @@ impl DesktopChannel {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn macos_display_notification_script(summary: &str) -> String {
+    // Escape backslashes first, then double quotes, to prevent AppleScript injection.
+    let escaped = summary.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        "display notification \"{escaped}\" with title \"sbh\" subtitle \"Storage Ballast Helper\""
+    )
+}
+
 impl Channel for DesktopChannel {
     fn name(&self) -> &'static str {
         "desktop"
@@ -430,11 +465,7 @@ impl Channel for DesktopChannel {
 
         #[cfg(target_os = "macos")]
         {
-            // Escape backslashes first, then double quotes, to prevent injection.
-            let escaped = summary.replace('\\', "\\\\").replace('"', "\\\"");
-            let script = format!(
-                "display notification \"{escaped}\" with title \"sbh\" subtitle \"Storage Ballast Helper\"",
-            );
+            let script = macos_display_notification_script(&summary);
             if let Ok(child) = Command::new("osascript").arg("-e").arg(&script).spawn() {
                 std::thread::spawn(move || {
                     let mut c = child;
@@ -693,6 +724,7 @@ pub struct NotificationManager {
     /// Prevents a low-priority event type from blocking unrelated higher-priority ones.
     last_send_by_type: HashMap<&'static str, Instant>,
     min_interval: Duration,
+    urgent_min_interval: Duration,
 }
 
 impl NotificationManager {
@@ -705,6 +737,7 @@ impl NotificationManager {
                 enabled: false,
                 last_send_by_type: HashMap::new(),
                 min_interval: Duration::ZERO,
+                urgent_min_interval: Duration::ZERO,
             };
         }
 
@@ -735,6 +768,7 @@ impl NotificationManager {
             enabled: true,
             last_send_by_type: HashMap::new(),
             min_interval: Duration::from_secs(config.min_notify_interval_secs),
+            urgent_min_interval: Duration::from_secs(config.urgent_notify_interval_secs),
         }
     }
 
@@ -756,28 +790,32 @@ impl NotificationManager {
             enabled: false,
             last_send_by_type: HashMap::new(),
             min_interval: Duration::ZERO,
+            urgent_min_interval: Duration::ZERO,
         }
     }
 
     /// Dispatch a notification event to all enabled channels.
     ///
-    /// Events are throttled per-event-type by `min_notify_interval_secs` (default
-    /// 60s). Each event type has its own throttle window so a low-severity cleanup
-    /// notification cannot block an unrelated pressure warning.
-    /// Red and Critical events bypass throttling to ensure timely alerts.
+    /// Events are throttled per-event-type. Warning-and-below events use
+    /// `min_notify_interval_secs`; Red and Critical events use
+    /// `urgent_notify_interval_secs` (default five minutes). Each event type has
+    /// its own throttle window so a cleanup notification cannot block a pressure
+    /// warning, and repeated emergency desktop alerts cannot spam the operator.
     pub fn notify(&mut self, event: &NotificationEvent) {
         if !self.enabled {
             return;
         }
 
-        // Throttle: skip if we sent this event type recently, unless Red/Critical.
         let level = event.level();
-        let bypass_throttle = level >= NotificationLevel::Red;
+        let interval = if level >= NotificationLevel::Red {
+            self.urgent_min_interval
+        } else {
+            self.min_interval
+        };
         let type_key = event.type_key();
-        if !bypass_throttle
-            && !self.min_interval.is_zero()
+        if !interval.is_zero()
             && let Some(last) = self.last_send_by_type.get(type_key)
-            && last.elapsed() < self.min_interval
+            && last.elapsed() < interval
         {
             return;
         }
@@ -950,6 +988,18 @@ mod tests {
     }
 
     #[test]
+    fn event_level_behavior_emergency_is_critical() {
+        let event = NotificationEvent::BehaviorEmergency {
+            source: "memory_pressure".to_string(),
+            memory_level: "Critical".to_string(),
+            disk_level: "Critical".to_string(),
+            action: "scan=DefiniteOnly cleanup=AnyDefiniteCandidate".to_string(),
+        };
+        assert_eq!(event.level(), NotificationLevel::Critical);
+        assert_eq!(event.type_key(), "behavior_emergency");
+    }
+
+    #[test]
     fn event_summary_pressure_changed() {
         let event = NotificationEvent::PressureChanged {
             from: "green".to_string(),
@@ -988,6 +1038,22 @@ mod tests {
     }
 
     #[test]
+    fn event_summary_behavior_emergency_mentions_both_pressures() {
+        let event = NotificationEvent::BehaviorEmergency {
+            source: "startup".to_string(),
+            memory_level: "Critical".to_string(),
+            disk_level: "Critical".to_string(),
+            action: "scan=DefiniteOnly cleanup=AnyDefiniteCandidate ballast=ReleaseFirst"
+                .to_string(),
+        };
+        let summary = event.summary();
+        assert!(summary.contains("startup"));
+        assert!(summary.contains("memory=Critical"));
+        assert!(summary.contains("disk=Critical"));
+        assert!(summary.contains("ReleaseFirst"));
+    }
+
+    #[test]
     fn default_config_has_journal_and_file() {
         let config = NotificationConfig::default();
         assert!(config.enabled);
@@ -995,6 +1061,14 @@ mod tests {
         assert!(config.channels.contains(&"file".to_string()));
         assert!(!config.desktop.enabled);
         assert!(!config.webhook.enabled);
+        assert_eq!(
+            config.min_notify_interval_secs,
+            DEFAULT_NOTIFY_INTERVAL_SECS
+        );
+        assert_eq!(
+            config.urgent_notify_interval_secs,
+            DEFAULT_URGENT_NOTIFY_INTERVAL_SECS
+        );
     }
 
     #[test]
@@ -1205,6 +1279,15 @@ mod tests {
     }
 
     #[test]
+    fn macos_display_notification_script_escapes_summary() {
+        let script = macos_display_notification_script(r#"quote " and backslash \"#);
+        assert_eq!(
+            script,
+            r#"display notification "quote \" and backslash \\" with title "sbh" subtitle "Storage Ballast Helper""#
+        );
+    }
+
+    #[test]
     fn manager_notify_dispatches_to_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notifications.jsonl");
@@ -1234,6 +1317,46 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
         assert_eq!(parsed["type"], "pressure_changed");
         assert_eq!(parsed["mount"], "/data");
+    }
+
+    #[test]
+    fn manager_throttles_urgent_events_per_category() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notifications.jsonl");
+
+        let config = NotificationConfig {
+            enabled: true,
+            channels: vec!["file".to_string()],
+            min_notify_interval_secs: 0,
+            urgent_notify_interval_secs: 300,
+            file: FileConfig { path: path.clone() },
+            ..Default::default()
+        };
+
+        let mut manager = NotificationManager::from_config(&config);
+        let pressure_event = NotificationEvent::BehaviorEmergency {
+            source: "memory_pressure".to_string(),
+            memory_level: "Critical".to_string(),
+            disk_level: "Critical".to_string(),
+            action: "scan=DefiniteOnly cleanup=AnyDefiniteCandidate".to_string(),
+        };
+        let error_event = NotificationEvent::Error {
+            code: "SBH-TEST".to_string(),
+            message: "different urgent category".to_string(),
+        };
+
+        manager.notify(&pressure_event);
+        manager.notify(&pressure_event);
+        manager.notify(&error_event);
+
+        let content = fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(first["type"], "behavior_emergency");
+        assert_eq!(second["type"], "error");
     }
 
     #[test]

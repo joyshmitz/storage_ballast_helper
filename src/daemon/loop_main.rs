@@ -32,7 +32,7 @@ use crate::core::errors::{Result, SbhError};
 use crate::daemon::notifications::{NotificationEvent, NotificationLevel, NotificationManager};
 use crate::daemon::policy::{
     ActiveMode, BallastAction, BehaviorDispatchTable, BehaviorMode, BehaviorPressureLevel,
-    CleanupAction, PolicyEngine, ScanAggressiveness,
+    CleanupAction, NotificationPriority, PolicyEngine, ScanAggressiveness,
 };
 use crate::daemon::process_io_history::ProcessIoHistory;
 use crate::daemon::self_monitor::{SelfMonitor, SelfMonitorTick, ThreadHeartbeat, ThreadStatus};
@@ -1098,6 +1098,25 @@ fn behavior_mode_summary(mode: BehaviorMode) -> String {
     )
 }
 
+fn behavior_emergency_event(
+    source: &str,
+    transition: &BehaviorTransition,
+) -> Option<NotificationEvent> {
+    if transition.to_memory != MemoryPressureLevel::Critical
+        || transition.to_disk != PressureLevel::Critical
+        || transition.to_mode.notification_priority != NotificationPriority::Emergency
+    {
+        return None;
+    }
+
+    Some(NotificationEvent::BehaviorEmergency {
+        source: source.to_string(),
+        memory_level: format!("{:?}", transition.to_memory),
+        disk_level: format!("{:?}", transition.to_disk),
+        action: behavior_mode_summary(transition.to_mode),
+    })
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct StatusDumpCounters {
     window_scans: u64,
@@ -1551,6 +1570,9 @@ impl MonitoringDaemon {
                 );
                 eprintln!("[SBH-DAEMON] {message}");
                 self.logger_handle.send(ActivityEvent::Info { message });
+                if let Some(event) = behavior_emergency_event(source, &transition) {
+                    self.notification_manager.notify(&event);
+                }
             }
             BehaviorUpdate::Deferred {
                 direction,
@@ -4657,6 +4679,36 @@ mod tests {
         assert_eq!(disk_transition.to_disk, PressureLevel::Red);
         assert_eq!(state.mode.cleanup_action, CleanupAction::DefiniteCandidates);
         assert_eq!(state.mode.ballast_action, BallastAction::ReleaseFirst);
+    }
+
+    #[test]
+    fn critical_memory_and_disk_transition_builds_emergency_notification() {
+        let mut state =
+            PressureBehaviorState::new(MemoryPressureLevel::Warn, PressureLevel::Yellow);
+        let transition = state
+            .update(MemoryPressureLevel::Critical, PressureLevel::Critical)
+            .expect("critical memory plus critical disk should enter emergency cell");
+
+        let event = behavior_emergency_event("memory_pressure", &transition)
+            .expect("critical+critical behavior transition should notify");
+
+        assert_eq!(event.level(), NotificationLevel::Critical);
+        assert_eq!(event.type_key(), "behavior_emergency");
+        let summary = event.summary();
+        assert!(summary.contains("memory=Critical"));
+        assert!(summary.contains("disk=Critical"));
+        assert!(summary.contains("ReleaseFirst"));
+    }
+
+    #[test]
+    fn non_emergency_behavior_transition_does_not_build_notification() {
+        let mut state =
+            PressureBehaviorState::new(MemoryPressureLevel::Normal, PressureLevel::Green);
+        let transition = state
+            .update(MemoryPressureLevel::Warn, PressureLevel::Yellow)
+            .expect("warning behavior should transition");
+
+        assert!(behavior_emergency_event("memory_pressure", &transition).is_none());
     }
 
     #[test]

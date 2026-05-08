@@ -601,6 +601,8 @@ recovery_trigger_windows = 5
 [notifications]
 enabled = true
 channels = ["journal", "file"]
+min_notify_interval_secs = 60
+urgent_notify_interval_secs = 300
 
 [notifications.desktop]
 enabled = false
@@ -1170,8 +1172,13 @@ The daemon dispatches alerts through four notification channels, each with indep
 | Journal | systemd structured logging via stderr | Warning |
 
 Default active channels are `journal` and `file`. Desktop and webhook channels are opt-in.
+On macOS, the desktop channel uses `osascript -e 'display notification ...'` as the
+first supported user-notification path. Red and Critical events are still
+throttled per event category by `urgent_notify_interval_secs` (default five
+minutes), so a Critical+Critical memory/disk event can alert promptly without
+spamming Notification Center.
 
-**Notification event types:** `PressureChanged`, `PredictiveWarning`, `CleanupCompleted`, `BallastReleased`, `BallastReplenished`, `DaemonStarted`, `DaemonStopped`, `Error`.
+**Notification event types:** `PressureChanged`, `PredictiveWarning`, `CleanupCompleted`, `BallastReleased`, `BallastReplenished`, `BehaviorEmergency`, `DaemonStarted`, `DaemonStopped`, `Error`.
 
 **Severity levels (ordered):** Info, Warning, Orange, Red, Critical. Each channel only dispatches events at or above its configured `min_level`.
 

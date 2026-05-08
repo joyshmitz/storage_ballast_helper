@@ -50,6 +50,14 @@ The dispatch table combines those two normalized values. For example, healthy
 memory plus red disk can scan aggressively and release ballast, while critical
 memory plus red disk uses definite-only cleanup and releases ballast first.
 
+When both normalized inputs are `Critical`, the daemon emits a
+`BehaviorEmergency` notification event. On macOS, an enabled desktop channel
+delivers that event through `osascript -e 'display notification ...'`. Urgent
+notification delivery is capped per event category by
+`notifications.urgent_notify_interval_secs` (default 300 seconds) so repeated
+Critical+Critical transitions alert the operator without flooding Notification
+Center.
+
 ## Behavior Transition Hysteresis
 
 The daemon applies time hysteresis to behavior-mode transitions after startup.
