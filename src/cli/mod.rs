@@ -1317,6 +1317,46 @@ mod tests {
     }
 
     #[test]
+    fn release_workflow_imports_developer_id_certificate_before_signing() {
+        let release_workflow = include_str!("../../.github/workflows/release.yml");
+        let macos_guide = include_str!("../../docs/macos.md");
+
+        for required in [
+            "Import Developer ID certificate",
+            "APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}",
+            "APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}",
+            "APPLE_DEVELOPER_ID_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_IDENTITY }}",
+            "security create-keychain",
+            "security import \"${cert_path}\"",
+            "security set-key-partition-list",
+            "security find-identity -v -p codesigning",
+            "Sign macOS release binary with Developer ID and hardened runtime",
+            "--sign \"${APPLE_DEVELOPER_ID_IDENTITY}\"",
+            "--timestamp",
+            "Authority=Developer ID Application",
+        ] {
+            assert!(
+                release_workflow.contains(required),
+                "release workflow must import and use Developer ID certificate fragment: {required}"
+            );
+        }
+
+        for required in [
+            "APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64",
+            "APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD",
+            "APPLE_DEVELOPER_ID_IDENTITY",
+            "base64-encoded Developer ID Application certificate",
+            "temporary keychain",
+            "Developer ID Application: Example LLC",
+        ] {
+            assert!(
+                macos_guide.contains(required),
+                "macOS guide must document Developer ID release secret fragment: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn ci_workflow_spot_checks_macos_release_builds_without_notarization() {
         let ci_workflow = include_str!("../../.github/workflows/ci.yml");
         let release_workflow = include_str!("../../.github/workflows/release.yml");

@@ -267,20 +267,27 @@ entitlements file is intentionally minimal:
 
 That file contains an empty entitlement dictionary. `sbh` does not need JIT,
 library-validation bypasses, camera, microphone, or network-server entitlements.
-CI signs the release binary with:
+Pull-request CI signs the release-style binary ad hoc with:
 
 ```bash
 codesign --force --sign - --options runtime --timestamp=none \
   --entitlements .github/macos/sbh.entitlements.plist target/release/sbh
 ```
 
-Tagged macOS release archives are signed the same way before packaging. The
-ad-hoc identity used in CI is only for build validation; Developer ID signing
-and notarization use the same entitlement file once release credentials are
-available.
+The ad-hoc identity used in PR CI is only for build validation. Tagged macOS
+releases import the Developer ID Application certificate from Actions secrets
+into a temporary keychain and sign the same binary with:
+
+```bash
+codesign --force --sign "${APPLE_DEVELOPER_ID_IDENTITY}" --options runtime \
+  --timestamp --entitlements .github/macos/sbh.entitlements.plist target/release/sbh
+```
+
 CI runs the ad-hoc signing check on both `push` and `pull_request` events so
 PRs exercise the macOS codesign path without requiring a Developer ID
-certificate.
+certificate. Tagged releases fail before packaging if the Developer ID
+certificate secrets are absent or the resulting binary is not signed by a
+`Developer ID Application` authority.
 
 Tagged macOS releases also run an explicit notarization phase. Apple accepts
 notary uploads as ZIP archives, disk images, or signed flat packages, while the
@@ -291,13 +298,20 @@ scanner and keeps the tarball naming contract unchanged.
 The release workflow uses these GitHub secrets:
 
 ```text
+APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64
+APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD
+APPLE_DEVELOPER_ID_IDENTITY
 APPLE_ID
 APPLE_TEAM_ID
 APPLE_APP_SPECIFIC_PASSWORD
 ```
 
-If any secret is missing, the macOS release job fails before packaging. When
-all credentials are present, the workflow first verifies that the binary was
+If any secret is missing, the macOS release job fails before packaging. The P12
+secret is the base64-encoded Developer ID Application certificate plus private
+key exported from Keychain Access, and `APPLE_DEVELOPER_ID_IDENTITY` is the full
+codesigning identity string, for example `Developer ID Application: Example LLC
+(TEAMID)`. When all credentials are present, the workflow imports the P12 into a
+temporary keychain, signs with Hardened Runtime, verifies that the binary was
 signed by a `Developer ID Application` authority, then submits the temporary ZIP
 with `xcrun notarytool submit`, extracts the submission id, polls `xcrun
 notarytool info` every 30 seconds for up to 30 minutes, and downloads `xcrun
