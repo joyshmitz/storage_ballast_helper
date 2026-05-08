@@ -8,6 +8,9 @@
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/storage_ballast_helper/main/scripts/install.sh | bash
 ```
 
+macOS users: jump straight to the [macOS quick start](#macos-quick-start) for
+the launchd, Homebrew, manual install, and Full Disk Access checklist.
+
 Cross-platform disk-pressure defense for AI coding workloads: predictive monitoring, safe cleanup, ballast release, and explainable policy decisions.
 
 ## TL;DR
@@ -131,6 +134,51 @@ Pin a specific version:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/storage_ballast_helper/main/scripts/install.sh | bash -s -- --version v0.1.0
 ```
+
+### macOS Quick Start
+
+For the default user LaunchAgent install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/storage_ballast_helper/main/scripts/install.sh | bash
+sbh install --auto
+sbh doctor --pal
+sbh status
+```
+
+`sbh install --auto` detects macOS, chooses launchd, installs a user-scoped
+LaunchAgent, uses native Application Support paths, and provisions the default
+ballast preset. Use system scope only when `sbh` must inspect system-wide paths
+or all users' process activity:
+
+```bash
+sudo sbh install --launchd --scope system --auto
+sudo sbh doctor --pal
+```
+
+Homebrew is supported by the packaged formula skeleton. Until the external tap
+is published, the source of truth is `packaging/homebrew/Formula/sbh.rb`; once
+published, the intended operator path is:
+
+```bash
+brew tap Dicklesworthstone/sbh
+brew install sbh
+sbh install --launchd --scope user --auto
+sbh doctor --pal
+```
+
+Manual macOS install from source is the same Cargo path as Linux, followed by
+launchd setup:
+
+```bash
+cargo install --git https://github.com/Dicklesworthstone/storage_ballast_helper --bin sbh
+sbh install --launchd --scope user --auto
+sbh doctor --pal
+```
+
+Grant Full Disk Access before relying on cleanup scans that need protected
+locations under `~/Library`; `sbh doctor --pal` reports the exact FDA status and
+links to `docs/macos-full-disk-access.md`.
 
 ### Option 1: From Git (Cargo)
 
@@ -260,6 +308,22 @@ Running `sbh install` without prior configuration launches the install wizard, w
 | Custom | user-specified | 1 GiB | varies |
 
 For non-interactive environments (CI, automation), `sbh install --auto` applies platform-detected defaults: the platform-native service manager, auto-discovered watched paths, user-scope service, and Medium ballast preset.
+
+### macOS Configure Checklist
+
+- **LaunchAgent vs LaunchDaemon:** user scope is the default and writes under
+  `~/Library/Application Support/sbh/`; system scope requires `sudo`, installs a
+  LaunchDaemon, writes under `/private/var/sbh/`, and can inspect all users'
+  process activity.
+- **Full Disk Access:** run `sbh doctor --pal` after install. If the
+  `macos.full_disk_access` check warns or fails, follow
+  `docs/macos-full-disk-access.md`, then restart the launchd service.
+- **Service control:** use `sbh service --launchd --scope user status` and
+  `sbh service --launchd --scope user restart` for user installs; replace
+  `--scope user` with `--scope system` for LaunchDaemons.
+- **Homebrew paths:** Apple Silicon installs normally live under
+  `/opt/homebrew`, Intel installs under `/usr/local`; bootstrap and doctor
+  checks inspect both families and repair stale launchd plist paths.
 
 ## Command Reference
 
@@ -1594,9 +1658,19 @@ For test harness conventions and structured logging registration, see `docs/test
 - Verify target mount with `sbh ballast status`.
 - Ensure the pressured path has a corresponding ballast pool.
 - Check for read-only/tmpfs/NFS skip rules.
+- macOS/APFS: local Time Machine snapshots may retain released ballast blocks.
+  Run `sbh clean --thin-local-snapshots --dry-run` and, if appropriate,
+  `sudo sbh clean --thin-local-snapshots --yes`.
+
+### "macOS Full Disk Access is missing"
+- Run `sbh doctor --pal` and check the `macos.full_disk_access` entry.
+- Follow `docs/macos-full-disk-access.md`.
+- Restart the launchd service after changing the grant:
+  `sbh service --launchd --scope user restart`.
 
 ### "Dashboard shows DEGRADED"
-- Confirm daemon is running: `systemctl status sbh-daemon` or `sbh daemon`.
+- Confirm daemon is running: Linux `systemctl status sbh-daemon`; macOS
+  `sbh service --launchd --scope user status`; foreground debugging `sbh daemon`.
 - Check state file path and permissions (default: `/var/lib/sbh/state.json`).
 - Validate config with `sbh config validate`.
 - Press `7` to view Diagnostics screen for connection error details.
@@ -1620,7 +1694,8 @@ For test harness conventions and structured logging registration, see `docs/test
 
 ### "Service fails to start"
 - Linux: inspect `systemctl status sbh` and `journalctl -u sbh -e` for logs.
-- macOS: inspect `launchctl list | grep sbh` and check `~/Library/Logs/sbh/` for log output.
+- macOS: run `sbh service --launchd --scope user status`, inspect
+  `launchctl list | grep sbh`, and check `~/Library/Logs/sbh/` for log output.
 - Run `sbh daemon` directly to capture startup errors.
 - Verify binary path is correct: `sbh config show --json | jq '.paths'`.
 
