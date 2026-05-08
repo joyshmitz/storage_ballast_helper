@@ -319,6 +319,13 @@ notarytool log` output on both success and failure. `Invalid`, `Rejected`, and
 timeout states fail the release with the notary log printed into the Actions
 output.
 
+The `Developer ID Certificate Expiration` workflow runs nightly and on manual
+dispatch. It decodes `APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64`, extracts the
+leaf certificate with `openssl pkcs12`, reports the `notAfter` timestamp, fails
+if the certificate is already expired, and emits a GitHub Actions warning when
+the certificate expires within 30 days. Until the Developer ID certificate
+secrets are configured, the workflow emits a warning that certificate expiration monitoring is inactive and exits successfully.
+
 The current CLI tarball flow does not staple a ticket because `stapler` supports
 app bundles, disk images, and signed flat packages rather than the `.tar.xz`
 artifact. Gatekeeper can still find the online notary ticket for the signed

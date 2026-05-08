@@ -1357,6 +1357,48 @@ mod tests {
     }
 
     #[test]
+    fn developer_id_certificate_expiration_workflow_monitors_nightly() {
+        let workflow = include_str!("../../.github/workflows/cert-expiration.yml");
+        let macos_guide = include_str!("../../docs/macos.md");
+
+        for required in [
+            "name: Developer ID Certificate Expiration",
+            "schedule:",
+            "cron: \"17 9 * * *\"",
+            "workflow_dispatch:",
+            "APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}",
+            "APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}",
+            "Developer ID certificate secrets are not configured; expiration monitoring is inactive",
+            "openssl pkcs12",
+            "openssl x509 -in \"${pem_path}\" -noout -enddate",
+            "warning_seconds=$((30 * 24 * 60 * 60))",
+            "openssl x509 -in \"${pem_path}\" -checkend 0 -noout",
+            "Developer ID certificate has expired",
+            "openssl x509 -in \"${pem_path}\" -checkend \"${warning_seconds}\" -noout",
+            "Developer ID certificate expires within 30 days",
+        ] {
+            assert!(
+                workflow.contains(required),
+                "certificate expiration workflow must include fragment: {required}"
+            );
+        }
+
+        for required in [
+            "Developer ID Certificate Expiration",
+            "runs nightly",
+            "openssl pkcs12",
+            "notAfter",
+            "expires within 30 days",
+            "expiration monitoring is inactive",
+        ] {
+            assert!(
+                macos_guide.contains(required),
+                "macOS guide must document certificate expiration monitoring: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn ci_workflow_spot_checks_macos_release_builds_without_notarization() {
         let ci_workflow = include_str!("../../.github/workflows/ci.yml");
         let release_workflow = include_str!("../../.github/workflows/release.yml");
