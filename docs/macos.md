@@ -4,6 +4,13 @@ This guide explains how `sbh` behaves on macOS and what an operator should
 expect from APFS, launchd, Full Disk Access, Homebrew-style installs, custom
 paths, and safety controls.
 
+The 2026-05-03 Mac disk-pressure incident is documented in
+`docs/macos-incident-case-study.md`: a 264 GB
+`/private/tmp/frankenterm-trash-20260503-092725` staging directory, a 9.8 GB
+Claude `vm_bundles` cache, and about 330 GB of active `/private/tmp/ft-*-target`
+build directories that sbh should detect but not delete while builds hold them
+open.
+
 ## Quick Start
 
 For a user-scoped launchd service:

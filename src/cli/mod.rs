@@ -1481,6 +1481,45 @@ mod tests {
     }
 
     #[test]
+    fn macos_incident_case_study_tracks_operator_numbers() {
+        let case_study = include_str!("../../docs/macos-incident-case-study.md");
+        let readme = include_str!("../../README.md");
+        let macos_guide = include_str!("../../docs/macos.md");
+
+        for required in [
+            "sbh saved my Mac from the brink",
+            "2026-05-03",
+            "147 MB free",
+            "1.95 TB",
+            "/private/tmp/frankenterm-trash-20260503-092725",
+            "264 GB",
+            "~/Library/Application Support/Claude/vm_bundles/claudevm.bundle",
+            "9.8 GB",
+            "/private/tmp/ft-*-target",
+            "about 330 GB",
+            "~/release-work/mcp_agent_mail_rust_buildroot",
+            "39 GB",
+            "Active `/private/tmp/ft-*-target` directories should remain protected",
+            "sacred-overlap reason",
+            "SBH-1101 unsupported platform",
+            "docs/cleanup-rules-macos.md",
+            "docs/migrating-from-other-tools.md",
+        ] {
+            assert!(
+                case_study.contains(required),
+                "macOS incident case study must preserve concrete operator evidence: {required}"
+            );
+        }
+
+        for linked_doc in [readme, macos_guide] {
+            assert!(
+                linked_doc.contains("docs/macos-incident-case-study.md"),
+                "macOS incident case study must be discoverable from README and macOS guide"
+            );
+        }
+    }
+
+    #[test]
     fn macos_cleanup_rules_doc_covers_catalog_contract() {
         let doc = include_str!("../../docs/cleanup-rules-macos.md");
 

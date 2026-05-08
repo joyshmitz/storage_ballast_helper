@@ -10,6 +10,8 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/storage_ballast_h
 
 macOS users: jump straight to the [macOS quick start](#macos-quick-start) for
 the launchd, Homebrew, manual install, and Full Disk Access checklist.
+For the incident that drove the Mac port, see the
+[2026-05-03 macOS case study](docs/macos-incident-case-study.md).
 
 Cross-platform disk-pressure defense for AI coding workloads: predictive monitoring, safe cleanup, ballast release, and explainable policy decisions.
 
@@ -534,6 +536,8 @@ Configure via command palette (`:` then type `pref`) or directly in the preferen
 - Installer/update parity contract and security policy: `docs/installer-dx-parity-matrix.md`
 - macOS Full Disk Access grant guide: `docs/macos-full-disk-access.md`
 - macOS operations guide: `docs/macos.md`
+- macOS incident case study with the 264 GB trash staging dir, 9.8 GB Claude
+  cache, and active build-target footprint: `docs/macos-incident-case-study.md`
 - Migrating from CleanMyMac, OmniDiskSweeper, DaisyDisk, or GrandPerspective:
   `docs/migrating-from-other-tools.md`
 - Sample Mac configs for developer, creative, and shared LaunchDaemon machines:
