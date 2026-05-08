@@ -3474,7 +3474,7 @@ fn scanner_thread_main(
                         if should_skip_protected_daemon_candidate(
                             &mut protection,
                             &path,
-                            &[],
+                            &sacred_paths,
                             logger,
                             "priority pre-scan",
                         ) {
@@ -3510,7 +3510,7 @@ fn scanner_thread_main(
                                     if should_skip_protected_daemon_candidate(
                                         &mut protection,
                                         &sub_path,
-                                        &[],
+                                        &sacred_paths,
                                         logger,
                                         "priority pre-scan",
                                     ) {
@@ -3536,7 +3536,7 @@ fn scanner_thread_main(
                                                     if should_skip_protected_daemon_candidate(
                                                         &mut protection,
                                                         &d3_path,
-                                                        &[],
+                                                        &sacred_paths,
                                                         logger,
                                                         "priority pre-scan",
                                                     ) {
@@ -3575,7 +3575,7 @@ fn scanner_thread_main(
                             if should_skip_protected_daemon_candidate(
                                 &mut protection,
                                 &candidate_path,
-                                &[],
+                                &sacred_paths,
                                 logger,
                                 "priority pre-scan",
                             ) {

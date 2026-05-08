@@ -926,7 +926,7 @@ fn daemon_exits_nonzero_when_rss_hard_cap_exceeded() {
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_foreground_daemon_idle_energy_budget() {
-    const SAMPLE_DURATION: Duration = Duration::from_secs(60);
+    const SAMPLE_DURATION: Duration = Duration::from_mins(1);
     const STARTUP_GRACE: Duration = Duration::from_secs(3);
     const MAX_IDLE_RSS_BYTES: u64 = 50 * 1_048_576;
     const MAX_IDLE_WAKEUPS_PER_SEC: u64 = 100;
