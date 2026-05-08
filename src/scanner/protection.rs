@@ -252,6 +252,43 @@ impl ProtectionRegistry {
         Ok(found)
     }
 
+    /// Discover `.sbh-protect` markers in `path` and its ancestors.
+    ///
+    /// This is a cheap safety check for code paths that evaluate a single
+    /// deletion candidate without going through `DirectoryWalker`. It preserves
+    /// the same subtree semantics as walker-discovered markers: once an
+    /// ancestor has a marker, the candidate and all descendants are protected.
+    pub fn discover_ancestor_markers(&mut self, path: &Path) -> Result<usize> {
+        let normalized = normalize_path_for_protection(path);
+        let mut found = 0usize;
+
+        for ancestor in normalized.ancestors() {
+            let marker_path = ancestor.join(MARKER_FILENAME);
+            match fs::symlink_metadata(&marker_path) {
+                Ok(_) => {
+                    if self
+                        .marker_paths
+                        .insert(normalize_path_for_protection(ancestor))
+                    {
+                        found += 1;
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                    return Err(SbhError::PermissionDenied { path: marker_path });
+                }
+                Err(source) => {
+                    return Err(SbhError::Io {
+                        path: marker_path,
+                        source,
+                    });
+                }
+            }
+        }
+
+        Ok(found)
+    }
+
     /// Register a single marker directory (used when walker encounters a marker
     /// during normal traversal, without full discovery).
     pub fn register_marker(&mut self, dir: &Path) -> bool {
@@ -1004,6 +1041,29 @@ mod tests {
         assert!(reg.is_protected(&protected));
         // Nested is still protected because it's a child of a protected dir.
         assert!(reg.is_protected(&nested));
+    }
+
+    #[test]
+    fn ancestor_marker_discovery_protects_direct_candidate_checks() {
+        let tmp = TempDir::new().unwrap();
+        let protected = tmp.path().join("repo").join("tools");
+        let candidate = protected.join("rust_fuzz_target");
+        fs::create_dir_all(&candidate).unwrap();
+        create_marker(&protected, None).unwrap();
+
+        let mut reg = ProtectionRegistry::marker_only();
+        assert_eq!(reg.marker_count(), 0);
+        assert!(!reg.is_protected(&candidate));
+
+        let discovered = reg.discover_ancestor_markers(&candidate).unwrap();
+
+        assert_eq!(discovered, 1);
+        assert!(reg.is_protected(&candidate));
+        assert!(
+            reg.protection_reason(&candidate)
+                .unwrap()
+                .contains(MARKER_FILENAME)
+        );
     }
 
     #[test]

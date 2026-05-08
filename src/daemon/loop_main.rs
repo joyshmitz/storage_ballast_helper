@@ -2758,6 +2758,7 @@ impl MonitoringDaemon {
         report_tx: Sender<WorkerReport>,
     ) -> Result<thread::JoinHandle<()>> {
         let shared_config = Arc::clone(&self.shared_executor_config);
+        let scanner_config = Arc::clone(&self.shared_scanner_config);
         let policy_engine = Arc::clone(&self.policy_engine);
         let shared_guard_diagnostics = Arc::clone(&self.shared_guard_diagnostics);
 
@@ -2768,6 +2769,7 @@ impl MonitoringDaemon {
                     &del_rx,
                     &logger,
                     &shared_config,
+                    &scanner_config,
                     &heartbeat,
                     &report_tx,
                     &policy_engine,
@@ -2870,6 +2872,55 @@ fn dispatch_top_candidates(
             true
         }
         Err(TrySendError::Disconnected(_)) => false, // Channel closed, exit
+    }
+}
+
+fn daemon_protection_reason(
+    protection: &mut ProtectionRegistry,
+    path: &Path,
+    sacred_paths: &[crate::platform::types::SacredPath],
+) -> Result<Option<String>> {
+    protection.discover_ancestor_markers(path)?;
+    if let Some(reason) = protection.protection_reason(path) {
+        return Ok(Some(reason));
+    }
+
+    let overlaps = protection::find_sacred_overlaps(path, sacred_paths)?;
+    Ok(overlaps
+        .first()
+        .map(|overlap| format!("sacred path overlap: {}", overlap.summary())))
+}
+
+fn should_skip_protected_daemon_candidate(
+    protection: &mut ProtectionRegistry,
+    path: &Path,
+    sacred_paths: &[crate::platform::types::SacredPath],
+    logger: &ActivityLoggerHandle,
+    context: &str,
+) -> bool {
+    match daemon_protection_reason(protection, path, sacred_paths) {
+        Ok(Some(reason)) => {
+            eprintln!(
+                "[SBH-SAFETY] {context}: protected candidate skipped: {} ({reason})",
+                path.display()
+            );
+            true
+        }
+        Ok(None) => false,
+        Err(err) => {
+            eprintln!(
+                "[SBH-SAFETY] {context}: protection check failed for {}; skipping candidate: {err}",
+                path.display()
+            );
+            logger.send(ActivityEvent::Error {
+                code: err.code().to_string(),
+                message: format!(
+                    "{context}: protection check failed for {}; skipped candidate: {err}",
+                    path.display()
+                ),
+            });
+            true
+        }
     }
 }
 
@@ -3039,6 +3090,21 @@ fn scanner_thread_main(
             &current_scanner_config.protected_paths,
         ));
 
+        // Build protection before priority pre-scan. The normal walker also
+        // enforces this, but priority pre-scan can dispatch deletion candidates
+        // before walker traversal has a chance to discover marker files.
+        let mut protection =
+            match ProtectionRegistry::new(Some(&current_scanner_config.protected_paths)) {
+                Ok(p) => p,
+                Err(e) => {
+                    logger.send(ActivityEvent::Error {
+                        code: "SBH-1001".to_string(),
+                        message: format!("protection registry init failed: {e}"),
+                    });
+                    continue;
+                }
+            };
+
         // ── Priority pre-scan pass ──
         // Before the general walker, do a shallow (depth 1-2) scan of each root
         // for known high-value cleanup targets. This ensures multi-GB dirs like
@@ -3055,6 +3121,15 @@ fn scanner_thread_main(
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if !path.is_dir() {
+                            continue;
+                        }
+                        if should_skip_protected_daemon_candidate(
+                            &mut protection,
+                            &path,
+                            &[],
+                            logger,
+                            "priority pre-scan",
+                        ) {
                             continue;
                         }
                         // Track whether depth-1 dir is a git repo (project root).
@@ -3084,6 +3159,15 @@ fn scanner_thread_main(
                             for sub_entry in sub_entries.flatten() {
                                 let sub_path = sub_entry.path();
                                 if sub_path.is_dir() {
+                                    if should_skip_protected_daemon_candidate(
+                                        &mut protection,
+                                        &sub_path,
+                                        &[],
+                                        logger,
+                                        "priority pre-scan",
+                                    ) {
+                                        continue;
+                                    }
                                     if known_git_dirs.contains(&sub_path)
                                         || sub_path.join(".git").exists()
                                     {
@@ -3101,6 +3185,15 @@ fn scanner_thread_main(
                                             for d3_entry in d3_entries.flatten() {
                                                 let d3_path = d3_entry.path();
                                                 if d3_path.is_dir() {
+                                                    if should_skip_protected_daemon_candidate(
+                                                        &mut protection,
+                                                        &d3_path,
+                                                        &[],
+                                                        logger,
+                                                        "priority pre-scan",
+                                                    ) {
+                                                        continue;
+                                                    }
                                                     if known_git_dirs.contains(&d3_path)
                                                         || d3_path.join(".git").exists()
                                                     {
@@ -3131,6 +3224,15 @@ fn scanner_thread_main(
                         }
 
                         for candidate_path in to_score {
+                            if should_skip_protected_daemon_candidate(
+                                &mut protection,
+                                &candidate_path,
+                                &[],
+                                logger,
+                                "priority pre-scan",
+                            ) {
+                                continue;
+                            }
                             let candidate_class = pattern_registry
                                 .classify(&candidate_path, StructuralSignals::default());
                             if candidate_class.category
@@ -3306,19 +3408,6 @@ fn scanner_thread_main(
                 excluded
             },
         };
-
-        // Initialize protection registry (reload from config + markers are discovered during walk).
-        let protection =
-            match ProtectionRegistry::new(Some(&current_scanner_config.protected_paths)) {
-                Ok(p) => p,
-                Err(e) => {
-                    logger.send(ActivityEvent::Error {
-                        code: "SBH-1001".to_string(),
-                        message: format!("protection registry init failed: {e}"),
-                    });
-                    continue;
-                }
-            };
 
         let walker = DirectoryWalker::new(walker_config, protection).with_heartbeat({
             let hb = Arc::clone(heartbeat);
@@ -3755,11 +3844,12 @@ impl RepeatDeletionTracker {
 ///
 /// Reads `dry_run`, `max_batch_size`, and `min_score` from shared atomics on each
 /// batch, so config reloads (SIGHUP) take effect without respawning the thread.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn executor_thread_main(
     del_rx: &Receiver<DeletionBatch>,
     logger: &ActivityLoggerHandle,
     shared_config: &Arc<SharedExecutorConfig>,
+    shared_scanner_config: &Arc<RwLock<crate::core::config::ScannerConfig>>,
     heartbeat: &Arc<ThreadHeartbeat>,
     report_tx: &Sender<WorkerReport>,
     policy_engine: &Arc<Mutex<PolicyEngine>>,
@@ -3904,7 +3994,36 @@ fn executor_thread_main(
             continue;
         }
 
-        let report = executor.execute(&plan, None);
+        let scanner_config = shared_scanner_config.read().clone();
+        let protection = match ProtectionRegistry::new(Some(&scanner_config.protected_paths)) {
+            Ok(registry) => Mutex::new(registry),
+            Err(err) => {
+                eprintln!(
+                    "[SBH-SAFETY] executor: protection registry init failed; skipping deletion batch: {err}"
+                );
+                logger.send(ActivityEvent::Error {
+                    code: "SBH-1001".to_string(),
+                    message: format!(
+                        "executor: protection registry init failed; skipped deletion batch: {err}"
+                    ),
+                });
+                continue;
+            }
+        };
+        let sacred_paths =
+            protection::sacred_paths_from_protected_patterns(&scanner_config.protected_paths);
+        let skip_protected = |path: &Path| {
+            let mut protection = protection.lock();
+            should_skip_protected_daemon_candidate(
+                &mut protection,
+                path,
+                &sacred_paths,
+                logger,
+                "executor preflight",
+            )
+        };
+
+        let report = executor.execute(&plan, Some(&skip_protected));
 
         // If preflight failed any candidates with NotWritable, the daemon's
         // sandbox doesn't include those paths. This is almost always a
@@ -4038,6 +4157,56 @@ mod tests {
                 summary: "test".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn daemon_protection_reason_detects_marker_ancestor_without_walker() {
+        let temp = tempfile::tempdir().unwrap();
+        let protected = temp.path().join("repo").join("tools");
+        let candidate = protected.join("rust_fuzz_target");
+        std::fs::create_dir_all(&candidate).unwrap();
+        protection::create_marker(&protected, None).unwrap();
+
+        let mut registry = ProtectionRegistry::marker_only();
+        let sacred_paths = Vec::new();
+
+        let reason = daemon_protection_reason(&mut registry, &candidate, &sacred_paths)
+            .unwrap()
+            .unwrap();
+
+        assert!(reason.contains(protection::MARKER_FILENAME));
+        assert!(
+            registry.is_protected(&candidate),
+            "direct daemon candidate checks must cache marker ancestors"
+        );
+    }
+
+    #[test]
+    fn daemon_protection_reason_detects_config_candidate_and_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let protected = temp
+            .path()
+            .join("asupersync_ansi_c")
+            .join("tools")
+            .join("rust_fuzz_target");
+        std::fs::create_dir_all(&protected).unwrap();
+        let parent = protected.parent().unwrap().to_path_buf();
+        let patterns = vec![protected.to_string_lossy().to_string()];
+        let sacred_paths = protection::sacred_paths_from_protected_patterns(&patterns);
+        let mut registry = ProtectionRegistry::new(Some(&patterns)).unwrap();
+
+        let protected_reason = daemon_protection_reason(&mut registry, &protected, &sacred_paths)
+            .unwrap()
+            .unwrap();
+        let parent_reason = daemon_protection_reason(&mut registry, &parent, &sacred_paths)
+            .unwrap()
+            .unwrap();
+
+        assert!(protected_reason.contains("config pattern"));
+        assert!(
+            parent_reason.contains("contains sacred path"),
+            "executor defense must skip a parent whose deletion would remove a protected child"
+        );
     }
 
     #[test]
