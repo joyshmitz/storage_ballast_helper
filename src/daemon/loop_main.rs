@@ -4117,6 +4117,7 @@ fn executor_thread_main(
 mod tests {
     use super::*;
     use crate::core::config::Config;
+    use crate::daemon::policy::NotificationPriority;
     use crate::monitor::pid::PressureLevel;
     use crate::monitor::special_locations::{
         SpecialKind, SpecialLocation, SpecialLocationRegistry,
@@ -4210,6 +4211,47 @@ mod tests {
     }
 
     #[test]
+    fn executor_preflight_skips_config_protected_daemon_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let protected = temp
+            .path()
+            .join("asupersync_ansi_c")
+            .join("tools")
+            .join("rust_fuzz_target");
+        std::fs::create_dir_all(&protected).unwrap();
+
+        let patterns = vec![protected.to_string_lossy().to_string()];
+        let sacred_paths = protection::sacred_paths_from_protected_patterns(&patterns);
+        let protection = Mutex::new(ProtectionRegistry::new(Some(&patterns)).unwrap());
+        let skip_protected = |path: &Path| {
+            let mut protection = protection.lock();
+            daemon_protection_reason(&mut protection, path, &sacred_paths)
+                .unwrap()
+                .is_some()
+        };
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                dry_run: true,
+                min_score: 0.0,
+                check_open_files: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let candidate_path = protected.to_string_lossy();
+        let plan = executor.plan(vec![test_candidate(&candidate_path, 1.2)]);
+        let report = executor.execute(&plan, Some(&skip_protected));
+
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert!(
+            protected.exists(),
+            "protected candidate must remain present after executor preflight"
+        );
+    }
+
+    #[test]
     fn behavior_state_updates_memory_and_disk_matrix_cells() {
         let mut state =
             PressureBehaviorState::new(MemoryPressureLevel::Normal, PressureLevel::Green);
@@ -4230,6 +4272,151 @@ mod tests {
         assert_eq!(disk_transition.to_disk, PressureLevel::Red);
         assert_eq!(state.mode.cleanup_action, CleanupAction::DefiniteCandidates);
         assert_eq!(state.mode.ballast_action, BallastAction::ReleaseFirst);
+    }
+
+    fn mock_memory_pressure(level: MemoryPressureLevel) -> MemoryPressure {
+        MemoryPressure {
+            level,
+            free_pages: None,
+            used_pages: None,
+            page_size_bytes: None,
+            compressor_used_bytes: None,
+            swap_total_bytes: None,
+            swap_used_bytes: None,
+            linux_psi_avg10: None,
+        }
+    }
+
+    struct MockMatrixCase {
+        memory: MemoryPressureLevel,
+        disk: PressureLevel,
+        mode: BehaviorMode,
+        allows_scan: bool,
+        delete_limit: usize,
+        releases_ballast: bool,
+    }
+
+    fn mock_behavior_mode(
+        scan_aggressiveness: ScanAggressiveness,
+        cleanup_action: CleanupAction,
+        ballast_action: BallastAction,
+        notification_priority: NotificationPriority,
+    ) -> BehaviorMode {
+        BehaviorMode {
+            scan_aggressiveness,
+            cleanup_action,
+            ballast_action,
+            notification_priority,
+        }
+    }
+
+    fn assert_mock_matrix_case(
+        state: &mut PressureBehaviorState,
+        tx: &Sender<MemoryPressureEvent>,
+        rx: &Receiver<MemoryPressureEvent>,
+        case: &MockMatrixCase,
+        configured_limit: usize,
+    ) {
+        tx.try_send(MemoryPressureEvent {
+            pressure: mock_memory_pressure(case.memory),
+            received_at: Instant::now(),
+        })
+        .expect("mock event channel should accept event");
+        let event = rx.try_recv().expect("mock event should be queued");
+        let transition = state
+            .update(event.pressure.level, case.disk)
+            .expect("mock pressure event should change the behavior cell");
+
+        assert_eq!(transition.to_memory, case.memory);
+        assert_eq!(transition.to_disk, case.disk);
+        assert_eq!(transition.to_mode, state.mode);
+        assert_eq!(state.mode, case.mode);
+        assert_eq!(behavior_allows_scan(state.mode), case.allows_scan);
+        assert_eq!(
+            behavior_delete_batch_limit(state.mode, configured_limit),
+            case.delete_limit
+        );
+        assert_eq!(
+            behavior_should_release_ballast(state.mode),
+            case.releases_ballast
+        );
+    }
+
+    #[test]
+    fn mock_memory_pressure_events_drive_matrix_actions() {
+        use BallastAction::{None as NoBallast, Release, ReleaseFirst};
+        use CleanupAction::{
+            AnyDefiniteCandidate, HighConfidenceCandidates, IdentifyOnly, MostPromisingCandidates,
+            None as NoCleanup,
+        };
+        use MemoryPressureLevel::{Critical as MemoryCritical, Normal as MemoryNormal, Warn};
+        use NotificationPriority::{Emergency, High, Low, Normal as NotifyNormal};
+        use PressureLevel::{Critical as DiskCritical, Green, Yellow};
+        use ScanAggressiveness::{Aggressive, DefiniteOnly, Light, Skip};
+
+        let (tx, rx) = bounded::<MemoryPressureEvent>(8);
+        let mut state =
+            PressureBehaviorState::new(MemoryPressureLevel::Normal, PressureLevel::Green);
+        let configured_limit = 17;
+        let cases = [
+            MockMatrixCase {
+                memory: Warn,
+                disk: Green,
+                mode: mock_behavior_mode(Light, NoCleanup, NoBallast, Low),
+                allows_scan: true,
+                delete_limit: 0,
+                releases_ballast: false,
+            },
+            MockMatrixCase {
+                memory: Warn,
+                disk: Yellow,
+                mode: mock_behavior_mode(Light, HighConfidenceCandidates, Release, NotifyNormal),
+                allows_scan: true,
+                delete_limit: configured_limit,
+                releases_ballast: true,
+            },
+            MockMatrixCase {
+                memory: MemoryCritical,
+                disk: Yellow,
+                mode: mock_behavior_mode(DefiniteOnly, MostPromisingCandidates, Release, High),
+                allows_scan: true,
+                delete_limit: configured_limit,
+                releases_ballast: true,
+            },
+            MockMatrixCase {
+                memory: MemoryCritical,
+                disk: DiskCritical,
+                mode: mock_behavior_mode(
+                    DefiniteOnly,
+                    AnyDefiniteCandidate,
+                    ReleaseFirst,
+                    Emergency,
+                ),
+                allows_scan: true,
+                delete_limit: configured_limit,
+                releases_ballast: true,
+            },
+            MockMatrixCase {
+                memory: MemoryCritical,
+                disk: Green,
+                mode: mock_behavior_mode(Skip, NoCleanup, NoBallast, NotifyNormal),
+                allows_scan: false,
+                delete_limit: 0,
+                releases_ballast: false,
+            },
+            MockMatrixCase {
+                memory: MemoryNormal,
+                disk: Yellow,
+                mode: mock_behavior_mode(Aggressive, IdentifyOnly, NoBallast, Low),
+                allows_scan: true,
+                delete_limit: 0,
+                releases_ballast: false,
+            },
+        ];
+
+        for case in &cases {
+            assert_mock_matrix_case(&mut state, &tx, &rx, case, configured_limit);
+        }
     }
 
     #[test]
