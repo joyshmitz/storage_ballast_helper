@@ -71,9 +71,9 @@ jobs:
       - name: Package archive
         run: |
           cd target/${{ matrix.target }}/release
-          # Artifact naming contract: sbh-{target}.tar.xz
+          # Artifact naming contract: sbh-{tag}-{target}.tar.xz
           # The installer script (scripts/install.sh) expects this exact format.
-          ARCHIVE_NAME="sbh-${{ matrix.target }}.${{ matrix.archive }}"
+          ARCHIVE_NAME="sbh-${GITHUB_REF_NAME}-${{ matrix.target }}.${{ matrix.archive }}"
           tar cJf "../../../${ARCHIVE_NAME}" sbh
           cd ../../..
           if command -v sha256sum >/dev/null 2>&1; then

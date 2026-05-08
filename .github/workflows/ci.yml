@@ -707,7 +707,8 @@ jobs:
           cargo build $CI_FEATURES --release
           # Build archive using contract naming and verify structure.
           TARGET=$(rustc -vV | grep host | awk '{print $2}')
-          ARCHIVE="sbh-${TARGET}.tar.xz"
+          VERSION="v$(grep '^version = ' Cargo.toml | head -n 1 | sed 's/version = "\(.*\)"/\1/')"
+          ARCHIVE="sbh-${VERSION}-${TARGET}.tar.xz"
           cd target/release && tar cJf "../../${ARCHIVE}" sbh && cd ../..
           sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
           # Verify archive contains the binary.

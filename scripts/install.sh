@@ -414,7 +414,30 @@ probe_release_assets() {
     base_url="https://github.com/${REPO}/releases/download/${RELEASE_LOCATOR}"
   fi
 
-  # Probe strategy 1: .tar.xz archive (original naming)
+  # Probe strategy 1: versioned .tar.xz archive.
+  local versioned_archive_name=""
+  if [[ "$RELEASE_LOCATOR" == "latest" ]]; then
+    versioned_archive_name="$(
+      printf '%s\n' "$asset_json" \
+        | grep -E "^${PROGRAM}-v[0-9][A-Za-z0-9._-]*-${TARGET_TRIPLE}[.]tar[.]xz$" \
+        | head -n 1 || true
+    )"
+  else
+    versioned_archive_name="${PROGRAM}-${RELEASE_LOCATOR}-${TARGET_TRIPLE}.tar.xz"
+  fi
+  local versioned_archive_checksum="${versioned_archive_name}.sha256"
+
+  if [[ -n "$versioned_archive_name" ]] \
+      && printf '%s\n' "$asset_json" | grep -qxF "$versioned_archive_name" 2>/dev/null; then
+    ASSET_FORMAT="archive"
+    ASSET_NAME="$versioned_archive_name"
+    CHECKSUM_NAME="$versioned_archive_checksum"
+    ASSET_URL="${base_url}/${ASSET_NAME}"
+    CHECKSUM_URL="${base_url}/${CHECKSUM_NAME}"
+    return 0
+  fi
+
+  # Probe strategy 2: legacy unversioned .tar.xz archive.
   local archive_name="${PROGRAM}-${TARGET_TRIPLE}.tar.xz"
   local archive_checksum="${archive_name}.sha256"
 
@@ -427,7 +450,7 @@ probe_release_assets() {
     return 0
   fi
 
-  # Probe strategy 2: raw binary (newer naming, e.g. sbh-linux-x86_64)
+  # Probe strategy 3: raw binary (newer naming, e.g. sbh-linux-x86_64)
   local raw_name
   raw_name="$(map_target_to_raw_name "$TARGET_TRIPLE")"
 
@@ -443,7 +466,18 @@ probe_release_assets() {
   # If the API call failed (no gh, no curl, rate-limited) fall back to
   # guessing with HEAD requests.
   if [[ -z "$asset_json" ]]; then
-    # Try archive first
+    # Try the versioned archive first when the tag is known.
+    if [[ -n "$versioned_archive_name" ]] \
+        && curl -fsSL --head "${base_url}/${versioned_archive_name}" >/dev/null 2>&1; then
+      ASSET_FORMAT="archive"
+      ASSET_NAME="$versioned_archive_name"
+      CHECKSUM_NAME="$versioned_archive_checksum"
+      ASSET_URL="${base_url}/${ASSET_NAME}"
+      CHECKSUM_URL="${base_url}/${CHECKSUM_NAME}"
+      return 0
+    fi
+
+    # Try the legacy archive before raw binary fallback.
     if curl -fsSL --head "${base_url}/${archive_name}" >/dev/null 2>&1; then
       ASSET_FORMAT="archive"
       ASSET_NAME="$archive_name"

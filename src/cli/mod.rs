@@ -252,9 +252,18 @@ pub struct VerificationOutcome {
 impl ReleaseArtifactContract {
     #[must_use]
     pub fn asset_name(&self) -> String {
+        match &self.locator {
+            ReleaseLocator::Tag(tag) => self.asset_name_for_tag(tag),
+            ReleaseLocator::Latest => self.unversioned_asset_name(),
+        }
+    }
+
+    #[must_use]
+    pub fn asset_name_for_tag(&self, release_tag: &str) -> String {
         format!(
-            "{}-{}.{}",
+            "{}-{}-{}.{}",
             self.binary_name,
+            release_tag,
             self.target.triple,
             self.target.archive.extension()
         )
@@ -266,8 +275,18 @@ impl ReleaseArtifactContract {
     }
 
     #[must_use]
+    pub fn checksum_name_for_tag(&self, release_tag: &str) -> String {
+        format!("{}.sha256", self.asset_name_for_tag(release_tag))
+    }
+
+    #[must_use]
     pub fn sigstore_bundle_name(&self) -> String {
         format!("{}.sigstore.json", self.asset_name())
+    }
+
+    #[must_use]
+    pub fn sigstore_bundle_name_for_tag(&self, release_tag: &str) -> String {
+        format!("{}.sigstore.json", self.asset_name_for_tag(release_tag))
     }
 
     #[must_use]
@@ -294,6 +313,15 @@ impl ReleaseArtifactContract {
                 )
             }
         }
+    }
+
+    fn unversioned_asset_name(&self) -> String {
+        format!(
+            "{}-{}.{}",
+            self.binary_name,
+            self.target.triple,
+            self.target.archive.extension()
+        )
     }
 }
 
@@ -1014,18 +1042,21 @@ mod tests {
             resolve_installer_artifact_contract(host, ReleaseChannel::Stable, Some("v0.1.0"))
                 .unwrap();
 
-        assert_eq!(contract.asset_name(), "sbh-x86_64-unknown-linux-gnu.tar.xz");
+        assert_eq!(
+            contract.asset_name(),
+            "sbh-v0.1.0-x86_64-unknown-linux-gnu.tar.xz"
+        );
         assert_eq!(
             contract.checksum_name(),
-            "sbh-x86_64-unknown-linux-gnu.tar.xz.sha256"
+            "sbh-v0.1.0-x86_64-unknown-linux-gnu.tar.xz.sha256"
         );
         assert_eq!(
             contract.sigstore_bundle_name(),
-            "sbh-x86_64-unknown-linux-gnu.tar.xz.sigstore.json"
+            "sbh-v0.1.0-x86_64-unknown-linux-gnu.tar.xz.sigstore.json"
         );
         assert_eq!(
             contract.asset_url(),
-            "https://github.com/Dicklesworthstone/storage_ballast_helper/releases/download/v0.1.0/sbh-x86_64-unknown-linux-gnu.tar.xz"
+            "https://github.com/Dicklesworthstone/storage_ballast_helper/releases/download/v0.1.0/sbh-v0.1.0-x86_64-unknown-linux-gnu.tar.xz"
         );
     }
 
@@ -1048,7 +1079,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("missing assets [sbh-x86_64-pc-windows-msvc.zip.sigstore.json]")
+                .contains("missing assets [sbh-v0.2.1-x86_64-pc-windows-msvc.zip.sigstore.json]")
         );
     }
 
@@ -1214,7 +1245,7 @@ mod tests {
     #[test]
     fn ci_release_targets_resolve_to_valid_contracts() {
         // Every CI target triple must produce a valid ReleaseArtifactContract
-        // with the expected asset naming scheme: sbh-{target}.tar.xz
+        // with the expected asset naming scheme: sbh-{tag}-{target}.tar.xz
         for triple in CI_RELEASE_TARGETS {
             // Parse the triple to find the matching host specifier.
             let (os, arch, abi) = match *triple {
@@ -1227,14 +1258,15 @@ mod tests {
 
             let host = HostSpecifier::from_parts(os, arch, abi).unwrap();
             let contract =
-                resolve_installer_artifact_contract(host, ReleaseChannel::Stable, None).unwrap();
+                resolve_installer_artifact_contract(host, ReleaseChannel::Stable, Some("v0.4.6"))
+                    .unwrap();
 
             assert_eq!(contract.target.triple, *triple);
             assert_eq!(contract.binary_name, RELEASE_BINARY_NAME);
             assert_eq!(contract.repository, RELEASE_REPOSITORY);
 
             // Verify naming contract matches installer expectation.
-            let expected_asset = format!("sbh-{triple}.tar.xz");
+            let expected_asset = format!("sbh-v0.4.6-{triple}.tar.xz");
             assert_eq!(contract.asset_name(), expected_asset);
             assert_eq!(contract.checksum_name(), format!("{expected_asset}.sha256"));
 
@@ -1242,6 +1274,33 @@ mod tests {
             let assets = contract.expected_release_assets().to_vec();
             assert!(validate_release_assets(&contract, &assets).is_ok());
         }
+    }
+
+    #[test]
+    fn macos_release_targets_use_separate_versioned_tarballs() {
+        let x86 = HostSpecifier::from_parts("macos", "x86_64", None).unwrap();
+        let arm = HostSpecifier::from_parts("macos", "aarch64", None).unwrap();
+
+        let x86_contract =
+            resolve_installer_artifact_contract(x86, ReleaseChannel::Stable, Some("v1.2.3"))
+                .unwrap();
+        let arm_contract =
+            resolve_installer_artifact_contract(arm, ReleaseChannel::Stable, Some("v1.2.3"))
+                .unwrap();
+
+        assert_eq!(
+            x86_contract.asset_name(),
+            "sbh-v1.2.3-x86_64-apple-darwin.tar.xz"
+        );
+        assert_eq!(
+            arm_contract.asset_name(),
+            "sbh-v1.2.3-aarch64-apple-darwin.tar.xz"
+        );
+        assert_ne!(x86_contract.asset_name(), arm_contract.asset_name());
+        assert!(!x86_contract.asset_name().contains("universal"));
+        assert!(!arm_contract.asset_name().contains("universal"));
+        assert!(!x86_contract.asset_name().contains("fat"));
+        assert!(!arm_contract.asset_name().contains("fat"));
     }
 
     #[test]

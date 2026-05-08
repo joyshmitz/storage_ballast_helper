@@ -691,8 +691,10 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
         }
     };
 
-    let archive_path = tmp_dir.join(contract.asset_name());
-    let checksum_path = tmp_dir.join(contract.checksum_name());
+    let archive_name = contract.asset_name_for_tag(&target.target_tag);
+    let checksum_name = contract.checksum_name_for_tag(&target.target_tag);
+    let archive_path = tmp_dir.join(&archive_name);
+    let checksum_path = tmp_dir.join(&checksum_name);
     if let (Some(source_archive), Some(source_checksum)) = (
         target.bundle_archive_path.as_ref(),
         target.bundle_checksum_path.as_ref(),
@@ -725,14 +727,14 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return report;
         }
-        report.step_ok(format!("Downloaded {}", contract.asset_name()));
+        report.step_ok(format!("Downloaded {archive_name}"));
 
         if let Err(e) = curl_download(&checksum_url, &checksum_path) {
             report.step_fail("Download checksum", e);
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return report;
         }
-        report.step_ok(format!("Downloaded {}", contract.checksum_name()));
+        report.step_ok(format!("Downloaded {checksum_name}"));
     }
 
     // Step 7: Verify integrity (shared code path with installer).
@@ -1049,7 +1051,7 @@ fn artifact_url_for_tag(contract: &ReleaseArtifactContract, target_tag: &str) ->
         "https://github.com/{}/releases/download/{}/{}",
         contract.repository,
         target_tag,
-        contract.asset_name()
+        contract.asset_name_for_tag(target_tag)
     )
 }
 
@@ -1329,9 +1331,10 @@ mod tests {
         archive_bytes: &[u8],
         sigstore_bundle_contents: Option<&[u8]>,
     ) -> PathBuf {
-        let archive_name = contract.asset_name();
-        let checksum_name = contract.checksum_name();
-        let sigstore_name = contract.sigstore_bundle_name();
+        let release_tag = normalize_tag(release_tag);
+        let archive_name = contract.asset_name_for_tag(&release_tag);
+        let checksum_name = contract.checksum_name_for_tag(&release_tag);
+        let sigstore_name = contract.sigstore_bundle_name_for_tag(&release_tag);
         let archive_path = root.join(&archive_name);
         std::fs::write(&archive_path, archive_bytes).unwrap();
         let checksum_hex = format!("{:x}", Sha256::digest(archive_bytes));
@@ -1348,7 +1351,7 @@ mod tests {
         let manifest = OfflineBundleManifest {
             version: "1".to_string(),
             repository: RELEASE_REPOSITORY.to_string(),
-            release_tag: release_tag.to_string(),
+            release_tag,
             artifacts: vec![OfflineBundleArtifact {
                 target: contract.target.triple.to_string(),
                 archive: archive_name,
