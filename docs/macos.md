@@ -339,6 +339,13 @@ protected_paths = [
 ]
 ```
 
+Sample configs for common Mac scenarios live under `docs/configs/`:
+
+- `docs/configs/developer-mac.toml` for source-heavy developer laptops.
+- `docs/configs/creative-mac.toml` for media-heavy Macs where most user data is
+  sacred and dry-run-first.
+- `docs/configs/shared-mac-launchdaemon.toml` for system-scope shared Macs.
+
 See `docs/cleanup-rules-macos.md` for the exhaustive macOS cleanup contract and
 `docs/sacred-paths.md` for the built-in sacred catalog and the reasoning for
 every protected pattern.

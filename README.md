@@ -533,6 +533,8 @@ Configure via command palette (`:` then type `pref`) or directly in the preferen
 - macOS operations guide: `docs/macos.md`
 - Migrating from CleanMyMac, OmniDiskSweeper, DaisyDisk, or GrandPerspective:
   `docs/migrating-from-other-tools.md`
+- Sample Mac configs for developer, creative, and shared LaunchDaemon machines:
+  `docs/configs/`
 - macOS launchd troubleshooting guide: `docs/launchd-troubleshooting.md`
 - Sacred path catalog and per-pattern safety reasoning: `docs/sacred-paths.md`
 - Dashboard/status baseline contract (pre-overhaul): `docs/dashboard-status-contract-baseline.md`

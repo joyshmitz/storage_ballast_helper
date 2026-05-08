@@ -1,0 +1,61 @@
+# Creative Mac profile.
+#
+# Use this when the machine contains large media libraries and project bundles.
+# The profile starts in dry-run mode and treats creative/user-data locations as
+# protected. Use visual tools for personal media decisions; use `sbh` for
+# pressure visibility, APFS snapshot warnings, ballast, and rebuildable caches.
+
+[pressure]
+green_min_free_pct = 30.0
+yellow_min_free_pct = 22.0
+orange_min_free_pct = 14.0
+red_min_free_pct = 7.0
+poll_interval_ms = 1500
+
+[pressure.prediction]
+enabled = true
+warning_horizon_minutes = 120.0
+action_horizon_minutes = 45.0
+min_confidence = 0.75
+
+[scanner]
+# Keep this profile conservative. Scratch folders are intentional cleanup
+# candidates; libraries and project bundles below are hard-protected.
+root_paths = [
+  "/Users/me/Creative Scratch",
+  "/Users/me/Library/Logs",
+  "/private/tmp",
+]
+
+protected_paths = [
+  "/Users/me/Pictures/Photos Library.photoslibrary",
+  "/Users/me/Movies/*.fcpbundle",
+  "/Users/me/Movies/*.imovielibrary",
+  "/Users/me/Music/Logic/*",
+  "/Users/me/Music/GarageBand/*",
+  "/Users/me/Pictures/Lightroom*",
+  "/Users/me/Pictures/Capture One*",
+  "/Users/me/Library/Mobile Documents/com~apple~CloudDocs/*",
+  "/Users/me/Library/Mail/*",
+  "/Users/me/Library/Messages/*",
+]
+
+min_file_age_minutes = 4320
+max_depth = 10
+parallelism = 2
+follow_symlinks = false
+cross_devices = false
+dry_run = true
+max_delete_batch = 20
+
+[scoring]
+min_score = 0.60
+calibration_floor = 0.80
+
+[ballast]
+# Keep ballast modest on media machines. Increase only after confirming the
+# ballast path lives on the same APFS volume that usually runs short.
+file_count = 3
+file_size_bytes = 1073741824
+auto_provision = true
+replenish_cooldown_minutes = 60

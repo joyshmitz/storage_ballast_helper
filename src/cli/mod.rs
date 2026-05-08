@@ -1493,6 +1493,71 @@ mod tests {
     }
 
     #[test]
+    fn macos_sample_configs_parse_and_remain_discoverable() {
+        let samples = [
+            (
+                "developer",
+                "docs/configs/developer-mac.toml",
+                include_str!("../../docs/configs/developer-mac.toml"),
+                &[
+                    "/Users/me/Projects",
+                    "/Users/me/Library/Developer/Xcode/DerivedData",
+                    "/private/tmp",
+                    "client-*",
+                ][..],
+            ),
+            (
+                "creative",
+                "docs/configs/creative-mac.toml",
+                include_str!("../../docs/configs/creative-mac.toml"),
+                &[
+                    "/Users/me/Creative Scratch",
+                    "Photos Library.photoslibrary",
+                    "*.fcpbundle",
+                    "dry_run = true",
+                ][..],
+            ),
+            (
+                "shared",
+                "docs/configs/shared-mac-launchdaemon.toml",
+                include_str!("../../docs/configs/shared-mac-launchdaemon.toml"),
+                &[
+                    "sudo sbh install --launchd --scope system --auto",
+                    "/Users",
+                    "/Users/*/.ssh/*",
+                    "parallelism = 6",
+                ][..],
+            ),
+        ];
+
+        for (name, path, raw, required_fragments) in samples {
+            let mut sample = NamedTempFile::new()
+                .unwrap_or_else(|error| panic!("create temp config for {name}: {error}"));
+            sample
+                .write_all(raw.as_bytes())
+                .unwrap_or_else(|error| panic!("write temp config for {name}: {error}"));
+            crate::core::config::Config::load(Some(sample.path()))
+                .unwrap_or_else(|error| panic!("{path} must load as a valid sbh config: {error}"));
+
+            for required in required_fragments {
+                assert!(
+                    raw.contains(required),
+                    "{path} missing required scenario fragment: {required}"
+                );
+            }
+        }
+
+        let readme = include_str!("../../README.md");
+        let macos_guide = include_str!("../../docs/macos.md");
+        for linked_doc in [readme, macos_guide] {
+            assert!(
+                linked_doc.contains("docs/configs/"),
+                "Mac sample config directory must be linked from README and macOS guide"
+            );
+        }
+    }
+
+    #[test]
     fn changelog_unreleased_macos_entries_include_concrete_savings_examples() {
         let changelog = include_str!("../../CHANGELOG.md");
         let unreleased = changelog

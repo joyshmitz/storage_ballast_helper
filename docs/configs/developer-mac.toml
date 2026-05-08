@@ -1,0 +1,61 @@
+# Developer Mac profile.
+#
+# Use this when the machine spends most of its disk on source checkouts,
+# compiler outputs, Xcode DerivedData, and temporary build roots. Copy the
+# file to the path reported by `sbh config path`, then replace `/Users/me`
+# with the real home directory.
+
+[pressure]
+# Keep more headroom than the default because compiler bursts can consume
+# several GiB quickly.
+green_min_free_pct = 25.0
+yellow_min_free_pct = 18.0
+orange_min_free_pct = 12.0
+red_min_free_pct = 6.0
+poll_interval_ms = 1000
+
+[pressure.prediction]
+enabled = true
+warning_horizon_minutes = 90.0
+action_horizon_minutes = 30.0
+min_confidence = 0.70
+
+[scanner]
+# Keep roots narrow and developer-specific. Avoid using `/Users/me` as a broad
+# root unless the protected_paths list below has been reviewed for that machine.
+root_paths = [
+  "/Users/me/Projects",
+  "/Users/me/Library/Developer/Xcode/DerivedData",
+  "/private/tmp",
+]
+
+protected_paths = [
+  "/Users/me/Projects/client-*",
+  "/Users/me/Projects/*/.git",
+  "/Users/me/Projects/*/.beads",
+  "/Users/me/Projects/*/.sbh-protect",
+  "/Users/me/.ssh/*",
+  "/Users/me/.config/gh/*",
+]
+
+min_file_age_minutes = 1440
+max_depth = 12
+parallelism = 4
+follow_symlinks = false
+cross_devices = false
+dry_run = false
+max_delete_batch = 50
+
+[scoring]
+# Developer build products should win only when the score is strong and all
+# hard vetoes pass.
+min_score = 0.45
+calibration_floor = 0.65
+
+[ballast]
+# Five 1 GiB files buy enough time for one large build burst without taking over
+# a laptop SSD.
+file_count = 5
+file_size_bytes = 1073741824
+auto_provision = true
+replenish_cooldown_minutes = 30

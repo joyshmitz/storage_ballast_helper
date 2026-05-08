@@ -1,0 +1,66 @@
+# Shared Mac LaunchDaemon profile.
+#
+# Use this for a lab, build host, or shared workstation where `sbh` runs with
+# system scope:
+#
+#   sudo sbh install --launchd --scope system --auto
+#
+# Copy this file to `/Library/Application Support/sbh/config.toml` and review
+# every protected path before starting the LaunchDaemon.
+
+[pressure]
+green_min_free_pct = 28.0
+yellow_min_free_pct = 20.0
+orange_min_free_pct = 12.0
+red_min_free_pct = 6.0
+poll_interval_ms = 1000
+
+[pressure.prediction]
+enabled = true
+warning_horizon_minutes = 90.0
+action_horizon_minutes = 30.0
+min_confidence = 0.70
+
+[scanner]
+# System scope can see more processes, but broad roots still need explicit
+# protections. Keep cross-device scanning off unless every mounted volume has
+# been reviewed.
+root_paths = [
+  "/Users",
+  "/private/tmp",
+  "/Library/Logs",
+]
+
+protected_paths = [
+  "/Users/*/.ssh/*",
+  "/Users/*/.gnupg/*",
+  "/Users/*/Library/Mail/*",
+  "/Users/*/Library/Messages/*",
+  "/Users/*/Library/Mobile Documents/com~apple~CloudDocs/*",
+  "/Users/*/Pictures/Photos Library.photoslibrary",
+  "/Users/*/Movies/*.fcpbundle",
+  "/Users/*/Music/Logic/*",
+  "/Users/*/Projects/client-*",
+  "/Users/*/Projects/*/.git",
+  "/Users/*/Projects/*/.beads",
+]
+
+min_file_age_minutes = 2880
+max_depth = 12
+parallelism = 6
+follow_symlinks = false
+cross_devices = false
+dry_run = false
+max_delete_batch = 75
+
+[scoring]
+min_score = 0.55
+calibration_floor = 0.75
+
+[ballast]
+# System scope uses `/private/var/sbh/` by default on macOS. Keep ballast on
+# the same APFS container as the shared data volume.
+file_count = 10
+file_size_bytes = 1073741824
+auto_provision = true
+replenish_cooldown_minutes = 45
