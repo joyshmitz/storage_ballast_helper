@@ -522,19 +522,19 @@ pub fn vm_swapusage() -> io::Result<SwapUsage> {
     sysctl::read::<String>("vm.swapusage").map(|raw| parse_vm_swapusage(&raw))
 }
 
-// `vm_stat` is backed by the same Mach VM counters we need here. Calling
-// `host_statistics64` directly would require unsafe FFI in this crate, which is
-// forbidden by the root lint.
 pub fn read_vm_stats() -> io::Result<VmStats> {
-    let output = Command::new("/usr/bin/vm_stat").output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "vm_stat failed with status {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    parse_vm_stat(&String::from_utf8_lossy(&output.stdout))
+    sbh_mach::host_vm_stats()
+        .map(|stats| VmStats {
+            page_size_bytes: stats.page_size_bytes,
+            free_count: stats.free_count,
+            active_count: stats.active_count,
+            inactive_count: stats.inactive_count,
+            wire_count: stats.wire_count,
+            speculative_count: stats.speculative_count,
+            compressor_page_count: stats.compressor_page_count,
+            throttled_count: stats.throttled_count,
+        })
+        .map_err(mach_error)
 }
 
 pub fn current_mach_task_usage() -> io::Result<MachTaskUsage> {

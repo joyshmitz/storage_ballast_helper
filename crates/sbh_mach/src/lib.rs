@@ -1,4 +1,4 @@
-//! Safe wrappers around the small Mach task-info surface `sbh` needs.
+//! Safe wrappers around the small Mach surface `sbh` needs.
 //!
 //! The main `storage_ballast_helper` crate forbids unsafe code. This crate keeps
 //! the platform FFI boundary narrow and exposes copied scalar values only.
@@ -10,7 +10,7 @@ use std::mem::{MaybeUninit, size_of};
 use std::ptr;
 
 use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
-use mach2::mach_init::mach_thread_self;
+use mach2::mach_init::{mach_host_self, mach_thread_self};
 use mach2::mach_port::mach_port_deallocate;
 use mach2::mach_types::thread_act_t;
 use mach2::message::mach_msg_type_number_t;
@@ -132,6 +132,38 @@ pub struct CurrentTaskUsage {
     pub cpu_system_micros: u64,
 }
 
+/// Host-wide VM statistics from `host_statistics64(HOST_VM_INFO64)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmStats {
+    /// Host VM page size in bytes.
+    pub page_size_bytes: u64,
+    /// Pages immediately available for allocation.
+    pub free_count: u64,
+    /// Active pages.
+    pub active_count: u64,
+    /// Inactive pages.
+    pub inactive_count: u64,
+    /// Wired pages.
+    pub wire_count: u64,
+    /// Speculative pages.
+    pub speculative_count: u64,
+    /// Pages occupied by the in-RAM compressor.
+    pub compressor_page_count: u64,
+    /// Throttled pages.
+    pub throttled_count: u64,
+}
+
+impl VmStats {
+    /// Pages represented by the core VM accounting buckets.
+    pub fn accounted_pages(&self) -> u64 {
+        self.free_count
+            .saturating_add(self.active_count)
+            .saturating_add(self.inactive_count)
+            .saturating_add(self.wire_count)
+            .saturating_add(self.compressor_page_count)
+    }
+}
+
 /// Read `MACH_TASK_BASIC_INFO` for the current task.
 ///
 /// Apple headers mark older `TASK_BASIC_INFO_64` flavors as compatibility
@@ -225,6 +257,50 @@ pub fn current_task_usage() -> Result<CurrentTaskUsage, MachError> {
     })
 }
 
+/// Read `HOST_VM_INFO64` for the current host.
+pub fn host_vm_stats() -> Result<VmStats, MachError> {
+    let mut info = MaybeUninit::<libc::vm_statistics64>::zeroed();
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+
+    let host = unsafe { mach_host_self() };
+    let code = unsafe {
+        libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            info.as_mut_ptr().cast::<libc::integer_t>(),
+            &mut count,
+        )
+    };
+    let _ = unsafe { mach_port_deallocate(mach_task_self(), host) };
+
+    ensure_success("host_statistics64(HOST_VM_INFO64)", code)?;
+    ensure_count(
+        "host_statistics64(HOST_VM_INFO64)",
+        count,
+        libc::HOST_VM_INFO64_COUNT,
+    )?;
+
+    let info = unsafe { info.assume_init() };
+    Ok(VmStats {
+        page_size_bytes: page_size_bytes()?,
+        free_count: natural_to_u64(unsafe { ptr::addr_of!(info.free_count).read_unaligned() }),
+        active_count: natural_to_u64(unsafe { ptr::addr_of!(info.active_count).read_unaligned() }),
+        inactive_count: natural_to_u64(unsafe {
+            ptr::addr_of!(info.inactive_count).read_unaligned()
+        }),
+        wire_count: natural_to_u64(unsafe { ptr::addr_of!(info.wire_count).read_unaligned() }),
+        speculative_count: natural_to_u64(unsafe {
+            ptr::addr_of!(info.speculative_count).read_unaligned()
+        }),
+        compressor_page_count: natural_to_u64(unsafe {
+            ptr::addr_of!(info.compressor_page_count).read_unaligned()
+        }),
+        throttled_count: natural_to_u64(unsafe {
+            ptr::addr_of!(info.throttled_count).read_unaligned()
+        }),
+    })
+}
+
 fn thread_basic_info_for_port(thread: thread_act_t) -> Result<ThreadBasicInfo, MachError> {
     let mut info = MaybeUninit::<MachThreadBasicInfoRaw>::zeroed();
     let mut count = THREAD_BASIC_INFO_COUNT;
@@ -291,10 +367,22 @@ fn time_value_to_micros(value: mach2::time_value::time_value_t) -> u64 {
         .saturating_add(u64::try_from(micros).unwrap_or(0))
 }
 
+fn page_size_bytes() -> Result<u64, MachError> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(page_size)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| MachError::new("sysconf(_SC_PAGESIZE)", libc::EINVAL))
+}
+
+fn natural_to_u64(value: libc::natural_t) -> u64 {
+    u64::from(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        current_task_basic_info, current_task_thread_times, current_task_usage,
+        current_task_basic_info, current_task_thread_times, current_task_usage, host_vm_stats,
         current_thread_basic_info,
     };
 
@@ -325,5 +413,13 @@ mod tests {
         let usage = current_task_usage().expect("current task usage should be readable");
         assert!(usage.rss_bytes > 1_048_576);
         assert!(usage.virtual_memory_bytes >= usage.rss_bytes);
+    }
+
+    #[test]
+    fn host_vm_stats_reports_plausible_page_accounting() {
+        let stats = host_vm_stats().expect("host VM stats should be readable");
+        assert!(stats.page_size_bytes >= 4096);
+        assert!(stats.accounted_pages() > 0);
+        assert!(stats.active_count.saturating_add(stats.wire_count) > 0);
     }
 }
