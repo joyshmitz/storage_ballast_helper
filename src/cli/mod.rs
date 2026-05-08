@@ -1452,6 +1452,46 @@ mod tests {
     }
 
     #[test]
+    fn changelog_unreleased_macos_entries_include_concrete_savings_examples() {
+        let changelog = include_str!("../../CHANGELOG.md");
+        let unreleased = changelog
+            .split("## [v0.4.6]")
+            .next()
+            .expect("CHANGELOG must contain an Unreleased section before v0.4.6");
+
+        for required in [
+            "### macOS",
+            "before/after space-recovery cases",
+            "12 GB Xcode DerivedData",
+            "24 hours",
+            "~/Library/Developer/Xcode/DerivedData/",
+            "64 GB Time Machine local snapshot",
+            "sudo tmutil thinlocalsnapshots / 9999999999999999 4",
+            "Electron caches",
+            "Cache",
+            "Code Cache",
+            "GPUCache",
+            "IndexedDB",
+            "Service Worker/CacheStorage",
+            "vm_bundles",
+            "8 GB app cache",
+            "~/release-work/*[-_]buildroot",
+            "7 days",
+            "mcp_agent_mail_rust_buildroot",
+            "11 days",
+            "39 GB",
+            "docs/cleanup-rules-macos.md",
+            "docs/macos.md",
+            "Full Disk Access",
+        ] {
+            assert!(
+                unreleased.contains(required),
+                "Unreleased CHANGELOG macOS entry must include concrete operator detail: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn release_workflow_notarizes_macos_binaries_asynchronously() {
         let release_workflow = include_str!("../../.github/workflows/release.yml");
 

@@ -10,6 +10,11 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.4.6...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.6...HEAD)
 
+### macOS
+
+- **Document the macOS cleanup wins in concrete operator terms.** The Unreleased macOS docs now explain the real before/after space-recovery cases instead of only listing implementation details. Before this work, a Mac operator had to infer what was safe from Linux-flavored artifact language; after it, the release notes call out the exact macOS cleanup shapes and tradeoffs: `sbh` can rank a stale 12 GB Xcode DerivedData child after 24 hours without deleting the broad `~/Library/Developer/Xcode/DerivedData/` root, surface a 64 GB Time Machine local snapshot retention case with the exact `sudo tmutil thinlocalsnapshots / 9999999999999999 4` reclaim command, classify regenerated Electron caches such as `Cache`, `Code Cache`, `GPUCache`, `IndexedDB`, `Service Worker/CacheStorage`, and `vm_bundles` so an idle 8 GB app cache can be cleaned while active app state remains guarded, and detect forgotten `~/release-work/*[-_]buildroot` staging trees after 7 days. The real incident example is preserved: `~/release-work/mcp_agent_mail_rust_buildroot` sat idle for 11 days and held 39 GB.
+- **Tie the release note back to the operator trust docs.** The macOS changelog now points readers to `docs/cleanup-rules-macos.md` for the exhaustive cleanup contract and `docs/macos.md` for platform behavior such as APFS retained snapshots, launchd service expectations, and Full Disk Access checks.
+
 ### Scanner
 
 - **Recognize bare in-tree `.rch-target/` as a first-class rch artifact pattern.** Previously the bare directory names (without a per-job suffix) only hit the generic suffix rules — `target-suffix` (`Suffix("-target")`, 0.88) for the hyphen variants and `underscore-target-suffix` (`Suffix("_target")`, 0.92) for the underscore variants — so they inherited moderate confidence. Stats grouping in `extract_pattern_label` was also lossy: `.rch-target`/`rch-target` landed in the generic `*-target` bucket while `.rch_target`/`rch_target` fell through to the catch-all `unknown` bucket (the existing `*-target` and prefix-based rch checks didn't cover them). Adds four explicit `Exact` patterns — `.rch-target` (0.95), `.rch_target` (0.94), `rch-target` (0.93), `rch_target` (0.93) — with confidences set above BOTH conflicting suffix matchers so `classify()` picks them deterministically. Updates `extract_pattern_label` to group all four with their per-job siblings under `rch_target_*`.
@@ -21,6 +26,7 @@ Compare: [`v0.4.6...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_
 ### Tests
 
 - Adds 7 tests covering the new behavior end-to-end: classification of all 4 bare variants, pattern-label grouping, fast-track under Red pressure outside `/tmp`, no fast-track below Orange, and the negative case (a generic `target-suffix` match in-tree must NOT fast-track).
+- Adds a static changelog coverage test for the macOS examples above so future release-note edits keep the concrete Xcode, Time Machine, Electron-cache, release-work, documentation, and Full Disk Access operator details.
 
 ---
 
