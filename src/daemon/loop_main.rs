@@ -105,6 +105,16 @@ const FULL_DISK_ACCESS_RECHECK_INTERVAL: Duration = Duration::from_mins(5);
 const MEMORY_PRESSURE_CHANNEL_CAP: usize = 16;
 /// Maximum time the monitor loop may wait between memory-pressure event checks.
 const MEMORY_PRESSURE_WAKE_INTERVAL: Duration = Duration::from_millis(500);
+/// Per-tick daemon work budget before the self-throttle treats ticks as expensive.
+const TICK_THROTTLE_SLOW_TICK_THRESHOLD: Duration = Duration::from_millis(200);
+/// Consecutive expensive ticks before backing off from the PID interval.
+const TICK_THROTTLE_SUSTAINED_TICKS: u8 = 3;
+/// Consecutive expensive ticks before escalating to the maximum backoff.
+const TICK_THROTTLE_ESCALATE_TICKS: u8 = TICK_THROTTLE_SUSTAINED_TICKS * 2;
+/// First self-throttle interval under sustained daemon resource pressure.
+const TICK_THROTTLE_FIRST_BACKOFF: Duration = Duration::from_secs(30);
+/// Maximum self-throttle interval under sustained daemon resource pressure.
+const TICK_THROTTLE_MAX_BACKOFF: Duration = Duration::from_mins(1);
 
 // ──────────────────── shared executor config ────────────────────
 
@@ -177,6 +187,89 @@ impl ThreadHealth {
             .retain(|t| now.duration_since(*t) < RESPAWN_WINDOW);
         self.panic_times.push(now);
         self.panic_times.len() <= MAX_RESPAWNS as usize
+    }
+}
+
+// ──────────────────── daemon tick self-throttle ────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickThrottleReason {
+    RssWarning,
+    SlowTick,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum TickThrottleStage {
+    #[default]
+    Normal,
+    Backoff30s,
+    Backoff60s,
+}
+
+impl TickThrottleStage {
+    const fn interval(self) -> Option<Duration> {
+        match self {
+            Self::Normal => None,
+            Self::Backoff30s => Some(TICK_THROTTLE_FIRST_BACKOFF),
+            Self::Backoff60s => Some(TICK_THROTTLE_MAX_BACKOFF),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TickThrottleDecision {
+    interval: Duration,
+    stage: TickThrottleStage,
+    reason: Option<TickThrottleReason>,
+    stage_changed: bool,
+}
+
+#[derive(Debug, Default)]
+struct AdaptiveTickThrottle {
+    consecutive_pressure_ticks: u8,
+    stage: TickThrottleStage,
+}
+
+impl AdaptiveTickThrottle {
+    fn observe(
+        &mut self,
+        requested_interval: Duration,
+        self_monitor_tick: SelfMonitorTick,
+        tick_duration: Duration,
+    ) -> TickThrottleDecision {
+        let reason = if self_monitor_tick.rss_bytes > self_monitor_tick.rss_warning_bytes {
+            Some(TickThrottleReason::RssWarning)
+        } else if tick_duration > TICK_THROTTLE_SLOW_TICK_THRESHOLD {
+            Some(TickThrottleReason::SlowTick)
+        } else {
+            None
+        };
+
+        let previous_stage = self.stage;
+        if reason.is_some() {
+            self.consecutive_pressure_ticks = self.consecutive_pressure_ticks.saturating_add(1);
+            self.stage = if self.consecutive_pressure_ticks >= TICK_THROTTLE_ESCALATE_TICKS {
+                TickThrottleStage::Backoff60s
+            } else if self.consecutive_pressure_ticks >= TICK_THROTTLE_SUSTAINED_TICKS {
+                TickThrottleStage::Backoff30s
+            } else {
+                TickThrottleStage::Normal
+            };
+        } else {
+            self.consecutive_pressure_ticks = 0;
+            self.stage = TickThrottleStage::Normal;
+        }
+
+        let interval = self.stage.interval().map_or(requested_interval, |minimum| {
+            requested_interval.max(minimum)
+        });
+
+        TickThrottleDecision {
+            interval,
+            stage: self.stage,
+            reason,
+            stage_changed: self.stage != previous_stage,
+        }
     }
 }
 
@@ -520,6 +613,7 @@ pub struct MonitoringDaemon {
     full_disk_access_granted_logged: bool,
     process_io_history: ProcessIoHistory,
     self_monitor: SelfMonitor,
+    tick_throttle: AdaptiveTickThrottle,
     policy_engine: Arc<Mutex<PolicyEngine>>,
     behavior_state: PressureBehaviorState,
     shared_guard_diagnostics: Arc<RwLock<Option<GuardDiagnostics>>>,
@@ -1158,6 +1252,7 @@ impl MonitoringDaemon {
             full_disk_access_granted_logged: false,
             process_io_history,
             self_monitor,
+            tick_throttle: AdaptiveTickThrottle::default(),
             behavior_state,
             scanner_heartbeat,
             executor_heartbeat,
@@ -1462,6 +1557,8 @@ impl MonitoringDaemon {
 
         // ──────── main monitoring loop ────────
         loop {
+            let tick_start = Instant::now();
+
             // 1. Check shutdown signal.
             if self.signal_handler.should_shutdown() {
                 eprintln!("[SBH-DAEMON] shutdown requested");
@@ -1604,7 +1701,7 @@ impl MonitoringDaemon {
             }
 
             // 7c. Self-monitoring: write state file + check RSS.
-            {
+            let self_monitor_tick = {
                 // Use the causing mount from the worst response so the state
                 // file reflects the mount that actually drove the pressure
                 // level, not the primary path which may be healthy.
@@ -1642,7 +1739,8 @@ impl MonitoringDaemon {
                     shutdown_result = Err(self.rss_hard_limit_error(tick));
                     break;
                 }
-            }
+                tick
+            };
 
             // 8. Foreground status dump signal (macOS SIGINFO / Ctrl+T).
             if self.signal_handler.should_dump_status() {
@@ -1780,13 +1878,34 @@ impl MonitoringDaemon {
                 self.last_summary_report = Instant::now();
             }
 
-            // 12. Sleep for the PID-adjusted interval, but wake immediately
-            // for memory-pressure transitions so behavior changes are not
-            // delayed until the next disk-pressure poll.
+            let tick_duration = tick_start.elapsed();
+            let throttle_decision = self.tick_throttle.observe(
+                response.scan_interval,
+                self_monitor_tick,
+                tick_duration,
+            );
+            if throttle_decision.stage_changed {
+                let message = format!(
+                    "daemon tick throttle stage={:?} reason={:?} requested_ms={} effective_ms={} tick_ms={} rss_bytes={} rss_warning_bytes={}",
+                    throttle_decision.stage,
+                    throttle_decision.reason,
+                    duration_millis(response.scan_interval),
+                    duration_millis(throttle_decision.interval),
+                    duration_millis(tick_duration),
+                    self_monitor_tick.rss_bytes,
+                    self_monitor_tick.rss_warning_bytes
+                );
+                eprintln!("[SBH-DAEMON] {message}");
+                self.logger_handle.send(ActivityEvent::Info { message });
+            }
+
+            // 12. Sleep for the PID/self-throttle adjusted interval, but wake
+            // immediately for memory-pressure transitions so behavior changes
+            // are not delayed until the next disk-pressure poll.
             self.sleep_with_memory_pressure_events(
                 &memory_pressure_rx,
                 response.level,
-                response.scan_interval,
+                throttle_decision.interval,
             );
         }
 
@@ -4179,6 +4298,65 @@ mod tests {
                 summary: "test".to_string(),
             },
         }
+    }
+
+    const fn test_self_monitor_tick(rss_bytes: u64, rss_warning_bytes: u64) -> SelfMonitorTick {
+        SelfMonitorTick {
+            rss_bytes,
+            rss_warning_bytes,
+            rss_hard_limit_bytes: u64::MAX,
+            rss_hard_limit_exceeded: false,
+        }
+    }
+
+    #[test]
+    fn adaptive_tick_throttle_requires_sustained_rss_pressure() {
+        let mut throttle = AdaptiveTickThrottle::default();
+        let requested = Duration::from_secs(15);
+        let pressured_tick = test_self_monitor_tick(257 * 1024 * 1024, 256 * 1024 * 1024);
+
+        let first = throttle.observe(requested, pressured_tick, Duration::from_millis(20));
+        let second = throttle.observe(requested, pressured_tick, Duration::from_millis(20));
+        let third = throttle.observe(requested, pressured_tick, Duration::from_millis(20));
+
+        assert_eq!(first.stage, TickThrottleStage::Normal);
+        assert_eq!(first.interval, requested);
+        assert_eq!(second.stage, TickThrottleStage::Normal);
+        assert_eq!(third.stage, TickThrottleStage::Backoff30s);
+        assert_eq!(third.interval, Duration::from_secs(30));
+        assert_eq!(third.reason, Some(TickThrottleReason::RssWarning));
+        assert!(third.stage_changed);
+    }
+
+    #[test]
+    fn adaptive_tick_throttle_escalates_on_slow_ticks_and_resets_when_clear() {
+        let mut throttle = AdaptiveTickThrottle::default();
+        let requested = Duration::from_secs(15);
+        let healthy_tick = test_self_monitor_tick(128 * 1024 * 1024, 256 * 1024 * 1024);
+        let mut decision = throttle.observe(
+            requested,
+            healthy_tick,
+            TICK_THROTTLE_SLOW_TICK_THRESHOLD + Duration::from_millis(1),
+        );
+
+        for _ in 1..TICK_THROTTLE_ESCALATE_TICKS {
+            decision = throttle.observe(
+                requested,
+                healthy_tick,
+                TICK_THROTTLE_SLOW_TICK_THRESHOLD + Duration::from_millis(1),
+            );
+        }
+
+        assert_eq!(decision.stage, TickThrottleStage::Backoff60s);
+        assert_eq!(decision.interval, Duration::from_mins(1));
+        assert_eq!(decision.reason, Some(TickThrottleReason::SlowTick));
+
+        let clear = throttle.observe(requested, healthy_tick, Duration::from_millis(20));
+
+        assert_eq!(clear.stage, TickThrottleStage::Normal);
+        assert_eq!(clear.interval, requested);
+        assert_eq!(clear.reason, None);
+        assert!(clear.stage_changed);
     }
 
     #[test]
