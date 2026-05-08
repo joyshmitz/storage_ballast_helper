@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::core::config::TelemetryConfig;
 use crate::monitor::pid::PressureLevel;
 use crate::platform::pal::Platform;
 use crate::platform::types::SelfStats;
@@ -32,6 +33,8 @@ pub const DAEMON_STATE_WRITE_INTERVAL_SECS: u64 = 30;
 /// (`sbh status`, `sbh check`, `read_daemon_prediction`) never report the
 /// daemon as absent simply because a write cycle hasn't completed yet.
 pub const DAEMON_STATE_STALE_THRESHOLD_SECS: u64 = 90;
+pub const DEFAULT_DAEMON_RSS_WARNING_BYTES: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES: u64 = 500 * 1024 * 1024;
 
 // ──────────────────── state file schema ────────────────────
 
@@ -225,6 +228,21 @@ pub struct DaemonHealth {
     pub last_pressure_level: PressureLevel,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelfMonitorTick {
+    pub rss_bytes: u64,
+    pub rss_warning_bytes: u64,
+    pub rss_hard_limit_bytes: u64,
+    pub rss_hard_limit_exceeded: bool,
+}
+
+impl SelfMonitorTick {
+    #[must_use]
+    pub const fn should_exit_for_rss_hard_limit(self) -> bool {
+        self.rss_hard_limit_exceeded
+    }
+}
+
 // ──────────────────── self-monitor ────────────────────
 
 /// Periodic self-monitoring: writes state file, checks RSS, reports status.
@@ -235,7 +253,8 @@ pub struct SelfMonitor {
     started_at_iso: String,
     write_interval: Duration,
     last_write: Option<Instant>,
-    rss_limit_bytes: u64,
+    rss_warning_bytes: u64,
+    rss_hard_limit_bytes: u64,
 
     // Mutable counters updated by the main loop.
     pub scan_count: u64,
@@ -252,6 +271,34 @@ pub struct SelfMonitor {
 impl SelfMonitor {
     /// Create a new self-monitor.
     pub fn new(state_file_path: PathBuf, platform: Arc<dyn Platform>) -> Self {
+        Self::with_rss_limits(
+            state_file_path,
+            platform,
+            DEFAULT_DAEMON_RSS_WARNING_BYTES,
+            DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES,
+        )
+    }
+
+    /// Create a new self-monitor using daemon RSS limits from config.
+    pub fn from_telemetry_config(
+        state_file_path: PathBuf,
+        platform: Arc<dyn Platform>,
+        telemetry: &TelemetryConfig,
+    ) -> Self {
+        Self::with_rss_limits(
+            state_file_path,
+            platform,
+            telemetry.daemon_rss_warning_bytes,
+            telemetry.daemon_rss_hard_limit_bytes,
+        )
+    }
+
+    fn with_rss_limits(
+        state_file_path: PathBuf,
+        platform: Arc<dyn Platform>,
+        rss_warning_bytes: u64,
+        rss_hard_limit_bytes: u64,
+    ) -> Self {
         let now = chrono::Utc::now();
         Self {
             state_file_path,
@@ -260,7 +307,8 @@ impl SelfMonitor {
             started_at_iso: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             write_interval: Duration::from_secs(DAEMON_STATE_WRITE_INTERVAL_SECS),
             last_write: None,
-            rss_limit_bytes: 256 * 1024 * 1024, // 256 MB
+            rss_warning_bytes,
+            rss_hard_limit_bytes,
 
             scan_count: 0,
             last_scan_at: None,
@@ -275,7 +323,7 @@ impl SelfMonitor {
 
     /// Check if it's time to write the state file. If so, write it.
     ///
-    /// Returns the current RSS in bytes (0 if unavailable).
+    /// Returns the current RSS sample and whether the hard cap was exceeded.
     #[allow(clippy::too_many_arguments)]
     pub fn maybe_write_state(
         &mut self,
@@ -286,22 +334,35 @@ impl SelfMonitor {
         ballast_total: usize,
         dropped_log_events: u64,
         policy_mode: &str,
-    ) -> u64 {
+    ) -> SelfMonitorTick {
         let now = Instant::now();
-        if let Some(last) = self.last_write
-            && now.duration_since(last) < self.write_interval
-        {
-            return 0;
+        let rss = self.current_rss_bytes();
+        let tick = SelfMonitorTick {
+            rss_bytes: rss,
+            rss_warning_bytes: self.rss_warning_bytes,
+            rss_hard_limit_bytes: self.rss_hard_limit_bytes,
+            rss_hard_limit_exceeded: rss > self.rss_hard_limit_bytes,
+        };
+
+        let write_due = self
+            .last_write
+            .is_none_or(|last| now.duration_since(last) >= self.write_interval);
+        if !write_due && !tick.rss_hard_limit_exceeded {
+            return tick;
         }
 
-        let rss = self.current_rss_bytes();
-
-        // Check RSS limit.
-        if rss > self.rss_limit_bytes {
+        if rss > self.rss_warning_bytes {
             eprintln!(
                 "[SBH-SELFMON] WARNING: RSS {} MB exceeds limit {} MB",
                 rss / (1024 * 1024),
-                self.rss_limit_bytes / (1024 * 1024),
+                self.rss_warning_bytes / (1024 * 1024),
+            );
+        }
+        if tick.rss_hard_limit_exceeded {
+            eprintln!(
+                "[SBH-SELFMON] FATAL: RSS {} MB exceeds hard limit {} MB; daemon will exit nonzero for service restart",
+                rss / (1024 * 1024),
+                self.rss_hard_limit_bytes / (1024 * 1024),
             );
         }
 
@@ -350,10 +411,10 @@ impl SelfMonitor {
         self.last_write = Some(now);
 
         if result.is_err() {
-            return rss;
+            return tick;
         }
 
-        rss
+        tick
     }
 
     /// Build a status string suitable for sd_notify STATUS.
@@ -922,6 +983,49 @@ mod tests {
         );
 
         assert_eq!(monitor.current_rss_bytes(), 12_345_678);
+    }
+
+    #[test]
+    fn rss_hard_limit_breach_returns_exit_action_and_writes_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut monitor = SelfMonitor::with_rss_limits(
+            path.clone(),
+            Arc::new(MockPlatform::healthy().with_self_stats(test_self_stats(2048))),
+            1024,
+            1536,
+        );
+
+        let tick =
+            monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 10, 10, 0, "enforce");
+
+        assert_eq!(tick.rss_bytes, 2048);
+        assert_eq!(tick.rss_warning_bytes, 1024);
+        assert_eq!(tick.rss_hard_limit_bytes, 1536);
+        assert!(tick.should_exit_for_rss_hard_limit());
+        let state = SelfMonitor::read_state(&path).expect("fatal RSS tick should persist state");
+        assert_eq!(state.memory_rss_bytes, 2048);
+    }
+
+    #[test]
+    fn rss_hard_limit_breach_forces_state_write_inside_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut monitor = SelfMonitor::with_rss_limits(
+            path.clone(),
+            Arc::new(MockPlatform::healthy().with_self_stats(test_self_stats(4096))),
+            1024,
+            2048,
+        );
+        monitor.write_interval = Duration::from_hours(1);
+        monitor.last_write = Some(Instant::now());
+
+        let tick = monitor.maybe_write_state(PressureLevel::Red, 1.0, "/data", 0, 1, 0, "enforce");
+
+        assert!(tick.should_exit_for_rss_hard_limit());
+        let state = SelfMonitor::read_state(&path).expect("hard-limit tick should force write");
+        assert_eq!(state.pressure.overall, "red");
+        assert_eq!(state.memory_rss_bytes, 4096);
     }
 
     // ──────── failure-injection tests ────────

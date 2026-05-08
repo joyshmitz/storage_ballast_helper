@@ -35,7 +35,7 @@ use crate::daemon::policy::{
     ScanAggressiveness,
 };
 use crate::daemon::process_io_history::ProcessIoHistory;
-use crate::daemon::self_monitor::{SelfMonitor, ThreadHeartbeat, ThreadStatus};
+use crate::daemon::self_monitor::{SelfMonitor, SelfMonitorTick, ThreadHeartbeat, ThreadStatus};
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, spawn_logger};
 use crate::logger::jsonl::JsonlConfig;
@@ -1085,7 +1085,11 @@ impl MonitoringDaemon {
         let shared_scanner_config = Arc::new(RwLock::new(config.scanner.clone()));
 
         // 11. Self-monitor (writes state.json for CLI, tracks health).
-        let self_monitor = SelfMonitor::new(config.paths.state_file.clone(), Arc::clone(&platform));
+        let self_monitor = SelfMonitor::from_telemetry_config(
+            config.paths.state_file.clone(),
+            Arc::clone(&platform),
+            &config.telemetry,
+        );
         let process_io_history = ProcessIoHistory::load_or_new(
             ProcessIoHistory::snapshot_path_for_state_file(&config.paths.state_file),
         );
@@ -1454,6 +1458,7 @@ impl MonitoringDaemon {
         )?);
 
         let mut last_health_check = Instant::now();
+        let mut shutdown_result = Ok(());
 
         // ──────── main monitoring loop ────────
         loop {
@@ -1624,7 +1629,7 @@ impl MonitoringDaemon {
                 let dropped_log_events = self.logger_handle.dropped_events();
 
                 let policy_mode = self.policy_engine.lock().mode().to_string();
-                self.self_monitor.maybe_write_state(
+                let tick = self.self_monitor.maybe_write_state(
                     response.level,
                     free_pct,
                     &mount_str,
@@ -1633,6 +1638,10 @@ impl MonitoringDaemon {
                     dropped_log_events,
                     &policy_mode,
                 );
+                if tick.should_exit_for_rss_hard_limit() {
+                    shutdown_result = Err(self.rss_hard_limit_error(tick));
+                    break;
+                }
             }
 
             // 8. Foreground status dump signal (macOS SIGINFO / Ctrl+T).
@@ -1783,7 +1792,7 @@ impl MonitoringDaemon {
 
         // ──────── shutdown sequence ────────
         self.shutdown(scan_tx, del_tx, scanner_join, executor_join);
-        Ok(())
+        shutdown_result
     }
 
     // ──────────────────── helpers ────────────────────
@@ -1791,6 +1800,18 @@ impl MonitoringDaemon {
     /// Return the first configured root path, or `/` as fallback.
     fn primary_path(&self) -> &Path {
         &self.cached_primary_path
+    }
+
+    fn rss_hard_limit_error(&self, tick: SelfMonitorTick) -> SbhError {
+        let details = format!(
+            "daemon RSS hard limit exceeded: rss={} bytes hard_limit={} bytes; exiting nonzero so the service manager can restart after its throttle interval",
+            tick.rss_bytes, tick.rss_hard_limit_bytes
+        );
+        self.logger_handle.send(ActivityEvent::Error {
+            code: "SBH-3901".to_string(),
+            message: details.clone(),
+        });
+        SbhError::Runtime { details }
     }
 
     // ──────────────────── pressure monitoring ────────────────────

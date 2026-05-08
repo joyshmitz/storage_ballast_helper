@@ -237,6 +237,10 @@ pub struct TelemetryConfig {
     pub guardrail_window_size: usize,
     /// Minimum observations before the adaptive guard can transition to PASS.
     pub guardrail_min_observations: usize,
+    /// RSS threshold that emits self-monitor warnings.
+    pub daemon_rss_warning_bytes: u64,
+    /// RSS hard cap that makes the daemon exit nonzero for service restart.
+    pub daemon_rss_hard_limit_bytes: u64,
 }
 
 /// Update-check behavior, cache policy, and opt-out controls.
@@ -517,6 +521,8 @@ impl Default for TelemetryConfig {
             ewma_rate_history_size: 200,
             guardrail_window_size: 500,
             guardrail_min_observations: 60,
+            daemon_rss_warning_bytes: 256 * 1024 * 1024,
+            daemon_rss_hard_limit_bytes: 500 * 1024 * 1024,
         }
     }
 }
@@ -977,6 +983,14 @@ impl Config {
             "SBH_TELEMETRY_EWMA_MIN_SAMPLES",
             &mut self.telemetry.ewma_min_samples,
         )?;
+        set_env_u64(
+            "SBH_TELEMETRY_DAEMON_RSS_WARNING_BYTES",
+            &mut self.telemetry.daemon_rss_warning_bytes,
+        )?;
+        set_env_u64(
+            "SBH_TELEMETRY_DAEMON_RSS_HARD_LIMIT_BYTES",
+            &mut self.telemetry.daemon_rss_hard_limit_bytes,
+        )?;
 
         // update
         self.apply_update_env_overrides_from(env_var)?;
@@ -1265,6 +1279,22 @@ impl Config {
         {
             return Err(SbhError::InvalidConfig {
                 details: "EWMA alpha values must satisfy 0 < min <= base <= max < 1".to_string(),
+            });
+        }
+        if self.telemetry.daemon_rss_warning_bytes == 0 {
+            return Err(SbhError::InvalidConfig {
+                details: "telemetry.daemon_rss_warning_bytes must be > 0".to_string(),
+            });
+        }
+        if self.telemetry.daemon_rss_hard_limit_bytes == 0 {
+            return Err(SbhError::InvalidConfig {
+                details: "telemetry.daemon_rss_hard_limit_bytes must be > 0".to_string(),
+            });
+        }
+        if self.telemetry.daemon_rss_warning_bytes > self.telemetry.daemon_rss_hard_limit_bytes {
+            return Err(SbhError::InvalidConfig {
+                details: "telemetry.daemon_rss_warning_bytes must be <= telemetry.daemon_rss_hard_limit_bytes"
+                    .to_string(),
             });
         }
 
@@ -1659,6 +1689,27 @@ mod tests {
         cfg.telemetry.ewma_base_alpha = 0.1;
         let err = cfg.validate().expect_err("expected alpha validation error");
         assert!(err.to_string().contains("alpha"));
+    }
+
+    #[test]
+    fn daemon_rss_hard_limit_defaults_to_500_mib() {
+        let cfg = Config::default();
+        assert_eq!(cfg.telemetry.daemon_rss_warning_bytes, 256 * 1024 * 1024);
+        assert_eq!(cfg.telemetry.daemon_rss_hard_limit_bytes, 500 * 1024 * 1024);
+    }
+
+    #[test]
+    fn daemon_rss_hard_limit_must_not_be_below_warning_limit() {
+        let mut cfg = Config::default();
+        cfg.telemetry.daemon_rss_warning_bytes = 1024;
+        cfg.telemetry.daemon_rss_hard_limit_bytes = 512;
+        let err = cfg
+            .validate()
+            .expect_err("expected daemon rss threshold validation error");
+        assert!(
+            err.to_string()
+                .contains("daemon_rss_warning_bytes must be <=")
+        );
     }
 
     #[test]

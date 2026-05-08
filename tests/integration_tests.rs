@@ -9,7 +9,6 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -761,19 +760,16 @@ fn macos_synthetic_writer_surfaces_in_blame_top_rows() {
 #[test]
 fn macos_synthetic_writer_surfaces_in_blame_top_rows() {}
 
-#[cfg(target_os = "macos")]
 struct ChildGuard {
     child: Child,
 }
 
-#[cfg(target_os = "macos")]
 impl ChildGuard {
     fn new(child: Child) -> Self {
         Self { child }
     }
 }
 
-#[cfg(target_os = "macos")]
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -824,6 +820,55 @@ fn wait_for_file(path: &Path, timeout: Duration, mut poll: impl FnMut()) {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[test]
+fn daemon_exits_nonzero_when_rss_hard_cap_exceeded() {
+    let dir = tempfile::tempdir().expect("create rss hard cap test dir");
+    let scan_root = dir.path().join("scan-root");
+    let state_dir = dir.path().join("state");
+    let ballast_dir = dir.path().join("ballast");
+    fs::create_dir(&scan_root).expect("create scan root");
+    fs::create_dir(&state_dir).expect("create state dir");
+    fs::create_dir(&ballast_dir).expect("create ballast dir");
+
+    let config_path = dir.path().join("config.toml");
+    let stderr_path = dir.path().join("daemon.stderr");
+    write_rss_hard_cap_test_config(&config_path, &scan_root, &state_dir, &ballast_dir);
+
+    let stderr = fs::File::create(&stderr_path).expect("create daemon stderr log");
+    let mut daemon = ChildGuard::new(
+        Command::new(common::sbh_bin_path())
+            .arg("--config")
+            .arg(&config_path)
+            .arg("daemon")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .expect("spawn daemon with tiny RSS hard cap"),
+    );
+
+    let status = wait_for_child_exit(&mut daemon.child, Duration::from_secs(10));
+    assert!(
+        !status.success(),
+        "RSS hard cap breach should exit nonzero, got {status}"
+    );
+
+    let stderr = fs::read_to_string(&stderr_path).expect("read daemon stderr");
+    assert!(
+        stderr.contains("RSS") && stderr.contains("hard limit"),
+        "daemon stderr should explain RSS hard limit breach; stderr:\n{stderr}"
+    );
+
+    let state_path = state_dir.join("state.json");
+    let state = storage_ballast_helper::daemon::self_monitor::SelfMonitor::read_state(&state_path)
+        .expect("hard cap exit should persist state");
+    assert!(
+        state.memory_rss_bytes > 1,
+        "state should contain fatal RSS sample, got {}",
+        state.memory_rss_bytes
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -980,7 +1025,7 @@ parallelism = 1
 dry_run = true
 
 [ballast]
-file_count = 0
+file_count = 1
 file_size_bytes = 4096
 "#,
         toml_path(&state_file),
@@ -1454,6 +1499,49 @@ fn sha256_file_hex(path: &Path) -> String {
     format!("{:x}", Sha256::digest(&bytes))
 }
 
+fn write_rss_hard_cap_test_config(
+    config_path: &Path,
+    scan_root: &Path,
+    state_dir: &Path,
+    ballast_dir: &Path,
+) {
+    let state_file = state_dir.join("state.json");
+    let sqlite_db = state_dir.join("activity.sqlite3");
+    let jsonl_log = state_dir.join("activity.jsonl");
+    let config = format!(
+        r#"[paths]
+state_file = "{}"
+sqlite_db = "{}"
+jsonl_log = "{}"
+ballast_dir = "{}"
+
+[pressure]
+poll_interval_ms = 100
+
+[scanner]
+root_paths = ["{}"]
+min_file_age_minutes = 60
+max_depth = 1
+parallelism = 1
+dry_run = true
+
+[telemetry]
+daemon_rss_warning_bytes = 1
+daemon_rss_hard_limit_bytes = 1
+
+[ballast]
+file_count = 1
+file_size_bytes = 4096
+"#,
+        toml_path(&state_file),
+        toml_path(&sqlite_db),
+        toml_path(&jsonl_log),
+        toml_path(ballast_dir),
+        toml_path(scan_root),
+    );
+    fs::write(config_path, config).expect("write daemon RSS hard cap test config");
+}
+
 #[cfg(target_os = "macos")]
 fn now_millis() -> u128 {
     SystemTime::now()
@@ -1503,7 +1591,6 @@ file_size_bytes = 4096
     fs::write(config_path, config).expect("write daemon signal test config");
 }
 
-#[cfg(target_os = "macos")]
 fn toml_path(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "\\\\")
@@ -1574,7 +1661,6 @@ fn wait_for_file_contains(
     }
 }
 
-#[cfg(target_os = "macos")]
 fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> ExitStatus {
     let deadline = Instant::now() + timeout;
     loop {
