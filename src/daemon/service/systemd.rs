@@ -223,11 +223,13 @@ impl SystemdServiceManager {
             Ok(stdout.trim().to_string())
         } else {
             Err(SbhError::Runtime {
-                details: format!(
-                    "systemctl {} failed (exit {}): {}",
-                    full_args.join(" "),
-                    output.status.code().unwrap_or(-1),
-                    stderr.trim()
+                details: format_systemctl_failure(
+                    &full_args,
+                    output.status.code(),
+                    &stdout,
+                    &stderr,
+                    &self.config.unit_path(),
+                    self.config.user_scope,
                 ),
             })
         }
@@ -357,6 +359,70 @@ fn sd_notify_linux(status: &str, socket_path: &str) {
     let _ = sock.send_to(msg.as_bytes(), socket_path);
 }
 
+fn format_systemctl_failure(
+    args: &[String],
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    unit_path: &std::path::Path,
+    user_scope: bool,
+) -> String {
+    let status_command = if user_scope {
+        format!("systemctl --user status {SYSTEMD_UNIT_NAME}")
+    } else {
+        format!("sudo systemctl status {SYSTEMD_UNIT_NAME}")
+    };
+    let journal_command = if user_scope {
+        format!("journalctl --user -u {SYSTEMD_UNIT_NAME} -n 100 --no-pager")
+    } else {
+        format!("sudo journalctl -u {SYSTEMD_UNIT_NAME} -n 100 --no-pager")
+    };
+    format!(
+        "{} failed with exit {}. stdout: {}; stderr: {}. \
+         Verify the unit with: systemd-analyze verify {}. \
+         Inspect service state with: {status_command}. \
+         Inspect recent logs with: {journal_command}.",
+        format_systemctl_command(args),
+        exit_code.map_or_else(|| "signal".to_string(), |code| code.to_string()),
+        compact_command_output(stdout),
+        compact_command_output(stderr),
+        systemd_shell_quote(&unit_path.display().to_string()),
+    )
+}
+
+fn format_systemctl_command(args: &[String]) -> String {
+    std::iter::once("systemctl")
+        .chain(args.iter().map(String::as_str))
+        .map(systemd_shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn systemd_shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '@' | '%' | '+')
+    }) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn compact_command_output(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_string();
+    }
+    let mut lines = trimmed.lines();
+    let mut rendered = lines.by_ref().take(6).collect::<Vec<_>>().join("\\n");
+    if lines.next().is_some() {
+        rendered.push_str("\\n...");
+    }
+    rendered
+}
+
 fn default_read_write_paths(user_scope: bool) -> Vec<PathBuf> {
     let mut paths = vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")];
     if !user_scope {
@@ -386,5 +452,47 @@ mod watchdog_tests {
         assert!(!systemd_watchdog_enabled(0, Some("/run/systemd/notify")));
         assert!(!systemd_watchdog_enabled(60, None));
         assert!(!systemd_watchdog_enabled(60, Some("")));
+    }
+
+    #[test]
+    fn systemctl_failure_names_command_outputs_and_remediation() {
+        let diagnostic = format_systemctl_failure(
+            &[
+                "--user".to_string(),
+                "enable".to_string(),
+                SYSTEMD_UNIT_NAME.to_string(),
+            ],
+            Some(1),
+            "stdout hint",
+            "stderr detail",
+            std::path::Path::new("/Users/me/.config/systemd/user/sbh.service"),
+            true,
+        );
+
+        assert!(diagnostic.contains("systemctl --user enable sbh.service failed with exit 1"));
+        assert!(diagnostic.contains("stdout: stdout hint"));
+        assert!(diagnostic.contains("stderr: stderr detail"));
+        assert!(
+            diagnostic
+                .contains("systemd-analyze verify /Users/me/.config/systemd/user/sbh.service")
+        );
+        assert!(diagnostic.contains("systemctl --user status sbh.service"));
+        assert!(diagnostic.contains("journalctl --user -u sbh.service -n 100 --no-pager"));
+    }
+
+    #[test]
+    fn systemctl_failure_quotes_unit_paths_with_spaces() {
+        let diagnostic = format_systemctl_failure(
+            &["daemon-reload".to_string()],
+            Some(1),
+            "",
+            "",
+            std::path::Path::new("/tmp/sbh test/sbh.service"),
+            false,
+        );
+
+        assert!(diagnostic.contains("systemctl daemon-reload failed with exit 1"));
+        assert!(diagnostic.contains("systemd-analyze verify '/tmp/sbh test/sbh.service'"));
+        assert!(diagnostic.contains("sudo systemctl status sbh.service"));
     }
 }

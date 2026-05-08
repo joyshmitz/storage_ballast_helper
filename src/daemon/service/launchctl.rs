@@ -1,9 +1,9 @@
 //! Safe wrappers for modern `launchctl` lifecycle commands.
 
+use std::error::Error as StdError;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-use thiserror::Error;
 
 use crate::core::errors::SbhError;
 
@@ -108,23 +108,19 @@ impl ParsedStatus {
 }
 
 /// Errors returned by `launchctl` wrappers.
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum LaunchctlError {
     /// The plist path could not be represented as UTF-8 for `launchctl`.
-    #[error("launchctl path is not valid UTF-8: {path}")]
     InvalidPath {
         /// Invalid path.
         path: PathBuf,
     },
     /// The `launchctl` executable could not be spawned.
-    #[error("failed to run launchctl: {source}")]
     Spawn {
         /// Spawn failure.
-        #[source]
         source: std::io::Error,
     },
     /// `launchctl` returned a non-zero exit status.
-    #[error("launchctl {args:?} failed with exit {exit_code:?}: {stderr}")]
     CommandFailed {
         /// Arguments passed after the executable.
         args: Vec<String>,
@@ -138,6 +134,35 @@ pub enum LaunchctlError {
 }
 
 impl LaunchctlError {
+    /// Human-facing diagnostic with the failed command and concrete next steps.
+    #[must_use]
+    pub fn diagnostic(&self) -> String {
+        match self {
+            Self::InvalidPath { path } => format!(
+                "launchctl cannot use plist path {} because it is not valid UTF-8. \
+                 Use a UTF-8 plist path and verify the plist with: plutil -lint {}",
+                path.display(),
+                path.display()
+            ),
+            Self::Spawn { source } => format!(
+                "failed to run launchctl: {source}. \
+                 Verify launchctl is available with: /bin/launchctl version"
+            ),
+            Self::CommandFailed {
+                args,
+                exit_code,
+                stdout,
+                stderr,
+            } => format!(
+                "{} failed with exit {}. {} {}",
+                format_launchctl_command(args),
+                exit_code.map_or_else(|| "signal".to_string(), |code| code.to_string()),
+                format_captured_output(stdout, stderr),
+                remediation_for_args(args)
+            ),
+        }
+    }
+
     /// Whether the failure means the service/domain is absent.
     #[must_use]
     pub fn is_not_loaded(&self) -> bool {
@@ -168,6 +193,21 @@ impl LaunchctlError {
     }
 }
 
+impl fmt::Display for LaunchctlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.diagnostic())
+    }
+}
+
+impl StdError for LaunchctlError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Spawn { source } => Some(source),
+            Self::InvalidPath { .. } | Self::CommandFailed { .. } => None,
+        }
+    }
+}
+
 impl From<LaunchctlError> for SbhError {
     fn from(value: LaunchctlError) -> Self {
         match value {
@@ -180,6 +220,115 @@ impl From<LaunchctlError> for SbhError {
             },
         }
     }
+}
+
+fn format_launchctl_command(args: &[String]) -> String {
+    std::iter::once("launchctl")
+        .chain(args.iter().map(String::as_str))
+        .map(shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '@' | '%' | '+')
+    }) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn format_captured_output(stdout: &str, stderr: &str) -> String {
+    format!(
+        "stdout: {}; stderr: {}.",
+        compact_output(stdout),
+        compact_output(stderr)
+    )
+}
+
+fn compact_output(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_string();
+    }
+    let mut lines = trimmed.lines();
+    let mut rendered = lines.by_ref().take(6).collect::<Vec<_>>().join("\\n");
+    if lines.next().is_some() {
+        rendered.push_str("\\n...");
+    }
+    rendered
+}
+
+fn remediation_for_args(args: &[String]) -> String {
+    match args.first().map(String::as_str) {
+        Some("bootstrap") => bootstrap_remediation(args),
+        Some("bootout") => target_remediation(
+            args.get(1).map(String::as_str),
+            "Inspect the loaded state with",
+            "If the service is already absent, no action is needed.",
+        ),
+        Some("kickstart") => {
+            let target = args.last().map(String::as_str);
+            target_remediation(
+                target,
+                "Verify the service is loaded with",
+                "If it is not loaded, run launchctl bootstrap for the plist before kickstart.",
+            )
+        }
+        Some("print") => target_remediation(
+            args.get(1).map(String::as_str),
+            "Retry the status probe with",
+            "If the target is absent, install with sbh install --launchd --scope user or choose the correct scope.",
+        ),
+        _ => format!("Retry manually with: {}", format_launchctl_command(args)),
+    }
+}
+
+fn bootstrap_remediation(args: &[String]) -> String {
+    let Some(domain) = args.get(1) else {
+        return "Retry manually with the intended launchctl bootstrap domain and plist path."
+            .to_string();
+    };
+    let Some(plist) = args.get(2) else {
+        return format!(
+            "Inspect the launchd domain with: launchctl print {}",
+            shell_quote(domain)
+        );
+    };
+    let target = bootstrap_target(domain, plist).map_or_else(
+        || "the stale service target".to_string(),
+        |target| shell_quote(&target),
+    );
+    format!(
+        "Verify the plist with: plutil -lint {}. \
+         Inspect the launchd domain with: launchctl print {}. \
+         If launchd has stale state, run: launchctl bootout {}; then retry: {}",
+        shell_quote(plist),
+        shell_quote(domain),
+        target,
+        format_launchctl_command(args)
+    )
+}
+
+fn bootstrap_target(domain: &str, plist: &str) -> Option<String> {
+    let label = Path::new(plist).file_stem()?.to_str()?;
+    Some(format!("{domain}/{label}"))
+}
+
+fn target_remediation(target: Option<&str>, probe_prefix: &str, fallback: &str) -> String {
+    target.map_or_else(
+        || fallback.to_string(),
+        |target| {
+            format!(
+                "{probe_prefix}: launchctl print {}. {fallback}",
+                shell_quote(target)
+            )
+        },
+    )
 }
 
 /// Pick the launchd target domain for an install scope.
@@ -330,7 +479,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        LaunchctlDomain, LaunchctlError, LaunchctlServiceTarget, bootstrap_args, parse_print_output,
+        LaunchctlDomain, LaunchctlError, LaunchctlServiceTarget, bootstrap_args,
+        format_launchctl_command, parse_print_output,
     };
 
     #[test]
@@ -418,5 +568,68 @@ gui/501/com.sbh.daemon = {
         };
 
         assert!(error.is_already_loaded());
+    }
+
+    #[test]
+    fn launchctl_command_diagnostic_includes_command_output_and_fix() {
+        let error = LaunchctlError::CommandFailed {
+            args: vec![
+                "bootstrap".to_string(),
+                "gui/501".to_string(),
+                "/Users/me/Library/LaunchAgents/com.sbh.daemon.plist".to_string(),
+            ],
+            exit_code: Some(5),
+            stdout: "domain bootstrap details".to_string(),
+            stderr: "Bootstrap failed: 5: Input/output error".to_string(),
+        };
+
+        let diagnostic = error.to_string();
+
+        assert!(diagnostic.contains(
+            "launchctl bootstrap gui/501 /Users/me/Library/LaunchAgents/com.sbh.daemon.plist failed with exit 5"
+        ));
+        assert!(diagnostic.contains("stdout: domain bootstrap details"));
+        assert!(diagnostic.contains("stderr: Bootstrap failed: 5: Input/output error"));
+        assert!(diagnostic.contains(
+            "Verify the plist with: plutil -lint /Users/me/Library/LaunchAgents/com.sbh.daemon.plist"
+        ));
+        assert!(
+            diagnostic.contains("launchctl bootout gui/501/com.sbh.daemon"),
+            "diagnostic should name the stale launchd target: {diagnostic}"
+        );
+    }
+
+    #[test]
+    fn launchctl_kickstart_diagnostic_names_status_probe() {
+        let error = LaunchctlError::CommandFailed {
+            args: vec![
+                "kickstart".to_string(),
+                "-k".to_string(),
+                "gui/501/com.sbh.daemon".to_string(),
+            ],
+            exit_code: Some(113),
+            stdout: String::new(),
+            stderr: "Could not find service".to_string(),
+        };
+
+        let diagnostic = error.to_string();
+
+        assert!(diagnostic.contains("launchctl kickstart -k gui/501/com.sbh.daemon"));
+        assert!(diagnostic.contains("launchctl print gui/501/com.sbh.daemon"));
+        assert!(diagnostic.contains("run launchctl bootstrap for the plist before kickstart"));
+    }
+
+    #[test]
+    fn launchctl_command_formatter_quotes_spaces() {
+        let command = format_launchctl_command(&[
+            "bootstrap".to_string(),
+            "gui/501".to_string(),
+            "/Users/me/Library/LaunchAgents/com example.sbh.plist".to_string(),
+        ]);
+
+        assert_eq!(
+            command,
+            "launchctl bootstrap gui/501 '/Users/me/Library/LaunchAgents/com example.sbh.plist'"
+        );
     }
 }
