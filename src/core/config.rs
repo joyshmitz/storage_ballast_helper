@@ -42,6 +42,8 @@ pub struct PressureConfig {
     pub orange_min_free_pct: f64,
     pub red_min_free_pct: f64,
     pub poll_interval_ms: u64,
+    /// Minimum seconds between repeated behavior transitions in the same direction.
+    pub behavior_hysteresis_secs: u64,
     /// Predictive pre-emption settings.
     pub prediction: PredictionConfig,
 }
@@ -418,6 +420,7 @@ impl Default for PressureConfig {
             orange_min_free_pct: 10.0,
             red_min_free_pct: 6.0,
             poll_interval_ms: 5_000,
+            behavior_hysteresis_secs: 5,
             prediction: PredictionConfig::default(),
         }
     }
@@ -870,6 +873,10 @@ impl Config {
         set_env_u64(
             "SBH_PRESSURE_POLL_INTERVAL_MS",
             &mut self.pressure.poll_interval_ms,
+        )?;
+        set_env_u64(
+            "SBH_PRESSURE_BEHAVIOR_HYSTERESIS_SECS",
+            &mut self.pressure.behavior_hysteresis_secs,
         )?;
 
         // prediction
@@ -1531,6 +1538,16 @@ mod tests {
     fn default_config_is_valid() {
         let cfg = Config::default();
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn pressure_behavior_hysteresis_defaults_and_toml_override() {
+        let cfg = Config::default();
+        assert_eq!(cfg.pressure.behavior_hysteresis_secs, 5);
+
+        let toml_str = "[pressure]\nbehavior_hysteresis_secs = 9\n";
+        let parsed: Config = toml::from_str(toml_str).expect("should parse");
+        assert_eq!(parsed.pressure.behavior_hysteresis_secs, 9);
     }
 
     #[test]

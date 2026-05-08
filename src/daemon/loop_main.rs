@@ -31,8 +31,8 @@ use crate::core::config::Config;
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::notifications::{NotificationEvent, NotificationLevel, NotificationManager};
 use crate::daemon::policy::{
-    ActiveMode, BallastAction, BehaviorDispatchTable, BehaviorMode, CleanupAction, PolicyEngine,
-    ScanAggressiveness,
+    ActiveMode, BallastAction, BehaviorDispatchTable, BehaviorMode, BehaviorPressureLevel,
+    CleanupAction, PolicyEngine, ScanAggressiveness,
 };
 use crate::daemon::process_io_history::ProcessIoHistory;
 use crate::daemon::self_monitor::{SelfMonitor, SelfMonitorTick, ThreadHeartbeat, ThreadStatus};
@@ -340,12 +340,38 @@ struct BehaviorTransition {
     to_mode: BehaviorMode,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BehaviorTransitionDirection {
+    Escalating,
+    Recovering,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingBehaviorTarget {
+    memory_level: MemoryPressureLevel,
+    disk_level: PressureLevel,
+    mode: BehaviorMode,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BehaviorUpdate {
+    Unchanged,
+    Applied(BehaviorTransition),
+    Deferred {
+        direction: BehaviorTransitionDirection,
+        remaining: Duration,
+    },
+}
+
 #[derive(Debug, Clone)]
 struct PressureBehaviorState {
     table: BehaviorDispatchTable,
     memory_level: MemoryPressureLevel,
     disk_level: PressureLevel,
     mode: BehaviorMode,
+    last_escalation_at: Option<Instant>,
+    last_recovery_at: Option<Instant>,
+    pending_target: Option<PendingBehaviorTarget>,
 }
 
 impl PressureBehaviorState {
@@ -357,22 +383,78 @@ impl PressureBehaviorState {
             memory_level,
             disk_level,
             mode,
+            last_escalation_at: None,
+            last_recovery_at: None,
+            pending_target: None,
         }
     }
 
+    #[cfg(test)]
     fn update(
         &mut self,
         memory_level: MemoryPressureLevel,
         disk_level: PressureLevel,
     ) -> Option<BehaviorTransition> {
+        self.update_with_hysteresis(memory_level, disk_level, Instant::now(), Duration::ZERO)
+            .into_transition()
+    }
+
+    fn update_with_hysteresis(
+        &mut self,
+        memory_level: MemoryPressureLevel,
+        disk_level: PressureLevel,
+        now: Instant,
+        min_interval: Duration,
+    ) -> BehaviorUpdate {
         let next_mode = self.table.mode_for(memory_level, disk_level);
         if self.memory_level == memory_level
             && self.disk_level == disk_level
             && self.mode == next_mode
         {
-            return None;
+            self.pending_target = None;
+            return BehaviorUpdate::Unchanged;
         }
 
+        if self.pending_target.is_some_and(|pending| {
+            pending.memory_level != memory_level
+                || pending.disk_level != disk_level
+                || pending.mode != next_mode
+        }) {
+            self.pending_target = None;
+        }
+
+        let Some(direction) =
+            transition_direction(self.memory_level, memory_level, self.disk_level, disk_level)
+        else {
+            let transition = self.apply_behavior_transition(memory_level, disk_level, next_mode);
+            self.pending_target = None;
+            return BehaviorUpdate::Applied(transition);
+        };
+
+        if let Some(remaining) = self.hysteresis_remaining(direction, now, min_interval) {
+            self.pending_target = Some(PendingBehaviorTarget {
+                memory_level,
+                disk_level,
+                mode: next_mode,
+            });
+            return BehaviorUpdate::Deferred {
+                direction,
+                remaining,
+            };
+        }
+
+        let transition = self.apply_behavior_transition(memory_level, disk_level, next_mode);
+        self.record_transition_direction(direction, now);
+        self.pending_target = None;
+        BehaviorUpdate::Applied(transition)
+    }
+
+    fn apply_behavior_transition(
+        &mut self,
+        memory_level: MemoryPressureLevel,
+        disk_level: PressureLevel,
+        next_mode: BehaviorMode,
+    ) -> BehaviorTransition {
         let transition = BehaviorTransition {
             from_memory: self.memory_level,
             to_memory: memory_level,
@@ -384,7 +466,87 @@ impl PressureBehaviorState {
         self.memory_level = memory_level;
         self.disk_level = disk_level;
         self.mode = next_mode;
-        Some(transition)
+        transition
+    }
+
+    fn hysteresis_remaining(
+        &self,
+        direction: BehaviorTransitionDirection,
+        now: Instant,
+        min_interval: Duration,
+    ) -> Option<Duration> {
+        if min_interval.is_zero() {
+            return None;
+        }
+
+        let last = match direction {
+            BehaviorTransitionDirection::Escalating => self.last_escalation_at,
+            BehaviorTransitionDirection::Recovering => self.last_recovery_at,
+        }?;
+        let elapsed = now.saturating_duration_since(last);
+        if elapsed >= min_interval {
+            None
+        } else {
+            min_interval.checked_sub(elapsed)
+        }
+    }
+
+    fn record_transition_direction(
+        &mut self,
+        direction: BehaviorTransitionDirection,
+        now: Instant,
+    ) {
+        match direction {
+            BehaviorTransitionDirection::Escalating => self.last_escalation_at = Some(now),
+            BehaviorTransitionDirection::Recovering => self.last_recovery_at = Some(now),
+        }
+    }
+}
+
+#[cfg(test)]
+impl BehaviorUpdate {
+    const fn into_transition(self) -> Option<BehaviorTransition> {
+        match self {
+            Self::Applied(transition) => Some(transition),
+            Self::Unchanged | Self::Deferred { .. } => None,
+        }
+    }
+}
+
+fn transition_direction(
+    from_memory: MemoryPressureLevel,
+    to_memory: MemoryPressureLevel,
+    from_disk: PressureLevel,
+    to_disk: PressureLevel,
+) -> Option<BehaviorTransitionDirection> {
+    use std::cmp::Ordering;
+
+    let memory_order =
+        behavior_pressure_rank(BehaviorPressureLevel::from_memory_pressure(to_memory)).cmp(
+            &behavior_pressure_rank(BehaviorPressureLevel::from_memory_pressure(from_memory)),
+        );
+    let disk_order = behavior_pressure_rank(BehaviorPressureLevel::from_disk_pressure(to_disk))
+        .cmp(&behavior_pressure_rank(
+            BehaviorPressureLevel::from_disk_pressure(from_disk),
+        ));
+
+    match (memory_order, disk_order) {
+        (Ordering::Equal, Ordering::Equal) => None,
+        (Ordering::Greater | Ordering::Equal, Ordering::Greater | Ordering::Equal) => {
+            Some(BehaviorTransitionDirection::Escalating)
+        }
+        (Ordering::Less | Ordering::Equal, Ordering::Less | Ordering::Equal) => {
+            Some(BehaviorTransitionDirection::Recovering)
+        }
+        (Ordering::Greater | Ordering::Less, Ordering::Less | Ordering::Greater) => None,
+    }
+}
+
+const fn behavior_pressure_rank(level: BehaviorPressureLevel) -> u8 {
+    match level {
+        BehaviorPressureLevel::Normal => 0,
+        BehaviorPressureLevel::Warn => 1,
+        BehaviorPressureLevel::Critical => 2,
     }
 }
 
@@ -1364,20 +1526,44 @@ impl MonitoringDaemon {
         source: &str,
         latency: Duration,
     ) {
-        if let Some(transition) = self.behavior_state.update(memory_level, disk_level) {
-            let message = format!(
-                "behavior mode changed source={source} latency_ms={} memory={:?}->{:?} \
-                 disk={:?}->{:?} mode=({}) -> ({})",
-                latency.as_millis(),
-                transition.from_memory,
-                transition.to_memory,
-                transition.from_disk,
-                transition.to_disk,
-                behavior_mode_summary(transition.from_mode),
-                behavior_mode_summary(transition.to_mode)
-            );
-            eprintln!("[SBH-DAEMON] {message}");
-            self.logger_handle.send(ActivityEvent::Info { message });
+        let hysteresis = if source == "startup" {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(self.config.pressure.behavior_hysteresis_secs)
+        };
+        match self.behavior_state.update_with_hysteresis(
+            memory_level,
+            disk_level,
+            Instant::now(),
+            hysteresis,
+        ) {
+            BehaviorUpdate::Applied(transition) => {
+                let message = format!(
+                    "behavior mode changed source={source} latency_ms={} memory={:?}->{:?} \
+                     disk={:?}->{:?} mode=({}) -> ({})",
+                    latency.as_millis(),
+                    transition.from_memory,
+                    transition.to_memory,
+                    transition.from_disk,
+                    transition.to_disk,
+                    behavior_mode_summary(transition.from_mode),
+                    behavior_mode_summary(transition.to_mode)
+                );
+                eprintln!("[SBH-DAEMON] {message}");
+                self.logger_handle.send(ActivityEvent::Info { message });
+            }
+            BehaviorUpdate::Deferred {
+                direction,
+                remaining,
+            } => {
+                let message = format!(
+                    "behavior mode transition deferred source={source} direction={direction:?} \
+                     remaining_ms={}",
+                    remaining.as_millis()
+                );
+                eprintln!("[SBH-DAEMON] {message}");
+            }
+            BehaviorUpdate::Unchanged => {}
         }
     }
 
@@ -4471,6 +4657,171 @@ mod tests {
         assert_eq!(disk_transition.to_disk, PressureLevel::Red);
         assert_eq!(state.mode.cleanup_action, CleanupAction::DefiniteCandidates);
         assert_eq!(state.mode.ballast_action, BallastAction::ReleaseFirst);
+    }
+
+    #[test]
+    fn behavior_hysteresis_defers_repeated_escalations() {
+        let t0 = Instant::now();
+        let hysteresis = Duration::from_secs(5);
+        let mut state =
+            PressureBehaviorState::new(MemoryPressureLevel::Normal, PressureLevel::Green);
+
+        match state.update_with_hysteresis(
+            MemoryPressureLevel::Warn,
+            PressureLevel::Green,
+            t0,
+            hysteresis,
+        ) {
+            BehaviorUpdate::Applied(transition) => {
+                assert_eq!(transition.to_memory, MemoryPressureLevel::Warn);
+            }
+            other => panic!("first escalation should apply immediately: {other:?}"),
+        }
+
+        match state.update_with_hysteresis(
+            MemoryPressureLevel::Critical,
+            PressureLevel::Green,
+            t0 + Duration::from_secs(1),
+            hysteresis,
+        ) {
+            BehaviorUpdate::Deferred {
+                direction,
+                remaining,
+            } => {
+                assert_eq!(direction, BehaviorTransitionDirection::Escalating);
+                assert_eq!(remaining, Duration::from_secs(4));
+            }
+            other => panic!("second escalation should be deferred: {other:?}"),
+        }
+        assert_eq!(state.memory_level, MemoryPressureLevel::Warn);
+
+        match state.update_with_hysteresis(
+            MemoryPressureLevel::Critical,
+            PressureLevel::Green,
+            t0 + hysteresis,
+            hysteresis,
+        ) {
+            BehaviorUpdate::Applied(transition) => {
+                assert_eq!(transition.from_memory, MemoryPressureLevel::Warn);
+                assert_eq!(transition.to_memory, MemoryPressureLevel::Critical);
+            }
+            other => panic!("deferred escalation should apply after hysteresis: {other:?}"),
+        }
+        assert_eq!(state.memory_level, MemoryPressureLevel::Critical);
+    }
+
+    #[test]
+    fn behavior_hysteresis_defers_repeated_recoveries() {
+        let t0 = Instant::now();
+        let hysteresis = Duration::from_secs(5);
+        let mut state =
+            PressureBehaviorState::new(MemoryPressureLevel::Critical, PressureLevel::Critical);
+
+        match state.update_with_hysteresis(
+            MemoryPressureLevel::Warn,
+            PressureLevel::Critical,
+            t0,
+            hysteresis,
+        ) {
+            BehaviorUpdate::Applied(transition) => {
+                assert_eq!(transition.to_memory, MemoryPressureLevel::Warn);
+                assert_eq!(transition.to_disk, PressureLevel::Critical);
+            }
+            other => panic!("first recovery should apply immediately: {other:?}"),
+        }
+
+        match state.update_with_hysteresis(
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+            t0 + Duration::from_secs(1),
+            hysteresis,
+        ) {
+            BehaviorUpdate::Deferred {
+                direction,
+                remaining,
+            } => {
+                assert_eq!(direction, BehaviorTransitionDirection::Recovering);
+                assert_eq!(remaining, Duration::from_secs(4));
+            }
+            other => panic!("second recovery should be deferred: {other:?}"),
+        }
+        assert_eq!(state.memory_level, MemoryPressureLevel::Warn);
+        assert_eq!(state.disk_level, PressureLevel::Critical);
+
+        match state.update_with_hysteresis(
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+            t0 + hysteresis,
+            hysteresis,
+        ) {
+            BehaviorUpdate::Applied(transition) => {
+                assert_eq!(transition.from_memory, MemoryPressureLevel::Warn);
+                assert_eq!(transition.to_memory, MemoryPressureLevel::Normal);
+                assert_eq!(transition.to_disk, PressureLevel::Green);
+            }
+            other => panic!("deferred recovery should apply after hysteresis: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn behavior_hysteresis_cancels_stale_pending_target() {
+        let t0 = Instant::now();
+        let hysteresis = Duration::from_secs(5);
+        let mut state =
+            PressureBehaviorState::new(MemoryPressureLevel::Normal, PressureLevel::Green);
+
+        assert!(
+            state
+                .update_with_hysteresis(
+                    MemoryPressureLevel::Warn,
+                    PressureLevel::Green,
+                    t0,
+                    hysteresis,
+                )
+                .into_transition()
+                .is_some()
+        );
+
+        match state.update_with_hysteresis(
+            MemoryPressureLevel::Critical,
+            PressureLevel::Green,
+            t0 + Duration::from_secs(1),
+            hysteresis,
+        ) {
+            BehaviorUpdate::Deferred {
+                direction,
+                remaining,
+            } => {
+                assert_eq!(direction, BehaviorTransitionDirection::Escalating);
+                assert_eq!(remaining, Duration::from_secs(4));
+            }
+            other => panic!("second escalation should be deferred: {other:?}"),
+        }
+
+        match state.update_with_hysteresis(
+            MemoryPressureLevel::Warn,
+            PressureLevel::Green,
+            t0 + hysteresis,
+            hysteresis,
+        ) {
+            BehaviorUpdate::Unchanged => {}
+            other => {
+                panic!("current observed pressure should cancel stale pending target: {other:?}")
+            }
+        }
+        assert_eq!(state.memory_level, MemoryPressureLevel::Warn);
+        assert_eq!(state.disk_level, PressureLevel::Green);
+
+        assert!(matches!(
+            state.update_with_hysteresis(
+                MemoryPressureLevel::Warn,
+                PressureLevel::Green,
+                t0 + hysteresis + Duration::from_secs(1),
+                hysteresis,
+            ),
+            BehaviorUpdate::Unchanged
+        ));
+        assert_eq!(state.memory_level, MemoryPressureLevel::Warn);
     }
 
     fn mock_memory_pressure(level: MemoryPressureLevel) -> MemoryPressure {

@@ -50,6 +50,25 @@ The dispatch table combines those two normalized values. For example, healthy
 memory plus red disk can scan aggressively and release ballast, while critical
 memory plus red disk uses definite-only cleanup and releases ballast first.
 
+## Behavior Transition Hysteresis
+
+The daemon applies time hysteresis to behavior-mode transitions after startup.
+This prevents a noisy memory or disk signal from flapping scan, cleanup, and
+ballast behavior back and forth within a few polling ticks.
+
+The default minimum interval is 5 seconds for repeated transitions in the same
+direction:
+
+- Escalating transitions are rate-limited against the previous escalation.
+- Recovering transitions are rate-limited against the previous recovery.
+- Escalation and recovery timers are independent, so a genuine reversal can
+  still apply immediately.
+
+The interval is configured with `pressure.behavior_hysteresis_secs` or the
+`SBH_PRESSURE_BEHAVIOR_HYSTERESIS_SECS` environment variable. A value of `0`
+disables behavior transition hysteresis. The startup seed bypasses hysteresis so
+the daemon begins in the behavior cell that matches the initial pressure sample.
+
 ## Linux Signal
 
 Linux uses PSI from `/proc/pressure/memory`, specifically the `some avg10`
