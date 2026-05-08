@@ -1,0 +1,337 @@
+# macOS Operations Guide
+
+This guide explains how `sbh` behaves on macOS and what an operator should
+expect from APFS, launchd, Full Disk Access, Homebrew-style installs, custom
+paths, and safety controls.
+
+## Quick Start
+
+For a user-scoped launchd service:
+
+```bash
+sbh install --launchd --scope user
+sbh doctor --pal
+sbh status
+```
+
+`sbh install --auto` chooses launchd on macOS, user scope, detected watched
+paths, and the medium ballast preset. Use `--scope system` only when the daemon
+must monitor system-wide paths or processes; system scope requires root and
+installs a LaunchDaemon.
+
+## Platform Defaults
+
+macOS uses native Application Support paths by default:
+
+| Scope | Config | State, logs, ballast, update cache |
+| --- | --- | --- |
+| User LaunchAgent | `~/Library/Application Support/sbh/config.toml` | `~/Library/Application Support/sbh/` |
+| System LaunchDaemon | `/Library/Application Support/sbh/config.toml` | `/private/var/sbh/` |
+
+Config path precedence is:
+
+1. `--config <PATH>`
+2. `SBH_CONFIG`
+3. Platform-native user default
+4. Platform-native system fallback when no user config exists
+
+On macOS, XDG layout is still supported for operators who already use it. `sbh`
+uses XDG paths when `SBH_USE_XDG_PATHS=1`, `XDG_CONFIG_HOME`, or
+`XDG_DATA_HOME` is set, or when `~/.config/sbh/config.toml` already exists and
+the native Application Support config does not.
+
+## launchd Integration
+
+`sbh` generates launchd plists instead of systemd units on macOS.
+
+| Scope | Plist location | Logs |
+| --- | --- | --- |
+| User | `~/Library/LaunchAgents/` | `~/Library/Logs/sbh/` |
+| System | `/Library/LaunchDaemons/` | `/var/log/sbh/` |
+
+The generated plist sets:
+
+- `RunAtLoad=true`, so the daemon starts on login or boot.
+- `KeepAlive` with `SuccessfulExit=false`, so crashes restart but clean exits
+  stay stopped.
+- `ThrottleInterval=10`, to avoid rapid restart loops.
+- `Nice=19` and `LowPriorityIO=true`, so cleanup work yields to foreground
+  user work and builds.
+
+Use these commands for service health:
+
+```bash
+sbh service --launchd --scope user status
+sbh service --launchd --scope user restart
+sbh doctor --pal
+```
+
+`sbh doctor --pal` checks launchd status and prints the exact remediation when
+launchctl cannot load or inspect the service.
+
+## APFS Capacity
+
+APFS space accounting is different from fixed Linux filesystems. Multiple
+volumes often share one APFS container, so a volume can report a logical size
+that is not the actual physical ceiling for disk pressure.
+
+On macOS, `sbh` combines:
+
+- `statfs` for live filesystem capacity.
+- `diskutil apfs list -plist` for APFS container and volume metadata.
+- Foundation important-usage capacity when available.
+- `tmutil listlocalsnapshots` for local Time Machine snapshot inventory.
+
+Status JSON exposes APFS metadata under the mount payload:
+
+```json
+{
+  "platform": {
+    "darwin": {
+      "apfs": {
+        "container_id": "/dev/disk3",
+        "container_total_bytes": 1000,
+        "container_available_bytes": 250,
+        "volume_role": "Data",
+        "purgeable_bytes": 32,
+        "local_snapshot_bytes": 64,
+        "free_excludes_purgeable": true
+      }
+    }
+  }
+}
+```
+
+The important invariant is `free_excludes_purgeable: true`. `sbh` reports
+purgeable storage, but it does not count purgeable bytes as free space when
+making pressure decisions. Purgeable storage is controlled by macOS and may not
+be immediately reclaimable when a build or daemon needs space right now.
+
+## Purgeable Space
+
+Finder and System Settings may show "available" space that includes purgeable
+content. `sbh` separates that from real free space because cleanup decisions
+must be conservative.
+
+When purgeable APFS storage is present, `sbh status` prints a separate
+Purgeable Storage section and JSON includes `purgeable_bytes`. Treat it as
+diagnostic context, not as guaranteed emergency headroom.
+
+## Local Time Machine Snapshots
+
+Local snapshots can retain blocks after files are deleted. This matters during
+incidents: `sbh ballast release` can unlink ballast files immediately, but APFS
+may not show the recovered bytes in `df`, Finder, or status output until the
+snapshot retaining those blocks is thinned or expires.
+
+Dry-run the snapshot thinning plan:
+
+```bash
+sbh clean --thin-local-snapshots --dry-run
+```
+
+Execute it for the root mount:
+
+```bash
+sudo sbh clean --thin-local-snapshots --yes
+```
+
+Target a specific APFS mount:
+
+```bash
+sudo sbh clean --thin-local-snapshots --yes --local-snapshot-mount /System/Volumes/Data
+```
+
+The underlying command is:
+
+```bash
+sudo tmutil thinlocalsnapshots <mount> 9999999999999999 4
+```
+
+Thinning can take 30 seconds or longer. The exact bytes released are controlled
+by Time Machine and APFS, not by `sbh`.
+
+## Ballast On APFS
+
+The default user ballast path is:
+
+```text
+~/Library/Application Support/sbh/ballast.bin
+```
+
+The default system ballast path is:
+
+```text
+/private/var/sbh/ballast.bin
+```
+
+`[paths].ballast_dir` can move the ballast pool to another volume. Put ballast
+on the same volume that needs emergency headroom. A ballast pool on the wrong
+mount does not help the full mount.
+
+When APFS local snapshots are present, released ballast blocks may remain
+retained by snapshots. If `sbh ballast release` warns about snapshots, thin
+snapshots and then re-check:
+
+```bash
+sbh status
+df -h /
+```
+
+## Full Disk Access
+
+macOS Transparency, Consent, and Control protects user data under locations
+such as Mail, Messages, and parts of `~/Library`. `sbh` probes Full Disk Access
+by attempting to read the Mail Envelope Index under:
+
+```text
+~/Library/Mail/V*/MailData/Envelope Index
+```
+
+Check the current grant:
+
+```bash
+sbh doctor --pal
+```
+
+When access is missing, doctor output includes a `macos_full_disk_access`
+follow-up and points to `docs/macos-full-disk-access.md`. Grant access before
+relying on macOS cleanup scans that need protected user data.
+
+After changing Full Disk Access, restart the launchd service or rerun the
+command that needs access:
+
+```bash
+sbh service --launchd --scope user restart
+sbh doctor --pal
+```
+
+Development builds need their own Full Disk Access entry if they run from a
+different path than the installed `sbh` binary.
+
+## Homebrew And Install Paths
+
+Apple Silicon Homebrew normally installs under:
+
+```text
+/opt/homebrew/bin/sbh
+```
+
+Intel Homebrew normally installs under:
+
+```text
+/usr/local/bin/sbh
+```
+
+Bootstrap and repair checks also inspect common Homebrew sbin paths and Cellar
+layouts under `/opt/homebrew` and `/usr/local`. That lets `sbh bootstrap` detect
+stale binaries, stale launchd plists, and legacy footprints after a move
+between manual and Homebrew-style locations.
+
+Homebrew tap publishing is release-engineering work. Until a formula is
+published, a manually installed or from-source binary can still live in one of
+the standard Homebrew prefixes as long as the launchd plist points at the
+actual binary path.
+
+## Watched Paths
+
+The install wizard auto-detects watched paths from:
+
+- `/data/projects`
+- platform temp directories, including `/tmp`
+- the user's home directory when available
+
+The static config defaults also include common Linux-style roots such as
+`/data/projects`, `/tmp`, `/data/tmp`, `/var/tmp`, `/home`, and `/root`.
+Review generated config on macOS and keep watched roots intentionally narrow.
+
+Set custom roots in config:
+
+```toml
+[scanner]
+root_paths = [
+  "/Users/me/Projects",
+  "/private/tmp",
+]
+```
+
+Use protections for durable data inside broad roots:
+
+```bash
+sbh protect /Users/me/Projects/important-repo
+```
+
+Or use config globs:
+
+```toml
+[scanner]
+protected_paths = [
+  "/Users/me/Projects/client-*",
+  "/Users/me/Library/Mobile Documents/com~apple~CloudDocs/Client Records/*",
+]
+```
+
+See `docs/sacred-paths.md` for the built-in sacred catalog and the reasoning
+for every protected pattern.
+
+## macOS Cleanup Safety Model
+
+macOS cleanup rules are specific and conservative:
+
+- Xcode DerivedData cleanup targets immediate children of
+  `~/Library/Developer/Xcode/DerivedData/`, not the root as one broad delete.
+- Electron cleanup targets regenerated cache shapes such as `Cache`,
+  `Code Cache`, `GPUCache`, `IndexedDB`, `Service Worker/CacheStorage`, and
+  `vm_bundles`.
+- `/private/tmp/*-target`, `*_target`, and `target_*` are treated as likely
+  build artifacts only after age and safety checks.
+- User-named trash directories under temporary roots are ambiguous and require
+  review unless another hard veto keeps them.
+- Time Machine snapshot thinning uses `tmutil`; it is not path deletion.
+- `~/.Trash` and iCloud Drive trash are report-only. `sbh` does not auto-empty
+  user trash.
+
+Every cleanup candidate still passes hard vetoes: sacred-overlap checks,
+`.sbh-protect` markers, parent checks, active-reference evidence where visible,
+minimum age, and source-root checks.
+
+User-scope macOS runs can have incomplete visibility into other users'
+processes. When active-reference checks are incomplete, `sbh` surfaces that
+reason in scan output instead of silently pretending visibility is complete.
+
+## Security Model
+
+`sbh` separates observation from mutation:
+
+- `sbh status`, `sbh check`, `sbh scan`, `sbh doctor --pal`, and dry-runs are
+  non-destructive.
+- `sbh clean --dry-run` prints the plan without deletion.
+- `sbh clean --yes`, daemon cleanup in enforcing policy modes, and ballast
+  release are mutating operations.
+- Protected paths and sacred paths are hard vetoes, not scoring hints.
+- Purgeable space is reported separately and excluded from free-space pressure
+  decisions.
+- launchd runs with low scheduling and IO priority so it yields to foreground
+  work.
+
+For incident response, prefer this sequence:
+
+```bash
+sbh doctor --pal
+sbh status --json
+sbh clean --thin-local-snapshots --dry-run
+sbh scan /private/tmp --top 20
+sbh clean /private/tmp --dry-run
+```
+
+Only add `--yes` after the dry-run output names exactly the paths you expect.
+
+## Troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| `sbh doctor --pal` reports missing Full Disk Access | Follow `docs/macos-full-disk-access.md`, restart launchd, rerun doctor. |
+| `df` does not show space after ballast release | Check local snapshots and run snapshot thinning. |
+| launchd says the service is not loaded | Run `sbh service --launchd --scope user status` for the exact launchctl diagnostic. |
+| Status shows purgeable bytes but pressure remains high | Treat purgeable as informational; free real space or thin snapshots. |
+| Cleanup cannot see active references for some processes | Use system scope when system-wide process visibility is required. |

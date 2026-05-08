@@ -466,6 +466,7 @@ Configure via command palette (`:` then type `pref`) or directly in the preferen
 
 - Installer/update parity contract and security policy: `docs/installer-dx-parity-matrix.md`
 - macOS Full Disk Access grant guide: `docs/macos-full-disk-access.md`
+- macOS operations guide: `docs/macos.md`
 - Sacred path catalog and per-pattern safety reasoning: `docs/sacred-paths.md`
 - Dashboard/status baseline contract (pre-overhaul): `docs/dashboard-status-contract-baseline.md`
 - Dashboard IA + navigation map (overhaul design baseline): `docs/dashboard-information-architecture.md`
