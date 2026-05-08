@@ -21,6 +21,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require docs updates for user-facing changes
+        if: github.event_name == 'pull_request'
+        run: bash scripts/ci_docs_update_check.sh
       - name: Strip local-only TUI path deps
         run: |
           # ftui crates use /dp/frankentui/ paths unavailable in CI

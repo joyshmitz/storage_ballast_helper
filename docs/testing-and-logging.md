@@ -193,6 +193,23 @@ gate level. HARD failures block merge/release. SOFT failures require waivers.
 **Remote compilation:** CPU-intensive stages use `rch exec` by default.
 Use `--local` to skip rch. CI workflows run locally (no rch available).
 
+**Docs update lint:** PR CI runs `scripts/ci_docs_update_check.sh` in the
+Format + Lint job before Cargo setup. The guard compares the pull request
+against the base branch and fails when user-facing source, installer,
+packaging, cleanup-policy, or config-schema files change without a companion
+update to README, `docs/`, CHANGELOG, CLI help text in `src/cli_app.rs`, or the
+Homebrew formula. It also checks two high-risk cases directly:
+
+- New `#[arg]` or `#[command]` annotations in `src/cli_app.rs` must add clap
+  help/about text or a Rust doc comment in the same diff.
+- New public config fields in `src/core/config.rs` must update config docs or
+  sample configs.
+
+Local dry run:
+```bash
+DOCS_UPDATE_BASE=origin/main DOCS_UPDATE_HEAD=HEAD bash scripts/ci_docs_update_check.sh
+```
+
 **CI artifact retention** (`.github/workflows/ci.yml`):
 
 | CI Job | Artifacts | Retention |

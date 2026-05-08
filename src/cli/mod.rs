@@ -1356,6 +1356,59 @@ mod tests {
     }
 
     #[test]
+    fn ci_requires_docs_updates_for_user_facing_changes() {
+        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
+        let docs_lint = include_str!("../../scripts/ci_docs_update_check.sh");
+        let testing_guide = include_str!("../../docs/testing-and-logging.md");
+
+        for required in [
+            "fetch-depth: 0",
+            "Require docs updates for user-facing changes",
+            "github.event_name == 'pull_request'",
+            "bash scripts/ci_docs_update_check.sh",
+        ] {
+            assert!(
+                ci_workflow.contains(required),
+                "CI workflow must run docs update lint on PRs: {required}"
+            );
+        }
+
+        for required in [
+            "src/(main|cli_app)\\.rs",
+            "src/core/config\\.rs",
+            "src/scanner/(patterns|protection|deletion|scoring)\\.rs",
+            "README\\.md",
+            "CHANGELOG\\.md",
+            "docs/",
+            "src/cli_app\\.rs",
+            "packaging/homebrew/Formula/sbh\\.rb",
+            "DOCS_UPDATE_BASE",
+            "DOCS_UPDATE_HEAD",
+            "::error::",
+            "CLI flag/command annotations changed without added help text",
+            "configuration fields changed without a config documentation update",
+        ] {
+            assert!(
+                docs_lint.contains(required),
+                "docs update lint must enforce user-facing/doc companion fragment: {required}"
+            );
+        }
+
+        for required in [
+            "scripts/ci_docs_update_check.sh",
+            "user-facing source",
+            "CLI help text",
+            "sample configs",
+            "DOCS_UPDATE_BASE=origin/main DOCS_UPDATE_HEAD=HEAD bash scripts/ci_docs_update_check.sh",
+        ] {
+            assert!(
+                testing_guide.contains(required),
+                "testing guide must document docs update lint behavior: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn homebrew_formula_skeleton_tracks_release_asset_contract() {
         let formula = include_str!("../../packaging/homebrew/Formula/sbh.rb");
 
