@@ -1296,6 +1296,27 @@ mod tests {
     }
 
     #[test]
+    fn ci_workflow_ad_hoc_signs_macos_pr_builds() {
+        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
+
+        for required in [
+            "pull_request:",
+            "macOS Platform Tests (${{ matrix.runner }})",
+            "Ad-hoc sign and verify release binary",
+            "codesign --force --sign -",
+            "codesign --verify --strict --verbose=2 \"${bin}\"",
+            "codesign -dv \"${bin}\"",
+            "codesign --display --verbose=4 \"${bin}\"",
+            "macos-codesign-output.txt",
+        ] {
+            assert!(
+                ci_workflow.contains(required),
+                "CI workflow must include PR ad-hoc signing contract fragment: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn release_workflow_notarizes_macos_binaries_asynchronously() {
         let release_workflow = include_str!("../../.github/workflows/release.yml");
 

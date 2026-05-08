@@ -340,6 +340,7 @@ jobs:
           {
             codesign --force --sign - --options runtime --timestamp=none --entitlements "${entitlements}" "${bin}"
             codesign --verify --strict --verbose=2 "${bin}"
+            codesign -dv "${bin}"
             codesign --display --verbose=4 "${bin}"
           } 2>&1 | tee macos-codesign-output.txt
           codesign --display --entitlements :- "${bin}" > macos-codesign-entitlements.plist

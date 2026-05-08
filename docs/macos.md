@@ -255,6 +255,9 @@ Tagged macOS release archives are signed the same way before packaging. The
 ad-hoc identity used in CI is only for build validation; Developer ID signing
 and notarization use the same entitlement file once release credentials are
 available.
+CI runs the ad-hoc signing check on both `push` and `pull_request` events so
+PRs exercise the macOS codesign path without requiring a Developer ID
+certificate.
 
 Tagged macOS releases also run an explicit notarization phase. Apple accepts
 notary uploads as ZIP archives, disk images, or signed flat packages, while the
