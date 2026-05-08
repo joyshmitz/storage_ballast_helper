@@ -122,6 +122,58 @@ fn subcommand_help_flags_work() {
 }
 
 #[test]
+fn macos_aware_help_text_is_visible() {
+    let top = common::run_cli_case("macos_aware_top_help", &["--help"]);
+    assert!(
+        top.status.success(),
+        "top-level --help failed; log: {}",
+        top.log_path.display()
+    );
+    for fragment in [
+        "Linux/macOS disk space guardian",
+        "auto-detects Linux/systemd and macOS/launchd",
+        "Full Disk Access diagnostics",
+    ] {
+        assert!(
+            top.stdout.contains(fragment),
+            "top-level --help missing platform fragment {fragment:?}; log: {}",
+            top.log_path.display()
+        );
+    }
+
+    let install = common::run_cli_case("macos_aware_install_help", &["install", "--help"]);
+    assert!(
+        install.status.success(),
+        "install --help failed; log: {}",
+        install.log_path.display()
+    );
+    for fragment in [
+        "Omit --systemd/--launchd for auto-detection",
+        "launchd user scope",
+        "Full Disk Access",
+    ] {
+        assert!(
+            install.stdout.contains(fragment),
+            "install --help missing platform fragment {fragment:?}; log: {}",
+            install.log_path.display()
+        );
+    }
+
+    let clean = common::run_cli_case("macos_aware_clean_help", &["clean", "--help"]);
+    assert!(
+        clean.status.success(),
+        "clean --help failed; log: {}",
+        clean.log_path.display()
+    );
+    assert!(
+        clean.stdout.contains("Time Machine/APFS")
+            && clean.stdout.contains("does not delete user paths"),
+        "clean --help missing Time Machine/APFS safety copy; log: {}",
+        clean.log_path.display()
+    );
+}
+
+#[test]
 fn json_flag_accepted_by_status() {
     let result = common::run_cli_case("json_flag_accepted_by_status", &["status", "--json"]);
     // Status may succeed or fail depending on system state, but

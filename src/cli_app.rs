@@ -60,7 +60,8 @@ const LOCAL_SNAPSHOT_THIN_URGENCY: u8 = 4;
     name = "sbh",
     author,
     version,
-    about = "Storage Ballast Helper - Disk Space Guardian",
+    about = "Storage Ballast Helper - Linux/macOS disk space guardian",
+    after_long_help = "Platform behavior:\n  sbh auto-detects Linux/systemd and macOS/launchd when service flags are omitted.\n  macOS runs use launchd, APFS-aware ballast checks, Time Machine snapshot warnings,\n  and Full Disk Access diagnostics where relevant.",
     long_about = None,
     arg_required_else_help = true,
     max_term_width = 100
@@ -152,6 +153,9 @@ struct DaemonArgs {
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
+#[command(
+    after_long_help = "Platform notes:\n  Omit --systemd/--launchd for auto-detection.\n  On macOS, --auto selects launchd user scope and native Application Support paths.\n  Use sbh doctor --pal after install to verify launchd, APFS, and Full Disk Access state."
+)]
 #[allow(clippy::struct_excessive_bools)]
 struct InstallArgs {
     /// Install systemd service units (Linux).
@@ -230,6 +234,9 @@ impl ResolvedServiceControl {
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
+#[command(
+    after_long_help = "Platform notes:\n  Omit --systemd/--launchd for auto-detection.\n  On macOS, launchd plist discovery checks both user and system scopes before removal."
+)]
 #[allow(clippy::struct_excessive_bools)]
 struct UninstallArgs {
     /// Remove systemd service units (Linux).
@@ -260,6 +267,9 @@ struct StatusArgs {
 }
 
 #[derive(Debug, Clone, Args, Serialize)]
+#[command(
+    after_long_help = "Platform notes:\n  Omit --systemd/--launchd for auto-detection.\n  On macOS, service status uses launchctl and reports the launchd target plus plist path."
+)]
 #[allow(clippy::struct_excessive_bools)]
 struct ServiceArgs {
     /// Use systemd service controls.
@@ -297,6 +307,9 @@ struct ServiceLogsArgs {
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
+#[command(
+    after_long_help = "Platform notes:\n  Use --pal for platform diagnostics.\n  On macOS this includes launchd, APFS, codesign/notarization, and Full Disk Access checks."
+)]
 struct DoctorArgs {
     /// Probe the Platform Abstraction Layer implementation.
     #[arg(long)]
@@ -339,6 +352,9 @@ struct ScanArgs {
 }
 
 #[derive(Debug, Clone, Args, Serialize)]
+#[command(
+    after_long_help = "Platform notes:\n  On macOS, --thin-local-snapshots asks Time Machine/APFS to reclaim local snapshot space.\n  It does not delete user paths and may require sudo/root."
+)]
 struct CleanArgs {
     /// Paths to clean (falls back to configured watched paths when omitted).
     #[arg(value_name = "PATH")]
@@ -382,6 +398,9 @@ impl Default for CleanArgs {
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
+#[command(
+    after_long_help = "Platform notes:\n  On macOS, ballast provisioning uses APFS-aware preallocation and verifies allocated blocks.\n  Ballast release warns when Time Machine local snapshots may retain released bytes."
+)]
 struct BallastArgs {
     /// Ballast operation to run.
     #[command(subcommand)]
@@ -7323,7 +7342,8 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
             OutputMode::Human => {
                 print_clean_summary(&report);
                 eprintln!(
-                    "\nConsider installing sbh for ongoing protection: sbh install --systemd --user"
+                    "\nConsider installing sbh for ongoing protection: {}",
+                    ongoing_protection_install_hint()
                 );
             }
             OutputMode::Json => {
@@ -7336,6 +7356,10 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+fn ongoing_protection_install_hint() -> &'static str {
+    "sbh install --auto"
 }
 
 /// Interactive emergency cleanup — like interactive clean but with emergency messaging.
@@ -7438,7 +7462,8 @@ fn run_interactive_emergency(
                 eprintln!("  Skipped: {items_skipped} items");
             }
             eprintln!(
-                "\nConsider installing sbh for ongoing protection: sbh install --systemd --user"
+                "\nConsider installing sbh for ongoing protection: {}",
+                ongoing_protection_install_hint()
             );
         }
         OutputMode::Json => {
@@ -10003,6 +10028,94 @@ mod tests {
                 "help output missing command: {keyword}"
             );
         }
+    }
+
+    fn render_subcommand_long_help(name: &str) -> String {
+        let mut cmd = Cli::command();
+        cmd.find_subcommand_mut(name)
+            .unwrap_or_else(|| panic!("missing subcommand {name}"))
+            .render_long_help()
+            .to_string()
+    }
+
+    #[test]
+    fn help_mentions_platform_autodetection_and_macos_behavior() {
+        let mut cmd = Cli::command();
+        let top_help = cmd.render_long_help().to_string();
+        for fragment in [
+            "Linux/macOS disk space guardian",
+            "auto-detects Linux/systemd and macOS/launchd",
+            "APFS-aware ballast checks",
+            "Full Disk Access diagnostics",
+        ] {
+            assert!(
+                top_help.contains(fragment),
+                "top-level help missing platform fragment: {fragment}"
+            );
+        }
+
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "install",
+                &[
+                    "Omit --systemd/--launchd for auto-detection",
+                    "launchd user scope",
+                    "Full Disk Access",
+                ],
+            ),
+            (
+                "uninstall",
+                &[
+                    "Omit --systemd/--launchd for auto-detection",
+                    "launchd plist discovery",
+                ],
+            ),
+            (
+                "service",
+                &[
+                    "Omit --systemd/--launchd for auto-detection",
+                    "launchctl",
+                    "plist path",
+                ],
+            ),
+            (
+                "doctor",
+                &[
+                    "launchd",
+                    "APFS",
+                    "codesign/notarization",
+                    "Full Disk Access",
+                ],
+            ),
+            (
+                "clean",
+                &["Time Machine/APFS", "does not delete user paths"],
+            ),
+            (
+                "ballast",
+                &["APFS-aware preallocation", "Time Machine local snapshots"],
+            ),
+        ];
+
+        for (subcommand, fragments) in cases {
+            let help = render_subcommand_long_help(subcommand);
+            for fragment in *fragments {
+                assert!(
+                    help.contains(fragment),
+                    "{subcommand} help missing platform fragment: {fragment}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn emergency_install_hint_uses_auto_detected_install() {
+        let hint = ongoing_protection_install_hint();
+        assert_eq!(hint, "sbh install --auto");
+        assert!(
+            !hint.contains("--systemd"),
+            "emergency hint must not recommend Linux-only service flags"
+        );
     }
 
     #[test]
