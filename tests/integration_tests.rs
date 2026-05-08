@@ -828,6 +828,172 @@ fn wait_for_file(path: &Path, timeout: Duration, mut poll: impl FnMut()) {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn macos_foreground_daemon_idle_energy_budget() {
+    const SAMPLE_DURATION: Duration = Duration::from_secs(60);
+    const STARTUP_GRACE: Duration = Duration::from_secs(3);
+    const MAX_IDLE_RSS_BYTES: u64 = 50 * 1_048_576;
+    const MAX_IDLE_WAKEUPS_PER_SEC: u64 = 100;
+
+    if should_skip_energy_impact_test() {
+        return;
+    }
+
+    let dir = tempfile::Builder::new()
+        .prefix("sbh_energy_test_")
+        .tempdir_in("/private/tmp")
+        .expect("create energy test directory");
+    let scan_root = dir.path().join("scan-root");
+    let state_dir = dir.path().join("state");
+    let ballast_dir = dir.path().join("ballast");
+    fs::create_dir(&scan_root).expect("create scan root");
+    fs::create_dir(&state_dir).expect("create state dir");
+    fs::create_dir(&ballast_dir).expect("create ballast dir");
+
+    let config_path = dir.path().join("config.toml");
+    let stderr_path = dir.path().join("daemon.stderr");
+    write_energy_test_config(&config_path, &scan_root, &state_dir, &ballast_dir);
+
+    let mut daemon = ChildGuard::new(spawn_energy_test_daemon(&config_path, &stderr_path));
+    std::thread::sleep(STARTUP_GRACE);
+    assert_child_still_running(&mut daemon.child, "energy daemon exited during startup");
+
+    let baseline = daemon_energy_sample(daemon.child.id());
+    let started_at = Instant::now();
+    std::thread::sleep(SAMPLE_DURATION);
+    assert_child_still_running(
+        &mut daemon.child,
+        "energy daemon exited before sample completed",
+    );
+    let elapsed = started_at.elapsed();
+    let final_sample = daemon_energy_sample(daemon.child.id());
+
+    let wakeups_delta = final_sample
+        .idle_wakeups
+        .saturating_sub(baseline.idle_wakeups);
+    let elapsed_secs = elapsed.as_secs().max(1);
+    let allowed_wakeups = MAX_IDLE_WAKEUPS_PER_SEC.saturating_mul(elapsed_secs);
+    assert!(
+        wakeups_delta <= allowed_wakeups,
+        "idle daemon exceeded wakeup budget: delta={wakeups_delta} elapsed_secs={elapsed_secs} allowed={allowed_wakeups} baseline={baseline:?} final={final_sample:?}"
+    );
+    assert!(
+        final_sample.rss_bytes <= MAX_IDLE_RSS_BYTES,
+        "idle daemon exceeded RSS budget: rss={} max={} baseline={baseline:?} final={final_sample:?}",
+        final_sample.rss_bytes,
+        MAX_IDLE_RSS_BYTES
+    );
+
+    send_signal(daemon.child.id(), "TERM");
+    let status = wait_for_child_exit(&mut daemon.child, Duration::from_secs(5));
+    assert!(
+        status.success(),
+        "energy daemon SIGTERM should exit cleanly, got {status}"
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn macos_foreground_daemon_idle_energy_budget() {}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct DaemonEnergySample {
+    rss_bytes: u64,
+    idle_wakeups: u64,
+}
+
+#[cfg(target_os = "macos")]
+fn should_skip_energy_impact_test() -> bool {
+    if env::var_os("SBH_SLOW_CI_RUNNER").is_some() {
+        eprintln!("skipping energy impact test on runner marked SBH_SLOW_CI_RUNNER");
+        return true;
+    }
+    if env::var_os("SBH_SKIP_ENERGY_IMPACT_TEST").is_some() {
+        eprintln!("skipping energy impact test because SBH_SKIP_ENERGY_IMPACT_TEST is set");
+        return true;
+    }
+    if env::var("SBH_RUN_ENERGY_IMPACT_TEST").as_deref() == Ok("1") {
+        return false;
+    }
+    eprintln!(
+        "skipping energy impact test; set SBH_RUN_ENERGY_IMPACT_TEST=1 to run the 60s release-binary budget check"
+    );
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_energy_sample(pid: u32) -> DaemonEnergySample {
+    let pid = i32::try_from(pid).expect("child pid should fit i32");
+    let task = storage_ballast_helper::platform::macos::libproc::proc_pidinfo_task(pid)
+        .expect("read daemon task info");
+    let rusage = storage_ballast_helper::platform::macos::libproc::proc_pid_rusage_v4_safe(pid)
+        .expect("read daemon rusage info");
+    DaemonEnergySample {
+        rss_bytes: task.pti_resident_size,
+        idle_wakeups: rusage
+            .ri_pkg_idle_wkups
+            .saturating_add(rusage.ri_interrupt_wkups),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_energy_test_daemon(config_path: &Path, stderr_path: &Path) -> Child {
+    let bin_path =
+        env::var_os("SBH_ENERGY_TEST_BIN").map_or_else(common::sbh_bin_path, PathBuf::from);
+    let stderr = fs::File::create(stderr_path).expect("create daemon stderr log");
+    Command::new(bin_path)
+        .arg("--config")
+        .arg(config_path)
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .expect("spawn foreground daemon for energy test")
+}
+
+#[cfg(target_os = "macos")]
+fn write_energy_test_config(
+    config_path: &Path,
+    scan_root: &Path,
+    state_dir: &Path,
+    ballast_dir: &Path,
+) {
+    let state_file = state_dir.join("state.json");
+    let sqlite_db = state_dir.join("activity.sqlite3");
+    let jsonl_log = state_dir.join("activity.jsonl");
+    let config = format!(
+        r#"[paths]
+state_file = "{}"
+sqlite_db = "{}"
+jsonl_log = "{}"
+ballast_dir = "{}"
+
+[pressure]
+poll_interval_ms = 15000
+
+[scanner]
+root_paths = ["{}"]
+min_file_age_minutes = 60
+max_depth = 1
+parallelism = 1
+dry_run = true
+
+[ballast]
+file_count = 0
+file_size_bytes = 4096
+"#,
+        toml_path(&state_file),
+        toml_path(&sqlite_db),
+        toml_path(&jsonl_log),
+        toml_path(ballast_dir),
+        toml_path(scan_root),
+    );
+    fs::write(config_path, config).expect("write daemon energy test config");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn macos_foreground_daemon_handles_term_hup_and_siginfo() {
     let dir = tempfile::Builder::new()
         .prefix("sbh_signal_test_")

@@ -317,6 +317,18 @@ jobs:
       - name: Build release binary
         shell: bash
         run: cargo build $CI_FEATURES --release 2>&1 | tee macos-release-build-output.txt
+      - name: Run idle energy impact budget
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="${PWD}/target/release/sbh"
+          test -x "${bin}"
+          SBH_RUN_ENERGY_IMPACT_TEST=1 \
+          SBH_ENERGY_TEST_BIN="${bin}" \
+            cargo test $CI_FEATURES --test integration_tests \
+              macos_foreground_daemon_idle_energy_budget \
+              -- --nocapture 2>&1 | tee macos-energy-impact-test-output.txt
       - name: Ad-hoc sign and verify release binary
         shell: bash
         run: |
@@ -389,6 +401,7 @@ jobs:
             macos-unit-bin-output.txt
             macos-integration-output.txt
             macos-release-build-output.txt
+            macos-energy-*.txt
             macos-codesign-output.txt
             macos-launchd-*.txt
             macos-launchd-*.jsonl
