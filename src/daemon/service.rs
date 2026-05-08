@@ -1148,6 +1148,31 @@ mod tests {
     }
 
     #[test]
+    fn plist_sets_background_qos_controls() {
+        let mgr = LaunchdServiceManager::new(test_launchd_config(false));
+        let value = parse_plist(&mgr.generate_plist());
+        let dict = value.as_dictionary().expect("plist root should be a dict");
+
+        assert_eq!(
+            dict.get("ProcessType").and_then(plist::Value::as_string),
+            Some("Background")
+        );
+        assert_eq!(
+            dict.get("LowPriorityIO").and_then(plist::Value::as_boolean),
+            Some(true)
+        );
+        assert_eq!(
+            dict.get("Nice").and_then(plist::Value::as_signed_integer),
+            Some(19)
+        );
+        assert_eq!(
+            dict.get("ThrottleInterval")
+                .and_then(plist::Value::as_signed_integer),
+            Some(60)
+        );
+    }
+
+    #[test]
     fn plist_has_throttle_interval() {
         let mgr = LaunchdServiceManager::new(test_launchd_config(false));
         let plist = mgr.generate_plist();
