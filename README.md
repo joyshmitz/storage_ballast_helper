@@ -531,6 +531,7 @@ Configure via command palette (`:` then type `pref`) or directly in the preferen
 - Installer/update parity contract and security policy: `docs/installer-dx-parity-matrix.md`
 - macOS Full Disk Access grant guide: `docs/macos-full-disk-access.md`
 - macOS operations guide: `docs/macos.md`
+- macOS launchd troubleshooting guide: `docs/launchd-troubleshooting.md`
 - Sacred path catalog and per-pattern safety reasoning: `docs/sacred-paths.md`
 - Dashboard/status baseline contract (pre-overhaul): `docs/dashboard-status-contract-baseline.md`
 - Dashboard IA + navigation map (overhaul design baseline): `docs/dashboard-information-architecture.md`
@@ -1696,6 +1697,8 @@ For test harness conventions and structured logging registration, see `docs/test
 - Linux: inspect `systemctl status sbh` and `journalctl -u sbh -e` for logs.
 - macOS: run `sbh service --launchd --scope user status`, inspect
   `launchctl list | grep sbh`, and check `~/Library/Logs/sbh/` for log output.
+  See `docs/launchd-troubleshooting.md` for interpreting `launchctl print`
+  output and stale-state recovery.
 - Run `sbh daemon` directly to capture startup errors.
 - Verify binary path is correct: `sbh config show --json | jq '.paths'`.
 

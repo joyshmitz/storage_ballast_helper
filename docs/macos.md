@@ -402,6 +402,6 @@ Only add `--yes` after the dry-run output names exactly the paths you expect.
 | --- | --- |
 | `sbh doctor --pal` reports missing Full Disk Access | Follow `docs/macos-full-disk-access.md`, restart launchd, rerun doctor. |
 | `df` does not show space after ballast release | Check local snapshots and run snapshot thinning. |
-| launchd says the service is not loaded | Run `sbh service --launchd --scope user status` for the exact launchctl diagnostic. |
+| launchd says the service is not loaded | Run `sbh service --launchd --scope user status`, then use `docs/launchd-troubleshooting.md` for `launchctl print` interpretation and recovery. |
 | Status shows purgeable bytes but pressure remains high | Treat purgeable as informational; free real space or thin snapshots. |
 | Cleanup cannot see active references for some processes | Use system scope when system-wide process visibility is required. |
