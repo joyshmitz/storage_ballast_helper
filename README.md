@@ -168,7 +168,7 @@ The bootstrap system detects and repairs common installation problems, from stal
 
 ### Migration Reasons
 
-The bootstrap scanner checks for 13 migration conditions:
+The bootstrap scanner checks for 15 migration conditions:
 
 | Reason | Description |
 | --- | --- |
@@ -178,6 +178,8 @@ The bootstrap scanner checks for 13 migration conditions:
 | `systemd-unit-stale-binary` | systemd `ExecStart` points to a missing binary |
 | `launchd-plist-stale-binary` | launchd `ProgramArguments` references a missing binary |
 | `deprecated-config-key` | Config uses renamed keys (`scan_interval_secs`, `max_ballast_mb`, `log_level`) |
+| `legacy-config-path` | Config exists in an older Linux/XDG, manual, or Homebrew path and should be copied to the canonical platform path |
+| `legacy-data-path` | State/log files exist in an older Linux/XDG, manual, or Homebrew data path and should be copied to the canonical platform data directory |
 | `missing-state-file` | Data directory exists but `state.json` is absent |
 | `orphaned-completion` | Shell completion script installed for an unavailable shell |
 | `stale-completion` | Completion script out of date |
@@ -188,9 +190,9 @@ The bootstrap scanner checks for 13 migration conditions:
 
 ### Repair Actions
 
-Each detected issue maps to one of 8 action types: `RemoveProfileLine`, `DeduplicateProfile`, `FixPermissions`, `UpdateServicePath`, `RemoveOrphanedFile`, `CleanupBackup`, `CreateDirectory`, `InitStateFile`.
+Each detected issue maps to one of 10 action types: `RemoveProfileLine`, `DeduplicateProfile`, `FixPermissions`, `UpdateServicePath`, `CopyLegacyConfig`, `CopyLegacyState`, `RemoveOrphanedFile`, `CleanupBackup`, `CreateDirectory`, `InitStateFile`.
 
-All mutations create timestamped backups before writing. A 7-day default threshold governs automatic cleanup of old backup files.
+All mutations create timestamped backups before writing. Legacy config/state migration is copy-only and never overwrites an existing canonical file, so older XDG/manual/Homebrew sources remain in place until the operator removes them deliberately. A 7-day default threshold governs automatic cleanup of old backup files.
 
 ```bash
 # Run bootstrap scan and repair

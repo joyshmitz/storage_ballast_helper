@@ -4,12 +4,14 @@
 //! and applies deterministic migrations with timestamped backups. Every mutation
 //! is logged with a reason code and is reversible.
 
+use std::env;
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::core::config::{PathsConfig, sacred_config_path_for};
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------
@@ -32,6 +34,10 @@ pub enum MigrationReason {
     LaunchdPlistStaleBinary,
     /// Config file uses a deprecated key or schema version.
     DeprecatedConfigKey,
+    /// Config file exists in a legacy or non-canonical install path.
+    LegacyConfigPath,
+    /// Data/state files exist in a legacy or non-canonical install path.
+    LegacyDataPath,
     /// Data directory exists but state file is missing or corrupt.
     MissingStateFile,
     /// Completion script is installed for a shell that is no longer present.
@@ -57,6 +63,8 @@ impl fmt::Display for MigrationReason {
             Self::SystemdUnitStaleBinary => "systemd-unit-stale-binary",
             Self::LaunchdPlistStaleBinary => "launchd-plist-stale-binary",
             Self::DeprecatedConfigKey => "deprecated-config-key",
+            Self::LegacyConfigPath => "legacy-config-path",
+            Self::LegacyDataPath => "legacy-data-path",
             Self::MissingStateFile => "missing-state-file",
             Self::OrphanedCompletion => "orphaned-completion",
             Self::StaleCompletion => "stale-completion",
@@ -136,7 +144,8 @@ pub struct MigrationAction {
     pub kind: ActionKind,
     /// Reason for this action.
     pub reason: MigrationReason,
-    /// Path being mutated.
+    /// Primary path for the action. For copy-only legacy migrations this is
+    /// the source path; destructive overwrite is still forbidden.
     pub target: PathBuf,
     /// Human-readable description of the change.
     pub description: String,
@@ -159,6 +168,10 @@ pub enum ActionKind {
     FixPermissions,
     /// Update a service unit file to point to current binary.
     UpdateServicePath,
+    /// Copy a legacy config file into the canonical config location.
+    CopyLegacyConfig,
+    /// Copy legacy state/log files into the canonical data location.
+    CopyLegacyState,
     /// Remove an orphaned completion script.
     RemoveOrphanedFile,
     /// Clean up stale backup files.
@@ -176,6 +189,8 @@ impl fmt::Display for ActionKind {
             Self::DeduplicateProfile => "deduplicate-profile",
             Self::FixPermissions => "fix-permissions",
             Self::UpdateServicePath => "update-service-path",
+            Self::CopyLegacyConfig => "copy-legacy-config",
+            Self::CopyLegacyState => "copy-legacy-state",
             Self::RemoveOrphanedFile => "remove-orphaned-file",
             Self::CleanupBackup => "cleanup-backup",
             Self::CreateDirectory => "create-directory",
@@ -273,22 +288,222 @@ fn is_sbh_path_line(line: &str) -> bool {
     (trimmed.starts_with("export PATH=") || trimmed.starts_with("PATH=")) && line.contains("sbh")
 }
 
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.contains(&path) {
+        paths.push(path);
+    }
+}
+
+fn push_homebrew_cellar_binaries(paths: &mut Vec<PathBuf>, prefix: &Path) {
+    let cellar = prefix.join("Cellar").join("sbh");
+    let Ok(entries) = fs::read_dir(cellar) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        push_unique_path(paths, entry.path().join("bin").join("sbh"));
+    }
+}
+
 /// Known locations to probe for sbh binaries.
 fn candidate_binary_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(home) = home_dir() {
-        paths.push(home.join(".local").join("bin").join("sbh"));
-        paths.push(home.join(".cargo").join("bin").join("sbh"));
+        push_unique_path(&mut paths, home.join(".local").join("bin").join("sbh"));
+        push_unique_path(&mut paths, home.join(".cargo").join("bin").join("sbh"));
     }
-    paths.push(PathBuf::from("/usr/local/bin/sbh"));
-    paths.push(PathBuf::from("/usr/bin/sbh"));
+    for path in [
+        "/opt/homebrew/bin/sbh",
+        "/opt/homebrew/sbin/sbh",
+        "/usr/local/bin/sbh",
+        "/usr/local/sbin/sbh",
+        "/usr/bin/sbh",
+    ] {
+        push_unique_path(&mut paths, PathBuf::from(path));
+    }
+    for prefix in [Path::new("/opt/homebrew"), Path::new("/usr/local")] {
+        push_homebrew_cellar_binaries(&mut paths, prefix);
+    }
     // Current executable location.
-    if let Ok(exe) = std::env::current_exe()
-        && !paths.contains(&exe)
-    {
-        paths.push(exe);
+    if let Ok(exe) = std::env::current_exe() {
+        push_unique_path(&mut paths, exe);
     }
     paths
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyPathKind {
+    Config,
+    Data,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyPathMigration {
+    kind: LegacyPathKind,
+    source: PathBuf,
+    destination: PathBuf,
+}
+
+const MIGRATABLE_DATA_FILES: &[&str] = &[
+    "state.json",
+    "activity.sqlite3",
+    "activity.sqlite3-wal",
+    "activity.sqlite3-shm",
+    "activity.jsonl",
+    "update-metadata.json",
+    "notifications.jsonl",
+];
+
+#[cfg(target_os = "macos")]
+fn xdg_layout_explicitly_requested() -> bool {
+    env::var_os("SBH_USE_XDG_PATHS").is_some_and(|value| {
+        matches!(
+            value.to_string_lossy().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }) || env::var_os("XDG_CONFIG_HOME").is_some()
+        || env::var_os("XDG_DATA_HOME").is_some()
+}
+
+fn xdg_paths_from_env_or_home(home: &Path) -> PathsConfig {
+    let config_file = env::var_os("XDG_CONFIG_HOME").map_or_else(
+        || home.join(".config").join("sbh").join("config.toml"),
+        |dir| PathBuf::from(dir).join("sbh").join("config.toml"),
+    );
+    let data_dir = env::var_os("XDG_DATA_HOME").map_or_else(
+        || home.join(".local").join("share").join("sbh"),
+        |dir| PathBuf::from(dir).join("sbh"),
+    );
+    paths_from_config_and_data_dir(config_file, &data_dir)
+}
+
+fn paths_from_config_and_data_dir(config_file: PathBuf, data_dir: &Path) -> PathsConfig {
+    PathsConfig {
+        config_file,
+        ballast_dir: data_dir.join("ballast"),
+        state_file: data_dir.join("state.json"),
+        sqlite_db: data_dir.join("activity.sqlite3"),
+        jsonl_log: data_dir.join("activity.jsonl"),
+    }
+}
+
+fn canonical_user_paths_for_home(home: &Path) -> PathsConfig {
+    #[cfg(target_os = "macos")]
+    {
+        if xdg_layout_explicitly_requested() {
+            xdg_paths_from_env_or_home(home)
+        } else {
+            PathsConfig::macos_native_for_home(home)
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        xdg_paths_from_env_or_home(home)
+    }
+}
+
+fn data_dir_for_paths(paths: &PathsConfig) -> PathBuf {
+    paths
+        .state_file
+        .parent()
+        .map_or_else(PathBuf::new, Path::to_path_buf)
+}
+
+fn push_legacy_path_migration(
+    migrations: &mut Vec<LegacyPathMigration>,
+    kind: LegacyPathKind,
+    source: PathBuf,
+    destination: PathBuf,
+) {
+    if source == destination {
+        return;
+    }
+    let migration = LegacyPathMigration {
+        kind,
+        source,
+        destination,
+    };
+    if !migrations.contains(&migration) {
+        migrations.push(migration);
+    }
+}
+
+fn push_legacy_path_set(
+    migrations: &mut Vec<LegacyPathMigration>,
+    legacy_paths: PathsConfig,
+    canonical_paths: &PathsConfig,
+) {
+    let legacy_data_dir = data_dir_for_paths(&legacy_paths);
+    push_legacy_path_migration(
+        migrations,
+        LegacyPathKind::Config,
+        legacy_paths.config_file,
+        canonical_paths.config_file.clone(),
+    );
+    push_legacy_path_migration(
+        migrations,
+        LegacyPathKind::Data,
+        legacy_data_dir,
+        data_dir_for_paths(canonical_paths),
+    );
+}
+
+fn legacy_user_path_migrations_for_home(home: &Path) -> Vec<LegacyPathMigration> {
+    let canonical_paths = canonical_user_paths_for_home(home);
+    let mut migrations = Vec::new();
+
+    push_legacy_path_set(
+        &mut migrations,
+        PathsConfig::xdg_for_home(home),
+        &canonical_paths,
+    );
+    push_legacy_path_set(
+        &mut migrations,
+        paths_from_config_and_data_dir(home.join(".sbh").join("config.toml"), &home.join(".sbh")),
+        &canonical_paths,
+    );
+
+    for prefix in [Path::new("/opt/homebrew"), Path::new("/usr/local")] {
+        push_legacy_path_set(
+            &mut migrations,
+            paths_from_config_and_data_dir(
+                prefix.join("etc").join("sbh").join("config.toml"),
+                &prefix.join("var").join("sbh"),
+            ),
+            &canonical_paths,
+        );
+        push_legacy_path_migration(
+            &mut migrations,
+            LegacyPathKind::Data,
+            prefix.join("var").join("lib").join("sbh"),
+            data_dir_for_paths(&canonical_paths),
+        );
+    }
+
+    migrations
+}
+
+fn legacy_system_path_migrations() -> Vec<LegacyPathMigration> {
+    let canonical_paths = PathsConfig::system_default();
+    let mut migrations = Vec::new();
+    push_legacy_path_set(
+        &mut migrations,
+        paths_from_config_and_data_dir(
+            PathBuf::from("/etc/sbh/config.toml"),
+            &PathBuf::from("/var/lib/sbh"),
+        ),
+        &canonical_paths,
+    );
+    migrations
+}
+
+fn candidate_legacy_path_migrations() -> Vec<LegacyPathMigration> {
+    let mut migrations = Vec::new();
+    if let Some(home) = home_dir() {
+        migrations.extend(legacy_user_path_migrations_for_home(&home));
+    }
+    migrations.extend(legacy_system_path_migrations());
+    migrations
 }
 
 /// Known shell profile paths to inspect for PATH entries.
@@ -364,6 +579,128 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
+fn scan_config_and_data_paths(paths: &PathsConfig, footprints: &mut Vec<Footprint>) {
+    let cfg = &paths.config_file;
+    if cfg.exists() {
+        let (healthy, issue, detail) = check_config_health(cfg);
+        footprints.push(Footprint {
+            kind: FootprintKind::ConfigFile,
+            path: cfg.clone(),
+            healthy,
+            issue,
+            detail,
+        });
+    }
+
+    let data = data_dir_for_paths(paths);
+    if data.exists() {
+        footprints.push(Footprint {
+            kind: FootprintKind::DataDirectory,
+            path: data,
+            healthy: true,
+            issue: None,
+            detail: None,
+        });
+
+        if paths.state_file.exists() {
+            footprints.push(Footprint {
+                kind: FootprintKind::StateFile,
+                path: paths.state_file.clone(),
+                healthy: true,
+                issue: None,
+                detail: None,
+            });
+        } else {
+            footprints.push(Footprint {
+                kind: FootprintKind::StateFile,
+                path: paths.state_file.clone(),
+                healthy: false,
+                issue: Some(MigrationReason::MissingStateFile),
+                detail: Some("data directory exists but state.json is missing".into()),
+            });
+        }
+
+        if paths.sqlite_db.exists() {
+            footprints.push(Footprint {
+                kind: FootprintKind::SqliteDb,
+                path: paths.sqlite_db.clone(),
+                healthy: true,
+                issue: None,
+                detail: None,
+            });
+        }
+
+        if paths.jsonl_log.exists() {
+            footprints.push(Footprint {
+                kind: FootprintKind::JsonlLog,
+                path: paths.jsonl_log.clone(),
+                healthy: true,
+                issue: None,
+                detail: None,
+            });
+        }
+    }
+}
+
+fn legacy_data_needs_migration(source: &Path, destination: &Path) -> bool {
+    MIGRATABLE_DATA_FILES.iter().any(|file_name| {
+        let source_file = source.join(file_name);
+        source_file.exists() && !destination.join(file_name).exists()
+    })
+}
+
+fn scan_legacy_path_migrations(footprints: &mut Vec<Footprint>) {
+    for migration in candidate_legacy_path_migrations() {
+        match migration.kind {
+            LegacyPathKind::Config => {
+                if migration.source.exists() {
+                    let destination_exists = migration.destination.exists();
+                    footprints.push(Footprint {
+                        kind: FootprintKind::ConfigFile,
+                        path: migration.source.clone(),
+                        healthy: destination_exists,
+                        issue: if destination_exists {
+                            None
+                        } else {
+                            Some(MigrationReason::LegacyConfigPath)
+                        },
+                        detail: Some(if destination_exists {
+                            format!(
+                                "legacy config retained at {}; canonical config already exists at {}, so it will not be overwritten",
+                                migration.source.display(),
+                                migration.destination.display()
+                            )
+                        } else {
+                            format!(
+                                "legacy config at {} should be copied to canonical path {}",
+                                migration.source.display(),
+                                migration.destination.display()
+                            )
+                        }),
+                    });
+                }
+            }
+            LegacyPathKind::Data => {
+                if migration.source.exists()
+                    && legacy_data_needs_migration(&migration.source, &migration.destination)
+                {
+                    footprints.push(Footprint {
+                        kind: FootprintKind::DataDirectory,
+                        path: migration.source.clone(),
+                        healthy: false,
+                        issue: Some(MigrationReason::LegacyDataPath),
+                        detail: Some(format!(
+                            "legacy state/log files under {} should be copied to canonical data directory {}",
+                            migration.source.display(),
+                            migration.destination.display()
+                        )),
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// Scan the system for all sbh installation footprints.
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -384,76 +721,11 @@ pub fn scan_footprints() -> Vec<Footprint> {
         }
     }
 
-    // -- Config file.
+    // -- Config and data files.
     if let Some(home) = home_dir() {
-        let cfg = home.join(".config").join("sbh").join("config.toml");
-        if cfg.exists() {
-            let (healthy, issue, detail) = check_config_health(&cfg);
-            footprints.push(Footprint {
-                kind: FootprintKind::ConfigFile,
-                path: cfg,
-                healthy,
-                issue,
-                detail,
-            });
-        }
-
-        // -- Data directory.
-        let data = home.join(".local").join("share").join("sbh");
-        if data.exists() {
-            footprints.push(Footprint {
-                kind: FootprintKind::DataDirectory,
-                path: data.clone(),
-                healthy: true,
-                issue: None,
-                detail: None,
-            });
-
-            // State file.
-            let state = data.join("state.json");
-            if state.exists() {
-                footprints.push(Footprint {
-                    kind: FootprintKind::StateFile,
-                    path: state,
-                    healthy: true,
-                    issue: None,
-                    detail: None,
-                });
-            } else if data.exists() {
-                footprints.push(Footprint {
-                    kind: FootprintKind::StateFile,
-                    path: state,
-                    healthy: false,
-                    issue: Some(MigrationReason::MissingStateFile),
-                    detail: Some("data directory exists but state.json is missing".into()),
-                });
-            }
-
-            // SQLite DB.
-            let sqlite = data.join("activity.sqlite3");
-            if sqlite.exists() {
-                footprints.push(Footprint {
-                    kind: FootprintKind::SqliteDb,
-                    path: sqlite,
-                    healthy: true,
-                    issue: None,
-                    detail: None,
-                });
-            }
-
-            // JSONL log.
-            let jsonl = data.join("activity.jsonl");
-            if jsonl.exists() {
-                footprints.push(Footprint {
-                    kind: FootprintKind::JsonlLog,
-                    path: jsonl,
-                    healthy: true,
-                    issue: None,
-                    detail: None,
-                });
-            }
-        }
+        scan_config_and_data_paths(&canonical_user_paths_for_home(&home), &mut footprints);
     }
+    scan_legacy_path_migrations(&mut footprints);
 
     // -- Shell profiles (PATH entries).
     for profile in candidate_profile_paths() {
@@ -529,7 +801,7 @@ pub fn scan_footprints() -> Vec<Footprint> {
                 scan_backups_in(parent, &mut footprints);
             }
         }
-        let data = home.join(".local").join("share").join("sbh");
+        let data = data_dir_for_paths(&canonical_user_paths_for_home(&home));
         if data.exists() {
             scan_backups_in(&data, &mut footprints);
         }
@@ -929,6 +1201,40 @@ fn plan_actions(footprints: &[Footprint], opts: &MigrateOptions) -> Vec<Migratio
                     });
                 }
             }
+            (FootprintKind::ConfigFile, Some(MigrationReason::LegacyConfigPath)) => {
+                if let Some(destination) = legacy_config_destination_for(&fp.path) {
+                    actions.push(MigrationAction {
+                        kind: ActionKind::CopyLegacyConfig,
+                        reason: MigrationReason::LegacyConfigPath,
+                        target: fp.path.clone(),
+                        description: format!(
+                            "copy legacy config {} to canonical path {}",
+                            fp.path.display(),
+                            destination.display()
+                        ),
+                        applied: false,
+                        backup_path: None,
+                        error: None,
+                    });
+                }
+            }
+            (FootprintKind::DataDirectory, Some(MigrationReason::LegacyDataPath)) => {
+                if let Some(destination) = legacy_data_destination_for(&fp.path) {
+                    actions.push(MigrationAction {
+                        kind: ActionKind::CopyLegacyState,
+                        reason: MigrationReason::LegacyDataPath,
+                        target: fp.path.clone(),
+                        description: format!(
+                            "copy legacy state/log files from {} to canonical data directory {}",
+                            fp.path.display(),
+                            destination.display()
+                        ),
+                        applied: false,
+                        backup_path: None,
+                        error: None,
+                    });
+                }
+            }
             (FootprintKind::ShellCompletion, Some(MigrationReason::OrphanedCompletion)) => {
                 actions.push(MigrationAction {
                     kind: ActionKind::RemoveOrphanedFile,
@@ -989,6 +1295,24 @@ fn current_binary_path() -> Option<PathBuf> {
     std::env::current_exe().ok()
 }
 
+fn legacy_config_destination_for(source: &Path) -> Option<PathBuf> {
+    candidate_legacy_path_migrations()
+        .into_iter()
+        .find(|migration| {
+            migration.kind == LegacyPathKind::Config && migration.source.as_path() == source
+        })
+        .map(|migration| migration.destination)
+}
+
+fn legacy_data_destination_for(source: &Path) -> Option<PathBuf> {
+    candidate_legacy_path_migrations()
+        .into_iter()
+        .find(|migration| {
+            migration.kind == LegacyPathKind::Data && migration.source.as_path() == source
+        })
+        .map(|migration| migration.destination)
+}
+
 // ---------------------------------------------------------------------------
 // Action application
 // ---------------------------------------------------------------------------
@@ -1000,6 +1324,8 @@ fn apply_actions(actions: &mut [MigrationAction], backup_dir: Option<&Path>) {
             ActionKind::DeduplicateProfile => apply_deduplicate_profile(action, backup_dir),
             ActionKind::FixPermissions => apply_fix_permissions(action),
             ActionKind::UpdateServicePath => apply_update_service_path(action, backup_dir),
+            ActionKind::CopyLegacyConfig => apply_copy_legacy_config(action),
+            ActionKind::CopyLegacyState => apply_copy_legacy_state(action),
             ActionKind::RemoveOrphanedFile => apply_remove_orphaned_file(action, backup_dir),
             ActionKind::CleanupBackup => apply_cleanup_backup(action),
             ActionKind::CreateDirectory => apply_create_directory(action),
@@ -1125,6 +1451,68 @@ fn apply_update_service_path(
         })
         .collect();
     fs::write(&action.target, updated.join("\n") + "\n")?;
+    Ok(())
+}
+
+fn copy_file_without_overwrite(source: &Path, destination: &Path) -> std::io::Result<bool> {
+    if destination.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, destination)?;
+    Ok(true)
+}
+
+fn apply_copy_legacy_config(action: &MigrationAction) -> std::io::Result<()> {
+    let Some(destination) = legacy_config_destination_for(&action.target) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "no canonical config destination known for {}",
+                action.target.display()
+            ),
+        ));
+    };
+
+    copy_file_without_overwrite(&action.target, &destination)?;
+
+    let source_sacred = sacred_config_path_for(&action.target);
+    if source_sacred.exists() {
+        let destination_sacred = sacred_config_path_for(&destination);
+        copy_file_without_overwrite(&source_sacred, &destination_sacred)?;
+    }
+
+    Ok(())
+}
+
+fn copy_legacy_data_files(source: &Path, destination: &Path) -> std::io::Result<usize> {
+    fs::create_dir_all(destination)?;
+    let mut copied = 0;
+    for file_name in MIGRATABLE_DATA_FILES {
+        let source_file = source.join(file_name);
+        if source_file.exists()
+            && copy_file_without_overwrite(&source_file, &destination.join(file_name))?
+        {
+            copied += 1;
+        }
+    }
+    Ok(copied)
+}
+
+fn apply_copy_legacy_state(action: &MigrationAction) -> std::io::Result<()> {
+    let Some(destination) = legacy_data_destination_for(&action.target) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "no canonical data destination known for {}",
+                action.target.display()
+            ),
+        ));
+    };
+
+    let _ = copy_legacy_data_files(&action.target, &destination)?;
     Ok(())
 }
 
@@ -1324,6 +1712,112 @@ mod tests {
         let backup = create_backup(&original, Some(&backup_dir)).unwrap();
         assert!(backup.starts_with(&backup_dir));
         assert!(backup.exists());
+    }
+
+    #[test]
+    fn candidate_binary_paths_include_homebrew_locations() {
+        let paths = candidate_binary_paths();
+        assert!(paths.contains(&PathBuf::from("/opt/homebrew/bin/sbh")));
+        assert!(paths.contains(&PathBuf::from("/usr/local/bin/sbh")));
+        assert!(paths.contains(&PathBuf::from("/usr/local/sbin/sbh")));
+    }
+
+    #[test]
+    fn legacy_user_migrations_include_dot_sbh_layout() {
+        let tmp = TempDir::new().unwrap();
+        let canonical = canonical_user_paths_for_home(tmp.path());
+        let migrations = legacy_user_path_migrations_for_home(tmp.path());
+
+        assert!(migrations.iter().any(|migration| {
+            migration.kind == LegacyPathKind::Config
+                && migration.source == tmp.path().join(".sbh").join("config.toml")
+                && migration.destination == canonical.config_file
+        }));
+        assert!(migrations.iter().any(|migration| {
+            migration.kind == LegacyPathKind::Data
+                && migration.source == tmp.path().join(".sbh")
+                && migration.destination == data_dir_for_paths(&canonical)
+        }));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_user_migrations_copy_xdg_to_macos_app_support() {
+        let tmp = TempDir::new().unwrap();
+        let canonical = PathsConfig::macos_native_for_home(tmp.path());
+        let migrations = legacy_user_path_migrations_for_home(tmp.path());
+
+        assert!(migrations.iter().any(|migration| {
+            migration.kind == LegacyPathKind::Config
+                && migration.source == tmp.path().join(".config").join("sbh").join("config.toml")
+                && migration.destination == canonical.config_file
+        }));
+        assert!(migrations.iter().any(|migration| {
+            migration.kind == LegacyPathKind::Data
+                && migration.source == tmp.path().join(".local").join("share").join("sbh")
+                && migration.destination == data_dir_for_paths(&canonical)
+        }));
+    }
+
+    #[test]
+    fn legacy_destination_lookup_round_trips_known_current_home_candidates() {
+        let Some(home) = home_dir() else {
+            return;
+        };
+        for migration in legacy_user_path_migrations_for_home(&home) {
+            match migration.kind {
+                LegacyPathKind::Config => {
+                    assert_eq!(
+                        legacy_config_destination_for(&migration.source),
+                        Some(migration.destination)
+                    );
+                }
+                LegacyPathKind::Data => {
+                    assert_eq!(
+                        legacy_data_destination_for(&migration.source),
+                        Some(migration.destination)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn copy_file_without_overwrite_preserves_existing_destination() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source.toml");
+        let destination = tmp.path().join("destination.toml");
+        fs::write(&source, "source").unwrap();
+        fs::write(&destination, "existing").unwrap();
+
+        let copied = copy_file_without_overwrite(&source, &destination).unwrap();
+
+        assert!(!copied);
+        assert_eq!(fs::read_to_string(destination).unwrap(), "existing");
+    }
+
+    #[test]
+    fn copy_legacy_data_files_copies_state_logs_without_ballast() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("legacy");
+        let destination = tmp.path().join("canonical");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("state.json"), "{}").unwrap();
+        fs::write(source.join("activity.jsonl"), "{}\n").unwrap();
+        fs::write(source.join("ballast"), "generated").unwrap();
+
+        let copied = copy_legacy_data_files(&source, &destination).unwrap();
+
+        assert_eq!(copied, 2);
+        assert_eq!(
+            fs::read_to_string(destination.join("state.json")).unwrap(),
+            "{}"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("activity.jsonl")).unwrap(),
+            "{}\n"
+        );
+        assert!(!destination.join("ballast").exists());
     }
 
     #[test]
@@ -2000,6 +2494,60 @@ mod tests {
     }
 
     #[test]
+    fn plan_actions_legacy_config_generates_copy_action() {
+        let Some(home) = home_dir() else {
+            return;
+        };
+        let Some(migration) = legacy_user_path_migrations_for_home(&home)
+            .into_iter()
+            .find(|migration| migration.kind == LegacyPathKind::Config)
+        else {
+            return;
+        };
+        let footprints = vec![Footprint {
+            kind: FootprintKind::ConfigFile,
+            path: migration.source.clone(),
+            healthy: false,
+            issue: Some(MigrationReason::LegacyConfigPath),
+            detail: None,
+        }];
+
+        let actions = plan_actions(&footprints, &MigrateOptions::default());
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ActionKind::CopyLegacyConfig);
+        assert_eq!(actions[0].target, migration.source);
+        assert!(actions[0].description.contains("canonical path"));
+    }
+
+    #[test]
+    fn plan_actions_legacy_data_generates_copy_action() {
+        let Some(home) = home_dir() else {
+            return;
+        };
+        let Some(migration) = legacy_user_path_migrations_for_home(&home)
+            .into_iter()
+            .find(|migration| migration.kind == LegacyPathKind::Data)
+        else {
+            return;
+        };
+        let footprints = vec![Footprint {
+            kind: FootprintKind::DataDirectory,
+            path: migration.source.clone(),
+            healthy: false,
+            issue: Some(MigrationReason::LegacyDataPath),
+            detail: None,
+        }];
+
+        let actions = plan_actions(&footprints, &MigrateOptions::default());
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ActionKind::CopyLegacyState);
+        assert_eq!(actions[0].target, migration.source);
+        assert!(actions[0].description.contains("canonical data directory"));
+    }
+
+    #[test]
     fn plan_actions_orphaned_completion_generates_remove() {
         let footprints = vec![Footprint {
             kind: FootprintKind::ShellCompletion,
@@ -2126,6 +2674,8 @@ mod tests {
             MigrationReason::SystemdUnitStaleBinary,
             MigrationReason::LaunchdPlistStaleBinary,
             MigrationReason::DeprecatedConfigKey,
+            MigrationReason::LegacyConfigPath,
+            MigrationReason::LegacyDataPath,
             MigrationReason::MissingStateFile,
             MigrationReason::OrphanedCompletion,
             MigrationReason::StaleCompletion,
@@ -2140,7 +2690,7 @@ mod tests {
             assert!(!s.is_empty(), "display should not be empty");
             assert!(seen.insert(s.clone()), "duplicate display: {s}");
         }
-        assert_eq!(seen.len(), 13, "should cover all 13 reason codes");
+        assert_eq!(seen.len(), 15, "should cover all 15 reason codes");
     }
 
     #[test]
@@ -2150,6 +2700,8 @@ mod tests {
             ActionKind::DeduplicateProfile,
             ActionKind::FixPermissions,
             ActionKind::UpdateServicePath,
+            ActionKind::CopyLegacyConfig,
+            ActionKind::CopyLegacyState,
             ActionKind::RemoveOrphanedFile,
             ActionKind::CleanupBackup,
             ActionKind::CreateDirectory,
@@ -2160,7 +2712,7 @@ mod tests {
             let s = k.to_string();
             assert!(seen.insert(s.clone()), "duplicate display: {s}");
         }
-        assert_eq!(seen.len(), 8, "should cover all 8 action kinds");
+        assert_eq!(seen.len(), 10, "should cover all 10 action kinds");
     }
 
     #[test]
