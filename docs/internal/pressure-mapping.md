@@ -83,6 +83,13 @@ Linux uses PSI from `/proc/pressure/memory`, specifically the `some avg10`
 field. The code stores this as centipercent in `linux_psi_avg10` so `12.34`
 becomes `1234`.
 
+For daemon subscriptions, Linux first registers a PSI trigger on
+`/proc/pressure/memory` and waits for it through `epoll`. The trigger uses the
+same 5% one-second threshold as the `Warn` boundary (`some 50000 1000000`).
+If the kernel, container, or permissions reject PSI triggers, the PAL falls
+back to the existing one-second sampler while preserving the same normalized
+behavior rows.
+
 | Linux PSI `some avg10` | Native `MemoryPressureLevel` |
 |---:|---|
 | missing or unreadable | `Unknown` |

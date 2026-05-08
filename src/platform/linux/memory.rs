@@ -4,10 +4,15 @@
 #![allow(missing_docs)]
 
 use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+use nix::errno::Errno;
+use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags};
 
 use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::MemoryInfo;
@@ -17,6 +22,9 @@ use crate::platform::types::{
 
 const MEMORY_PSI_PATH: &str = "/proc/pressure/memory";
 const MEMORY_PRESSURE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const MEMORY_PRESSURE_EPOLL_TIMEOUT_MS: u16 = 1000;
+const PSI_TRIGGER_WINDOW_US: u64 = 1_000_000;
+const PSI_WARN_TRIGGER_STALL_US: u64 = 50_000;
 const PSI_WARN_AVG10_CENTIPERCENT: u64 = 500;
 const PSI_CRITICAL_AVG10_CENTIPERCENT: u64 = 2_000;
 
@@ -41,11 +49,17 @@ pub(super) fn read_memory_pressure() -> Result<MemoryPressure> {
 pub(super) fn subscribe_memory_pressure(
     callback: MemoryPressureCallback,
 ) -> Result<SubscriptionHandle> {
-    spawn_memory_pressure_subscription(
-        "linux-memory-pressure-poll",
-        MEMORY_PRESSURE_POLL_INTERVAL,
-        callback,
-        read_memory_pressure,
+    let callback: Arc<dyn Fn(MemoryPressure) + Send + Sync + 'static> = Arc::from(callback);
+    spawn_memory_pressure_epoll_subscription(Arc::clone(&callback), read_memory_pressure).or_else(
+        |_| {
+            let callback = Arc::clone(&callback);
+            spawn_memory_pressure_subscription(
+                "linux-memory-pressure-poll",
+                MEMORY_PRESSURE_POLL_INTERVAL,
+                Box::new(move |pressure| callback(pressure)),
+                read_memory_pressure,
+            )
+        },
     )
 }
 
@@ -179,6 +193,107 @@ fn system_page_size_bytes() -> u64 {
         .unwrap_or(4096)
 }
 
+fn memory_psi_trigger_spec() -> String {
+    format!("some {PSI_WARN_TRIGGER_STALL_US} {PSI_TRIGGER_WINDOW_US}")
+}
+
+fn open_memory_psi_trigger(path: &Path, trigger: &str) -> Result<File> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|source| SbhError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    let mut trigger_bytes = trigger.as_bytes().to_vec();
+    trigger_bytes.push(0);
+    file.write_all(&trigger_bytes)
+        .map_err(|source| SbhError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(file)
+}
+
+fn spawn_memory_pressure_epoll_subscription<F>(
+    callback: Arc<dyn Fn(MemoryPressure) + Send + Sync + 'static>,
+    sampler: F,
+) -> Result<SubscriptionHandle>
+where
+    F: Fn() -> Result<MemoryPressure> + Send + 'static,
+{
+    let initial = sampler()?;
+    let trigger = memory_psi_trigger_spec();
+    let psi_fd = open_memory_psi_trigger(Path::new(MEMORY_PSI_PATH), &trigger)?;
+    let epoll = Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC).map_err(|error| {
+        PalError::method_failed("linux", "subscribe_memory_pressure", error.to_string())
+    })?;
+    epoll
+        .add(
+            &psi_fd,
+            EpollEvent::new(
+                EpollFlags::EPOLLPRI | EpollFlags::EPOLLERR | EpollFlags::EPOLLHUP,
+                1,
+            ),
+        )
+        .map_err(|error| {
+            PalError::method_failed("linux", "subscribe_memory_pressure", error.to_string())
+        })?;
+
+    let liveness = Arc::new(());
+    let weak_liveness = Arc::downgrade(&liveness);
+    let thread = std::thread::Builder::new()
+        .name("sbh-linux-memory-pressure-psi-epoll".to_string())
+        .spawn(move || {
+            // The kernel removes the PSI trigger when its file descriptor closes.
+            let _psi_fd = psi_fd;
+            let mut last_level = initial.level;
+            let mut events = [EpollEvent::empty()];
+            loop {
+                if weak_liveness.upgrade().is_none() {
+                    break;
+                }
+
+                let count = match epoll.wait(&mut events, MEMORY_PRESSURE_EPOLL_TIMEOUT_MS) {
+                    Ok(count) => count,
+                    Err(Errno::EINTR) => continue,
+                    Err(_) => break,
+                };
+                if count == 0 {
+                    continue;
+                }
+
+                let flags = events[0].events();
+                if flags.intersects(EpollFlags::EPOLLERR | EpollFlags::EPOLLHUP) {
+                    break;
+                }
+                if !flags.contains(EpollFlags::EPOLLPRI) {
+                    continue;
+                }
+
+                let Ok(pressure) = sampler() else {
+                    continue;
+                };
+                if pressure.level != last_level {
+                    last_level = pressure.level;
+                    callback(pressure);
+                }
+            }
+        })
+        .map_err(|error| {
+            PalError::method_failed("linux", "subscribe_memory_pressure", error.to_string())
+        })?;
+    drop(thread);
+
+    Ok(SubscriptionHandle::active_with_liveness(
+        "linux-memory-pressure-psi-epoll",
+        liveness,
+    ))
+}
+
 fn spawn_memory_pressure_subscription<F>(
     source: &'static str,
     interval: Duration,
@@ -227,7 +342,7 @@ mod tests {
     use crate::platform::types::{MemoryPressure, MemoryPressureLevel};
 
     use super::{
-        memory_pressure_from_info, parse_meminfo, parse_memory_psi_avg10,
+        memory_pressure_from_info, memory_psi_trigger_spec, parse_meminfo, parse_memory_psi_avg10,
         spawn_memory_pressure_subscription,
     };
 
@@ -315,6 +430,25 @@ mod tests {
         assert_eq!(
             memory_pressure_from_info(&info, None, 4096).level,
             MemoryPressureLevel::Unknown
+        );
+    }
+
+    #[test]
+    fn memory_psi_trigger_spec_tracks_warn_threshold() {
+        assert_eq!(memory_psi_trigger_spec(), "some 50000 1000000");
+    }
+
+    #[test]
+    fn subscribe_memory_pressure_uses_epoll_or_polling_fallback() {
+        let handle = super::subscribe_memory_pressure(Box::new(|_| {}))
+            .expect("memory pressure subscription should start or fall back");
+        assert!(
+            matches!(
+                handle.source.as_str(),
+                "linux-memory-pressure-psi-epoll" | "linux-memory-pressure-poll"
+            ),
+            "unexpected subscription source: {}",
+            handle.source
         );
     }
 

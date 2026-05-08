@@ -5196,6 +5196,14 @@ mod tests {
         assert_eq!(parsed["pressure"]["causing_mount"], "/");
         assert_eq!(parsed["ballast"]["released"], 3);
         assert_eq!(parsed["memory"]["ram_free_pct"], 50.0);
+        assert_eq!(
+            parsed["policy"]["behavior"]["scan_aggressiveness"],
+            "aggressive"
+        );
+        assert_eq!(
+            parsed["policy"]["behavior"]["cleanup_action"],
+            "identify_only"
+        );
         assert_eq!(parsed["threads"][0]["status"], "running");
     }
 
