@@ -1428,6 +1428,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn behavior_dispatch_table_is_identical_for_linux_and_macos_transition_sources() {
+        let table = BehaviorDispatchTable::default();
+        let linux_transitions = [
+            ("linux-memory-pressure-normal", MemoryPressureLevel::Normal),
+            ("linux-memory-pressure-warn", MemoryPressureLevel::Warn),
+            (
+                "linux-memory-pressure-critical",
+                MemoryPressureLevel::Critical,
+            ),
+        ];
+        let macos_transitions = [
+            ("macos-memory-pressure-normal", MemoryPressureLevel::Normal),
+            ("macos-memory-pressure-warn", MemoryPressureLevel::Warn),
+            (
+                "macos-memory-pressure-critical",
+                MemoryPressureLevel::Critical,
+            ),
+        ];
+        let disk_transitions = [
+            ("disk-green", PressureLevel::Green),
+            ("disk-yellow", PressureLevel::Yellow),
+            ("disk-orange", PressureLevel::Orange),
+            ("disk-red", PressureLevel::Red),
+            ("disk-critical", PressureLevel::Critical),
+        ];
+
+        for ((linux_source, linux_memory), (macos_source, macos_memory)) in
+            linux_transitions.into_iter().zip(macos_transitions)
+        {
+            let normalized_memory = BehaviorPressureLevel::from_memory_pressure(linux_memory);
+            assert_eq!(
+                normalized_memory,
+                BehaviorPressureLevel::from_memory_pressure(macos_memory),
+                "{linux_source} and {macos_source} must normalize into the same behavior row"
+            );
+
+            for (disk_source, disk_level) in disk_transitions {
+                let normalized_disk = BehaviorPressureLevel::from_disk_pressure(disk_level);
+                let expected = table.mode_for_levels(normalized_memory, normalized_disk);
+                assert_eq!(
+                    table.mode_for(linux_memory, disk_level),
+                    expected,
+                    "{linux_source} with {disk_source} must use the shared behavior matrix"
+                );
+                assert_eq!(
+                    table.mode_for(macos_memory, disk_level),
+                    expected,
+                    "{macos_source} with {disk_source} must use the shared behavior matrix"
+                );
+                assert_eq!(
+                    table.mode_for(linux_memory, disk_level),
+                    table.mode_for(macos_memory, disk_level),
+                    "{linux_source} and {macos_source} diverged for {disk_source}"
+                );
+            }
+        }
+    }
+
     // ──── mode lifecycle tests ────
 
     #[test]
