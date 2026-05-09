@@ -1492,14 +1492,24 @@ mod tests {
         let release_workflow = include_str!("../../.github/workflows/release.yml");
         let workflows = [ci_workflow, release_workflow].join("\n");
 
-        for required in ["actions/checkout@v6.0.2", "actions/upload-artifact@v7.0.1"] {
+        for required in [
+            "actions/checkout@v6.0.2",
+            "actions/upload-artifact@v7.0.1",
+            "actions/download-artifact@v8.0.1",
+            "softprops/action-gh-release@v3.0.0",
+        ] {
             assert!(
                 workflows.contains(required),
                 "workflows must use Node 24-ready GitHub action release: {required}"
             );
         }
 
-        for deprecated in ["actions/checkout@v4", "actions/upload-artifact@v4"] {
+        for deprecated in [
+            "actions/checkout@v4",
+            "actions/upload-artifact@v4",
+            "actions/download-artifact@v4",
+            "softprops/action-gh-release@v2",
+        ] {
             assert!(
                 !workflows.contains(deprecated),
                 "workflows must not use deprecated Node 20 action release: {deprecated}"
