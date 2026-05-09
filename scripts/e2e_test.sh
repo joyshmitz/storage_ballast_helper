@@ -730,11 +730,17 @@ main() {
   # Invalid subcommand: exit 2.
   tally_case run_case_expect_fail exit_invalid_subcommand 2 "" "${bin}" nonexistent
 
-  # install without flags: user error exit 1.
-  tally_case run_case_expect_fail exit_install_no_flags 1 "specify --systemd" "${bin}" install
-
-  # uninstall without flags: user error exit 1.
-  tally_case run_case_expect_fail exit_uninstall_no_flags 1 "specify --systemd" "${bin}" uninstall
+  # Plain install/uninstall now auto-detect the host service manager and can
+  # mutate local service state. Keep this section side-effect-free by checking
+  # the wrong explicit service flag for the current host instead.
+  local wrong_service_flag
+  case "$(uname -s)" in
+    Darwin) wrong_service_flag="--systemd" ;;
+    Linux) wrong_service_flag="--launchd" ;;
+    *) wrong_service_flag="--systemd" ;;
+  esac
+  tally_case run_case_expect_fail exit_install_wrong_service_flag 1 "omit the service flag for auto-detection" "${bin}" install "${wrong_service_flag}" --dry-run
+  tally_case run_case_expect_fail exit_uninstall_wrong_service_flag 1 "omit the service flag for auto-detection" "${bin}" uninstall "${wrong_service_flag}"
 
   # ── Section 3: Configuration system ──────────────────────────────────────
 
