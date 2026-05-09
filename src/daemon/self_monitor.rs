@@ -781,7 +781,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         let mut monitor = test_monitor(path.clone());
-        monitor.write_interval = Duration::from_millis(50);
+        monitor.write_interval = Duration::from_mins(1);
 
         // First write always happens.
         let _rss =
@@ -796,7 +796,11 @@ mod tests {
         assert_eq!(content_before, content_after);
 
         // After interval, write happens again.
-        std::thread::sleep(Duration::from_millis(60));
+        monitor.last_write = Some(
+            Instant::now()
+                .checked_sub(Duration::from_mins(2))
+                .expect("test instant supports two-minute subtraction"),
+        );
         monitor.maybe_write_state(PressureLevel::Yellow, 12.0, "/data", 8, 10, 0, "enforce");
         let updated = fs::read_to_string(&path).unwrap();
         assert!(updated.contains("yellow"));

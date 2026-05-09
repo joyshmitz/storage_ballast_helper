@@ -107,8 +107,9 @@ mod tests {
         std::os::unix::fs::symlink(&real, &alias).unwrap();
 
         let resolved = resolve_absolute_path(&alias.join("missing").join("child"));
+        let expected_parent = std::fs::canonicalize(&real).unwrap();
 
-        assert_eq!(resolved, real.join("missing").join("child"));
+        assert_eq!(resolved, expected_parent.join("missing").join("child"));
     }
 
     #[test]

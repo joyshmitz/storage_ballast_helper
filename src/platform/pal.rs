@@ -595,33 +595,39 @@ impl Platform for MockPlatform {
     }
 
     fn open_files_under(&self, path: &Path) -> Result<Vec<OpenFile>> {
+        let root = crate::core::paths::resolve_absolute_path(path);
         Ok(self
             .open_files
             .iter()
-            .filter(|open_file| open_file.path.starts_with(path))
+            .filter(|open_file| {
+                crate::core::paths::resolve_absolute_path(&open_file.path).starts_with(&root)
+            })
             .cloned()
             .collect())
     }
 
     fn executables_under(&self, path: &Path) -> Result<Vec<ProcessInfo>> {
+        let root = crate::core::paths::resolve_absolute_path(path);
         Ok(self
             .executables
             .iter()
             .filter(|process| {
-                process
-                    .executable
-                    .as_deref()
-                    .is_some_and(|executable| executable.starts_with(path))
+                process.executable.as_deref().is_some_and(|executable| {
+                    crate::core::paths::resolve_absolute_path(executable).starts_with(&root)
+                })
             })
             .cloned()
             .collect())
     }
 
     fn mmap_regions_under(&self, path: &Path) -> Result<Vec<MappedRegion>> {
+        let root = crate::core::paths::resolve_absolute_path(path);
         Ok(self
             .mmap_regions
             .iter()
-            .filter(|region| region.path.starts_with(path))
+            .filter(|region| {
+                crate::core::paths::resolve_absolute_path(&region.path).starts_with(&root)
+            })
             .cloned()
             .collect())
     }

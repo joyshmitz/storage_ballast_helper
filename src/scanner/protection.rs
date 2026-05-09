@@ -188,10 +188,11 @@ impl ProtectionRegistry {
         }
 
         // Check config patterns.
-        let path_str = normalize_path_for_matching(path);
-        for pattern in &self.config_patterns {
-            if pattern.compiled.is_match(&path_str) {
-                return Some(format!("protected by config pattern: {}", pattern.original));
+        for p_str in path_match_texts(path) {
+            for pattern in &self.config_patterns {
+                if pattern.compiled.is_match(&p_str) {
+                    return Some(format!("protected by config pattern: {}", pattern.original));
+                }
             }
         }
 
@@ -361,9 +362,7 @@ impl ProtectionRegistry {
         // Check the path itself and all its ancestor prefixes so that
         // a pattern protecting "/data/projects/production-app" also
         // protects "/data/projects/production-app/target/debug".
-        let mut current = Some(path);
-        while let Some(p) = current {
-            let p_str = normalize_path_for_matching(p);
+        for p_str in path_match_texts(path) {
             if self
                 .config_patterns
                 .iter()
@@ -371,7 +370,6 @@ impl ProtectionRegistry {
             {
                 return true;
             }
-            current = p.parent();
         }
         false
     }
@@ -629,6 +627,35 @@ fn glob_to_regex(pattern: &str) -> Result<Regex> {
 
 fn normalize_path_for_matching(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+fn path_match_texts(path: &Path) -> Vec<String> {
+    let mut texts = Vec::new();
+    push_text_and_ancestors(&mut texts, normalize_path_for_matching(path));
+    push_text_and_ancestors(
+        &mut texts,
+        normalize_path_for_matching(&normalize_path_for_protection(path)),
+    );
+    texts
+}
+
+fn push_text_and_ancestors(texts: &mut Vec<String>, mut text: String) {
+    loop {
+        if !text.is_empty() && !texts.contains(&text) {
+            texts.push(text.clone());
+        }
+
+        let Some(index) = text.rfind('/') else {
+            break;
+        };
+        if index == 0 {
+            if !texts.iter().any(|existing| existing == "/") {
+                texts.push("/".to_string());
+            }
+            break;
+        }
+        text.truncate(index);
+    }
 }
 
 fn normalize_protected_pattern_for_matching(pattern: &str) -> String {
