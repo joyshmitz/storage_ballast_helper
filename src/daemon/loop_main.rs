@@ -1678,7 +1678,7 @@ impl MonitoringDaemon {
             memory_info: memory_info.as_ref(),
             policy_mode: self.policy_engine.lock().mode().to_string(),
             behavior_mode: self.behavior_state.mode,
-            last_predictive_action: format!("{:?}", &self.last_predictive_action),
+            last_predictive_action: format!("{:?}", self.last_predictive_action),
             last_ewma_confidence: self.last_ewma_confidence,
             guard: guard.as_ref(),
             counters: StatusDumpCounters {
