@@ -1,9 +1,10 @@
 # macOS/Linux Parity Prompt-To-Artifact Completion Audit
 
 Bead: `bd-r7m7.11`
+Refresh bead: `bd-r7m7.12`
 Parent: `bd-r7m7`
-Last audited: 2026-05-09 08:39 UTC
-Audit base head: `214ca5a`
+Last audited: 2026-05-09 08:54 UTC
+Latest pushed head inspected: `046946f`
 
 This is the closeout gate for the active objective: make `sbh` seamlessly
 support macOS in addition to Linux, with automatic platform detection during
@@ -40,17 +41,20 @@ operator-visible outcomes:
 
 ## Current Tracker And CI State
 
-- `bd-r7m7` is open with 25 of 26 children closed. This audit is the remaining
-  child as of 2026-05-09 08:39 UTC.
+- `bd-r7m7` is open with 26 of 27 children closed. This refresh bead is the
+  current in-progress child as of 2026-05-09 08:54 UTC.
 - `bd-ykwh` is open with 11 of 16 children closed. The remaining work is
   release-credential and Homebrew distribution plumbing.
 - `br ready --json` returned `[]`; remaining open actionable release work is
   blocked or already assigned to `SilentGlacier`.
 - In-progress release blockers are `bd-ykwh.2`, `bd-ykwh.3`, `bd-ykwh.10`, and
   `bd-ykwh.13`.
-- CI run `25596686483` for head `214ca5a` was queued at audit time with
+- CI run `25596980897` for head `046946f` was queued at audit time with
   `Homebrew Formula Validation` and `Format + Lint` materialized but not green.
   Do not treat queued CI as proof.
+- Local Homebrew formula checks passed at refresh time: `brew style
+  packaging/homebrew/Formula/sbh.rb` and the generated-formula placeholder
+  replacement path both reported no style offenses.
 
 ## Checklist
 
@@ -92,7 +96,7 @@ containing `bd-twgw` and `bd-j40b`, then restore the protected worktree files.
 ## Live Release Blocker Evidence
 
 The user confirmed Apple Developer Program enrollment, so enrollment itself is
-not the current blocker. Live checks at 2026-05-09 08:34 UTC still showed:
+not the current blocker. Live checks at 2026-05-09 08:54 UTC still showed:
 
 - `security find-identity -v -p codesigning`: `0 valid identities found`
 - `xcrun notarytool history --keychain-profile sbh-notary --output-format json`:
