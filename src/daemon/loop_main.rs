@@ -1062,6 +1062,10 @@ fn full_disk_access_status_log_message(
     }
 }
 
+fn daemon_activity_error_code(error: &SbhError) -> String {
+    error.code().to_string()
+}
+
 fn behavior_allows_scan(mode: BehaviorMode) -> bool {
     mode.scan_aggressiveness != ScanAggressiveness::Skip
 }
@@ -1471,7 +1475,7 @@ impl MonitoringDaemon {
             }
             Err(error) => {
                 self.logger_handle.send(ActivityEvent::Error {
-                    code: "SBH-1101".to_string(),
+                    code: daemon_activity_error_code(&error),
                     message: format!("Full Disk Access recheck failed: {error}"),
                 });
             }
@@ -1516,7 +1520,7 @@ impl MonitoringDaemon {
             }
             Err(error) => {
                 self.logger_handle.send(ActivityEvent::Error {
-                    code: "SBH-1101".to_string(),
+                    code: daemon_activity_error_code(&error),
                     message: format!("memory pressure subscription unavailable: {error}"),
                 });
                 None
@@ -1529,7 +1533,7 @@ impl MonitoringDaemon {
             Ok(pressure) => pressure.level,
             Err(error) => {
                 self.logger_handle.send(ActivityEvent::Error {
-                    code: "SBH-1101".to_string(),
+                    code: daemon_activity_error_code(&error),
                     message: format!("initial memory pressure read failed: {error}"),
                 });
                 MemoryPressureLevel::Unknown
@@ -4471,6 +4475,7 @@ mod tests {
         SpecialKind, SpecialLocation, SpecialLocationRegistry,
     };
     use crate::platform::pal::{MemoryInfo, MockPlatform};
+    use crate::platform::types::PalError;
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification};
     use crate::scanner::scoring::{DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::path::Path;
@@ -5198,6 +5203,21 @@ mod tests {
             .is_none(),
             "unchanged missing state should not spam logs"
         );
+    }
+
+    #[test]
+    fn daemon_activity_error_code_uses_actual_error_variant() {
+        let pal_error = SbhError::from(PalError::method_failed(
+            "macos",
+            "memory_pressure",
+            "host_statistics64 failed",
+        ));
+        assert_eq!(daemon_activity_error_code(&pal_error), "SBH-1102");
+
+        let unsupported = SbhError::UnsupportedPlatform {
+            details: "unsupported operating system 'plan9'".to_string(),
+        };
+        assert_eq!(daemon_activity_error_code(&unsupported), "SBH-1101");
     }
 
     #[test]
