@@ -1487,6 +1487,27 @@ mod tests {
     }
 
     #[test]
+    fn workflows_use_node24_ready_github_actions() {
+        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
+        let release_workflow = include_str!("../../.github/workflows/release.yml");
+        let workflows = [ci_workflow, release_workflow].join("\n");
+
+        for required in ["actions/checkout@v6.0.2", "actions/upload-artifact@v7.0.1"] {
+            assert!(
+                workflows.contains(required),
+                "workflows must use Node 24-ready GitHub action release: {required}"
+            );
+        }
+
+        for deprecated in ["actions/checkout@v4", "actions/upload-artifact@v4"] {
+            assert!(
+                !workflows.contains(deprecated),
+                "workflows must not use deprecated Node 20 action release: {deprecated}"
+            );
+        }
+    }
+
+    #[test]
     fn ci_runs_macos_validation_lanes_independently_from_linux_check() {
         let ci_workflow = include_str!("../../.github/workflows/ci.yml");
         let testing_guide = include_str!("../../docs/testing-and-logging.md");

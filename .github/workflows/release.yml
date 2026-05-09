@@ -42,7 +42,7 @@ jobs:
             os: macos-latest
             archive: tar.xz
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.2
       - name: Strip local-only TUI path deps
         run: |
           # ftui crates use /dp/frankentui/ paths unavailable in CI
@@ -254,7 +254,7 @@ jobs:
           fi
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: sbh-${{ matrix.target }}
           path: |
@@ -269,7 +269,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.2
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -313,12 +313,12 @@ jobs:
           fi
 
       - name: Check out source repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.2
         with:
           path: sbh-source
 
       - name: Check out Homebrew tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.2
         with:
           repository: ${{ env.HOMEBREW_TAP_REPOSITORY }}
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
