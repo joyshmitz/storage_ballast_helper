@@ -4289,7 +4289,7 @@ fn release_doctor_setup_steps() -> Vec<ReleaseDoctorSetupStep> {
             docs: "docs/macos.md#code-signing-and-hardened-runtime",
             commands: vec![
                 "export CSR_PATH=\"$HOME/Desktop/sbh-developer-id.certSigningRequest\"".to_string(),
-                "certtool r \"$CSR_PATH\"".to_string(),
+                "certtool r \"$CSR_PATH\" u".to_string(),
                 "certtool V \"$CSR_PATH\"".to_string(),
                 "open https://developer.apple.com/account/resources/certificates/add".to_string(),
             ],
@@ -9200,7 +9200,7 @@ mod tests {
 
         for required in [
             "export CSR_PATH=\"$HOME/Desktop/sbh-developer-id.certSigningRequest\"",
-            "certtool r \"$CSR_PATH\"",
+            "certtool r \"$CSR_PATH\" u",
             "certtool V \"$CSR_PATH\"",
             "open https://developer.apple.com/account/resources/certificates/add",
             "security find-identity -v -p codesigning",

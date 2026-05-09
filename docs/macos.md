@@ -331,7 +331,7 @@ it handles private key material:
 
    ```bash
    export CSR_PATH="$HOME/Desktop/sbh-developer-id.certSigningRequest"
-   certtool r "$CSR_PATH"
+   certtool r "$CSR_PATH" u
    certtool V "$CSR_PATH"
    open https://developer.apple.com/account/resources/certificates/add
    ```
