@@ -1716,7 +1716,7 @@ mod tests {
             "executor_preflight_skips_config_protected_daemon_candidate",
             "macos-platform",
             "macos-15-intel",
-            "25596980897",
+            "Do not treat queued CI as",
             "0 valid identities found",
             "sbh-notary",
             "HOMEBREW_TAP_TOKEN",

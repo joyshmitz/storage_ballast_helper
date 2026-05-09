@@ -1,10 +1,12 @@
 # macOS/Linux Parity Prompt-To-Artifact Completion Audit
 
 Bead: `bd-r7m7.11`
-Refresh bead: `bd-r7m7.12`
+Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`
 Parent: `bd-r7m7`
-Last audited: 2026-05-09 08:54 UTC
-Latest pushed head inspected: `046946f`
+Last audited: 2026-05-09 08:57 UTC
+Evidence snapshot: latest pushed head and CI run at audit time; refresh with
+`gh run list --repo Dicklesworthstone/storage_ballast_helper --branch main`
+before any close decision.
 
 This is the closeout gate for the active objective: make `sbh` seamlessly
 support macOS in addition to Linux, with automatic platform detection during
@@ -41,17 +43,17 @@ operator-visible outcomes:
 
 ## Current Tracker And CI State
 
-- `bd-r7m7` is open with 26 of 27 children closed. This refresh bead is the
-  current in-progress child as of 2026-05-09 08:54 UTC.
-- `bd-ykwh` is open with 11 of 16 children closed. The remaining work is
-  release-credential and Homebrew distribution plumbing.
-- `br ready --json` returned `[]`; remaining open actionable release work is
-  blocked or already assigned to `SilentGlacier`.
+- `bd-r7m7` remains open. Use live `br epic status --json` output before any
+  close decision because audit refresh beads change child counts.
+- `bd-ykwh` remains open. The remaining work is release-credential and Homebrew
+  distribution plumbing.
+- `br ready --json` returned `[]`; remaining open actionable release work was
+  blocked or already assigned to `SilentGlacier` at audit time.
 - In-progress release blockers are `bd-ykwh.2`, `bd-ykwh.3`, `bd-ykwh.10`, and
   `bd-ykwh.13`.
-- CI run `25596980897` for head `046946f` was queued at audit time with
-  `Homebrew Formula Validation` and `Format + Lint` materialized but not green.
-  Do not treat queued CI as proof.
+- The latest CI run was queued at audit time with `Homebrew Formula Validation`
+  and `Format + Lint` materialized but not green. Do not treat queued CI as
+  proof; inspect the latest run for the final pushed head before closing.
 - Local Homebrew formula checks passed at refresh time: `brew style
   packaging/homebrew/Formula/sbh.rb` and the generated-formula placeholder
   replacement path both reported no style offenses.
