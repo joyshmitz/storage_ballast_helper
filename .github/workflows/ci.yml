@@ -50,6 +50,9 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6.0.2
+      - name: Check formula syntax
+        shell: bash
+        run: ruby -c packaging/homebrew/Formula/sbh.rb 2>&1 | tee homebrew-formula-syntax-output.txt
       - name: Check formula style
         shell: bash
         run: brew style packaging/homebrew/Formula/sbh.rb 2>&1 | tee homebrew-formula-style-output.txt
@@ -77,6 +80,7 @@ jobs:
           grep -q "version \"${version}\"" generated-homebrew/Formula/sbh.rb
           grep -q "sha256 \"${arm_sha}\"" generated-homebrew/Formula/sbh.rb
           grep -q "sha256 \"${intel_sha}\"" generated-homebrew/Formula/sbh.rb
+          ruby -c generated-homebrew/Formula/sbh.rb 2>&1 | tee homebrew-generated-formula-syntax-output.txt
           brew style generated-homebrew/Formula/sbh.rb 2>&1 | tee homebrew-generated-formula-style-output.txt
       - name: Upload Homebrew formula logs
         if: always()
@@ -84,7 +88,9 @@ jobs:
         with:
           name: homebrew-formula-logs
           path: |
+            homebrew-formula-syntax-output.txt
             homebrew-formula-style-output.txt
+            homebrew-generated-formula-syntax-output.txt
             homebrew-generated-formula-style-output.txt
             generated-homebrew/Formula/sbh.rb
           retention-days: 14
