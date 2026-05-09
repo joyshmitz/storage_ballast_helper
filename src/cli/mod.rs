@@ -2203,6 +2203,7 @@ mod tests {
     #[test]
     fn unix_installer_verifies_macos_binary_trust_before_install() {
         let installer = include_str!("../../scripts/install.sh");
+        let readme = include_str!("../../README.md");
         let macos_guide = include_str!("../../docs/macos.md");
 
         for required in [
@@ -2243,6 +2244,19 @@ mod tests {
             assert!(
                 macos_guide.contains(required),
                 "macOS guide must document installer trust check fragment: {required}"
+            );
+        }
+
+        for required in [
+            "Skip artifact verification, including macOS trust checks",
+            "macOS binary trust checks",
+            "codesign --verify --strict --verbose=2",
+            "spctl -a -t execute -vv",
+            "including checksum, signature, and macOS trust checks",
+        ] {
+            assert!(
+                readme.contains(required),
+                "README must document installer trust check fragment: {required}"
             );
         }
     }

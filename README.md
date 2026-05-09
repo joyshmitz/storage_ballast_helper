@@ -587,7 +587,7 @@ Environment overrides are available for operator automation:
 | `--system` | Install to system-wide location (requires root) |
 | `--user` | Install to user-local location (`~/.local/bin`) |
 | `--dry-run` | Print what would be done without making changes |
-| `--no-verify` | Skip integrity verification (unsafe; debugging only) |
+| `--no-verify` | Skip artifact verification, including macOS trust checks (unsafe; debugging only) |
 
 Useful operator checks:
 
@@ -1474,7 +1474,7 @@ Source: `src/daemon/service.rs`
 
 ### Supply Chain Verification
 
-Binary releases and updates pass through a verification pipeline before installation. The pipeline has two layers: mandatory checksum verification and optional cryptographic signature verification.
+Binary releases, installers, and updates pass through a verification pipeline before installation. The pipeline has three layers where applicable: mandatory checksum verification, optional cryptographic signature verification, and macOS binary trust checks.
 
 #### SHA-256 Checksums
 
@@ -1493,9 +1493,13 @@ When a Sigstore bundle (`.sigstore` file) is present alongside the release artif
 
 If the `cosign` binary is not installed on the system, the pipeline probes for it at verification time. When `cosign` is absent and the policy is `Required`, the outcome is `Deny` with reason code `sigstore_required_unavailable`. When the policy is `Optional`, missing `cosign` degrades to checksum-only with a warning.
 
+#### macOS Binary Trust Checks
+
+On macOS, the Unix installer and self-update path also run `codesign --verify --strict --verbose=2` and `spctl -a -t execute -vv` against the downloaded candidate before installing or replacing `sbh`. This rejects unsigned, malformed, or Gatekeeper-rejected binaries before they become active.
+
 #### Bypass and Audit Trail
 
-The `--no-verify` flag explicitly bypasses all verification. This is a loud operation: the outcome includes `bypass_used: true`, a warning message, and reason code `verify_bypass`. The structured `VerificationOutcome` captures the full decision trail (bypass, checksum status, signature status, reason codes, warnings) for audit logging.
+The `--no-verify` flag explicitly bypasses all artifact verification, including checksum, signature, and macOS trust checks. This is a loud operation: the outcome includes `bypass_used: true`, a warning message, and reason code `verify_bypass`. The structured `VerificationOutcome` captures the full decision trail (bypass, checksum status, signature status, reason codes, warnings) for audit logging.
 
 For airgapped environments, the `--offline` flag accepts a local bundle manifest, allowing updates without network access while maintaining checksum verification.
 
