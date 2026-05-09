@@ -401,6 +401,77 @@ jobs:
             echo "::error::sbh release binary was signed with a forbidden entitlement"
             exit 1
           fi
+      - name: Capture release doctor diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="./target/release/sbh"
+          if [ ! -x "${bin}" ]; then
+            echo "release binary is not available" | tee macos-release-doctor-status.txt
+            exit 0
+          fi
+
+          set +e
+          "${bin}" --json doctor --release > macos-release-doctor-output.json 2> macos-release-doctor-stderr.txt
+          doctor_status=$?
+          set -e
+          echo "exit_status=${doctor_status}" | tee macos-release-doctor-status.txt
+
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          output = pathlib.Path("macos-release-doctor-output.json")
+          try:
+              report = json.loads(output.read_text(encoding="utf-8"))
+          except Exception as error:
+              print(f"::error::release doctor did not emit valid JSON: {error}")
+              sys.exit(1)
+
+          required_top = {
+              "repository",
+              "notary_profile",
+              "required_github_secrets",
+              "checks",
+              "setup_steps",
+          }
+          missing_top = sorted(required_top.difference(report))
+          if missing_top:
+              print(f"::error::release doctor JSON missing keys: {missing_top}")
+              sys.exit(1)
+
+          checks = {check.get("id"): check.get("status") for check in report["checks"]}
+          required_checks = [
+              "release.developer_id_identity",
+              "release.notary_profile",
+              "release.github_secrets",
+          ]
+          missing_checks = [check for check in required_checks if check not in checks]
+          if missing_checks:
+              print(f"::error::release doctor JSON missing checks: {missing_checks}")
+              sys.exit(1)
+
+          pathlib.Path("macos-release-doctor-summary.txt").write_text(
+              "\n".join(f"{check}={checks[check]}" for check in required_checks) + "\n",
+              encoding="utf-8",
+          )
+          PY
+      - name: Prepare macOS binary diagnostic artifact
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="./target/release/sbh"
+          mkdir -p macos-release-artifact
+          if [ ! -x "${bin}" ]; then
+            echo "release binary is not available" | tee macos-release-artifact/README.txt
+            exit 0
+          fi
+          cp "${bin}" "macos-release-artifact/sbh-${{ matrix.runner }}"
+          shasum -a 256 "macos-release-artifact/sbh-${{ matrix.runner }}" \
+            | tee "macos-release-artifact/sbh-${{ matrix.runner }}.sha256"
       - name: Exercise launchd user service lifecycle
         if: matrix.os == 'macos-latest'
         shell: bash
@@ -466,10 +537,19 @@ jobs:
             macos-codesign-output.txt
             macos-codesign-entitlements.plist
             macos-*entitlements*-output.txt
+            macos-release-doctor-*.json
+            macos-release-doctor-*.txt
             macos-launchd-*.txt
             macos-launchd-*.jsonl
             macos-e2e-smoke-output.txt
             sbh-completions.zsh
+          retention-days: 14
+      - name: Upload macOS binary diagnostic artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release-binary-${{ matrix.os }}
+          path: macos-release-artifact/
           retention-days: 14
 
   macos-coverage:

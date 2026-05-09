@@ -3,7 +3,7 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`
 Parent: `bd-r7m7`
-Last audited: 2026-05-09 10:13 UTC
+Last audited: 2026-05-09 16:34 UTC
 Evidence snapshot: the audit intentionally avoids pinning exact commit hashes or
 GitHub Actions run ids because every audit-only commit would make those literals
 stale. Before any close decision, refresh the live head and newest run with:
@@ -54,6 +54,16 @@ operator-visible outcomes:
 - README and docs let a Mac user install, configure, verify, and diagnose the
   release path without reading workflow internals.
 
+## Prompt-To-Artifact Checklist
+
+| Prompt requirement | Concrete artifacts inspected | Current audit result |
+|---|---|---|
+| "support mac os in addition to linux" | `src/platform/pal.rs`, `src/platform/linux`, `src/platform/macos`, Linux and macOS CI workflow lanes, macOS integration tests, existing Linux unit/integration lanes | Repo-side platform implementation exists for both OS families. Final proof still requires the final pushed head to complete all Linux and macOS CI jobs green. |
+| "everything automatically detected during installation" | `src/cli/install.rs`, `src/daemon/service.rs`, launchd/systemd workflow tests, `docs/macos.md`, Homebrew formula and release workflow | Installer/service detection is implemented and documented. Signed/notarized release install remains blocked by Developer ID, notary, Homebrew token, and final tag-release proof. |
+| "while running" automatic platform behavior | PAL-backed status/check/scan/clean/blame/daemon paths, APFS/Mach/libproc macOS implementations, Linux PAL preservation, focused protection regression tests | Runtime behavior is routed through platform-specific implementations behind the shared CLI/PAL surface. Final proof still depends on queued hosted CI and live release diagnostics. |
+| "always does the right thing" / "just works" | Protected-path daemon tests, active-reference/open-file checks, sacred-path catalog, APFS accounting tests, launchd lifecycle test, docs and doctor diagnostics | Safety and diagnostics are covered in source and tests. Installed sbh 0.4.6 daemons must be upgraded/restarted because they predate the daemon protection fix. |
+| "additional testing infrastructure" | `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, macOS platform/coverage/benchmark jobs, Homebrew validation, release-doctor tests, protected-path tests | Infrastructure exists and focused local/rch proof passed, but the current hosted run is still queued and cannot be treated as final green proof. |
+
 ## Current Tracker And CI State
 
 - `bd-r7m7` remains open. Use live `br epic status --json` output before any
@@ -66,13 +76,101 @@ operator-visible outcomes:
   `bd-ykwh.13`.
 - `bd-ykwh.20` is closed; release CI now runs `spctl -a -t execute -vv` after
   notarization acceptance and before packaging macOS tarballs.
-- The newest CI run for the current head was queued at audit time with
-  `Homebrew Formula Validation` and `Format + Lint` materialized but not green.
-  Do not treat queued CI as proof; inspect the latest run for the final pushed
-  head before closing.
+- The newest CI run for the current head was still queued at audit refresh time.
+  `macOS Platform Tests (intel)` completed successfully on `macos-15-intel`;
+  `Format + Lint`, `macOS Platform Tests (apple-silicon)`, `Homebrew Formula
+  Validation`, `macOS Performance Budgets`, and `macOS Coverage` remained
+  queued with no runner assigned. Do not treat queued CI as proof; inspect the
+  latest run for the final pushed head before closing.
+- Live recheck at 2026-05-09 16:26 UTC showed the same CI state and
+  `br ready --json` still returned `[]`.
 - Local Homebrew formula checks passed at refresh time: `brew style
   packaging/homebrew/Formula/sbh.rb` and the generated-formula placeholder
   replacement path both reported no style offenses.
+- Additional local formula validation passed with
+  `ruby -c packaging/homebrew/Formula/sbh.rb`. The installed Homebrew version
+  rejects path-based `brew audit --formula --strict packaging/homebrew/Formula/sbh.rb`
+  and requires auditing by formula name, so full `brew audit` remains covered by
+  the hosted `Homebrew Formula Validation` job and release/tap verification.
+- Supplemental current-head proof while hosted CI was queued: local
+  `cargo fmt --check` passed, and
+  `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_ci_exact_format_lint cargo clippy --no-default-features --features cli,daemon,sqlite --lib --bin sbh -- -D warnings`
+  returned remote exit 0. This does not replace hosted CI green status.
+- Focused protected-path regression proof passed with
+  `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_daemon_protection_proof cargo test --lib protected -- --nocapture`.
+  The run reported 13 passed tests, including the daemon executor preflight and
+  protected `rust_fuzz_target` priority pre-scan regression.
+- Focused release-doctor proof passed with
+  `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_release_doctor_proof cargo test --bin sbh release_doctor -- --nocapture`.
+  The run reported 3 passed tests covering missing external credentials,
+  credential-present success, and stdin-based release-secret setup steps.
+- Focused release workflow contract proof passed with
+  `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_workflow_contract_proof cargo test --lib workflow -- --nocapture`.
+  The run reported 13 passed tests, including Developer ID import, hardened
+  runtime signing, async notarization, PR ad-hoc signing, Homebrew tap PR update,
+  and CI cancellation behavior.
+- Focused Homebrew contract proof passed with
+  `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_homebrew_contract_proof cargo test --lib homebrew -- --nocapture`.
+  The run reported 5 passed tests covering formula skeleton asset names,
+  checksum marker replacement, CI formula generation, tap PR updates, and
+  Homebrew install-path discovery.
+- Focused macOS CLI auto-detection proof passed with
+  `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_bin_macos_proof cargo test --bin sbh macos -- --nocapture`.
+  The run reported 10 passed tests covering launchd auto-selection, macOS
+  release install defaults, doctor remediation, process attribution visibility,
+  and platform-autodetection help text.
+- Focused macOS library runtime proof passed with
+  `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_lib_macos_proof cargo test --lib macos -- --nocapture`.
+  Remote sync failed on one worker with permission errors, so `rch` fell back to
+  local execution on macOS. The run reported 112 passed tests covering APFS
+  capacity, purgeable and snapshot parsing, Mach/sysctl memory data, libproc
+  process/open-file visibility, macOS PAL behavior, cleanup catalog safety,
+  sacred catalog coverage, launchd defaults, and macOS release/update contracts.
+- Attempted current-source macOS binary proof with
+  `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_current_macos_binary cargo build --bin sbh --target aarch64-apple-darwin`.
+  The selected Linux worker failed before compiling `sbh` because the
+  `aarch64-apple-darwin` Rust target was not installed there. No local
+  current-source macOS binary was produced, so `sbh doctor --release --json`
+  remains unproven from a current build.
+- The macOS platform CI lane now captures `sbh --json doctor --release` from
+  the just-built current-source release binary, validates the diagnostic JSON
+  shape, uploads the doctor output with the macOS logs, and preserves an
+  ad-hoc-signed diagnostic binary artifact plus SHA-256. This improves future
+  closeout evidence but does not replace a final passing release doctor with
+  real Developer ID, notary, and Homebrew credentials.
+- The artifact-retention patch was validated with
+  `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_macos_ci_artifact_proof cargo test --lib macos -- --nocapture`.
+  The run reported 46 passed tests, including the updated CI workflow contract
+  and macOS completion-audit guard. Full compiler gates also passed:
+  `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_ci_artifact_check cargo check --all-targets`
+  and
+  `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_ci_artifact_clippy cargo clippy --all-targets -- -D warnings`.
+- Static workflow validation passed locally with Ruby YAML parsing for
+  `.github/workflows/ci.yml`, `.github/workflows/release.yml`, and
+  `.github/workflows/cert-expiration.yml`. The expected CI quality gate,
+  macOS platform, coverage, benchmark, Homebrew formula, Developer ID signing,
+  notarization, Gatekeeper, and Homebrew tap workflow anchors are present.
+- Local packaging-input validation passed at refresh time:
+  `plutil -lint .github/macos/sbh.entitlements.plist`,
+  `ruby -c packaging/homebrew/Formula/sbh.rb`, and
+  `brew style packaging/homebrew/Formula/sbh.rb`.
+- A read-only REST scan of the 30 most recently pushed owner repositories found
+  at least 1,483 queued workflow runs and 14 in-progress runs across the
+  account, including large queues in `asupersync`, `pi_agent_rust`,
+  `franken_node`, and `agentic_coding_flywheel_setup`. This makes the current
+  `storage_ballast_helper` hosted-runner delay look account-wide rather than an
+  isolated workflow syntax or repository-permission issue.
+- `storage_ballast_helper` has no self-hosted Actions runners registered, so
+  the final CI gate currently depends entirely on GitHub-hosted runner capacity.
+  Registering a self-hosted runner or canceling queued runs in other repositories
+  would be remote state changes and needs explicit operator approval.
+- A narrower queue triage found the largest queued-run sources were
+  `asupersync` (858 queued), `pi_agent_rust` (239 queued), `franken_node` (116
+  queued), `agentic_coding_flywheel_setup` (104 queued), and
+  `ultimate_bug_scanner` (35 queued). If the operator wants to free hosted
+  Actions capacity, cancellation should start with those repositories rather
+  than this repo's current run, because this run already contains useful
+  completed Intel macOS proof.
 
 ## Checklist
 
@@ -83,7 +181,7 @@ operator-visible outcomes:
 | Scan finds and ranks macOS reclaim candidates | `src/platform/macos/cleanup_catalog.rs`, `tests/common/mod.rs::SyntheticMacTree`, `src/scanner/patterns.rs` macOS cleanup tests, `docs/macos-incident-case-study.md` | Covered for Xcode, CoreSimulator, Electron caches, `/private/tmp/*-target`, `*_target`, `target_*`, user trash, and sacred paths. |
 | Clean/daemon deletion respects protected paths and active builds | `src/daemon/loop_main.rs::should_skip_protected_daemon_candidate`, `src/scanner/walker.rs`, `src/scanner/deletion.rs`, `bd-twgw`, `bd-j40b`, `daemon::loop_main::tests::scanner_prescan_does_not_dispatch_protected_rust_fuzz_target`, `daemon::loop_main::tests::executor_preflight_skips_config_protected_daemon_candidate` | Fixed in current source. Installed sbh 0.4.6 daemons must be upgraded/restarted because they can still delete protected artifact-looking paths. |
 | Blame attributes macOS disk growth to processes | `tests/integration_tests.rs::macos_synthetic_writer_surfaces_in_blame_top_rows`, `src/cli_app.rs::collect_blame_report_at`, macOS PAL libproc process I/O and open-file code | Covered by macOS integration test and PAL-backed implementation. |
-| CI validates Linux and macOS | `.github/workflows/ci.yml` jobs `check`, `unit`, `integration`, `linux-arm64`, `decision-plane`, `dashboard`, `e2e`, `macos-platform`, `macos-coverage`, `macos-benchmarks`, `stress`, `artifact-contract`, `provenance`, and `Homebrew Formula Validation` | Infrastructure exists. The macOS platform, coverage, and benchmark jobs are independent from the Ubuntu `check` job so Linux runner queueing cannot hide missing macOS proof. Final goal cannot close until the final head completes green. `macos-13` has been replaced with `macos-15-intel` because GitHub retired the old runner label; `macos-latest` remains the arm64 lane. |
+| CI validates Linux and macOS | `.github/workflows/ci.yml` jobs `check`, `unit`, `integration`, `linux-arm64`, `decision-plane`, `dashboard`, `e2e`, `macos-platform`, `macos-coverage`, `macos-benchmarks`, `stress`, `artifact-contract`, `provenance`, and `Homebrew Formula Validation` | Infrastructure exists. The macOS platform, coverage, and benchmark jobs are independent from the Ubuntu `check` job so Linux runner queueing cannot hide missing macOS proof. Current-head Intel macOS platform proof passed on `macos-15-intel`, including 52 integration tests, E2E smoke, APFS JSON status, and ad-hoc hardened-runtime codesign. A follow-up workflow patch captures current-source release-doctor JSON and the diagnostic macOS binary artifact for future runs. Final goal cannot close until the final head completes all required jobs green. `macos-13` has been replaced with `macos-15-intel` because GitHub retired the old runner label; `macos-latest` remains the arm64 lane. |
 | Docs explain install, configure, verify, and diagnose | `README.md`, `docs/macos.md`, `docs/macos-full-disk-access.md`, `docs/cleanup-rules-macos.md`, `docs/testing-and-logging.md`, sample configs in `docs/configs/` | Covered in docs. Keep docs update lint green for future CLI/config changes. |
 | Release is signed, notarized, Gatekeeper-assessed, and distributed through Homebrew | `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, `.github/macos/sbh.entitlements.plist`, `packaging/homebrew/Formula/sbh.rb`, `docs/macos.md` release diagnostics, `src/cli/mod.rs::release_workflow_notarizes_macos_binaries_asynchronously` | Workflow and docs exist. `bd-ykwh.20` added release-side `spctl -a -t execute -vv` before packaging. Live credentials and a successful tag release are still missing, so this is not complete. |
 
@@ -102,8 +200,8 @@ Current source status:
 - `bd-j40b` added the exact incident regression for the protected
   `asupersync_ansi_c/tools/rust_fuzz_target` path shape.
 - The focused proof lane is
-  `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_daemon_protection cargo test --lib protected -- --nocapture`.
-- On 2026-05-09 this lane passed 12 protection-related tests, including
+  `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_daemon_protection_proof cargo test --lib protected -- --nocapture`.
+- On 2026-05-09 this lane passed 13 protection-related tests, including
   `scanner_prescan_does_not_dispatch_protected_rust_fuzz_target` and
   `executor_preflight_skips_config_protected_daemon_candidate`.
 
@@ -114,13 +212,15 @@ containing `bd-twgw` and `bd-j40b`, then restore the protected worktree files.
 ## Live Release Blocker Evidence
 
 The user confirmed Apple Developer Program enrollment, so enrollment itself is
-not the current blocker. Live checks at 2026-05-09 10:13 UTC still showed:
+not the current blocker. Live checks at 2026-05-09 16:26 UTC still showed:
 
 - `security find-identity -v -p codesigning`: `0 valid identities found`
 - `xcrun notarytool history --keychain-profile sbh-notary --output-format json`:
   missing `sbh-notary` keychain profile
 - `gh secret list --repo Dicklesworthstone/storage_ballast_helper --json name,updatedAt`:
   `[]`
+- No existing `~/Desktop/sbh-developer-id.certSigningRequest` file or keychain
+  item labeled `sbh Developer ID` was present.
 
 Remaining release blockers:
 

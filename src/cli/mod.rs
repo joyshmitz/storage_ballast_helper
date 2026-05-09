@@ -1437,6 +1437,13 @@ mod tests {
             "macOS Platform Tests (${{ matrix.runner }})",
             "Build release binary",
             "cargo build $CI_FEATURES --release 2>&1 | tee macos-release-build-output.txt",
+            "Capture release doctor diagnostics",
+            "\"${bin}\" --json doctor --release > macos-release-doctor-output.json",
+            "macos-release-doctor-summary.txt",
+            "Prepare macOS binary diagnostic artifact",
+            "macos-release-artifact/sbh-${{ matrix.runner }}",
+            "Upload macOS binary diagnostic artifact",
+            "macos-release-binary-${{ matrix.os }}",
             "macos-release-build-output.txt",
         ] {
             assert!(
