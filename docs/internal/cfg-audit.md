@@ -17,15 +17,15 @@ Classification values:
 | File | Line | Current Behavior | Classification | Target PAL Method | Notes |
 |---|---:|---|---|---|---|
 | `src/scanner/deletion.rs` | 757 | Gates `circuit_breaker_halts_batch_on_consecutive_failures` to Linux because the fixture relies on Unix permissions producing a deletion failure shape known to hold on Linux. | `cfg-gate-keep` | `N/A` | Test-only proof for Linux deletion semantics. Add separate macOS proof if APFS/permission behavior needs equivalent coverage. |
-| `src/scanner/deletion.rs` | 825 | Gates `nested_open_file_is_detected_for_parent_directory` to Linux because it depends on `/proc/<pid>/fd` ancestor collection. | `PAL-method` | `open_path_ancestors(root_paths)` | Once macOS libproc support exists, this should be a platform contract test plus Linux/macOS backend tests. |
+| `src/scanner/deletion.rs` | 825 | Gates `nested_open_file_is_detected_for_parent_directory` to Linux because it depends on `/proc/<pid>/fd` ancestor collection. | `cfg-gate-keep` | `N/A` | Linux-specific `/proc` regression. macOS PAL/libproc coverage now lives in `open_path_ancestors_uses_platform_collector_on_macos` (`bd-r7m7.3`). |
 | `src/scanner/walker.rs` | 604 | Selects Linux implementation for inode-based open-file collection. | `PAL-method` | `open_file_keys()` | Deletion safety should not silently downgrade on macOS. Linux can keep `/proc`; macOS needs libproc/fd inspection. |
 | `src/scanner/walker.rs` | 608 | Returns an empty open-file set on every non-Linux target for the legacy inode fallback. | `PAL-method` | `open_file_keys()` | The newer PAL active-reference path reports macOS user-scope visibility as incomplete; this fallback should still move behind a platform-owned result before deletion preflight is fully symmetric. |
 | `src/scanner/walker.rs` | 614 | Compiles `/proc` inode scan only on Linux. | `PAL-method` | `open_file_keys()` | Move under Linux PAL backend or a Linux-specific implementation module. |
 | `src/scanner/walker.rs` | 672 | Allows `OPEN_FILES_SCAN_BUDGET` to be dead code off Linux. | `PAL-method` | `open_file_scan_limits()` | This constant belongs with the Linux open-file backend; macOS should define its own limits. |
 | `src/scanner/walker.rs` | 677 | Allows `OPEN_FILES_MAX_PIDS` to be dead code off Linux. | `PAL-method` | `open_file_scan_limits()` | Same implementation-owned limit issue as `OPEN_FILES_SCAN_BUDGET`. |
-| `src/scanner/walker.rs` | 688 | Selects Linux implementation for open-path ancestor collection. | `PAL-method` | `open_path_ancestors(root_paths)` | This is the safer subtree-open veto path and should become a platform capability. |
-| `src/scanner/walker.rs` | 692 | Returns an empty, complete ancestor set on non-Linux for the legacy `/proc` ancestor fallback. | `PAL-method` | `open_path_ancestors(root_paths)` | The PAL active-reference collector now emits `fd check incomplete: other-user processes not visible` for user-scope macOS runs; this fallback remains a cleanup-preflight parity gap. |
-| `src/scanner/walker.rs` | 699 | Compiles `/proc` path-ancestor scan only on Linux. | `PAL-method` | `open_path_ancestors(root_paths)` | Linux backend can retain `/proc`; macOS backend should use libproc path/fd APIs. |
+| `src/scanner/walker.rs` | 688 | Dispatches open-path ancestor collection to Linux `/proc` or macOS PAL/libproc by target. | `cfg-gate-keep` | `N/A` | Closed for cleanup executor preflight by `bd-r7m7.3`; the target gate selects backend code rather than skipping macOS. |
+| `src/scanner/walker.rs` | 692 | Uses the compile-time PAL on macOS/non-Linux targets instead of returning an empty, complete ancestor set. | `cfg-gate-keep` | `N/A` | Closed for macOS by `bd-r7m7.3`. If more OSes are added, this branch must grow a backend rather than silently returning empty. |
+| `src/scanner/walker.rs` | 699 | Compiles `/proc` path-ancestor scan only on Linux. | `cfg-gate-keep` | `N/A` | Correct as the Linux backend; macOS cleanup preflight uses the PAL/libproc backend. |
 | `src/scanner/walker.rs` | 806 | Allows `OpenPathCache` to be dead code off Linux. | `PAL-method` | `open_path_cache()` | Cache should be platform-owned or backed by a trait object so non-Linux code has a real implementation. |
 | `src/scanner/walker.rs` | 823 | Uses Linux subtree scan in `OpenPathCache::is_path_open`. | `PAL-method` | `is_path_open(path)` | Should delegate to platform open-file inspection. |
 | `src/scanner/walker.rs` | 827 | Returns `false` for `OpenPathCache::is_path_open` on non-Linux. | `PAL-method` | `is_path_open(path)` | Current macOS behavior weakens the open-file safety veto. |
@@ -73,7 +73,7 @@ The repeated sites point to these first-class platform methods or platform-owned
 | `service_ownership_policy()` | `root:root` | `root:wheel` | Recommendation text is scattered in service code. |
 | `process_blame_snapshot()` | `/proc/<pid>` | libproc process/cwd APIs | `sbh blame` is Linux-only. |
 | `self_stats()` | `/proc/self/status` | `proc_pid_rusage` or equivalent | macOS daemon RSS currently reports zero. |
-| `open_file_keys()` / `open_path_ancestors()` / `is_path_open()` | `/proc/<pid>/fd` | libproc fd/path APIs | macOS cleanup can miss open-file vetoes. |
+| `open_file_keys()` / `open_path_ancestors()` / `is_path_open()` | `/proc/<pid>/fd` | libproc fd/path APIs | Executor preflight parity is closed for macOS by `bd-r7m7.3`; legacy inode-key fallback remains Linux-specific. |
 | `preallocate_file(file, offset, len)` | `fallocate` | `fcntl(F_PREALLOCATE)` or unsupported | macOS ballast provisioning falls back to slow random writes. |
 
 ## Sign-Off
