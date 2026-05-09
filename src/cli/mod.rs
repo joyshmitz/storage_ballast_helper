@@ -913,6 +913,17 @@ mod tests {
 
     use tempfile::{NamedTempFile, TempDir};
 
+    fn workflow_block<'a>(workflow: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+        let start = workflow
+            .find(start_marker)
+            .unwrap_or_else(|| panic!("workflow missing start marker: {start_marker}"));
+        let rest = &workflow[start..];
+        let end = rest
+            .find(end_marker)
+            .unwrap_or_else(|| panic!("workflow missing end marker: {end_marker}"));
+        &rest[..end]
+    }
+
     #[test]
     fn parses_aliases_for_os_arch_and_abi() {
         let host = HostSpecifier::from_parts("darwin", "arm64", Some("none")).unwrap();
@@ -1466,6 +1477,41 @@ mod tests {
                 .contains("Quality gate failures should not block release artifact production"),
             "release workflow must not document non-blocking quality gates"
         );
+    }
+
+    #[test]
+    fn ci_runs_macos_validation_lanes_independently_from_linux_check() {
+        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
+        let testing_guide = include_str!("../../docs/testing-and-logging.md");
+
+        for (job, end_marker) in [
+            ("  macos-platform:\n", "\n  macos-coverage:\n"),
+            ("  macos-coverage:\n", "\n  macos-benchmarks:\n"),
+            ("  macos-benchmarks:\n", "\n  stress:\n"),
+        ] {
+            let block = workflow_block(ci_workflow, job, end_marker);
+            assert!(
+                block.contains("runs-on: macos") || block.contains("runs-on: ${{ matrix.os }}"),
+                "macOS validation job must run on a macOS hosted runner: {job}"
+            );
+            assert!(
+                !block.contains("needs: check"),
+                "macOS validation job must not wait behind the Ubuntu check job: {job}"
+            );
+        }
+
+        for required in [
+            "macOS validation independence",
+            "`macos-platform`, `macos-coverage`, and",
+            "`macos-benchmarks` jobs intentionally",
+            "do not declare `needs: check`",
+            "a queued Ubuntu runner cannot hide missing macOS proof",
+        ] {
+            assert!(
+                testing_guide.contains(required),
+                "testing guide must document independent macOS validation: {required}"
+            );
+        }
     }
 
     #[test]

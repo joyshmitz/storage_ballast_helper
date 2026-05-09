@@ -296,7 +296,6 @@ jobs:
   macos-platform:
     name: macOS Platform Tests (${{ matrix.runner }})
     runs-on: ${{ matrix.os }}
-    needs: check
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -476,7 +475,6 @@ jobs:
   macos-coverage:
     name: macOS Coverage
     runs-on: macos-latest
-    needs: check
     timeout-minutes: 45
     env:
       COVERAGE_DELTA_FLOOR: "-2.0"
@@ -586,7 +584,6 @@ jobs:
   macos-benchmarks:
     name: macOS Performance Budgets
     runs-on: macos-latest
-    needs: check
     timeout-minutes: 45
     env:
       BENCH_REGRESSION_LIMIT: "20.0"

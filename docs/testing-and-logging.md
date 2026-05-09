@@ -216,6 +216,13 @@ concurrency group `github.workflow` plus the PR number or ref, with
 newer commits from waiting behind obsolete hosted-runner jobs while preserving
 `workflow_call` behavior for release quality gates.
 
+**macOS validation independence:** The `macos-platform`, `macos-coverage`, and
+`macos-benchmarks` jobs intentionally do not declare `needs: check`. They still
+run their own checkout, toolchain setup, build, tests, and artifact upload, but
+a queued Ubuntu runner cannot hide missing macOS proof. The final provenance job
+continues to require all Linux and macOS validation lanes before a CI run is
+trusted.
+
 **CI artifact retention** (`.github/workflows/ci.yml`):
 
 | CI Job | Artifacts | Retention |
