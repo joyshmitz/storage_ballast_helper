@@ -1529,6 +1529,8 @@ mod tests {
             "sbh-v#{version}-x86_64-apple-darwin.tar.xz",
             "REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256",
             "REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256",
+            "sha256 \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+            "sha256 \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"",
             "system bin/\"sbh\", \"setup\", \"--verify\", \"--bin-dir\", bin",
             "run [opt_bin/\"sbh\", \"daemon\"]",
             "keep_alive crashed: true",
@@ -1542,6 +1544,41 @@ mod tests {
                 "Homebrew formula skeleton must include contract fragment: {required}"
             );
         }
+    }
+
+    #[test]
+    fn homebrew_formula_generation_removes_checksum_markers() {
+        let formula = include_str!("../../packaging/homebrew/Formula/sbh.rb");
+        let arm_sha = "0".repeat(64);
+        let intel_sha = "1".repeat(64);
+
+        let generated = formula
+            .replace("version \"0.4.7\"", "version \"9.8.7\"")
+            .replace(
+                "      # REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256\n      sha256 \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+                &format!("      sha256 \"{arm_sha}\""),
+            )
+            .replace(
+                "      # REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256\n      sha256 \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"",
+                &format!("      sha256 \"{intel_sha}\""),
+            );
+
+        assert!(
+            !generated.contains("REPLACE_WITH_"),
+            "generated Homebrew formula must not retain checksum marker comments"
+        );
+        assert!(
+            generated.contains("version \"9.8.7\""),
+            "generated Homebrew formula must use the release tag version"
+        );
+        assert!(
+            generated.contains(&format!("sha256 \"{arm_sha}\"")),
+            "generated Homebrew formula must contain the aarch64 macOS release checksum"
+        );
+        assert!(
+            generated.contains(&format!("sha256 \"{intel_sha}\"")),
+            "generated Homebrew formula must contain the x86_64 macOS release checksum"
+        );
     }
 
     #[test]
@@ -1560,6 +1597,7 @@ mod tests {
             "homebrew-sbh/Formula/sbh.rb",
             "REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256",
             "REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256",
+            "sha256 \"[0-9a-f]{64}\"",
             "grep -q 'REPLACE_WITH_' homebrew-sbh/Formula/sbh.rb",
             "branch=\"update-sbh-${GITHUB_REF_NAME}\"",
             "gh pr list",

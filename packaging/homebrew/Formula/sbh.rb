@@ -10,13 +10,15 @@ class Sbh < Formula
     on_arm do
       url "https://github.com/Dicklesworthstone/storage_ballast_helper/releases/download/v#{version}/" \
           "sbh-v#{version}-aarch64-apple-darwin.tar.xz"
-      sha256 "REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256"
+      # REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256
+      sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     end
 
     on_intel do
       url "https://github.com/Dicklesworthstone/storage_ballast_helper/releases/download/v#{version}/" \
           "sbh-v#{version}-x86_64-apple-darwin.tar.xz"
-      sha256 "REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256"
+      # REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256
+      sha256 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     end
   end
 

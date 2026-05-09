@@ -355,8 +355,8 @@ jobs:
           VERSION="${version}" ARM_SHA="${arm_sha}" INTEL_SHA="${intel_sha}" \
             perl -0pi -e '
               s/version "[^"]+"/version "$ENV{VERSION}"/;
-              s/REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256/$ENV{ARM_SHA}/g;
-              s/REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256/$ENV{INTEL_SHA}/g;
+              s/      # REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256\n      sha256 "[0-9a-f]{64}"/      sha256 "$ENV{ARM_SHA}"/g;
+              s/      # REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256\n      sha256 "[0-9a-f]{64}"/      sha256 "$ENV{INTEL_SHA}"/g;
             ' homebrew-sbh/Formula/sbh.rb
 
           if grep -q 'REPLACE_WITH_' homebrew-sbh/Formula/sbh.rb; then
