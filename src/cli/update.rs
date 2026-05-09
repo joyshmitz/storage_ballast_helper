@@ -4,6 +4,7 @@
 //! (`resolve_updater_artifact_contract`, `verify_artifact_supply_chain`)
 //! so install and update paths cannot drift.
 
+use std::cmp::Ordering;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -655,18 +656,35 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
 
     // Step 4: Compare versions.
     let current_tag = format!("v{current}");
-    if current_tag == target.target_tag && !opts.force {
-        report.update_available = false;
-        report.step_ok(format!(
-            "Already at {}, no update needed",
-            target.target_tag
-        ));
-        report.success = true;
-        return report;
+    match compare_release_tags(&current_tag, &target.target_tag) {
+        Some(Ordering::Equal) if !opts.force => {
+            report.update_available = false;
+            report.step_ok(format!(
+                "Already at {}, no update needed",
+                target.target_tag
+            ));
+            report.success = true;
+            return report;
+        }
+        Some(Ordering::Greater) if opts.pinned_version.is_none() => {
+            report.update_available = false;
+            report.step_ok(format!(
+                "Latest available {} is older than current {current_tag}; no downgrade needed",
+                target.target_tag
+            ));
+            report.success = true;
+            return report;
+        }
+        _ => {}
     }
     report.update_available = true;
+    let selection = match compare_release_tags(&current_tag, &target.target_tag) {
+        Some(Ordering::Greater) => "Pinned downgrade selected",
+        Some(Ordering::Equal) => "Forced reinstall selected",
+        _ => "Update available",
+    };
     report.step_ok(format!(
-        "Update available: {current_tag} -> {}",
+        "{selection}: {current_tag} -> {}",
         target.target_tag
     ));
 
@@ -1081,6 +1099,50 @@ fn normalize_tag(version: &str) -> String {
     } else {
         format!("v{version}")
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedReleaseTag {
+    core: [u64; 3],
+    prerelease: Option<String>,
+}
+
+fn parse_release_tag(tag: &str) -> Option<ParsedReleaseTag> {
+    let without_prefix = tag.strip_prefix('v').unwrap_or(tag);
+    let without_build = without_prefix
+        .split_once('+')
+        .map_or(without_prefix, |(version, _build)| version);
+    let (core, prerelease) = without_build
+        .split_once('-')
+        .map_or((without_build, None), |(version, prerelease)| {
+            (version, Some(prerelease.to_string()))
+        });
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(ParsedReleaseTag {
+        core: [major, minor, patch],
+        prerelease,
+    })
+}
+
+fn compare_release_tags(left: &str, right: &str) -> Option<Ordering> {
+    let left = parse_release_tag(left)?;
+    let right = parse_release_tag(right)?;
+    let core = left.core.cmp(&right.core);
+    if core != Ordering::Equal {
+        return Some(core);
+    }
+    Some(match (&left.prerelease, &right.prerelease) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(left), Some(right)) => left.cmp(right),
+    })
 }
 
 fn unix_seconds(now: SystemTime) -> u64 {
@@ -1758,6 +1820,27 @@ mod tests {
     }
 
     #[test]
+    fn release_tag_comparison_orders_stable_versions() {
+        assert_eq!(
+            compare_release_tags("v0.4.7", "v0.4.6"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_release_tags("0.4.6", "v0.4.7"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_release_tags("v1.2.3", "1.2.3"),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            compare_release_tags("v1.2.3", "v1.2.3-rc.1"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(compare_release_tags("nightly", "v1.2.3"), None);
+    }
+
+    #[test]
     fn target_metadata_uses_cache_when_refresh_disabled() {
         let cache_dir = tempfile::tempdir().unwrap();
         let cache = UpdateMetadataCache::new(
@@ -1830,6 +1913,90 @@ mod tests {
         assert_eq!(
             cached.artifact_url,
             artifact_url_for_tag(&contract, "v1.2.3")
+        );
+    }
+
+    #[test]
+    fn run_update_sequence_cached_older_latest_does_not_offer_downgrade() {
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = test_contract();
+        let cache_path = tmp.path().join("update-cache.json");
+        let cache = UpdateMetadataCache::new(cache_path.clone(), Duration::from_mins(5));
+        let old_tag = "v0.0.0";
+        cache
+            .store(&CachedUpdateMetadata {
+                target_tag: old_tag.to_string(),
+                artifact_url: artifact_url_for_tag(&contract, old_tag),
+                fetched_at_unix_secs: unix_seconds(SystemTime::now()),
+            })
+            .unwrap();
+
+        let opts = UpdateOptions {
+            check_only: true,
+            pinned_version: None,
+            force: false,
+            install_dir: default_install_dir(false),
+            no_verify: false,
+            dry_run: false,
+            max_backups: 5,
+            metadata_cache_file: cache_path,
+            metadata_cache_ttl: Duration::from_mins(5),
+            refresh_cache: false,
+            notices_enabled: true,
+            offline_bundle_manifest: None,
+        };
+
+        let report = run_update_sequence(&opts);
+        assert!(
+            report.success,
+            "older cached latest should succeed: {report:?}"
+        );
+        assert!(
+            !report.update_available,
+            "older cached latest must not be offered as an update: {report:?}"
+        );
+        assert_eq!(report.target_version, Some(old_tag.to_string()));
+        assert!(
+            report
+                .steps
+                .iter()
+                .any(|step| step.description.contains("no downgrade needed")),
+            "report should explain that implicit downgrades are suppressed: {report:?}"
+        );
+    }
+
+    #[test]
+    fn run_update_sequence_pinned_older_version_is_explicit_downgrade() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_tag = "v0.0.0";
+        let opts = UpdateOptions {
+            check_only: true,
+            pinned_version: Some(old_tag.to_string()),
+            force: false,
+            install_dir: default_install_dir(false),
+            no_verify: false,
+            dry_run: false,
+            max_backups: 5,
+            metadata_cache_file: tmp.path().join("update-cache.json"),
+            metadata_cache_ttl: Duration::from_mins(5),
+            refresh_cache: false,
+            notices_enabled: true,
+            offline_bundle_manifest: None,
+        };
+
+        let report = run_update_sequence(&opts);
+        assert!(report.success, "pinned older version should be accepted");
+        assert!(
+            report.update_available,
+            "explicit pinned older version should remain operator-directed"
+        );
+        assert_eq!(report.target_version, Some(old_tag.to_string()));
+        assert!(
+            report
+                .steps
+                .iter()
+                .any(|step| step.description.contains("Pinned downgrade selected")),
+            "report should distinguish explicit downgrade from ordinary update: {report:?}"
         );
     }
 
