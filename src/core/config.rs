@@ -407,9 +407,16 @@ impl SacredConfig {
 
     pub fn remove_protected_path(&mut self, path: &str) -> bool {
         let before = self.protected_paths.len();
-        self.protected_paths.retain(|known| known != path);
+        self.protected_paths
+            .retain(|known| !protected_path_matches(known, path));
         before != self.protected_paths.len()
     }
+}
+
+fn protected_path_matches(known: &str, path: &str) -> bool {
+    known == path
+        || crate::core::paths::resolve_absolute_path(Path::new(known))
+            == crate::core::paths::resolve_absolute_path(Path::new(path))
 }
 
 impl Default for PressureConfig {
@@ -2025,6 +2032,24 @@ mod tests {
                 "/Users/jemanuel/Pictures/*.photoslibrary".to_string(),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sacred_config_removes_canonical_equivalent_paths() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        let alias = tmp.path().join("alias");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let mut sacred = SacredConfig {
+            protected_paths: vec![alias.to_string_lossy().to_string()],
+        };
+
+        let real_path = real.to_string_lossy();
+        assert!(sacred.remove_protected_path(real_path.as_ref()));
+        assert!(sacred.protected_paths.is_empty());
     }
 
     #[test]

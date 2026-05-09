@@ -10092,17 +10092,18 @@ mod tests {
 
         let sacred_path = sacred_config_path_for(&config_path);
         let sacred = load_sacred_config(&sacred_path).unwrap();
-        assert_eq!(
-            sacred.protected_paths,
-            vec![protected.to_string_lossy().to_string()]
-        );
+        let protected_config_path = std::fs::canonicalize(&protected)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(sacred.protected_paths, vec![protected_config_path.clone()]);
 
         let loaded = Config::load(Some(&config_path)).unwrap();
         assert!(
             loaded
                 .scanner
                 .protected_paths
-                .contains(&protected.to_string_lossy().to_string())
+                .contains(&protected_config_path)
         );
     }
 
