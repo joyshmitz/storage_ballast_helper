@@ -1360,6 +1360,11 @@ mod tests {
             "base64-encoded Developer ID Application certificate",
             "temporary keychain",
             "Developer ID Application: Example LLC",
+            "non-secret credential setup plan",
+            "`$P12_PATH`",
+            "`$HOMEBREW_TAP_TOKEN`",
+            "--body-file -",
+            "JSON `setup_steps` field",
         ] {
             assert!(
                 macos_guide.contains(required),

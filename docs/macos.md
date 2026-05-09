@@ -399,6 +399,21 @@ missing local signing identity, missing notary profile, and missing GitHub
 Actions secrets as explicit diagnostics so the external Apple/GitHub credential
 setup can be finished without inspecting workflow internals.
 
+The release doctor also prints a non-secret credential setup plan. The plan
+uses placeholder environment variables such as `$P12_PATH`, `$P12_PASSWORD`,
+`$APPLE_ID`, `$APPLE_TEAM_ID`, `$APPLE_APP_SPECIFIC_PASSWORD`, and
+`$HOMEBREW_TAP_TOKEN`; it never prints secret values. The GitHub secret commands
+use `--body-file -` so secret material can be piped from stdin instead of being
+stored in shell history. After completing the plan, rerun:
+
+```bash
+sbh doctor --release --json
+```
+
+The JSON `setup_steps` field is stable enough for handoff automation that wants
+to display the same Developer ID, notary, Homebrew token, and final recheck
+commands without scraping this document.
+
 The current CLI tarball flow does not staple a ticket because `stapler` supports
 app bundles, disk images, and signed flat packages rather than the `.tar.xz`
 artifact. Gatekeeper can still find the online notary ticket for the signed

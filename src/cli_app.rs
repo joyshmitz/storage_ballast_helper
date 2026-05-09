@@ -3878,6 +3878,16 @@ struct ReleaseDoctorReport {
     notary_profile: &'static str,
     required_github_secrets: Vec<&'static str>,
     checks: Vec<DoctorCheck>,
+    setup_steps: Vec<ReleaseDoctorSetupStep>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ReleaseDoctorSetupStep {
+    id: &'static str,
+    title: &'static str,
+    reason: &'static str,
+    docs: &'static str,
+    commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4009,6 +4019,14 @@ fn print_release_doctor_report(report: &ReleaseDoctorReport) {
     );
     println!("\nRelease checks:");
     print_doctor_checks(&report.checks);
+    println!("\nCredential setup plan:");
+    for step in &report.setup_steps {
+        println!("  {}: {}", step.title, step.reason);
+        println!("    Docs: {}", step.docs);
+        for command in &step.commands {
+            println!("    $ {command}");
+        }
+    }
 }
 
 fn print_doctor_checks(checks: &[DoctorCheck]) {
@@ -4046,6 +4064,7 @@ where
         repository: RELEASE_REPOSITORY,
         notary_profile: RELEASE_DOCTOR_NOTARY_PROFILE,
         required_github_secrets: RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS.to_vec(),
+        setup_steps: release_doctor_setup_steps(),
         checks: vec![
             release_developer_id_identity_check(run_command),
             release_notary_profile_check(run_command),
@@ -4226,6 +4245,62 @@ fn parse_github_secret_names(raw: &str) -> std::result::Result<HashSet<String>, 
         names.insert(name.to_string());
     }
     Ok(names)
+}
+
+fn release_doctor_setup_steps() -> Vec<ReleaseDoctorSetupStep> {
+    vec![
+        ReleaseDoctorSetupStep {
+            id: "developer_id_certificate",
+            title: "Developer ID certificate",
+            reason: "Create/export the Developer ID Application identity and store the signing secrets for tagged macOS releases.",
+            docs: "docs/macos.md#code-signing-and-hardened-runtime",
+            commands: vec![
+                "security find-identity -v -p codesigning".to_string(),
+                format!(
+                    "base64 < \"$P12_PATH\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 -R {RELEASE_REPOSITORY} --body-file -",
+                ),
+                format!(
+                    "printf '%s' \"$P12_PASSWORD\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD -R {RELEASE_REPOSITORY} --body-file -",
+                ),
+                format!(
+                    "printf '%s' \"$DEVELOPER_ID_IDENTITY\" | gh secret set APPLE_DEVELOPER_ID_IDENTITY -R {RELEASE_REPOSITORY} --body-file -",
+                ),
+            ],
+        },
+        ReleaseDoctorSetupStep {
+            id: "notary_credentials",
+            title: "Notary credentials",
+            reason: "Create the local notarytool profile used by release readiness checks and store CI notarization credentials.",
+            docs: "docs/macos.md#release-readiness-diagnostics",
+            commands: vec![
+                format!(
+                    "xcrun notarytool store-credentials {RELEASE_DOCTOR_NOTARY_PROFILE} --apple-id \"$APPLE_ID\" --team-id \"$APPLE_TEAM_ID\" --password \"$APPLE_APP_SPECIFIC_PASSWORD\"",
+                ),
+                format!(
+                    "printf '%s' \"$APPLE_ID\" | gh secret set APPLE_ID -R {RELEASE_REPOSITORY} --body-file -",
+                ),
+                format!(
+                    "printf '%s' \"$APPLE_TEAM_ID\" | gh secret set APPLE_TEAM_ID -R {RELEASE_REPOSITORY} --body-file -",
+                ),
+                format!(
+                    "printf '%s' \"$APPLE_APP_SPECIFIC_PASSWORD\" | gh secret set APPLE_APP_SPECIFIC_PASSWORD -R {RELEASE_REPOSITORY} --body-file -",
+                ),
+            ],
+        },
+        ReleaseDoctorSetupStep {
+            id: "homebrew_tap_token",
+            title: "Homebrew tap token",
+            reason: "Store the least-privilege token that lets the release workflow open formula update pull requests.",
+            docs: "docs/macos.md#homebrew-and-install-paths",
+            commands: vec![
+                format!(
+                    "printf '%s' \"$HOMEBREW_TAP_TOKEN\" | gh secret set HOMEBREW_TAP_TOKEN -R {RELEASE_REPOSITORY} --body-file -",
+                ),
+                format!("gh secret list -R {RELEASE_REPOSITORY} --json name,updatedAt,visibility",),
+                "sbh doctor --release --json".to_string(),
+            ],
+        },
+    ]
 }
 
 fn pal_doctor_report(platform: &dyn Platform) -> PalDoctorReport {
@@ -8999,6 +9074,19 @@ mod tests {
         assert_eq!(report.repository, RELEASE_REPOSITORY);
         assert_eq!(report.notary_profile, RELEASE_DOCTOR_NOTARY_PROFILE);
         assert!(report.checks.iter().all(|check| check.status == "PASS"));
+        let setup_ids = report
+            .setup_steps
+            .iter()
+            .map(|step| step.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            setup_ids,
+            vec![
+                "developer_id_certificate",
+                "notary_credentials",
+                "homebrew_tap_token"
+            ]
+        );
     }
 
     #[test]
@@ -9053,6 +9141,44 @@ mod tests {
                 .contains("APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64")
         );
         assert!(secrets.message.contains("HOMEBREW_TAP_TOKEN"));
+    }
+
+    #[test]
+    fn release_doctor_setup_plan_uses_stdin_secrets_and_rechecks() {
+        let steps = release_doctor_setup_steps();
+        let all_commands = steps
+            .iter()
+            .flat_map(|step| step.commands.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for required in [
+            "security find-identity -v -p codesigning",
+            "base64 < \"$P12_PATH\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64",
+            "printf '%s' \"$P12_PASSWORD\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD",
+            "printf '%s' \"$DEVELOPER_ID_IDENTITY\" | gh secret set APPLE_DEVELOPER_ID_IDENTITY",
+            "xcrun notarytool store-credentials sbh-notary",
+            "printf '%s' \"$APPLE_ID\" | gh secret set APPLE_ID",
+            "printf '%s' \"$APPLE_TEAM_ID\" | gh secret set APPLE_TEAM_ID",
+            "printf '%s' \"$APPLE_APP_SPECIFIC_PASSWORD\" | gh secret set APPLE_APP_SPECIFIC_PASSWORD",
+            "printf '%s' \"$HOMEBREW_TAP_TOKEN\" | gh secret set HOMEBREW_TAP_TOKEN",
+            "gh secret list -R Dicklesworthstone/storage_ballast_helper --json name,updatedAt,visibility",
+            "sbh doctor --release --json",
+            "--body-file -",
+        ] {
+            assert!(
+                all_commands.contains(required),
+                "release doctor setup plan must include safe handoff command fragment: {required}"
+            );
+        }
+
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.docs.starts_with("docs/macos.md#")),
+            "each release setup step should point at the macOS guide"
+        );
     }
 
     #[test]
