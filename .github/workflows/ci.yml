@@ -407,6 +407,38 @@ jobs:
             echo "::error::sbh release binary was signed with a forbidden entitlement"
             exit 1
           fi
+      - name: Exercise Homebrew formula install from current signed binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="${PWD}/target/release/sbh"
+          test -x "${bin}"
+          mkdir -p macos-homebrew-archive macos-homebrew-formula/Formula
+          cp "${bin}" macos-homebrew-archive/sbh
+          archive="${PWD}/macos-homebrew-archive/sbh-ci-${{ matrix.runner }}.tar.xz"
+          tar -C macos-homebrew-archive -cJf "${archive}" sbh
+          archive_sha="$(shasum -a 256 "${archive}" | awk '{print $1}')"
+          archive_url="file://${archive}"
+          export ARCHIVE_SHA="${archive_sha}"
+          export ARCHIVE_URL="${archive_url}"
+
+          ruby - <<'RUBY'
+          formula = File.read("packaging/homebrew/Formula/sbh.rb")
+          formula = formula.sub("class Sbh < Formula", "class SbhCi < Formula")
+          formula = formula.gsub(
+            %r{url "https://github\.com/Dicklesworthstone/storage_ballast_helper/releases/download/v#\{version\}/" \\\n\s+"sbh-v#\{version\}-(?:aarch64|x86_64)-apple-darwin\.tar\.xz"},
+            %(url "#{ENV.fetch("ARCHIVE_URL")}"),
+          )
+          formula = formula.gsub(
+            /# REPLACE_WITH_[A-Z0-9_]+_SHA256\n\s+sha256 "[0-9a-f]{64}"/,
+            %(sha256 "#{ENV.fetch("ARCHIVE_SHA")}"),
+          )
+          File.write("macos-homebrew-formula/Formula/sbh-ci.rb", formula)
+          RUBY
+
+          ruby -c macos-homebrew-formula/Formula/sbh-ci.rb 2>&1 | tee macos-homebrew-formula-syntax-output.txt
+          brew install --formula --build-from-source --skip-link macos-homebrew-formula/Formula/sbh-ci.rb 2>&1 | tee macos-homebrew-install-output.txt
+          brew test --force sbh-ci 2>&1 | tee macos-homebrew-test-output.txt
       - name: Capture release doctor diagnostics
         if: always()
         shell: bash
@@ -539,6 +571,8 @@ jobs:
             macos-unit-bin-output.txt
             macos-integration-output.txt
             macos-release-build-output.txt
+            macos-homebrew-*.txt
+            macos-homebrew-formula/Formula/sbh-ci.rb
             macos-energy-*.txt
             macos-codesign-output.txt
             macos-codesign-entitlements.plist

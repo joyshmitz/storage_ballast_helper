@@ -1738,6 +1738,14 @@ mod tests {
             "homebrew-generated-formula-syntax-output.txt",
             "homebrew-generated-formula-style-output.txt",
             "generated-homebrew/Formula/sbh.rb",
+            "Exercise Homebrew formula install from current signed binary",
+            "macos-homebrew-archive",
+            "class SbhCi < Formula",
+            "brew install --formula --build-from-source --skip-link macos-homebrew-formula/Formula/sbh-ci.rb",
+            "brew test --force sbh-ci",
+            "macos-homebrew-install-output.txt",
+            "macos-homebrew-test-output.txt",
+            "macos-homebrew-formula/Formula/sbh-ci.rb",
         ] {
             assert!(
                 ci_workflow.contains(required),
