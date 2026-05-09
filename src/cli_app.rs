@@ -1001,6 +1001,40 @@ fn resolve_install_service(
     Ok(Some(ResolvedInstallService { kind, user_scope }))
 }
 
+fn resolve_uninstall_kind(
+    args: &UninstallArgs,
+    detected_kind: ServiceKind,
+) -> Result<ServiceKind, CliError> {
+    if args.systemd && detected_kind != ServiceKind::Systemd {
+        return Err(CliError::User(format!(
+            "Error: --systemd is only supported on Linux/systemd hosts. Detected {} on this platform; omit the service flag for auto-detection.",
+            service_kind_name(detected_kind)
+        )));
+    }
+    if args.launchd && detected_kind != ServiceKind::Launchd {
+        return Err(CliError::User(format!(
+            "Error: --launchd is only supported on macOS/launchd hosts. Detected {} on this platform; omit the service flag for auto-detection.",
+            service_kind_name(detected_kind)
+        )));
+    }
+
+    let kind = if args.systemd {
+        ServiceKind::Systemd
+    } else if args.launchd {
+        ServiceKind::Launchd
+    } else {
+        detected_kind
+    };
+
+    if kind == ServiceKind::None {
+        return Err(CliError::User(
+            "automatic service uninstall is not supported on this platform".to_string(),
+        ));
+    }
+
+    Ok(kind)
+}
+
 fn macos_install_dir_for_service(service: Option<ResolvedInstallService>) -> PathBuf {
     if service.is_some_and(|service| !service.user_scope) {
         return PathBuf::from("/usr/local/bin");
@@ -1489,11 +1523,10 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
 
 #[allow(clippy::too_many_lines)]
 fn run_uninstall(cli: &Cli, args: &UninstallArgs) -> Result<(), CliError> {
-    if !args.systemd && !args.launchd {
-        return Err(CliError::User("specify --systemd or --launchd".to_string()));
-    }
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+    let service_kind = resolve_uninstall_kind(args, platform.service_kind())?;
 
-    if args.launchd {
+    if service_kind == ServiceKind::Launchd {
         // Determine scope: check system plists first, then user agents. Include
         // both the production label and a configured CI/test label.
         let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
@@ -9726,6 +9759,7 @@ mod tests {
     #[test]
     fn uninstall_command_parses_scope_flags() {
         for case in [
+            vec!["sbh", "uninstall"],
             vec!["sbh", "uninstall", "--launchd"],
             vec!["sbh", "uninstall", "--launchd", "--scope", "user"],
             vec!["sbh", "uninstall", "--launchd", "--scope", "system"],
@@ -9741,6 +9775,44 @@ mod tests {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["sbh", "uninstall", "--systemd", "--launchd"]).is_err());
+    }
+
+    #[test]
+    fn uninstall_auto_selects_detected_service_kind() {
+        let args = UninstallArgs::default();
+
+        assert_eq!(
+            resolve_uninstall_kind(&args, ServiceKind::Launchd).expect("launchd should resolve"),
+            ServiceKind::Launchd
+        );
+        assert_eq!(
+            resolve_uninstall_kind(&args, ServiceKind::Systemd).expect("systemd should resolve"),
+            ServiceKind::Systemd
+        );
+    }
+
+    #[test]
+    fn uninstall_auto_errors_on_unsupported_service_kind() {
+        let err = resolve_uninstall_kind(&UninstallArgs::default(), ServiceKind::None)
+            .expect_err("unsupported platform should fail auto uninstall");
+
+        assert!(
+            err.to_string()
+                .contains("automatic service uninstall is not supported")
+        );
+    }
+
+    #[test]
+    fn uninstall_explicit_wrong_service_errors() {
+        let args = UninstallArgs {
+            systemd: true,
+            ..UninstallArgs::default()
+        };
+        let err = resolve_uninstall_kind(&args, ServiceKind::Launchd)
+            .expect_err("--systemd should fail on launchd hosts");
+
+        assert!(err.to_string().contains("--systemd"));
+        assert!(err.to_string().contains("launchd"));
     }
 
     #[test]
