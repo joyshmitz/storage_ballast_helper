@@ -375,6 +375,22 @@ artifact. Gatekeeper can still find the online notary ticket for the signed
 binary. A future `.pkg` or `.dmg` distribution path should staple and validate
 that package after notarization.
 
+## Self-Update Verification
+
+`sbh update` verifies the downloaded archive checksum before extraction. On
+macOS, it also verifies the extracted candidate binary before the atomic replacement step:
+
+1. Execute the candidate with `sbh --version` to catch noexec mounts and dynamic
+   linker failures.
+2. Run `codesign --verify --strict --verbose=2 <candidate>` to reject unsigned
+   or malformed signatures.
+3. Run `spctl -a -t execute -vv <candidate>` so Gatekeeper accepts the signed
+   and notarized binary.
+4. Rename the verified candidate into place atomically and roll back to the
+   previous binary if any pre-swap check or rename fails.
+
+The unsafe `sbh update --no-verify` escape hatch bypasses checksum, Sigstore, codesign, and Gatekeeper checks. Use it only for deliberate recovery from a trusted local bundle.
+
 ## Watched Paths
 
 The install wizard auto-detects watched paths from:

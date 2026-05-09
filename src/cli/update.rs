@@ -132,6 +132,21 @@ pub enum UpdateServiceRestartStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryTrustPolicy {
+    Enforce,
+    BypassNoVerify,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinaryTrustCommandOutput {
+    success: bool,
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
 /// Structured outcome for activating a freshly installed update in the service.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct UpdateServiceRestart {
@@ -800,7 +815,12 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
     }
 
     // Step 9: Extract and install with atomic rollback.
-    match extract_and_install(&archive_path, &install_path) {
+    let binary_trust_policy = if opts.no_verify {
+        BinaryTrustPolicy::BypassNoVerify
+    } else {
+        BinaryTrustPolicy::Enforce
+    };
+    match extract_and_install(&archive_path, &install_path, binary_trust_policy) {
         Ok(()) => {
             report.step_ok(format!("Installed to {}", install_path.display()));
             report.applied = true;
@@ -1128,6 +1148,7 @@ fn curl_download(url: &str, dest: &Path) -> std::result::Result<(), String> {
 fn extract_and_install(
     archive_path: &Path,
     install_path: &Path,
+    binary_trust_policy: BinaryTrustPolicy,
 ) -> std::result::Result<(), String> {
     let extract_dir = archive_path.with_extension("extract");
     std::fs::create_dir_all(&extract_dir)
@@ -1201,6 +1222,15 @@ fn extract_and_install(
         return Err(format!("new binary failed self-test: {e}"));
     }
 
+    if let Err(e) = verify_binary_trust(&temp_install_path, binary_trust_policy) {
+        let _ = std::fs::remove_file(&temp_install_path);
+        let _ = std::fs::remove_dir_all(&extract_dir);
+        if backup_path.exists() {
+            let _ = std::fs::rename(&backup_path, install_path);
+        }
+        return Err(format!("new binary failed trust verification: {e}"));
+    }
+
     if let Err(e) = std::fs::rename(&temp_install_path, install_path) {
         // Rollback: restore from backup if it exists.
         if backup_path.exists() {
@@ -1225,6 +1255,105 @@ fn extract_and_install(
     let _ = std::fs::remove_file(&backup_path);
     let _ = std::fs::remove_dir_all(&extract_dir);
     Ok(())
+}
+
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        clippy::unnecessary_wraps,
+        reason = "the shared update flow needs a fallible trust check on macOS"
+    )
+)]
+fn verify_binary_trust(path: &Path, policy: BinaryTrustPolicy) -> std::result::Result<(), String> {
+    if matches!(policy, BinaryTrustPolicy::BypassNoVerify) {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        verify_macos_binary_trust_with_runner(path, run_binary_trust_command)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn verify_macos_binary_trust_with_runner<F>(
+    path: &Path,
+    mut run_command: F,
+) -> std::result::Result<(), String>
+where
+    F: FnMut(&str, &[String]) -> std::io::Result<BinaryTrustCommandOutput>,
+{
+    let path_arg = path.display().to_string();
+    let codesign_args = vec![
+        "--verify".to_string(),
+        "--strict".to_string(),
+        "--verbose=2".to_string(),
+        path_arg.clone(),
+    ];
+    let codesign = run_command("codesign", &codesign_args)
+        .map_err(|error| format!("failed to run codesign: {error}"))?;
+    if !codesign.success {
+        return Err(format!(
+            "codesign rejected {} before update: {}",
+            path.display(),
+            binary_trust_command_detail(&codesign)
+        ));
+    }
+
+    let spctl_args = vec![
+        "-a".to_string(),
+        "-t".to_string(),
+        "execute".to_string(),
+        "-vv".to_string(),
+        path_arg,
+    ];
+    let spctl = run_command("spctl", &spctl_args)
+        .map_err(|error| format!("failed to run spctl: {error}"))?;
+    if !spctl.success {
+        return Err(format!(
+            "Gatekeeper rejected {} before update: {}",
+            path.display(),
+            binary_trust_command_detail(&spctl)
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_binary_trust_command(
+    program: &str,
+    args: &[String],
+) -> std::io::Result<BinaryTrustCommandOutput> {
+    let output = Command::new(program).args(args).output()?;
+    Ok(BinaryTrustCommandOutput {
+        success: output.status.success(),
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn binary_trust_command_detail(output: &BinaryTrustCommandOutput) -> String {
+    let status = output
+        .code
+        .map_or_else(|| "signal".to_string(), |code| format!("exit {code}"));
+    let stdout = output.stdout.trim();
+    let stderr = output.stderr.trim();
+
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => status,
+        (false, true) => format!("{status}; stdout: {stdout}"),
+        (true, false) => format!("{status}; stderr: {stderr}"),
+        (false, false) => format!("{status}; stdout: {stdout}; stderr: {stderr}"),
+    }
 }
 
 fn verify_binary_execution(path: &Path) -> std::result::Result<(), String> {
@@ -1379,6 +1508,107 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&one);
         let _ = std::fs::remove_dir_all(&two);
+    }
+
+    fn trust_output(
+        success: bool,
+        code: i32,
+        stdout: &str,
+        stderr: &str,
+    ) -> BinaryTrustCommandOutput {
+        BinaryTrustCommandOutput {
+            success,
+            code: Some(code),
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    #[test]
+    fn macos_binary_trust_verifier_checks_codesign_then_gatekeeper() {
+        let candidate = PathBuf::from("/tmp/sbh.new");
+        let mut calls: Vec<(String, Vec<String>)> = Vec::new();
+
+        verify_macos_binary_trust_with_runner(&candidate, |program, args| {
+            calls.push((program.to_string(), args.to_vec()));
+            Ok(trust_output(true, 0, "", "accepted"))
+        })
+        .unwrap();
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "codesign");
+        assert_eq!(
+            calls[0].1,
+            vec![
+                "--verify".to_string(),
+                "--strict".to_string(),
+                "--verbose=2".to_string(),
+                "/tmp/sbh.new".to_string(),
+            ]
+        );
+        assert_eq!(calls[1].0, "spctl");
+        assert_eq!(
+            calls[1].1,
+            vec![
+                "-a".to_string(),
+                "-t".to_string(),
+                "execute".to_string(),
+                "-vv".to_string(),
+                "/tmp/sbh.new".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn macos_binary_trust_verifier_stops_when_codesign_rejects_candidate() {
+        let candidate = PathBuf::from("/tmp/sbh.new");
+        let mut calls = 0usize;
+
+        let error = verify_macos_binary_trust_with_runner(&candidate, |program, _args| {
+            calls += 1;
+            assert_eq!(program, "codesign");
+            Ok(trust_output(
+                false,
+                1,
+                "",
+                "code object is not signed at all",
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(calls, 1);
+        assert!(error.contains("codesign rejected /tmp/sbh.new before update"));
+        assert!(error.contains("code object is not signed at all"));
+    }
+
+    #[test]
+    fn binary_trust_bypass_skips_platform_trust_checks() {
+        verify_binary_trust(
+            Path::new("/tmp/unsigned-sbh"),
+            BinaryTrustPolicy::BypassNoVerify,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn macos_update_docs_cover_pre_swap_trust_checks() {
+        let doc = include_str!("../../docs/macos.md");
+
+        for required in [
+            "Self-Update Verification",
+            "before the atomic replacement step",
+            "sbh --version",
+            "codesign --verify --strict --verbose=2 <candidate>",
+            "spctl -a -t execute -vv <candidate>",
+            "Rename the verified candidate into place atomically",
+            "sbh update --no-verify",
+            "bypasses checksum, Sigstore, codesign, and Gatekeeper checks",
+        ] {
+            assert!(
+                doc.contains(required),
+                "macOS guide must document self-update trust check fragment: {required}"
+            );
+        }
     }
 
     #[test]
