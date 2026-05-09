@@ -289,6 +289,14 @@ certificate. Tagged releases fail before packaging if the Developer ID
 certificate secrets are absent or the resulting binary is not signed by a
 `Developer ID Application` authority.
 
+The Unix one-liner installer keeps checksum verification enabled by default.
+On macOS, that same `--verify` path also runs
+`codesign --verify --strict --verbose=2` and
+`spctl -a -t execute -vv` against the downloaded `sbh` binary before writing it
+to the destination directory. The explicit `--no-verify` flag bypasses these
+installer trust checks and should only be used for deliberate recovery from a
+trusted local artifact.
+
 Tagged macOS releases also run an explicit notarization phase. Apple accepts
 notary uploads as ZIP archives, disk images, or signed flat packages, while the
 existing release artifact remains `sbh-{tag}-{target}.tar.xz`; the workflow

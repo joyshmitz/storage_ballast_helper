@@ -208,8 +208,8 @@ Options:
   --user                  Install to user location (default: ~/.local/bin)
   --system                Install to system location (/usr/local/bin)
   --dry-run               Print planned actions without changing the system
-  --verify                Enforce checksum verification (default)
-  --no-verify             Skip checksum verification (unsafe, logged)
+  --verify                Enforce checksum and macOS trust verification (default)
+  --no-verify             Skip artifact verification (unsafe, logged)
   --json                  Emit machine-readable JSON summary
   --trace-id <id>         Set explicit trace id for event correlation
   --event-log <path>      Append per-phase JSONL events to the given file
@@ -516,6 +516,36 @@ sha256_file() {
   else
     die "Neither sha256sum nor shasum is available for checksum verification"
   fi
+}
+
+is_macos_target() {
+  [[ "${TARGET_TRIPLE:-}" == *-apple-darwin ]]
+}
+
+verify_macos_binary_trust() {
+  local binary_path="$1"
+
+  if ! is_macos_target; then
+    return 0
+  fi
+
+  start_phase "verify_macos_trust" "verifying macOS code signature and Gatekeeper assessment"
+  log_header "Verifying macOS binary trust"
+
+  if ! command -v codesign >/dev/null 2>&1; then
+    die "codesign is required to verify macOS release binaries. Install Xcode Command Line Tools or retry only with --no-verify if you trust the artifact."
+  fi
+  if ! command -v spctl >/dev/null 2>&1; then
+    die "spctl is required to verify macOS Gatekeeper assessment. Install Xcode Command Line Tools or retry only with --no-verify if you trust the artifact."
+  fi
+  if ! codesign --verify --strict --verbose=2 "$binary_path"; then
+    die "macOS code signature verification failed for ${ASSET_NAME}. Refusing to install."
+  fi
+  if ! spctl -a -t execute -vv "$binary_path"; then
+    die "macOS Gatekeeper assessment failed for ${ASSET_NAME}. Refusing to install."
+  fi
+
+  finish_phase "macOS code signature and Gatekeeper assessment verified"
 }
 
 verify_mode_label() {
@@ -900,7 +930,7 @@ main() {
   finish_phase "resolved prerequisites and artifact contract"
 
   if [[ "$VERIFY" -eq 0 ]]; then
-    log_warn "Checksum verification is disabled (--no-verify)."
+    log_warn "Artifact verification is disabled (--no-verify)."
   fi
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -993,6 +1023,7 @@ main() {
         log_warn "Checksum file not available — skipping verification"
         finish_phase "checksum file unavailable; skipped"
       fi
+      verify_macos_binary_trust "$binary_path"
     fi
 
     start_phase "install_binary" "installing sbh binary"
@@ -1043,6 +1074,10 @@ main() {
     binary_path="$(find "$extract_dir" -type f -name "$PROGRAM" | head -n 1 || true)"
     [[ -n "$binary_path" ]] || die "Downloaded archive does not contain '${PROGRAM}' binary"
     finish_phase "release archive extracted"
+
+    if [[ "$VERIFY" -eq 1 ]]; then
+      verify_macos_binary_trust "$binary_path"
+    fi
 
     start_phase "install_binary" "installing sbh binary"
     log_header "Installing binary"

@@ -2177,6 +2177,7 @@ mod tests {
             "CHECKSUM_URL=\"${base_url}/${CHECKSUM_NAME}\"",
             "# Probe strategy 2: legacy unversioned .tar.xz archive.",
             "# Probe strategy 3: raw binary",
+            "verify_macos_binary_trust \"$binary_path\"",
         ] {
             assert!(
                 installer.contains(required),
@@ -2197,6 +2198,53 @@ mod tests {
             versioned < legacy && legacy < raw,
             "installer must prefer current versioned archives before legacy/raw fallbacks"
         );
+    }
+
+    #[test]
+    fn unix_installer_verifies_macos_binary_trust_before_install() {
+        let installer = include_str!("../../scripts/install.sh");
+        let macos_guide = include_str!("../../docs/macos.md");
+
+        for required in [
+            "is_macos_target()",
+            "[[ \"${TARGET_TRIPLE:-}\" == *-apple-darwin ]]",
+            "start_phase \"verify_macos_trust\"",
+            "command -v codesign",
+            "command -v spctl",
+            "codesign --verify --strict --verbose=2 \"$binary_path\"",
+            "spctl -a -t execute -vv \"$binary_path\"",
+            "macOS code signature verification failed",
+            "macOS Gatekeeper assessment failed",
+            "finish_phase \"macOS code signature and Gatekeeper assessment verified\"",
+        ] {
+            assert!(
+                installer.contains(required),
+                "Unix installer must enforce macOS binary trust fragment: {required}"
+            );
+        }
+
+        let trust_check = installer
+            .find("verify_macos_binary_trust \"$binary_path\"")
+            .expect("installer must call the macOS trust verifier");
+        let install_phase = installer
+            .find("start_phase \"install_binary\" \"installing sbh binary\"")
+            .expect("installer must retain install phase");
+        assert!(
+            trust_check < install_phase,
+            "installer must verify macOS binary trust before installing the binary"
+        );
+
+        for required in [
+            "codesign --verify --strict --verbose=2",
+            "spctl -a -t execute -vv",
+            "The explicit `--no-verify` flag bypasses these",
+            "installer trust checks",
+        ] {
+            assert!(
+                macos_guide.contains(required),
+                "macOS guide must document installer trust check fragment: {required}"
+            );
+        }
     }
 
     #[test]
