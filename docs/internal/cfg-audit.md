@@ -59,8 +59,8 @@ Classification values:
 | `src/cli/wizard.rs` | 815 | Invalid service input falls back to macOS launchd. | `PAL-method` | `default_service_choice()` | Same shared default-service contract. |
 | `src/cli/wizard.rs` | 949 | Unit test checks Linux auto-detection path. | `PAL-method` | `default_service_choice()` | Prefer explicit Linux/macOS test cases independent of the runner OS. |
 | `src/cli/wizard.rs` | 951 | Unit test checks macOS auto-detection path. | `PAL-method` | `default_service_choice()` | Prefer explicit Linux/macOS test cases independent of the runner OS. |
-| `src/ballast/manager.rs` | 588 | Tries Linux `fallocate` for fast ballast allocation before random-data fallback. | `PAL-method` | `preallocate_file(file, offset, len)` | macOS should use `fcntl(F_PREALLOCATE)` or report unsupported so fallback remains explicit. |
-| `src/ballast/manager.rs` | 638 | Compiles the `nix::fcntl::fallocate` helper only on Linux. | `PAL-method` | `preallocate_file(file, offset, len)` | Move into Linux platform backend; add macOS backend and fallback tests. |
+| `src/ballast/manager.rs` | 619 | Calls `Platform::preallocate_file()` before random-data fallback. | `PAL-method` | `preallocate_file(file, offset, len)` | Closed for macOS: ballast provisioning is PAL-backed and verifies allocated blocks through `file_block_count()`. |
+| `src/platform/macos/pal.rs` | 260 | Implements macOS `preallocate_file()` through the platform backend and verifies allocated blocks. | `cfg-gate-keep` | `N/A` | Backend-specific implementation with `preallocate_file_reserves_blocks_on_macos` and APFS ballast integration coverage. |
 | `src/daemon/signals.rs` | 238 | Sends watchdog status through Linux `sd_notify`. | `cfg-gate-keep` | `N/A` | Systemd notification is Linux-specific and should remain gated in the systemd service manager. |
 | `src/daemon/signals.rs` | 244 | No-ops watchdog notification on non-Linux. | `cfg-gate-keep` | `N/A` | Correct for launchd; launchd health is managed differently. |
 | `src/daemon/signals.rs` | 251 | Compiles `UnixDatagram` systemd notification helper only on Linux. | `cfg-gate-keep` | `N/A` | Keep with systemd-specific implementation. |
@@ -77,7 +77,7 @@ The repeated sites point to these first-class platform methods or platform-owned
 | `process_blame_snapshot()` | `/proc/<pid>` | libproc process/cwd/open-file APIs | Closed for macOS; `sbh blame` now uses PAL-backed process and open-file attribution. |
 | `self_stats()` | `/proc/self/status` plus `/proc/self/io` | Mach task usage plus libproc rusage | Closed for macOS; daemon self-monitor consumes the PAL method. |
 | `open_file_keys()` / `open_path_ancestors()` / `is_path_open()` | `/proc/<pid>/fd` | libproc fd/path APIs | Executor preflight parity is closed for macOS by `bd-r7m7.3`; legacy inode-key fallback remains Linux-specific. |
-| `preallocate_file(file, offset, len)` | `fallocate` | `fcntl(F_PREALLOCATE)` or unsupported | macOS ballast provisioning falls back to slow random writes. |
+| `preallocate_file(file, offset, len)` | `LinuxPal::preallocate_file()` | `MacOsPal::preallocate_file()` | Closed for macOS; ballast manager uses PAL preallocation and block-count verification before fallback. |
 
 ## Sign-Off
 
