@@ -170,6 +170,36 @@ pub fn service_manager_for_kind(kind: ServiceKind, user_scope: bool) -> Box<dyn 
         .unwrap_or_else(|_| Box::<NoopServiceManager>::default())
 }
 
+/// Default service scope for unqualified status/doctor/control flows.
+///
+/// This mirrors the CLI auto-detection contract: Linux/systemd defaults to the
+/// system service, while macOS/launchd defaults to the user LaunchAgent.
+#[must_use]
+pub const fn default_service_control_user_scope(kind: ServiceKind) -> bool {
+    matches!(kind, ServiceKind::Launchd)
+}
+
+/// Build a service manager for status/doctor/control flows using the platform
+/// default scope.
+#[must_use]
+pub fn service_manager_for_default_control_kind(kind: ServiceKind) -> Box<dyn ServiceManager> {
+    service_manager_for_kind_control(kind, default_service_control_user_scope(kind))
+}
+
+/// Build a service manager for status/doctor/control flows.
+///
+/// launchd status and log inspection may target a system LaunchDaemon from a
+/// non-root process, so this path uses launchd's control constructor instead of
+/// the install constructor with its root guard.
+#[must_use]
+pub fn service_manager_for_kind_control(
+    kind: ServiceKind,
+    user_scope: bool,
+) -> Box<dyn ServiceManager> {
+    try_service_manager_for_kind_control(kind, user_scope)
+        .unwrap_or_else(|_| Box::<NoopServiceManager>::default())
+}
+
 /// Build a service manager from a platform, using `Platform::service_kind()` as
 /// the dispatch key.
 #[must_use]
@@ -188,6 +218,20 @@ pub fn try_service_manager_for_kind(
     match kind {
         ServiceKind::Systemd => Ok(Box::new(SystemdServiceManager::from_env(user_scope)?)),
         ServiceKind::Launchd => Ok(Box::new(LaunchdServiceManager::from_env(user_scope)?)),
+        ServiceKind::None => Ok(Box::<NoopServiceManager>::default()),
+    }
+}
+
+/// Fallible service-manager dispatcher for status/doctor/control flows.
+pub fn try_service_manager_for_kind_control(
+    kind: ServiceKind,
+    user_scope: bool,
+) -> Result<Box<dyn ServiceManager>> {
+    match kind {
+        ServiceKind::Systemd => Ok(Box::new(SystemdServiceManager::from_env(user_scope)?)),
+        ServiceKind::Launchd => Ok(Box::new(LaunchdServiceManager::from_env_for_control(
+            user_scope,
+        )?)),
         ServiceKind::None => Ok(Box::<NoopServiceManager>::default()),
     }
 }
@@ -1021,6 +1065,28 @@ mod tests {
         let mgr = service_manager_for_platform(&platform, false);
 
         assert_eq!(mgr.status().unwrap(), "unknown");
+    }
+
+    #[test]
+    fn default_control_scope_matches_platform_auto_detection() {
+        assert!(!default_service_control_user_scope(ServiceKind::Systemd));
+        assert!(default_service_control_user_scope(ServiceKind::Launchd));
+        assert!(!default_service_control_user_scope(ServiceKind::None));
+    }
+
+    #[test]
+    fn default_launchd_control_manager_targets_user_logs() {
+        let mgr = service_manager_for_default_control_kind(ServiceKind::Launchd);
+        let logs_path = mgr
+            .logs_path()
+            .expect("launchd control manager should expose log path")
+            .expect("launchd control manager should not fall back to noop");
+
+        assert!(
+            logs_path.ends_with(Path::new("Library/Logs/sbh/sbh.log")),
+            "default launchd control should inspect the user LaunchAgent, got {}",
+            logs_path.display()
+        );
     }
 
     #[test]

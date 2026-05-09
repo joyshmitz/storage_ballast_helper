@@ -1,4 +1,4 @@
-//! macOS PAL skeleton.
+//! macOS PAL implementation.
 
 #![cfg(target_os = "macos")]
 #![allow(missing_docs)]
@@ -99,7 +99,7 @@ impl Platform for MacOsPal {
     }
 
     fn service_manager(&self) -> Box<dyn ServiceManager> {
-        crate::daemon::service::service_manager_for_kind(ServiceKind::Launchd, false)
+        crate::daemon::service::service_manager_for_default_control_kind(ServiceKind::Launchd)
     }
 
     fn capacity(&self, mount: &Path) -> Result<Capacity> {
@@ -1023,7 +1023,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::io::Write;
     use std::os::unix::fs::MetadataExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
@@ -1040,10 +1040,25 @@ mod tests {
     fn assert_platform<T: Platform>(_platform: &T) {}
 
     #[test]
-    fn macos_pal_skeleton_implements_platform() {
+    fn macos_pal_implements_platform() {
         let platform = MacOsPal::new();
         assert_platform(&platform);
         assert_eq!(platform.name(), "macos");
+    }
+
+    #[test]
+    fn macos_pal_default_service_manager_targets_user_launchd_control() {
+        let logs_path = MacOsPal::new()
+            .service_manager()
+            .logs_path()
+            .expect("macOS service manager should expose launchd log path")
+            .expect("macOS service manager should not fall back to noop");
+
+        assert!(
+            logs_path.ends_with(Path::new("Library/Logs/sbh/sbh.log")),
+            "macOS PAL default service manager should target user launchd control, got {}",
+            logs_path.display()
+        );
     }
 
     #[test]
