@@ -417,6 +417,9 @@ jobs:
           cp "${bin}" macos-homebrew-archive/sbh
           archive="${PWD}/macos-homebrew-archive/sbh-ci-${{ matrix.runner }}.tar.xz"
           formula_path="${PWD}/macos-homebrew-formula/Formula/sbh-ci.rb"
+          tap_name="sbh/local-ci"
+          tap_root="$(brew --repository)/Library/Taps/sbh/homebrew-local-ci"
+          tap_formula_path="${tap_root}/Formula/sbh-ci.rb"
           tar -C macos-homebrew-archive -cJf "${archive}" sbh
           archive_sha="$(shasum -a 256 "${archive}" | awk '{print $1}')"
           archive_url="file://${archive}"
@@ -437,9 +440,12 @@ jobs:
           File.write("macos-homebrew-formula/Formula/sbh-ci.rb", formula)
           RUBY
 
+          brew tap-new --no-git "${tap_name}" 2>&1 | tee macos-homebrew-tap-new-output.txt
+          cp "${formula_path}" "${tap_formula_path}"
           ruby -c "${formula_path}" 2>&1 | tee macos-homebrew-formula-syntax-output.txt
-          brew install --formula --build-from-source --skip-link "${formula_path}" 2>&1 | tee macos-homebrew-install-output.txt
-          brew test --force sbh-ci 2>&1 | tee macos-homebrew-test-output.txt
+          ruby -c "${tap_formula_path}" 2>&1 | tee -a macos-homebrew-formula-syntax-output.txt
+          brew install --formula --build-from-source --skip-link "${tap_name}/sbh-ci" 2>&1 | tee macos-homebrew-install-output.txt
+          brew test --force "${tap_name}/sbh-ci" 2>&1 | tee macos-homebrew-test-output.txt
       - name: Capture release doctor diagnostics
         if: always()
         shell: bash
