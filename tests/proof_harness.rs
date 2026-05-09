@@ -790,8 +790,8 @@ fn fault_eprocess_drift_forces_fallback() {
         ..PolicyConfig::default()
     });
     engine.promote(); // canary
-    // Guard drift only triggers fallback when pressure is above green.
-    engine.set_pressure_level(PressureLevel::Yellow);
+    // Guard drift only triggers fallback at Orange+ pressure.
+    engine.set_pressure_level(PressureLevel::Orange);
 
     let drift_guard = failing_guard();
     let candidates = vec![make_scored(DecisionAction::Delete, 2.5)];

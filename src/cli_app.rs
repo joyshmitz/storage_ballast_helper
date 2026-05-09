@@ -9127,6 +9127,7 @@ mod tests {
         assert_eq!(
             setup_ids,
             vec![
+                "developer_id_csr",
                 "developer_id_certificate",
                 "notary_credentials",
                 "homebrew_tap_token"

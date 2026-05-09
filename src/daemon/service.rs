@@ -1271,15 +1271,15 @@ mod tests {
             (
                 home.join("Library/Logs/sbh/sbh.log"),
                 home.join("Library/Logs/sbh/sbh.err"),
-                home.join(".local/share/sbh"),
-                home.join(".config/sbh/config.toml"),
+                home.join("Library/Application Support/sbh"),
+                home.join("Library/Application Support/sbh/config.toml"),
             )
         } else {
             (
                 PathBuf::from("/var/log/sbh/sbh.log"),
                 PathBuf::from("/var/log/sbh/sbh.err"),
-                PathBuf::from("/var/lib/sbh"),
-                PathBuf::from("/etc/sbh/config.toml"),
+                PathBuf::from("/private/var/sbh"),
+                PathBuf::from("/Library/Application Support/sbh/config.toml"),
             )
         };
         LaunchdConfig {
@@ -1436,7 +1436,7 @@ mod tests {
         assert_eq!(
             dict.get("WorkingDirectory")
                 .and_then(plist::Value::as_string),
-            Some("/var/lib/sbh")
+            Some("/private/var/sbh")
         );
         assert_eq!(
             dict.get("ProcessType").and_then(plist::Value::as_string),
@@ -1444,11 +1444,11 @@ mod tests {
         );
         assert_eq!(
             env.get("SBH_CONFIG_PATH").and_then(plist::Value::as_string),
-            Some("/etc/sbh/config.toml")
+            Some("/Library/Application Support/sbh/config.toml")
         );
         assert_eq!(
             env.get("SBH_CONFIG").and_then(plist::Value::as_string),
-            Some("/etc/sbh/config.toml")
+            Some("/Library/Application Support/sbh/config.toml")
         );
         assert_eq!(
             env.get("RUST_LOG").and_then(plist::Value::as_string),

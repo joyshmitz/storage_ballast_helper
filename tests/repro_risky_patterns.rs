@@ -15,7 +15,7 @@ mod tests {
     }
 
     #[test]
-    fn risky_cargo_prefix_deletes_source_module() {
+    fn source_cargo_prefix_is_not_deleted() {
         let registry = ArtifactPatternRegistry::default();
         let engine = default_engine();
 
@@ -26,11 +26,10 @@ mod tests {
 
         let classification = registry.classify(&path, signals);
 
-        // Assert that it currently matches the "cargo_" pattern with high confidence
-        assert_eq!(classification.pattern_name, "cargo-prefix");
+        assert_ne!(classification.pattern_name, "cargo-prefix");
         assert!(
-            classification.combined_confidence > 0.5,
-            "Confidence too high for source dir: {}",
+            classification.combined_confidence < 0.2,
+            "Confidence should stay low for source dir: {}",
             classification.combined_confidence
         );
 
@@ -45,21 +44,17 @@ mod tests {
             excluded: false,
         };
 
-        // At moderate pressure (0.5), this should NOT be deleted.
-        // But with current logic, it likely IS deleted.
         let score = engine.score_candidate(&input, 0.5);
 
-        // If this assertion passes, the bug is real (it says Delete).
-        // I want to verify the BUG exists, so I assert Delete.
         assert_eq!(
             score.decision.action,
-            DecisionAction::Delete,
-            "DANGEROUS: Source module 'cargo_utils' flagged for deletion!"
+            DecisionAction::Keep,
+            "Source module 'cargo_utils' must not be flagged for deletion"
         );
     }
 
     #[test]
-    fn risky_cache_name_deletes_source_module() {
+    fn source_cache_dir_is_not_deleted() {
         let registry = ArtifactPatternRegistry::default();
         let engine = default_engine();
 
@@ -85,8 +80,8 @@ mod tests {
         let score = engine.score_candidate(&input, 0.5);
         assert_eq!(
             score.decision.action,
-            DecisionAction::Delete,
-            "DANGEROUS: Source module 'cache' flagged for deletion!"
+            DecisionAction::Keep,
+            "Source module 'cache' must not be flagged for deletion"
         );
     }
 }

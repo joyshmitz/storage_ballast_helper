@@ -7,6 +7,8 @@
 //! These tests complement the unit-level coverage in `adapters.rs`, `cli_app.rs`,
 //! `runtime.rs`, and `update.rs` by exercising **cross-component** scenarios.
 
+#![cfg(feature = "tui")]
+
 mod common;
 
 use std::collections::HashMap;

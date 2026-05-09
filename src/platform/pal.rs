@@ -781,7 +781,8 @@ mod tests {
 
     #[test]
     fn mock_platform_builder_covers_extended_pal_methods() {
-        let root = PathBuf::from("/tmp/sbh-mock");
+        let temp = tempfile::tempdir().expect("mock root tempdir");
+        let root = temp.path().to_path_buf();
         let open_path = root.join("target/debug/object.o");
         let executable_path = root.join("target/debug/tool");
         let mmap_path = root.join("target/incremental/cache.bin");

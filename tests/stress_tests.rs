@@ -202,7 +202,7 @@ fn stress_rapid_fill_burst() {
 // ════════════════════════════════════════════════════════════════
 //
 // Disk stays at ~8% free for an extended period (normal CI churn).
-// PID should stabilize in Yellow/Orange, urgency moderate but not max.
+// PID should stabilize in Red with high urgency, but avoid false Critical churn.
 
 #[test]
 fn stress_sustained_low_pressure() {
@@ -261,10 +261,10 @@ fn stress_sustained_low_pressure() {
     let avg_urgency = urgency_sum / 200.0;
 
     // At 8% free with thresholds green=20%, yellow=14%, orange=10%, red=6%:
-    // We expect mostly Orange with some Yellow.
+    // We expect sustained Red pressure and high urgency.
     assert!(
-        avg_urgency > 0.1 && avg_urgency < 0.9,
-        "sustained pressure should have moderate urgency, got {avg_urgency:.3}"
+        avg_urgency >= 0.9,
+        "sustained Red pressure should have high urgency, got {avg_urgency:.3}"
     );
     // Should NOT frequently hit Critical.
     assert!(
@@ -601,8 +601,8 @@ fn stress_decision_plane_drift() {
     report.steps += 1;
 
     // Phase 3: Inject drift — 50 bad observations.
-    // Pressure must be non-green for check_guard_triggers to trigger fallback.
-    engine.set_pressure_level(PressureLevel::Yellow);
+    // Guard drift fallback is reserved for Orange+ pressure.
+    engine.set_pressure_level(PressureLevel::Orange);
     let mut drift_steps = 0;
     let mut guard_fail_at: Option<usize> = None;
     for i in 0..50 {

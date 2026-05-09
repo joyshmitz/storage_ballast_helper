@@ -518,7 +518,7 @@ mod tests {
             mostly_object_files: true,
             ..StructuralSignals::default()
         };
-        let classification = registry.classify(&path, signals);
+        let classification = classify_macos(&registry, &path, signals);
 
         assert_eq!(classification.pattern_name, "xcode-derived-data");
         assert_eq!(classification.category, ArtifactCategory::BuildOutput);
@@ -603,7 +603,7 @@ mod tests {
             "/Users/operator/Library/Application Support/Claude/Service Worker/CacheStorage/session-1",
         );
         let signals = StructuralSignals::default();
-        let classification = registry.classify(&path, signals);
+        let classification = classify_macos(&registry, &path, signals);
 
         assert_eq!(classification.pattern_name, "electron-service-worker-cache");
         assert_eq!(classification.category, ArtifactCategory::CacheDir);
@@ -684,7 +684,7 @@ mod tests {
         let engine = default_engine();
         let path = PathBuf::from("/tmp/frankenterm-trash-20260503");
         let signals = StructuralSignals::default();
-        let classification = registry.classify(&path, signals);
+        let classification = classify_macos(&registry, &path, signals);
 
         assert_eq!(classification.pattern_name, "user-named-trash");
         assert_eq!(classification.category, ArtifactCategory::TempDir);
@@ -789,7 +789,7 @@ mod tests {
             has_cargo_toml: true,
             ..StructuralSignals::default()
         };
-        let classification = registry.classify(&path, signals);
+        let classification = classify_macos(&registry, &path, signals);
 
         assert_eq!(classification.pattern_name, "release-work-buildroot");
         assert_eq!(classification.category, ArtifactCategory::BuildOutput);
@@ -818,7 +818,7 @@ mod tests {
         let engine = default_engine();
         let path = PathBuf::from("/Users/operator/release-work/mcp_agent_mail_rust_buildroot");
         let signals = StructuralSignals::default();
-        let classification = registry.classify(&path, signals);
+        let classification = classify_macos(&registry, &path, signals);
 
         assert_eq!(classification.pattern_name, "release-work-buildroot");
 
