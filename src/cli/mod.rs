@@ -1702,6 +1702,36 @@ mod tests {
     }
 
     #[test]
+    fn macos_completion_audit_maps_goal_to_evidence() {
+        let audit = include_str!("../../docs/internal/macos-parity-completion-audit.md");
+
+        for required in [
+            "Prompt-To-Artifact Completion Audit",
+            "bd-r7m7",
+            "bd-ykwh",
+            "macos_launchd_user_service_lifecycle_bootstrap_kickstart_bootout",
+            "macos_status_json_matches_diskutil_apfs_capacity",
+            "macos_synthetic_writer_surfaces_in_blame_top_rows",
+            "scanner_prescan_does_not_dispatch_protected_rust_fuzz_target",
+            "executor_preflight_skips_config_protected_daemon_candidate",
+            "macos-platform",
+            "macos-15-intel",
+            "25596686483",
+            "0 valid identities found",
+            "sbh-notary",
+            "HOMEBREW_TAP_TOKEN",
+            "Not Complete",
+            "sbh doctor --release --json",
+            "Developer ID Application",
+        ] {
+            assert!(
+                audit.contains(required),
+                "macOS parity audit must map completion evidence or blocker fragment: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn macos_incident_case_study_tracks_operator_numbers() {
         let case_study = include_str!("../../docs/macos-incident-case-study.md");
         let readme = include_str!("../../README.md");
