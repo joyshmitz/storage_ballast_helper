@@ -180,6 +180,86 @@ fn macos_aware_help_text_is_visible() {
 }
 
 #[test]
+fn release_doctor_json_failure_exits_nonzero_after_parseable_report() {
+    let empty_path = tempfile::tempdir().expect("create empty PATH fixture");
+    let path_value = empty_path.path().to_string_lossy().to_string();
+    let result = common::run_cli_case_with_env(
+        "release_doctor_json_failure_exits_nonzero_after_parseable_report",
+        &["--json", "doctor", "--release"],
+        &[("PATH", &path_value)],
+    );
+
+    assert!(
+        !result.status.success(),
+        "release doctor should fail when external release credentials/tools are unavailable; log: {}",
+        result.log_path.display()
+    );
+    assert!(
+        result.stderr.contains("doctor checks failed"),
+        "release doctor should explain the failing exit after printing JSON; stderr={:?}; log={}",
+        result.stderr,
+        result.log_path.display()
+    );
+
+    let payload: Value = serde_json::from_str(result.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "release doctor should print parseable JSON before failing: {err}; stdout={:?}; stderr={:?}; log={}",
+            result.stdout,
+            result.stderr,
+            result.log_path.display()
+        )
+    });
+    assert_eq!(payload["repository"].as_str(), Some(RELEASE_REPOSITORY));
+    assert_eq!(payload["notary_profile"].as_str(), Some("sbh-notary"));
+
+    let checks = payload["checks"].as_array().unwrap_or_else(|| {
+        panic!(
+            "release doctor JSON missing checks array: {payload}; log={}",
+            result.log_path.display()
+        )
+    });
+    for check_id in [
+        "release.developer_id_identity",
+        "release.notary_profile",
+        "release.github_secrets",
+    ] {
+        let status = checks
+            .iter()
+            .find(|check| check["id"].as_str() == Some(check_id))
+            .and_then(|check| check["status"].as_str());
+        assert_eq!(
+            status,
+            Some("FAIL"),
+            "release doctor check {check_id} should fail under empty PATH; payload={payload}; log={}",
+            result.log_path.display()
+        );
+    }
+
+    let required_secrets = payload["required_github_secrets"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "release doctor JSON missing required secrets: {payload}; log={}",
+                result.log_path.display()
+            )
+        });
+    assert!(
+        required_secrets
+            .iter()
+            .any(|secret| secret.as_str() == Some("HOMEBREW_TAP_TOKEN")),
+        "release doctor should include Homebrew tap secret requirement; payload={payload}; log={}",
+        result.log_path.display()
+    );
+    assert!(
+        payload["setup_steps"]
+            .as_array()
+            .is_some_and(|steps| !steps.is_empty()),
+        "release doctor should include non-secret setup steps; payload={payload}; log={}",
+        result.log_path.display()
+    );
+}
+
+#[test]
 fn json_flag_accepted_by_status() {
     let result = common::run_cli_case("json_flag_accepted_by_status", &["status", "--json"]);
     // Status may succeed or fail depending on system state, but
