@@ -210,6 +210,12 @@ Local dry run:
 DOCS_UPDATE_BASE=origin/main DOCS_UPDATE_HEAD=HEAD bash scripts/ci_docs_update_check.sh
 ```
 
+**Superseded CI cancellation:** Branch and pull-request CI runs use workflow
+concurrency group `github.workflow` plus the PR number or ref, with
+`cancel-in-progress` enabled for `push` and `pull_request` events. This keeps
+newer commits from waiting behind obsolete hosted-runner jobs while preserving
+`workflow_call` behavior for release quality gates.
+
 **CI artifact retention** (`.github/workflows/ci.yml`):
 
 | CI Job | Artifacts | Retention |

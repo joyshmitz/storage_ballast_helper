@@ -1672,6 +1672,36 @@ mod tests {
     }
 
     #[test]
+    fn ci_workflow_cancels_superseded_push_and_pr_runs() {
+        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
+        let testing_guide = include_str!("../../docs/testing-and-logging.md");
+
+        for required in [
+            "concurrency:",
+            "group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+            "cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}",
+            "workflow_call:",
+        ] {
+            assert!(
+                ci_workflow.contains(required),
+                "CI workflow must cancel superseded branch/PR runs without disabling workflow_call: {required}"
+            );
+        }
+
+        for required in [
+            "Superseded CI cancellation",
+            "`cancel-in-progress` enabled for `push` and `pull_request` events",
+            "newer commits from waiting behind obsolete hosted-runner jobs",
+            "`workflow_call` behavior for release quality gates",
+        ] {
+            assert!(
+                testing_guide.contains(required),
+                "testing guide must document CI supersession behavior: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn macos_incident_case_study_tracks_operator_numbers() {
         let case_study = include_str!("../../docs/macos-incident-case-study.md");
         let readme = include_str!("../../README.md");
