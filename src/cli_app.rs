@@ -533,8 +533,8 @@ struct CheckArgs {
     /// Desired minimum free percentage.
     #[arg(long, value_name = "PERCENT")]
     target_free: Option<f64>,
-    /// Minimum required free space in bytes (e.g. 5000000000 for ~5GB).
-    #[arg(long, value_name = "BYTES")]
+    /// Minimum required free space. Accepts bytes or K/M/G/T suffixes, e.g. 5G.
+    #[arg(long, value_name = "SIZE", value_parser = parse_byte_count)]
     need: Option<u64>,
     /// Predict if space will last for this many minutes (requires running daemon).
     #[arg(long, value_name = "MINUTES")]
@@ -7531,6 +7531,92 @@ fn read_daemon_prediction(state_path: &Path, mount_point: &Path) -> Option<f64> 
     rate_obj.get("bytes_per_sec")?.as_f64()
 }
 
+fn parse_byte_count(raw: &str) -> std::result::Result<u64, String> {
+    let input = raw.trim();
+    if input.is_empty() {
+        return Err("byte count must not be empty".to_string());
+    }
+
+    let split = input
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .unwrap_or(input.len());
+    let (number, suffix) = input.split_at(split);
+    let suffix = suffix.trim().to_ascii_lowercase();
+    let multiplier = match suffix.as_str() {
+        "" | "b" | "byte" | "bytes" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024_u64.pow(2),
+        "g" | "gb" | "gib" => 1024_u64.pow(3),
+        "t" | "tb" | "tib" => 1024_u64.pow(4),
+        _ => {
+            return Err(
+                "byte count suffix must be one of B, K, M, G, T, KiB, MiB, GiB, or TiB".to_string(),
+            );
+        }
+    };
+
+    parse_decimal_byte_count(number, multiplier)
+}
+
+fn parse_decimal_byte_count(number: &str, multiplier: u64) -> std::result::Result<u64, String> {
+    if number.is_empty() {
+        return Err("byte count is missing a number".to_string());
+    }
+    if number.bytes().filter(|byte| *byte == b'.').count() > 1 {
+        return Err("byte count contains more than one decimal point".to_string());
+    }
+
+    let (whole, fractional) = number
+        .split_once('.')
+        .map_or((number, None), |(whole, fractional)| {
+            (whole, Some(fractional))
+        });
+
+    if whole.is_empty() && fractional.is_none_or(str::is_empty) {
+        return Err("byte count is missing a number".to_string());
+    }
+    if !whole.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("byte count contains invalid digits".to_string());
+    }
+
+    let whole_value = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse::<u128>()
+            .map_err(|_| "byte count is too large".to_string())?
+    };
+    let multiplier = u128::from(multiplier);
+    let mut total = whole_value
+        .checked_mul(multiplier)
+        .ok_or_else(|| "byte count is too large".to_string())?;
+
+    if let Some(fractional) = fractional
+        && !fractional.is_empty()
+    {
+        if !fractional.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("byte count contains invalid fractional digits".to_string());
+        }
+        let scale_power = u32::try_from(fractional.len())
+            .map_err(|_| "byte count has too many fractional digits".to_string())?;
+        let scale = 10_u128
+            .checked_pow(scale_power)
+            .ok_or_else(|| "byte count has too many fractional digits".to_string())?;
+        let fractional_value = fractional
+            .parse::<u128>()
+            .map_err(|_| "byte count fractional part is too large".to_string())?;
+        let fractional_bytes = fractional_value
+            .checked_mul(multiplier)
+            .ok_or_else(|| "byte count is too large".to_string())?
+            / scale;
+        total = total
+            .checked_add(fractional_bytes)
+            .ok_or_else(|| "byte count is too large".to_string())?;
+    }
+
+    u64::try_from(total).map_err(|_| "byte count is too large".to_string())
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     let start = std::time::Instant::now();
@@ -8904,6 +8990,54 @@ mod tests {
         for case in &cases {
             let parsed = Cli::try_parse_from(case.iter().copied());
             assert!(parsed.is_ok(), "failed to parse case: {case:?}");
+        }
+    }
+
+    #[test]
+    fn check_command_parses_documented_need_suffixes() {
+        let parsed = Cli::try_parse_from(["sbh", "check", "/tmp", "--need", "5G"])
+            .expect("documented --need suffix should parse");
+
+        let Command::Check(args) = parsed.command else {
+            panic!("expected check command");
+        };
+        assert_eq!(args.need, Some(5 * 1024_u64.pow(3)));
+    }
+
+    #[test]
+    fn parse_byte_count_accepts_binary_suffixes_and_decimals() {
+        let cases = [
+            ("0", 0),
+            ("1024", 1024),
+            ("1K", 1024),
+            ("1kb", 1024),
+            ("1KiB", 1024),
+            ("2M", 2 * 1024_u64.pow(2)),
+            ("1.5G", 1_610_612_736),
+            ("5 GB", 5 * 1024_u64.pow(3)),
+            ("2TiB", 2 * 1024_u64.pow(4)),
+        ];
+
+        for (input, expected) in cases {
+            let parsed = parse_byte_count(input).unwrap_or_else(|err| panic!("{input:?}: {err}"));
+            assert_eq!(parsed, expected, "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn parse_byte_count_rejects_invalid_inputs() {
+        for input in [
+            "",
+            "G",
+            "1XB",
+            "1.2.3G",
+            "1G extra",
+            "18446744073709551616T",
+        ] {
+            assert!(
+                parse_byte_count(input).is_err(),
+                "input should be rejected: {input:?}"
+            );
         }
     }
 
