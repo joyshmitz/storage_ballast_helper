@@ -416,6 +416,7 @@ jobs:
           mkdir -p macos-homebrew-archive macos-homebrew-formula/Formula
           cp "${bin}" macos-homebrew-archive/sbh
           archive="${PWD}/macos-homebrew-archive/sbh-ci-${{ matrix.runner }}.tar.xz"
+          formula_path="${PWD}/macos-homebrew-formula/Formula/sbh-ci.rb"
           tar -C macos-homebrew-archive -cJf "${archive}" sbh
           archive_sha="$(shasum -a 256 "${archive}" | awk '{print $1}')"
           archive_url="file://${archive}"
@@ -436,8 +437,8 @@ jobs:
           File.write("macos-homebrew-formula/Formula/sbh-ci.rb", formula)
           RUBY
 
-          ruby -c macos-homebrew-formula/Formula/sbh-ci.rb 2>&1 | tee macos-homebrew-formula-syntax-output.txt
-          brew install --formula --build-from-source --skip-link macos-homebrew-formula/Formula/sbh-ci.rb 2>&1 | tee macos-homebrew-install-output.txt
+          ruby -c "${formula_path}" 2>&1 | tee macos-homebrew-formula-syntax-output.txt
+          brew install --formula --build-from-source --skip-link "${formula_path}" 2>&1 | tee macos-homebrew-install-output.txt
           brew test --force sbh-ci 2>&1 | tee macos-homebrew-test-output.txt
       - name: Capture release doctor diagnostics
         if: always()
