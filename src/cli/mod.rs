@@ -1447,6 +1447,19 @@ mod tests {
             !release_workflow.contains("pull_request:"),
             "full release workflow must not run on PRs"
         );
+        assert!(
+            release_workflow.contains("needs: quality-gate"),
+            "release artifact builds must depend on the reusable CI quality gate"
+        );
+        assert!(
+            !release_workflow.contains("if: always() && !cancelled()"),
+            "release artifact builds must not continue after quality-gate failure"
+        );
+        assert!(
+            !release_workflow
+                .contains("Quality gate failures should not block release artifact production"),
+            "release workflow must not document non-blocking quality gates"
+        );
     }
 
     #[test]
