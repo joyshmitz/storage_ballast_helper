@@ -4079,7 +4079,23 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
         }
     }
 
+    let failed = pal_report
+        .as_ref()
+        .is_some_and(|report| doctor_checks_have_failures(&report.checks))
+        || release_report
+            .as_ref()
+            .is_some_and(|report| doctor_checks_have_failures(&report.checks));
+    if failed {
+        return Err(CliError::User(
+            "doctor checks failed; inspect the report above for remediation steps".to_string(),
+        ));
+    }
+
     Ok(())
+}
+
+fn doctor_checks_have_failures(checks: &[DoctorCheck]) -> bool {
+    checks.iter().any(|check| check.status == "FAIL")
 }
 
 fn print_pal_doctor_report(report: &PalDoctorReport) {
@@ -9404,6 +9420,21 @@ mod tests {
                 .contains("APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64")
         );
         assert!(secrets.message.contains("HOMEBREW_TAP_TOKEN"));
+    }
+
+    #[test]
+    fn doctor_checks_have_failures_detects_fail_status_only() {
+        let checks = vec![
+            doctor_check("doctor.pass", "Passing check", "PASS", "ok", None),
+            doctor_check("doctor.warn", "Warning check", "WARN", "warn", None),
+        ];
+        assert!(!doctor_checks_have_failures(&checks));
+
+        let checks = vec![
+            doctor_check("doctor.pass", "Passing check", "PASS", "ok", None),
+            doctor_check("doctor.fail", "Failing check", "FAIL", "fail", None),
+        ];
+        assert!(doctor_checks_have_failures(&checks));
     }
 
     #[test]

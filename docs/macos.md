@@ -424,6 +424,9 @@ Treat any `FAIL` result as a release blocker. The command intentionally reports
 missing local signing identity, missing notary profile, and missing GitHub
 Actions secrets as explicit diagnostics so the external Apple/GitHub credential
 setup can be finished without inspecting workflow internals.
+When any selected doctor check reports `FAIL`, the command exits nonzero after
+printing the full human or JSON report so automation can gate release work
+without scraping terminal text.
 
 The release doctor also prints a non-secret credential setup plan. The plan
 starts with the CSR/keychain request step now that Apple Developer Program
