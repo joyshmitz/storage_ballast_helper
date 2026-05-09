@@ -1,11 +1,14 @@
 # macOS/Linux Parity Prompt-To-Artifact Completion Audit
 
 Bead: `bd-r7m7.11`
-Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`
+Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`
 Parent: `bd-r7m7`
-Last audited: 2026-05-09 08:57 UTC
-Evidence snapshot: latest pushed head and CI run at audit time; refresh with
-`gh run list --repo Dicklesworthstone/storage_ballast_helper --branch main`
+Last audited: 2026-05-09 10:13 UTC
+Evidence snapshot: pushed head
+`0c2f39d4b43e9d318039c58b0519e667b3c8abfd`
+(`bd-ykwh.20 verify release Gatekeeper acceptance`) and CI run `25598551173`.
+Refresh with
+`gh run view <latest-run> --repo Dicklesworthstone/storage_ballast_helper --json status,conclusion,headSha,jobs`
 before any close decision.
 
 This is the closeout gate for the active objective: make `sbh` seamlessly
@@ -48,12 +51,15 @@ operator-visible outcomes:
 - `bd-ykwh` remains open. The remaining work is release-credential and Homebrew
   distribution plumbing.
 - `br ready --json` returned `[]`; remaining open actionable release work was
-  blocked or already assigned to `SilentGlacier` at audit time.
+  blocked or already assigned at audit time.
 - In-progress release blockers are `bd-ykwh.2`, `bd-ykwh.3`, `bd-ykwh.10`, and
   `bd-ykwh.13`.
-- The latest CI run was queued at audit time with `Homebrew Formula Validation`
-  and `Format + Lint` materialized but not green. Do not treat queued CI as
-  proof; inspect the latest run for the final pushed head before closing.
+- `bd-ykwh.20` is closed; release CI now runs `spctl -a -t execute -vv` after
+  notarization acceptance and before packaging macOS tarballs.
+- CI run `25598551173` for head `0c2f39d4b43e9d318039c58b0519e667b3c8abfd`
+  was queued at audit time with `Homebrew Formula Validation` and
+  `Format + Lint` materialized but not green. Do not treat queued CI as proof;
+  inspect the latest run for the final pushed head before closing.
 - Local Homebrew formula checks passed at refresh time: `brew style
   packaging/homebrew/Formula/sbh.rb` and the generated-formula placeholder
   replacement path both reported no style offenses.
@@ -69,7 +75,7 @@ operator-visible outcomes:
 | Blame attributes macOS disk growth to processes | `tests/integration_tests.rs::macos_synthetic_writer_surfaces_in_blame_top_rows`, `src/cli_app.rs::collect_blame_report_at`, macOS PAL libproc process I/O and open-file code | Covered by macOS integration test and PAL-backed implementation. |
 | CI validates Linux and macOS | `.github/workflows/ci.yml` jobs `check`, `unit`, `integration`, `linux-arm64`, `decision-plane`, `dashboard`, `e2e`, `macos-platform`, `macos-coverage`, `macos-benchmarks`, `stress`, `artifact-contract`, `provenance`, and `Homebrew Formula Validation` | Infrastructure exists. Final goal cannot close until the final head completes green. `macos-13` has been replaced with `macos-15-intel` because GitHub retired the old runner label; `macos-latest` remains the arm64 lane. |
 | Docs explain install, configure, verify, and diagnose | `README.md`, `docs/macos.md`, `docs/macos-full-disk-access.md`, `docs/cleanup-rules-macos.md`, `docs/testing-and-logging.md`, sample configs in `docs/configs/` | Covered in docs. Keep docs update lint green for future CLI/config changes. |
-| Release is signed, notarized, and distributed through Homebrew | `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, `.github/macos/sbh.entitlements.plist`, `packaging/homebrew/Formula/sbh.rb`, `docs/macos.md` release diagnostics | Workflow and docs exist, but live credentials are missing. This is not complete. |
+| Release is signed, notarized, Gatekeeper-assessed, and distributed through Homebrew | `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, `.github/macos/sbh.entitlements.plist`, `packaging/homebrew/Formula/sbh.rb`, `docs/macos.md` release diagnostics, `src/cli/mod.rs::release_workflow_notarizes_macos_binaries_asynchronously` | Workflow and docs exist. `bd-ykwh.20` added release-side `spctl -a -t execute -vv` before packaging. Live credentials and a successful tag release are still missing, so this is not complete. |
 
 ## Protected-Path Daemon Regression
 
@@ -98,7 +104,7 @@ containing `bd-twgw` and `bd-j40b`, then restore the protected worktree files.
 ## Live Release Blocker Evidence
 
 The user confirmed Apple Developer Program enrollment, so enrollment itself is
-not the current blocker. Live checks at 2026-05-09 08:54 UTC still showed:
+not the current blocker. Live checks at 2026-05-09 10:13 UTC still showed:
 
 - `security find-identity -v -p codesigning`: `0 valid identities found`
 - `xcrun notarytool history --keychain-profile sbh-notary --output-format json`:
