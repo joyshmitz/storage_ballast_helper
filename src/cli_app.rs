@@ -1127,13 +1127,27 @@ fn run_macos_release_binary_install(
         }
     }
 
-    if report.success {
-        Ok(install_path)
-    } else {
-        Err(CliError::Runtime(
+    validate_macos_release_install_report(args, &report, install_path)
+}
+
+fn validate_macos_release_install_report(
+    args: &InstallArgs,
+    report: &UpdateReport,
+    install_path: Option<PathBuf>,
+) -> Result<Option<PathBuf>, CliError> {
+    if !report.success {
+        return Err(CliError::Runtime(
             "macOS release binary install failed".to_string(),
-        ))
+        ));
     }
+
+    if !args.dry_run && install_path.is_none() {
+        return Err(CliError::Runtime(
+            "macOS release binary install did not produce an installed binary path; latest published release may be older than the running binary. Re-run with --from-source or install from a published release artifact.".to_string(),
+        ));
+    }
+
+    Ok(install_path)
 }
 
 fn resolve_service_control(
@@ -9806,6 +9820,64 @@ mod tests {
         let opts = build_macos_release_install_options(&args, &config, service);
 
         assert_eq!(opts.install_dir, PathBuf::from("/usr/local/bin"));
+    }
+
+    #[test]
+    fn macos_release_install_rejects_non_dry_run_without_binary_path() {
+        let args = InstallArgs {
+            dry_run: false,
+            ..InstallArgs::default()
+        };
+        let report = UpdateReport {
+            current_version: "0.4.7".to_string(),
+            target_version: Some("v0.4.6".to_string()),
+            update_available: false,
+            applied: false,
+            check_only: false,
+            dry_run: false,
+            artifact_url: None,
+            notices_enabled: true,
+            install_path: None,
+            backup_id: None,
+            steps: Vec::new(),
+            success: true,
+            follow_up: Vec::new(),
+            service_restart: None,
+        };
+
+        let err = validate_macos_release_install_report(&args, &report, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("did not produce an installed binary path"),
+            "non-dry-run install should not continue to service registration without a binary path: {err}"
+        );
+    }
+
+    #[test]
+    fn macos_release_install_dry_run_allows_no_binary_path() {
+        let args = InstallArgs {
+            dry_run: true,
+            ..InstallArgs::default()
+        };
+        let report = UpdateReport {
+            current_version: "0.4.7".to_string(),
+            target_version: Some("v0.4.6".to_string()),
+            update_available: false,
+            applied: false,
+            check_only: false,
+            dry_run: true,
+            artifact_url: None,
+            notices_enabled: true,
+            install_path: None,
+            backup_id: None,
+            steps: Vec::new(),
+            success: true,
+            follow_up: Vec::new(),
+            service_restart: None,
+        };
+
+        let path = validate_macos_release_install_report(&args, &report, None).unwrap();
+        assert_eq!(path, None);
     }
 
     #[test]
