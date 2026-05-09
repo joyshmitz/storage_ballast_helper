@@ -306,6 +306,13 @@ APPLE_TEAM_ID
 APPLE_APP_SPECIFIC_PASSWORD
 ```
 
+Apple Developer Program enrollment is confirmed for this project. Use the
+already-enrolled Apple Developer account or team that owns the Developer ID
+Application certificate and notarization credentials. The repository workflow is
+intentionally team-agnostic: Organization and Individual memberships both use
+the same secret names, and the selected Team ID is represented by
+`APPLE_TEAM_ID` rather than by branching release logic.
+
 If any secret is missing, the macOS release job fails before packaging. The P12
 secret is the base64-encoded Developer ID Application certificate plus private
 key exported from Keychain Access, and `APPLE_DEVELOPER_ID_IDENTITY` is the full
