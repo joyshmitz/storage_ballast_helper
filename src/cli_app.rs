@@ -800,7 +800,13 @@ fn run_daemon(cli: &Cli, args: &DaemonArgs) -> Result<(), CliError> {
 }
 
 fn install_requests_service(args: &InstallArgs) -> bool {
-    args.systemd || args.launchd || args.user || args.scope.is_some() || !args.from_source
+    args.systemd
+        || args.launchd
+        || args.user
+        || args.scope.is_some()
+        || args.auto
+        || args.wizard
+        || !args.from_source
 }
 
 fn service_kind_name(kind: ServiceKind) -> &'static str {
@@ -986,7 +992,7 @@ fn resolve_install_service(
     let user_scope = match args.scope {
         Some(InstallScopeArg::User) => true,
         Some(InstallScopeArg::System) => false,
-        None if args.user => true,
+        None if args.user || args.auto || args.wizard => true,
         None => kind == ServiceKind::Launchd,
     };
 
@@ -999,6 +1005,20 @@ fn resolve_install_service(
     }
 
     Ok(Some(ResolvedInstallService { kind, user_scope }))
+}
+
+fn apply_resolved_service_to_wizard_answers(
+    answers: &mut storage_ballast_helper::cli::wizard::WizardAnswers,
+    service: Option<ResolvedInstallService>,
+) {
+    use storage_ballast_helper::cli::wizard::ServiceChoice;
+
+    if let Some(service) = service {
+        answers.service = ServiceChoice::from_service_kind(service.kind);
+        answers.user_scope = service.user_scope;
+    } else {
+        answers.service = ServiceChoice::None;
+    }
 }
 
 fn resolve_uninstall_kind(
@@ -1212,22 +1232,18 @@ fn resolve_uninstall_user_scope(
 #[allow(clippy::too_many_lines)]
 fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     // -- wizard / auto mode ---------------------------------------------------
-    if args.wizard || args.auto {
+    if args.wizard {
         use storage_ballast_helper::cli::wizard::{
-            WizardSummary, auto_answers_for_platform, format_summary, run_interactive_for_platform,
-            write_config,
+            WizardSummary, format_summary, run_interactive_for_platform, write_config,
         };
 
         let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
-        let answers = if args.auto {
-            auto_answers_for_platform(platform.as_ref())
-        } else {
-            let stdin = io::stdin();
-            let mut reader = stdin.lock();
-            let mut writer = io::stderr();
-            run_interactive_for_platform(&mut reader, &mut writer, platform.as_ref())
-                .map_err(|e| CliError::User(format!("wizard cancelled: {e}")))?
-        };
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        let mut writer = io::stderr();
+        let answers = run_interactive_for_platform(&mut reader, &mut writer, platform.as_ref())
+            .map_err(|e| CliError::User(format!("wizard cancelled: {e}")))?;
+        drop(reader);
 
         let config_path = answers.to_config().paths.config_file;
 
@@ -1261,8 +1277,47 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     let service_kind = platform.service_kind();
     let sudo_command = format_sudo_rerun_command(cli, service_kind);
     let service = resolve_install_service(args, service_kind, running_as_root(), &sudo_command)?;
-    let config = load_install_config(cli, service);
-    let macos_binary_path = if service_kind == ServiceKind::Launchd && !args.from_source {
+    let auto_install = if args.auto {
+        use storage_ballast_helper::cli::wizard::{
+            WizardSummary, auto_answers_for_platform, format_summary, write_config,
+        };
+
+        let mut answers = auto_answers_for_platform(platform.as_ref());
+        apply_resolved_service_to_wizard_answers(&mut answers, service);
+        let config = answers.to_config();
+        let config_path = config.paths.config_file.clone();
+        let config_written = if args.dry_run {
+            config_path
+        } else {
+            write_config(&answers, &config_path)
+                .map_err(|e| CliError::Runtime(format!("failed to write config: {e}")))?
+        };
+        let summary = WizardSummary {
+            answers,
+            config_path: config_written,
+            config_written: !args.dry_run,
+            warnings: vec![],
+        };
+
+        match output_mode(cli) {
+            OutputMode::Human => {
+                print!("{}", format_summary(&summary));
+            }
+            OutputMode::Json => {
+                let payload = serde_json::to_value(&summary)?;
+                write_json_line(&payload)?;
+            }
+        }
+
+        Some((summary, config))
+    } else {
+        None
+    };
+    let config = auto_install.as_ref().map_or_else(
+        || load_install_config(cli, service),
+        |(_, config)| config.clone(),
+    );
+    let mut installed_binary_path = if service_kind == ServiceKind::Launchd && !args.from_source {
         run_macos_release_binary_install(cli, args, &config, service)?
     } else {
         None
@@ -1322,6 +1377,9 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
                     .unwrap_or_else(|| "from-source build failed".to_string()),
             ));
         }
+        if let Some(binary_path) = result.binary_path {
+            installed_binary_path = Some(binary_path);
+        }
 
         // From-source-only installs stop after the binary install. Passing a
         // service flag or scope asks for service registration after the build.
@@ -1337,15 +1395,23 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
             InstallOptions, format_install_report, run_install_sequence_with_bundle,
         };
 
-        let ballast_size_bytes = args.ballast_size.checked_mul(1024 * 1024).ok_or_else(|| {
-            CliError::User(format!(
-                "ballast size {} MB overflows u64 when converted to bytes",
-                args.ballast_size
-            ))
-        })?;
+        let auto_answers = auto_install.as_ref().map(|(summary, _)| &summary.answers);
+        let ballast_count =
+            auto_answers.map_or(args.ballast_count, |answers| answers.ballast_file_count);
+        let ballast_size_bytes = if let Some(answers) = auto_answers {
+            answers.ballast_file_size_bytes
+        } else {
+            args.ballast_size.checked_mul(1024 * 1024).ok_or_else(|| {
+                CliError::User(format!(
+                    "ballast size {} MB overflows u64 when converted to bytes",
+                    args.ballast_size
+                ))
+            })?
+        };
+
         let opts = InstallOptions {
             config: config.clone(),
-            ballast_count: args.ballast_count,
+            ballast_count,
             ballast_size_bytes,
             ballast_path: args.ballast_path.clone(),
             dry_run: args.dry_run,
@@ -1383,7 +1449,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     if service.kind == ServiceKind::Launchd {
         let mut launchd_config = LaunchdConfig::from_env(service.user_scope)
             .map_err(|e| CliError::Runtime(e.to_string()))?;
-        if let Some(binary_path) = macos_binary_path {
+        if let Some(binary_path) = installed_binary_path.clone() {
             launchd_config.binary_path = binary_path;
         }
         launchd_config
@@ -1451,6 +1517,9 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     let mut systemd_config =
         storage_ballast_helper::daemon::service::SystemdConfig::from_env(service.user_scope)
             .map_err(|e| CliError::Runtime(e.to_string()))?;
+    if let Some(binary_path) = installed_binary_path {
+        systemd_config.binary_path = binary_path;
+    }
 
     // Add configured paths to ReadWritePaths to satisfy ProtectSystem=strict
     for path in &config.scanner.root_paths {
@@ -9776,6 +9845,95 @@ mod tests {
         assert_eq!(service.kind, ServiceKind::Systemd);
         assert!(!service.user_scope);
         assert_eq!(service.scope_name(), "system");
+    }
+
+    #[test]
+    fn install_auto_flag_selects_user_scope_on_all_supported_service_kinds() {
+        let args = InstallArgs {
+            auto: true,
+            ..InstallArgs::default()
+        };
+
+        let linux = resolve_install_service(
+            &args,
+            ServiceKind::Systemd,
+            false,
+            "sudo sbh install --scope system",
+        )
+        .expect("--auto should not require root for systemd user scope")
+        .expect("--auto should request service installation");
+        assert_eq!(linux.kind, ServiceKind::Systemd);
+        assert!(linux.user_scope);
+
+        let macos = resolve_install_service(
+            &args,
+            ServiceKind::Launchd,
+            false,
+            "sudo sbh install --scope system",
+        )
+        .expect("--auto should resolve launchd")
+        .expect("--auto should request service installation");
+        assert_eq!(macos.kind, ServiceKind::Launchd);
+        assert!(macos.user_scope);
+    }
+
+    #[test]
+    fn install_auto_from_source_still_requests_detected_user_service() {
+        let args = InstallArgs {
+            auto: true,
+            from_source: true,
+            ..InstallArgs::default()
+        };
+
+        let service = resolve_install_service(
+            &args,
+            ServiceKind::Systemd,
+            false,
+            "sudo sbh install --scope system",
+        )
+        .expect("--from-source --auto should resolve")
+        .expect("--auto should request service registration after source install");
+
+        assert_eq!(service.kind, ServiceKind::Systemd);
+        assert!(service.user_scope);
+    }
+
+    #[test]
+    fn install_auto_explicit_system_scope_still_requires_root() {
+        let args = InstallArgs {
+            auto: true,
+            scope: Some(InstallScopeArg::System),
+            ..InstallArgs::default()
+        };
+        let err = resolve_install_service(
+            &args,
+            ServiceKind::Launchd,
+            false,
+            "sudo sbh install --scope system",
+        )
+        .expect_err("explicit system-scope auto install should still require root");
+
+        assert!(err.to_string().contains("requires root"));
+    }
+
+    #[test]
+    fn auto_wizard_answers_follow_resolved_service_for_config_paths() {
+        let mut answers = storage_ballast_helper::cli::wizard::auto_answers();
+        apply_resolved_service_to_wizard_answers(
+            &mut answers,
+            Some(ResolvedInstallService {
+                kind: ServiceKind::Launchd,
+                user_scope: false,
+            }),
+        );
+        let config = answers.to_config();
+
+        assert_eq!(
+            answers.service,
+            storage_ballast_helper::cli::wizard::ServiceChoice::Launchd
+        );
+        assert!(!answers.user_scope);
+        assert_eq!(config.paths, PathsConfig::system_default());
     }
 
     #[test]
