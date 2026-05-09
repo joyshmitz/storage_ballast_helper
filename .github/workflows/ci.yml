@@ -914,7 +914,7 @@ jobs:
   provenance:
     name: Provenance Metadata
     runs-on: ubuntu-latest
-    needs: [unit, integration, linux-arm64, decision-plane, dashboard, e2e, macos-platform, macos-coverage, macos-benchmarks, stress, artifact-contract]
+    needs: [homebrew-formula, unit, integration, linux-arm64, decision-plane, dashboard, e2e, macos-platform, macos-coverage, macos-benchmarks, stress, artifact-contract]
     steps:
       - uses: actions/checkout@v6.0.2
       - name: Strip local-only TUI path deps

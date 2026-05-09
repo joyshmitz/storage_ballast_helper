@@ -1746,6 +1746,7 @@ mod tests {
             "macos-homebrew-install-output.txt",
             "macos-homebrew-test-output.txt",
             "macos-homebrew-formula/Formula/sbh-ci.rb",
+            "needs: [homebrew-formula, unit, integration, linux-arm64, decision-plane, dashboard, e2e, macos-platform, macos-coverage, macos-benchmarks, stress, artifact-contract]",
         ] {
             assert!(
                 ci_workflow.contains(required),
