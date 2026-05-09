@@ -2163,6 +2163,42 @@ mod tests {
     }
 
     #[test]
+    fn unix_installer_prefers_versioned_macos_release_tarballs() {
+        let installer = include_str!("../../scripts/install.sh");
+
+        for required in [
+            "x86_64) TARGET_TRIPLE=\"x86_64-apple-darwin\"",
+            "arm64|aarch64) TARGET_TRIPLE=\"aarch64-apple-darwin\"",
+            "versioned_archive_name=\"${PROGRAM}-${RELEASE_LOCATOR}-${TARGET_TRIPLE}.tar.xz\"",
+            "grep -E \"^${PROGRAM}-v[0-9][A-Za-z0-9._-]*-${TARGET_TRIPLE}[.]tar[.]xz$\"",
+            "CHECKSUM_NAME=\"$versioned_archive_checksum\"",
+            "ASSET_URL=\"${base_url}/${ASSET_NAME}\"",
+            "CHECKSUM_URL=\"${base_url}/${CHECKSUM_NAME}\"",
+            "# Probe strategy 2: legacy unversioned .tar.xz archive.",
+            "# Probe strategy 3: raw binary",
+        ] {
+            assert!(
+                installer.contains(required),
+                "Unix installer must preserve macOS release asset contract fragment: {required}"
+            );
+        }
+
+        let versioned = installer
+            .find("# Probe strategy 1: versioned .tar.xz archive.")
+            .expect("installer must probe versioned release archives");
+        let legacy = installer
+            .find("# Probe strategy 2: legacy unversioned .tar.xz archive.")
+            .expect("installer must retain legacy archive fallback after current contract");
+        let raw = installer
+            .find("# Probe strategy 3: raw binary")
+            .expect("installer must retain raw binary fallback after archive contracts");
+        assert!(
+            versioned < legacy && legacy < raw,
+            "installer must prefer current versioned archives before legacy/raw fallbacks"
+        );
+    }
+
+    #[test]
     fn ci_release_targets_are_not_empty() {
         assert!(
             !CI_RELEASE_TARGETS.is_empty(),
