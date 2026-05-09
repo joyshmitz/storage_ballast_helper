@@ -34,7 +34,7 @@ Classification values:
 | `src/scanner/walker.rs` | 1281 | Gates nested-root open ancestor ordering test to Linux. | `PAL-method` | `open_path_ancestors(root_paths)` | Same open-ancestor platform contract as the sibling-subtree test. |
 | `src/cli_app.rs` | 698 | Rejects `--systemd` unless compiled on Linux. | `PAL-method` | `service_manager_kind()` | Install validation should ask the detected platform/service manager, not inline host cfgs. |
 | `src/cli_app.rs` | 703 | Rejects `--launchd` unless compiled on macOS. | `PAL-method` | `service_manager_kind()` | Needed for automatic install detection and clearer unsupported-service errors. |
-| `src/cli_app.rs` | 1506 | Compiles process blame attribution only on Linux through `/proc`. | `PAL-method` | `process_blame_snapshot()` | macOS needs libproc-backed process/cwd discovery instead of returning no attribution. |
+| `src/cli_app.rs` | 2355 | Collects process blame through the PAL via `process_list()`, `process_io()`, and `open_files_under()`. | `PAL-method` | `process_blame_snapshot()` | Closed for macOS: `MacOsPal` supplies libproc/rusage/open-file data, and `macos_synthetic_writer_surfaces_in_blame_top_rows` covers the CLI path. |
 | `src/daemon/self_monitor.rs` | 524 | Reads RSS through Linux implementation. | `PAL-method` | `self_stats()` | The daemon self-monitor should get RSS from PAL, with Linux `/proc` and macOS `proc_pid_rusage` or equivalent. |
 | `src/daemon/self_monitor.rs` | 528 | Returns zero RSS on non-Linux. | `PAL-method` | `self_stats()` | Returning zero hides daemon memory growth on macOS. |
 | `src/daemon/self_monitor.rs` | 534 | Compiles `/proc/self/status` RSS parser only on Linux. | `PAL-method` | `self_stats()` | Move into Linux PAL backend. |
@@ -71,7 +71,7 @@ The repeated sites point to these first-class platform methods or platform-owned
 | `detect_platform()` | `LinuxPlatform::new()` | `MacPlatform::new()` | macOS currently fails at PAL detection. |
 | `service_manager_kind()` / `default_service_choice()` | systemd when available | launchd | Install and wizard defaults duplicate cfg logic. |
 | `service_ownership_policy()` | `root:root` | `root:wheel` | Recommendation text is scattered in service code. |
-| `process_blame_snapshot()` | `/proc/<pid>` | libproc process/cwd APIs | `sbh blame` is Linux-only. |
+| `process_blame_snapshot()` | `/proc/<pid>` | libproc process/cwd/open-file APIs | Closed for macOS; `sbh blame` now uses PAL-backed process and open-file attribution. |
 | `self_stats()` | `/proc/self/status` | `proc_pid_rusage` or equivalent | macOS daemon RSS currently reports zero. |
 | `open_file_keys()` / `open_path_ancestors()` / `is_path_open()` | `/proc/<pid>/fd` | libproc fd/path APIs | Executor preflight parity is closed for macOS by `bd-r7m7.3`; legacy inode-key fallback remains Linux-specific. |
 | `preallocate_file(file, offset, len)` | `fallocate` | `fcntl(F_PREALLOCATE)` or unsupported | macOS ballast provisioning falls back to slow random writes. |
