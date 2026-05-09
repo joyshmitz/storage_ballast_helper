@@ -1354,6 +1354,7 @@ mod tests {
             "base64 < \"$P12_PATH\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64",
             "gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD",
             "gh secret set APPLE_APP_SPECIFIC_PASSWORD",
+            "gh secret set HOMEBREW_TAP_TOKEN",
             "gh secret list -R Dicklesworthstone/storage_ballast_helper",
             "Rotate the Developer ID certificate and app-specific password every 12 months",
             "`Developer ID Certificate Expiration` workflow manually",

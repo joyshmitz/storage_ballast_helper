@@ -304,6 +304,7 @@ APPLE_DEVELOPER_ID_IDENTITY
 APPLE_ID
 APPLE_TEAM_ID
 APPLE_APP_SPECIFIC_PASSWORD
+HOMEBREW_TAP_TOKEN
 ```
 
 Apple Developer Program enrollment is confirmed for this project. Use the
@@ -338,6 +339,8 @@ it handles private key material:
    printf '%s' "$APPLE_TEAM_ID" | gh secret set APPLE_TEAM_ID \
      -R Dicklesworthstone/storage_ballast_helper --body-file -
    printf '%s' "$APPLE_APP_SPECIFIC_PASSWORD" | gh secret set APPLE_APP_SPECIFIC_PASSWORD \
+     -R Dicklesworthstone/storage_ballast_helper --body-file -
+   printf '%s' "$HOMEBREW_TAP_TOKEN" | gh secret set HOMEBREW_TAP_TOKEN \
      -R Dicklesworthstone/storage_ballast_helper --body-file -
    gh secret list -R Dicklesworthstone/storage_ballast_helper
    ```
