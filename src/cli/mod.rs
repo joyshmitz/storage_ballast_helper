@@ -1779,6 +1779,7 @@ mod tests {
     #[test]
     fn readme_platform_sections_stay_cross_platform() {
         let readme = include_str!("../../README.md");
+        let notifications = include_str!("../daemon/notifications.rs");
 
         for required in [
             "systemd/launchd stdout and stderr capture",
@@ -1794,14 +1795,30 @@ mod tests {
             );
         }
 
+        for required in [
+            "systemd journals and launchd",
+            "stdout/stderr capture both receive the same operator-visible events",
+            "Journal/service log (structured stderr)",
+            "systemd captures stderr in the journal, while launchd captures it in",
+            "StandardErrorPath",
+        ] {
+            assert!(
+                notifications.contains(required),
+                "notification source docs must keep journal channel platform-neutral: {required}"
+            );
+        }
+
         for stale in [
             "auto-discovers RAM-backed mounts from `/proc/mounts`",
             "reads its own RSS (Resident Set Size) from `/proc/self/statm`",
             "Platform abstraction (Linux: procfs, statvfs, mounts)",
+            "Journal notification settings (systemd journal via stderr)",
+            "Journal (systemd structured stderr)",
+            "systemd captures stderr and annotates with PRIORITY via SyslogIdentifier",
         ] {
             assert!(
-                !readme.contains(stale),
-                "README platform section retained stale Linux-only wording: {stale}"
+                !readme.contains(stale) && !notifications.contains(stale),
+                "platform docs retained stale Linux-only wording: {stale}"
             );
         }
     }

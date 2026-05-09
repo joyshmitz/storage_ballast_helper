@@ -370,7 +370,10 @@ impl Default for FileConfig {
     }
 }
 
-/// Journal notification settings (systemd journal via stderr).
+/// Service-log notification settings.
+///
+/// The channel writes structured stderr lines so systemd journals and launchd
+/// stdout/stderr capture both receive the same operator-visible events.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct JournalConfig {
@@ -535,7 +538,7 @@ impl Channel for FileChannel {
     }
 }
 
-// ──── Journal (systemd structured stderr) ────
+// ──── Journal/service log (structured stderr) ────
 
 struct JournalChannel {
     min_level: NotificationLevel,
@@ -562,8 +565,9 @@ impl Channel for JournalChannel {
         let level = event.level();
         let summary = event.summary();
 
-        // systemd captures stderr and annotates with PRIORITY via SyslogIdentifier.
-        // Structured fields for filtering: SBH_EVENT=..., SBH_LEVEL=...
+        // systemd captures stderr in the journal, while launchd captures it in
+        // the configured StandardErrorPath. Structured fields remain stable for
+        // filtering: SBH_EVENT=..., SBH_LEVEL=...
         let priority = match level {
             NotificationLevel::Critical => "CRIT",
             NotificationLevel::Red => "ERR",
