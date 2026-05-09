@@ -1705,6 +1705,42 @@ impl MonitoringDaemon {
         eprintln!("{payload}");
     }
 
+    fn maybe_write_self_monitor_state(&mut self, response: &PressureResponse) -> SelfMonitorTick {
+        // Use the causing mount from the worst response so the state file
+        // reflects the mount that actually drove the pressure level, not the
+        // primary path which may be healthy.
+        let state_path = &response.causing_mount;
+        let free_pct = self
+            .fs_collector
+            .collect(state_path)
+            .map_or(0.0, |s| s.free_pct());
+        let mount_str = state_path.to_string_lossy().into_owned();
+        let ballast_available = self
+            .ballast_coordinator
+            .inventory()
+            .iter()
+            .map(|i| i.files_available)
+            .sum();
+        let ballast_total = self
+            .ballast_coordinator
+            .inventory()
+            .iter()
+            .map(|i| i.files_total)
+            .sum();
+        let dropped_log_events = self.logger_handle.dropped_events();
+        let policy_mode = self.policy_engine.lock().mode().to_string();
+
+        self.self_monitor.maybe_write_state(
+            response.level,
+            free_pct,
+            &mount_str,
+            ballast_available,
+            ballast_total,
+            dropped_log_events,
+            &policy_mode,
+        )
+    }
+
     /// Run the monitoring loop until shutdown is requested.
     ///
     /// This is the main entry point for `sbh daemon`.
@@ -1733,6 +1769,10 @@ impl MonitoringDaemon {
                 "[SBH-DAEMON] starting under pressure: {:?} (urgency={:.2})",
                 initial_response.level, initial_response.urgency
             );
+        }
+        let startup_monitor_tick = self.maybe_write_self_monitor_state(&initial_response);
+        if startup_monitor_tick.should_exit_for_rss_hard_limit() {
+            return Err(self.rss_hard_limit_error(startup_monitor_tick));
         }
 
         let (memory_pressure_tx, memory_pressure_rx) =
@@ -1840,6 +1880,21 @@ impl MonitoringDaemon {
             self.drain_memory_pressure_events(&memory_pressure_rx, response.level);
             self.sample_process_io_history();
 
+            // Foreground status requests should be responsive even when the
+            // next cleanup/special-location pass is expensive.
+            if self.signal_handler.should_dump_status() {
+                self.emit_status_dump(&response);
+            }
+
+            // Check daemon memory limits before scheduling cleanup work. A hard
+            // RSS breach should exit promptly for the service manager restart
+            // path instead of spending another tick on scans or deletions.
+            let self_monitor_tick = self.maybe_write_self_monitor_state(&response);
+            if self_monitor_tick.should_exit_for_rss_hard_limit() {
+                shutdown_result = Err(self.rss_hard_limit_error(self_monitor_tick));
+                break;
+            }
+
             // 5. Handle pressure response.
             self.handle_pressure(&response, &scan_tx, &scan_rx);
 
@@ -1855,7 +1910,7 @@ impl MonitoringDaemon {
                 response.level, response.urgency
             ));
 
-            // 7b. Drain worker reports so counters are current for state write.
+            // 7b. Drain worker reports so summaries and future state writes are current.
             while let Ok(report) = report_rx.try_recv() {
                 match report {
                     WorkerReport::ScanCompleted {
@@ -1910,53 +1965,6 @@ impl MonitoringDaemon {
                         }
                     }
                 }
-            }
-
-            // 7c. Self-monitoring: write state file + check RSS.
-            let self_monitor_tick = {
-                // Use the causing mount from the worst response so the state
-                // file reflects the mount that actually drove the pressure
-                // level, not the primary path which may be healthy.
-                let state_path = &response.causing_mount;
-                let free_pct = self
-                    .fs_collector
-                    .collect(state_path)
-                    .map_or(0.0, |s| s.free_pct());
-                let mount_str = state_path.to_string_lossy().into_owned();
-                let ballast_available = self
-                    .ballast_coordinator
-                    .inventory()
-                    .iter()
-                    .map(|i| i.files_available)
-                    .sum();
-                let ballast_total = self
-                    .ballast_coordinator
-                    .inventory()
-                    .iter()
-                    .map(|i| i.files_total)
-                    .sum();
-                let dropped_log_events = self.logger_handle.dropped_events();
-
-                let policy_mode = self.policy_engine.lock().mode().to_string();
-                let tick = self.self_monitor.maybe_write_state(
-                    response.level,
-                    free_pct,
-                    &mount_str,
-                    ballast_available,
-                    ballast_total,
-                    dropped_log_events,
-                    &policy_mode,
-                );
-                if tick.should_exit_for_rss_hard_limit() {
-                    shutdown_result = Err(self.rss_hard_limit_error(tick));
-                    break;
-                }
-                tick
-            };
-
-            // 8. Foreground status dump signal (macOS SIGINFO / Ctrl+T).
-            if self.signal_handler.should_dump_status() {
-                self.emit_status_dump(&response);
             }
 
             // 9. Forced scan signal (SIGUSR1).

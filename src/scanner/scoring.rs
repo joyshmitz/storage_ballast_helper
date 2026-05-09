@@ -990,6 +990,7 @@ fn is_system_path(path: &Path) -> bool {
     // by parent protections.
     // Note: We must NOT allow the root itself (e.g. /var/tmp) to be deleted.
     if (path.starts_with("/var/tmp") && path != Path::new("/var/tmp"))
+        || (path.starts_with("/var/folders") && path != Path::new("/var/folders"))
         || (path.starts_with("/dev/shm") && path != Path::new("/dev/shm"))
     {
         return false;
@@ -1128,6 +1129,7 @@ mod tests {
             "/home/user/Documents",
             "/dev/shm/test",
             "/var/tmp/test_build",
+            "/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T/sbh-build",
         ] {
             let score = engine.score_candidate(
                 &CandidateInput {

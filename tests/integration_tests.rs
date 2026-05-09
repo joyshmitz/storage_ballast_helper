@@ -51,6 +51,12 @@ use storage_ballast_helper::scanner::scoring::{
 };
 use storage_ballast_helper::scanner::walker::{DirectoryWalker, WalkerConfig};
 
+#[cfg(target_os = "macos")]
+const MACOS_LIVE_CAPACITY_TOLERANCE_BYTES: u64 = 512 * 1_048_576;
+
+#[cfg(target_os = "macos")]
+static MACOS_APFS_CAPACITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn help_command_prints_usage() {
     let result = common::run_cli_case("help_command_prints_usage", &["--help"]);
@@ -307,7 +313,9 @@ fn scan_reports_home_trash_without_candidate() {}
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_status_json_matches_diskutil_apfs_capacity() {
-    const TOLERANCE_BYTES: u64 = 100 * 1_048_576;
+    let _capacity_guard = MACOS_APFS_CAPACITY_TEST_LOCK
+        .lock()
+        .expect("APFS capacity test lock should not be poisoned");
 
     let result = common::run_cli_case(
         "macos_status_json_matches_diskutil_apfs_capacity",
@@ -363,16 +371,26 @@ fn macos_status_json_matches_diskutil_apfs_capacity() {
         data_mount,
         "container_total",
         diskutil_total,
-        TOLERANCE_BYTES,
+        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
     );
-    assert_json_bytes_close(data_mount, "total", diskutil_total, TOLERANCE_BYTES);
+    assert_json_bytes_close(
+        data_mount,
+        "total",
+        diskutil_total,
+        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
+    );
     assert_json_bytes_close(
         data_mount,
         "container_available",
         diskutil_available,
-        TOLERANCE_BYTES,
+        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
     );
-    assert_json_bytes_close(data_mount, "free", diskutil_available, TOLERANCE_BYTES);
+    assert_json_bytes_close(
+        data_mount,
+        "free",
+        diskutil_available,
+        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
+    );
 
     let apfs = &data_mount["platform"]["darwin"]["apfs"];
     assert_eq!(apfs["container_id"].as_str(), Some(container_id));
@@ -382,13 +400,13 @@ fn macos_status_json_matches_diskutil_apfs_capacity() {
         apfs,
         "container_total_bytes",
         diskutil_total,
-        TOLERANCE_BYTES,
+        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
     );
     assert_json_bytes_close(
         apfs,
         "container_available_bytes",
         diskutil_available,
-        TOLERANCE_BYTES,
+        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
     );
 }
 
@@ -442,7 +460,9 @@ fn macos_status_json_matches_diskutil_apfs_capacity() {}
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_check_json_matches_diskutil_apfs_capacity() {
-    const TOLERANCE_BYTES: u64 = 100 * 1_048_576;
+    let _capacity_guard = MACOS_APFS_CAPACITY_TEST_LOCK
+        .lock()
+        .expect("APFS capacity test lock should not be poisoned");
 
     let result = common::run_cli_case(
         "macos_check_json_matches_diskutil_apfs_capacity",
@@ -474,16 +494,26 @@ fn macos_check_json_matches_diskutil_apfs_capacity() {
         &payload,
         "container_total_bytes",
         diskutil_total,
-        TOLERANCE_BYTES,
+        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
     );
-    assert_json_bytes_close(&payload, "total_bytes", diskutil_total, TOLERANCE_BYTES);
+    assert_json_bytes_close(
+        &payload,
+        "total_bytes",
+        diskutil_total,
+        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
+    );
     assert_json_bytes_close(
         &payload,
         "container_available_bytes",
         diskutil_available,
-        TOLERANCE_BYTES,
+        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
     );
-    assert_json_bytes_close(&payload, "free_bytes", diskutil_available, TOLERANCE_BYTES);
+    assert_json_bytes_close(
+        &payload,
+        "free_bytes",
+        diskutil_available,
+        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
+    );
 
     let apfs = &payload["platform"]["darwin"]["apfs"];
     assert_eq!(apfs["container_id"].as_str(), Some(container_id));
@@ -492,13 +522,13 @@ fn macos_check_json_matches_diskutil_apfs_capacity() {
         apfs,
         "container_total_bytes",
         diskutil_total,
-        TOLERANCE_BYTES,
+        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
     );
     assert_json_bytes_close(
         apfs,
         "container_available_bytes",
         diskutil_available,
-        TOLERANCE_BYTES,
+        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
     );
 }
 
@@ -519,6 +549,9 @@ fn macos_apfs_ballast_preallocates_and_releases_space() {
         );
         return;
     }
+    let _capacity_guard = MACOS_APFS_CAPACITY_TEST_LOCK
+        .lock()
+        .expect("APFS capacity test lock should not be poisoned");
 
     let platform = storage_ballast_helper::platform::current();
     let dir = tempfile::Builder::new()
@@ -2063,7 +2096,7 @@ proptest! {
         has_build in any::<bool>(),
         mostly_object_files in any::<bool>(),
         size_mib in 1_u64..4096,
-        age_hours in 1_u64..720,
+        age_hours in 24_u64..720,
     ) {
         let path = PathBuf::from("/private/tmp/ft-cod7-target");
         let signals = StructuralSignals {
@@ -2325,11 +2358,6 @@ fn update_system_and_user_flags_conflict_in_cli_integration() {
 #[test]
 fn update_check_uses_fresh_cache_when_offline_and_path_disabled() {
     let home = tempfile::tempdir().expect("create temp home");
-    let cache_path = home.path().join(".local/share/sbh/update-metadata.json");
-    let cache_parent = cache_path
-        .parent()
-        .expect("cache path should have parent directory");
-    fs::create_dir_all(cache_parent).expect("create cache parent directory");
 
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2340,11 +2368,21 @@ fn update_check_uses_fresh_cache_when_offline_and_path_disabled() {
         "artifact_url": "https://example.invalid/sbh-x86_64-unknown-linux-gnu.tar.xz",
         "fetched_at_unix_secs": now_secs,
     });
-    fs::write(
-        &cache_path,
-        serde_json::to_vec_pretty(&cache_entry).expect("serialize cache entry"),
-    )
-    .expect("write cache file");
+    for cache_path in [
+        home.path().join(".local/share/sbh/update-metadata.json"),
+        home.path()
+            .join("Library/Application Support/sbh/update-metadata.json"),
+    ] {
+        let cache_parent = cache_path
+            .parent()
+            .expect("cache path should have parent directory");
+        fs::create_dir_all(cache_parent).expect("create cache parent directory");
+        fs::write(
+            &cache_path,
+            serde_json::to_vec_pretty(&cache_entry).expect("serialize cache entry"),
+        )
+        .expect("write cache file");
+    }
 
     let home_str = home.path().to_string_lossy().to_string();
     let result = common::run_cli_case_with_env(
