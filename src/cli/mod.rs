@@ -2085,6 +2085,8 @@ mod tests {
             "plutil -extract status raw -o - \"${info_plist}\"",
             "sleep 30",
             "xcrun notarytool log \"${submission_id}\"",
+            "spctl -a -t execute -vv \"${bin}\"",
+            "Gatekeeper assessment failed after notarization",
             "notarization timed out after 30 minutes",
             "sbh-*-notary-*.plist",
             "sbh-*-notary-*.json",
@@ -2095,6 +2097,17 @@ mod tests {
                 "release workflow must include notarization contract fragment: {required}"
             );
         }
+
+        let gatekeeper_assessment = release_workflow
+            .find("spctl -a -t execute -vv \"${bin}\"")
+            .expect("release workflow must assess Gatekeeper acceptance");
+        let package_archive = release_workflow
+            .find("- name: Package archive")
+            .expect("release workflow must package archives after verification");
+        assert!(
+            gatekeeper_assessment < package_archive,
+            "release workflow must assess Gatekeeper acceptance before packaging"
+        );
 
         assert!(
             !release_workflow.contains("notarytool submit \"${upload}\" --wait"),

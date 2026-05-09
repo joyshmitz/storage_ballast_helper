@@ -369,7 +369,10 @@ temporary keychain, signs with Hardened Runtime, verifies that the binary was
 signed by a `Developer ID Application` authority, then submits the temporary ZIP
 with `xcrun notarytool submit`, extracts the submission id, polls `xcrun
 notarytool info` every 30 seconds for up to 30 minutes, and downloads `xcrun
-notarytool log` output on both success and failure. `Invalid`, `Rejected`, and
+notarytool log` output on both success and failure. After Apple accepts the
+submission, the workflow runs `spctl -a -t execute -vv` against the signed
+binary before packaging the tarball, so Gatekeeper rejection fails the release
+instead of being discovered by an installer later. `Invalid`, `Rejected`, and
 timeout states fail the release with the notary log printed into the Actions
 output.
 

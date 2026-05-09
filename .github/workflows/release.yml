@@ -234,6 +234,10 @@ jobs:
             --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
             "${log_json}" || true
           cat "${log_json}" || true
+          if ! spctl -a -t execute -vv "${bin}"; then
+            echo "::error::Gatekeeper assessment failed after notarization"
+            exit 1
+          fi
 
       - name: Package archive
         run: |
