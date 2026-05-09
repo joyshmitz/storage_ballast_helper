@@ -313,6 +313,42 @@ intentionally team-agnostic: Organization and Individual memberships both use
 the same secret names, and the selected Team ID is represented by
 `APPLE_TEAM_ID` rather than by branching release logic.
 
+Developer ID certificate setup is intentionally outside the repository because
+it handles private key material:
+
+1. Create a `Developer ID Application` certificate in the Apple Developer
+   portal for the selected account or team.
+2. Install the certificate in Keychain Access on a trusted Mac and verify that
+   `security find-identity -v -p codesigning` lists a `Developer ID
+   Application` identity for the selected Team ID.
+3. Export that identity, including the private key, as an encrypted P12 file.
+   Keep the P12 outside the repository and protect it with a unique password.
+4. Set the release secrets from stdin so the values do not appear in shell
+   history:
+
+   ```bash
+   base64 < "$P12_PATH" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 \
+     -R Dicklesworthstone/storage_ballast_helper --body-file -
+   printf '%s' "$P12_PASSWORD" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD \
+     -R Dicklesworthstone/storage_ballast_helper --body-file -
+   printf '%s' "$DEVELOPER_ID_IDENTITY" | gh secret set APPLE_DEVELOPER_ID_IDENTITY \
+     -R Dicklesworthstone/storage_ballast_helper --body-file -
+   printf '%s' "$APPLE_ID" | gh secret set APPLE_ID \
+     -R Dicklesworthstone/storage_ballast_helper --body-file -
+   printf '%s' "$APPLE_TEAM_ID" | gh secret set APPLE_TEAM_ID \
+     -R Dicklesworthstone/storage_ballast_helper --body-file -
+   printf '%s' "$APPLE_APP_SPECIFIC_PASSWORD" | gh secret set APPLE_APP_SPECIFIC_PASSWORD \
+     -R Dicklesworthstone/storage_ballast_helper --body-file -
+   gh secret list -R Dicklesworthstone/storage_ballast_helper
+   ```
+
+Rotate the Developer ID certificate and app-specific password every 12 months,
+or immediately after any maintainer, runner, or secret exposure incident. During
+rotation, create and store the replacement secrets first, run the
+`Developer ID Certificate Expiration` workflow manually, then publish the next
+tagged release only after the release workflow signs, notarizes, and verifies
+the binary with the new identity.
+
 If any secret is missing, the macOS release job fails before packaging. The P12
 secret is the base64-encoded Developer ID Application certificate plus private
 key exported from Keychain Access, and `APPLE_DEVELOPER_ID_IDENTITY` is the full
