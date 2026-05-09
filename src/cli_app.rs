@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use storage_ballast_helper::ballast::manager::BallastManager;
+use storage_ballast_helper::cli::RELEASE_REPOSITORY;
 use storage_ballast_helper::cli::update::{UpdateReport, UpdateServiceRestart};
 use storage_ballast_helper::core::config::{
     Config, PathsConfig, load_sacred_config, sacred_config_path_for, write_sacred_config,
@@ -308,12 +309,15 @@ struct ServiceLogsArgs {
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
 #[command(
-    after_long_help = "Platform notes:\n  Use --pal for platform diagnostics.\n  On macOS this includes launchd, APFS, codesign/notarization, and Full Disk Access checks."
+    after_long_help = "Platform notes:\n  Use --pal for platform diagnostics.\n  Use --release for macOS release signing/notarization/Homebrew readiness.\n  On macOS --pal includes launchd, APFS, codesign/notarization, and Full Disk Access checks."
 )]
 struct DoctorArgs {
     /// Probe the Platform Abstraction Layer implementation.
     #[arg(long)]
     pal: bool,
+    /// Probe macOS release signing, notarization, and Homebrew CI readiness.
+    #[arg(long)]
+    release: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -3869,6 +3873,14 @@ struct PalDoctorReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct ReleaseDoctorReport {
+    repository: &'static str,
+    notary_profile: &'static str,
+    required_github_secrets: Vec<&'static str>,
+    checks: Vec<DoctorCheck>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct DoctorCheck {
     id: &'static str,
     title: &'static str,
@@ -3900,74 +3912,320 @@ struct PalDoctorFollowUp {
 }
 
 fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
-    if !args.pal {
+    if !args.pal && !args.release {
         return Err(CliError::User(
-            "specify a diagnostic target, for example: sbh doctor --pal".to_string(),
+            "specify a diagnostic target, for example: sbh doctor --pal or sbh doctor --release"
+                .to_string(),
         ));
     }
 
-    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
-    let report = pal_doctor_report(platform.as_ref());
+    let pal_report = if args.pal {
+        let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+        Some(pal_doctor_report(platform.as_ref()))
+    } else {
+        None
+    };
+    let release_report = args.release.then(release_doctor_report);
 
     match output_mode(cli) {
         OutputMode::Json => {
-            let payload = serde_json::to_value(&report)?;
+            let payload = match (&pal_report, &release_report) {
+                (Some(report), None) => serde_json::to_value(report)?,
+                (None, Some(report)) => serde_json::to_value(report)?,
+                (Some(pal), Some(release)) => json!({
+                    "pal": pal,
+                    "release": release,
+                }),
+                (None, None) => unreachable!("doctor target validation already ran"),
+            };
             write_json_line(&payload)?;
         }
         OutputMode::Human => {
-            println!("PAL doctor: {}", report.platform);
-            println!(
-                "  implemented={} not_implemented={} failed={} skipped={}",
-                report.implemented, report.not_implemented, report.failed, report.skipped
-            );
-            if !report.checks.is_empty() {
-                println!("\nPlatform checks:");
-                for check in &report.checks {
-                    println!(
-                        "  [{:<4}] {:<28} {}",
-                        check.status, check.title, check.message
-                    );
-                    if let Some(remediation) = &check.remediation {
-                        println!("         fix: {remediation}");
-                    }
-                }
-                println!();
+            if let Some(report) = &pal_report {
+                print_pal_doctor_report(report);
             }
-            for method in &report.methods {
-                match (&method.bead, &method.message) {
-                    (Some(bead), Some(message)) => {
-                        println!(
-                            "  {:<28} {:<16} {:<12} {}",
-                            method.method, method.status, bead, message
-                        );
-                    }
-                    (Some(bead), None) => {
-                        println!("  {:<28} {:<16} {bead}", method.method, method.status);
-                    }
-                    (None, Some(message)) => {
-                        println!("  {:<28} {:<16} {}", method.method, method.status, message);
-                    }
-                    (None, None) => {
-                        println!("  {:<28} {}", method.method, method.status);
-                    }
+            if let Some(report) = &release_report {
+                if pal_report.is_some() {
+                    println!();
                 }
-            }
-            if !report.follow_up.is_empty() {
-                println!("\nFollow-up:");
-                for item in &report.follow_up {
-                    println!("  {} ({})", item.title, item.severity);
-                    println!("    {}", item.message);
-                    println!("    Docs: {}", item.docs);
-                    for (index, step) in item.steps.iter().enumerate() {
-                        println!("    {}. {}", index + 1, step);
-                    }
-                    println!("    Re-check: {}", item.recheck_command);
-                }
+                print_release_doctor_report(report);
             }
         }
     }
 
     Ok(())
+}
+
+fn print_pal_doctor_report(report: &PalDoctorReport) {
+    println!("PAL doctor: {}", report.platform);
+    println!(
+        "  implemented={} not_implemented={} failed={} skipped={}",
+        report.implemented, report.not_implemented, report.failed, report.skipped
+    );
+    if !report.checks.is_empty() {
+        println!("\nPlatform checks:");
+        print_doctor_checks(&report.checks);
+        println!();
+    }
+    for method in &report.methods {
+        match (&method.bead, &method.message) {
+            (Some(bead), Some(message)) => {
+                println!(
+                    "  {:<28} {:<16} {:<12} {}",
+                    method.method, method.status, bead, message
+                );
+            }
+            (Some(bead), None) => {
+                println!("  {:<28} {:<16} {bead}", method.method, method.status);
+            }
+            (None, Some(message)) => {
+                println!("  {:<28} {:<16} {}", method.method, method.status, message);
+            }
+            (None, None) => {
+                println!("  {:<28} {}", method.method, method.status);
+            }
+        }
+    }
+    if !report.follow_up.is_empty() {
+        println!("\nFollow-up:");
+        for item in &report.follow_up {
+            println!("  {} ({})", item.title, item.severity);
+            println!("    {}", item.message);
+            println!("    Docs: {}", item.docs);
+            for (index, step) in item.steps.iter().enumerate() {
+                println!("    {}. {}", index + 1, step);
+            }
+            println!("    Re-check: {}", item.recheck_command);
+        }
+    }
+}
+
+fn print_release_doctor_report(report: &ReleaseDoctorReport) {
+    println!("Release doctor: {}", report.repository);
+    println!("  notary_profile={}", report.notary_profile);
+    println!(
+        "  required_github_secrets={}",
+        report.required_github_secrets.join(", ")
+    );
+    println!("\nRelease checks:");
+    print_doctor_checks(&report.checks);
+}
+
+fn print_doctor_checks(checks: &[DoctorCheck]) {
+    for check in checks {
+        println!(
+            "  [{:<4}] {:<28} {}",
+            check.status, check.title, check.message
+        );
+        if let Some(remediation) = &check.remediation {
+            println!("         fix: {remediation}");
+        }
+    }
+}
+
+const RELEASE_DOCTOR_NOTARY_PROFILE: &str = "sbh-notary";
+const RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS: &[&str] = &[
+    "APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64",
+    "APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD",
+    "APPLE_DEVELOPER_ID_IDENTITY",
+    "APPLE_ID",
+    "APPLE_TEAM_ID",
+    "APPLE_APP_SPECIFIC_PASSWORD",
+    "HOMEBREW_TAP_TOKEN",
+];
+
+fn release_doctor_report() -> ReleaseDoctorReport {
+    release_doctor_report_with_command_runner(&run_doctor_command)
+}
+
+fn release_doctor_report_with_command_runner<F>(run_command: &F) -> ReleaseDoctorReport
+where
+    F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
+{
+    ReleaseDoctorReport {
+        repository: RELEASE_REPOSITORY,
+        notary_profile: RELEASE_DOCTOR_NOTARY_PROFILE,
+        required_github_secrets: RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS.to_vec(),
+        checks: vec![
+            release_developer_id_identity_check(run_command),
+            release_notary_profile_check(run_command),
+            release_github_secrets_check(run_command),
+        ],
+    }
+}
+
+fn release_developer_id_identity_check<F>(run_command: &F) -> DoctorCheck
+where
+    F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
+{
+    let args = vec![
+        "find-identity".to_string(),
+        "-v".to_string(),
+        "-p".to_string(),
+        "codesigning".to_string(),
+    ];
+
+    match run_command("security", &args) {
+        Ok(outcome) if outcome.success && command_text(&outcome).contains("Developer ID Application") => {
+            doctor_check(
+                "release.developer_id_identity",
+                "Developer ID identity",
+                "PASS",
+                "found a Developer ID Application signing identity",
+                None,
+            )
+        }
+        Ok(outcome) => doctor_check(
+            "release.developer_id_identity",
+            "Developer ID identity",
+            "FAIL",
+            format!(
+                "no Developer ID Application signing identity is available: {}",
+                command_detail(&outcome)
+            ),
+            Some("Create a Developer ID Application certificate in the Apple Developer portal, export it as a password-protected .p12 with the private key, and set the release workflow secrets documented in docs/macos.md.".to_string()),
+        ),
+        Err(error) => doctor_check(
+            "release.developer_id_identity",
+            "Developer ID identity",
+            "FAIL",
+            format!("failed to run security find-identity: {error}"),
+            Some("Run this check on macOS with Xcode Command Line Tools installed.".to_string()),
+        ),
+    }
+}
+
+fn release_notary_profile_check<F>(run_command: &F) -> DoctorCheck
+where
+    F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
+{
+    let args = vec![
+        "notarytool".to_string(),
+        "history".to_string(),
+        "--keychain-profile".to_string(),
+        RELEASE_DOCTOR_NOTARY_PROFILE.to_string(),
+        "--output-format".to_string(),
+        "json".to_string(),
+    ];
+
+    match run_command("xcrun", &args) {
+        Ok(outcome) if outcome.success => doctor_check(
+            "release.notary_profile",
+            "Notary profile",
+            "PASS",
+            format!("notarytool keychain profile '{RELEASE_DOCTOR_NOTARY_PROFILE}' is usable"),
+            None,
+        ),
+        Ok(outcome) => doctor_check(
+            "release.notary_profile",
+            "Notary profile",
+            "FAIL",
+            format!(
+                "notarytool profile '{}' is not usable: {}",
+                RELEASE_DOCTOR_NOTARY_PROFILE,
+                command_detail(&outcome)
+            ),
+            Some(format!(
+                "Create the profile with `xcrun notarytool store-credentials {RELEASE_DOCTOR_NOTARY_PROFILE}` using the Apple ID, Team ID, and app-specific password from docs/macos.md.",
+            )),
+        ),
+        Err(error) => doctor_check(
+            "release.notary_profile",
+            "Notary profile",
+            "FAIL",
+            format!("failed to run xcrun notarytool: {error}"),
+            Some(
+                "Install Xcode Command Line Tools and configure notarytool credentials."
+                    .to_string(),
+            ),
+        ),
+    }
+}
+
+fn release_github_secrets_check<F>(run_command: &F) -> DoctorCheck
+where
+    F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
+{
+    let args = vec![
+        "secret".to_string(),
+        "list".to_string(),
+        "-R".to_string(),
+        RELEASE_REPOSITORY.to_string(),
+        "--json".to_string(),
+        "name".to_string(),
+    ];
+
+    match run_command("gh", &args) {
+        Ok(outcome) if outcome.success => {
+            let secret_names = match parse_github_secret_names(&outcome.stdout) {
+                Ok(names) => names,
+                Err(error) => {
+                    return doctor_check(
+                        "release.github_secrets",
+                        "GitHub release secrets",
+                        "FAIL",
+                        format!("could not parse gh secret list output: {error}"),
+                        Some("Re-run `gh secret list --json name` and check GitHub CLI authentication.".to_string()),
+                    );
+                }
+            };
+            let missing = RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS
+                .iter()
+                .copied()
+                .filter(|secret| !secret_names.contains(*secret))
+                .collect::<Vec<_>>();
+
+            if missing.is_empty() {
+                doctor_check(
+                    "release.github_secrets",
+                    "GitHub release secrets",
+                    "PASS",
+                    "all required release secrets are configured",
+                    None,
+                )
+            } else {
+                doctor_check(
+                    "release.github_secrets",
+                    "GitHub release secrets",
+                    "FAIL",
+                    format!("missing required secrets: {}", missing.join(", ")),
+                    Some(format!(
+                        "Set the missing secrets on {RELEASE_REPOSITORY} with the commands documented in docs/macos.md.",
+                    )),
+                )
+            }
+        }
+        Ok(outcome) => doctor_check(
+            "release.github_secrets",
+            "GitHub release secrets",
+            "FAIL",
+            format!("gh secret list failed: {}", command_detail(&outcome)),
+            Some("Authenticate GitHub CLI with secret-read access to the repository, then re-run sbh doctor --release.".to_string()),
+        ),
+        Err(error) => doctor_check(
+            "release.github_secrets",
+            "GitHub release secrets",
+            "FAIL",
+            format!("failed to run gh secret list: {error}"),
+            Some("Install GitHub CLI and authenticate before checking release secrets.".to_string()),
+        ),
+    }
+}
+
+fn parse_github_secret_names(raw: &str) -> std::result::Result<HashSet<String>, String> {
+    let value = serde_json::from_str::<Value>(raw).map_err(|error| error.to_string())?;
+    let entries = value
+        .as_array()
+        .ok_or_else(|| "expected top-level JSON array".to_string())?;
+    let mut names = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "secret entry missing string field 'name'".to_string())?;
+        names.insert(name.to_string());
+    }
+    Ok(names)
 }
 
 fn pal_doctor_report(platform: &dyn Platform) -> PalDoctorReport {
@@ -4388,6 +4646,14 @@ fn command_detail(outcome: &DoctorCommandOutcome) -> String {
         return stdout.to_string();
     }
     format!("exit {:?}", outcome.exit_code)
+}
+
+fn command_text(outcome: &DoctorCommandOutcome) -> String {
+    let mut text = String::with_capacity(outcome.stdout.len() + outcome.stderr.len() + 1);
+    text.push_str(&outcome.stdout);
+    text.push('\n');
+    text.push_str(&outcome.stderr);
+    text
 }
 
 fn full_disk_access_follow_up(
@@ -8495,6 +8761,8 @@ mod tests {
             vec!["sbh", "dashboard", "--new-dashboard"],
             vec!["sbh", "dashboard", "--legacy-dashboard"],
             vec!["sbh", "doctor", "--pal"],
+            vec!["sbh", "doctor", "--release"],
+            vec!["sbh", "doctor", "--pal", "--release"],
             vec!["sbh", "service", "status"],
             vec!["sbh", "service", "--launchd", "--scope", "user", "status"],
             vec![
@@ -8622,6 +8890,14 @@ mod tests {
             .expect("doctor check should be present")
     }
 
+    fn release_check_by_id<'a>(report: &'a ReleaseDoctorReport, id: &str) -> &'a DoctorCheck {
+        report
+            .checks
+            .iter()
+            .find(|check| check.id == id)
+            .expect("release doctor check should be present")
+    }
+
     #[test]
     fn pal_doctor_report_includes_macos_specific_checks() {
         let platform = macos_doctor_mock(2 * 1024 * 1024 * 1024, FullDiskAccessState::Granted);
@@ -8687,6 +8963,96 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("Full Disk Access"))
         );
+    }
+
+    #[test]
+    fn release_doctor_report_passes_when_credentials_are_present() {
+        let secrets = RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS
+            .iter()
+            .map(|name| json!({ "name": name }))
+            .collect::<Vec<_>>();
+        let secrets_json = serde_json::to_string(&secrets).unwrap();
+        let command = |program: &str, _args: &[String]| match program {
+            "security" => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: "1) ABCDEF \"Developer ID Application: Example LLC (TEAMID)\"".to_string(),
+                stderr: String::new(),
+            }),
+            "xcrun" => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: "{\"history\":[]}".to_string(),
+                stderr: String::new(),
+            }),
+            "gh" => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: secrets_json.clone(),
+                stderr: String::new(),
+            }),
+            other => panic!("unexpected release doctor command: {other}"),
+        };
+
+        let report = release_doctor_report_with_command_runner(&command);
+
+        assert_eq!(report.repository, RELEASE_REPOSITORY);
+        assert_eq!(report.notary_profile, RELEASE_DOCTOR_NOTARY_PROFILE);
+        assert!(report.checks.iter().all(|check| check.status == "PASS"));
+    }
+
+    #[test]
+    fn release_doctor_report_flags_missing_external_credentials() {
+        let command = |program: &str, _args: &[String]| match program {
+            "security" => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: "0 valid identities found".to_string(),
+                stderr: String::new(),
+            }),
+            "xcrun" => Ok(DoctorCommandOutcome {
+                success: false,
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: "No Keychain password item found for profile: sbh-notary".to_string(),
+            }),
+            "gh" => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: "[]".to_string(),
+                stderr: String::new(),
+            }),
+            other => panic!("unexpected release doctor command: {other}"),
+        };
+
+        let report = release_doctor_report_with_command_runner(&command);
+
+        assert_eq!(
+            release_check_by_id(&report, "release.developer_id_identity").status,
+            "FAIL"
+        );
+        assert!(
+            release_check_by_id(&report, "release.developer_id_identity")
+                .message
+                .contains("0 valid identities found")
+        );
+        assert_eq!(
+            release_check_by_id(&report, "release.notary_profile").status,
+            "FAIL"
+        );
+        assert!(
+            release_check_by_id(&report, "release.notary_profile")
+                .message
+                .contains("No Keychain password item")
+        );
+        let secrets = release_check_by_id(&report, "release.github_secrets");
+        assert_eq!(secrets.status, "FAIL");
+        assert!(
+            secrets
+                .message
+                .contains("APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64")
+        );
+        assert!(secrets.message.contains("HOMEBREW_TAP_TOKEN"));
     }
 
     #[test]

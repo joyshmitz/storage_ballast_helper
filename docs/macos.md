@@ -369,6 +369,36 @@ if the certificate is already expired, and emits a GitHub Actions warning when
 the certificate expires within 30 days. Until the Developer ID certificate
 secrets are configured, the workflow emits a warning that certificate expiration monitoring is inactive and exits successfully.
 
+## Release Readiness Diagnostics
+
+Run this before cutting a signed macOS release:
+
+```bash
+sbh doctor --release
+```
+
+The release doctor does not print secret values. It checks only readiness
+signals:
+
+1. `security find-identity -v -p codesigning` must list a `Developer ID
+   Application` identity.
+2. `xcrun notarytool history --keychain-profile sbh-notary --output-format json`
+   must authenticate successfully with the configured keychain profile.
+3. `gh secret list -R Dicklesworthstone/storage_ballast_helper --json name` must
+   report every release secret used by the GitHub Actions workflow, including
+   `HOMEBREW_TAP_TOKEN`.
+
+For automation or handoff checks, use:
+
+```bash
+sbh doctor --release --json
+```
+
+Treat any `FAIL` result as a release blocker. The command intentionally reports
+missing local signing identity, missing notary profile, and missing GitHub
+Actions secrets as explicit diagnostics so the external Apple/GitHub credential
+setup can be finished without inspecting workflow internals.
+
 The current CLI tarball flow does not staple a ticket because `stapler` supports
 app bundles, disk images, and signed flat packages rather than the `.tar.xz`
 artifact. Gatekeeper can still find the online notary ticket for the signed
