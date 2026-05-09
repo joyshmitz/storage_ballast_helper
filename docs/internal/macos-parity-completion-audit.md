@@ -1,15 +1,25 @@
 # macOS/Linux Parity Prompt-To-Artifact Completion Audit
 
 Bead: `bd-r7m7.11`
-Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`
+Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`
 Parent: `bd-r7m7`
 Last audited: 2026-05-09 10:13 UTC
-Evidence snapshot: pushed head
-`0c2f39d4b43e9d318039c58b0519e667b3c8abfd`
-(`bd-ykwh.20 verify release Gatekeeper acceptance`) and CI run `25598551173`.
-Refresh with
-`gh run view <latest-run> --repo Dicklesworthstone/storage_ballast_helper --json status,conclusion,headSha,jobs`
-before any close decision.
+Evidence snapshot: the audit intentionally avoids pinning exact commit hashes or
+GitHub Actions run ids because every audit-only commit would make those literals
+stale. Before any close decision, refresh the live head and newest run with:
+
+```bash
+git rev-parse HEAD
+git status --short --branch
+gh run list --repo Dicklesworthstone/storage_ballast_helper --branch main --limit 5 \
+  --json databaseId,headSha,status,conclusion,workflowName,url,createdAt,event
+```
+
+Then inspect the run for the current head with:
+
+```bash
+gh run view <latest-run> --repo Dicklesworthstone/storage_ballast_helper --json status,conclusion,headSha,jobs
+```
 
 This is the closeout gate for the active objective: make `sbh` seamlessly
 support macOS in addition to Linux, with automatic platform detection during
@@ -56,10 +66,10 @@ operator-visible outcomes:
   `bd-ykwh.13`.
 - `bd-ykwh.20` is closed; release CI now runs `spctl -a -t execute -vv` after
   notarization acceptance and before packaging macOS tarballs.
-- CI run `25598551173` for head `0c2f39d4b43e9d318039c58b0519e667b3c8abfd`
-  was queued at audit time with `Homebrew Formula Validation` and
-  `Format + Lint` materialized but not green. Do not treat queued CI as proof;
-  inspect the latest run for the final pushed head before closing.
+- The newest CI run for the current head was queued at audit time with
+  `Homebrew Formula Validation` and `Format + Lint` materialized but not green.
+  Do not treat queued CI as proof; inspect the latest run for the final pushed
+  head before closing.
 - Local Homebrew formula checks passed at refresh time: `brew style
   packaging/homebrew/Formula/sbh.rb` and the generated-formula placeholder
   replacement path both reported no style offenses.
