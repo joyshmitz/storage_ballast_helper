@@ -1626,6 +1626,47 @@ mod tests {
     }
 
     #[test]
+    fn ci_validates_homebrew_formula_generation() {
+        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
+        let testing_guide = include_str!("../../docs/testing-and-logging.md");
+
+        for required in [
+            "homebrew-formula:",
+            "Homebrew Formula Validation",
+            "runs-on: macos-latest",
+            "brew style packaging/homebrew/Formula/sbh.rb",
+            "generated-homebrew/Formula/sbh.rb",
+            "REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256",
+            "REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256",
+            "generated Homebrew formula retained checksum markers",
+            "brew style generated-homebrew/Formula/sbh.rb",
+            "homebrew-formula-style-output.txt",
+            "homebrew-generated-formula-style-output.txt",
+            "generated-homebrew/Formula/sbh.rb",
+        ] {
+            assert!(
+                ci_workflow.contains(required),
+                "CI must validate Homebrew formula generation fragment: {required}"
+            );
+        }
+
+        for required in [
+            "homebrew-formula",
+            "brew style",
+            "packaging/homebrew/Formula/sbh.rb",
+            ".github/workflows/release.yml",
+            "REPLACE_WITH_",
+            "normal PR/push CI",
+            "homebrew-generated-formula-style-output.txt",
+        ] {
+            assert!(
+                testing_guide.contains(required),
+                "testing guide must document Homebrew formula CI validation: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn macos_incident_case_study_tracks_operator_numbers() {
         let case_study = include_str!("../../docs/macos-incident-case-study.md");
         let readme = include_str!("../../README.md");

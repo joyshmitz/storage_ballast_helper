@@ -41,6 +41,50 @@ jobs:
         # --lib --bin avoids compiling test files that import tui:: types
         run: cargo clippy $CI_FEATURES --lib --bin sbh -- -D warnings
 
+  homebrew-formula:
+    name: Homebrew Formula Validation
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check formula style
+        shell: bash
+        run: brew style packaging/homebrew/Formula/sbh.rb 2>&1 | tee homebrew-formula-style-output.txt
+      - name: Validate generated tap formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p generated-homebrew/Formula
+          cp packaging/homebrew/Formula/sbh.rb generated-homebrew/Formula/sbh.rb
+          version="9.8.7"
+          arm_sha="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          intel_sha="fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+          VERSION="${version}" ARM_SHA="${arm_sha}" INTEL_SHA="${intel_sha}" \
+            perl -0pi -e '
+              s/version "[^"]+"/version "$ENV{VERSION}"/;
+              s/      # REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256\n      sha256 "[0-9a-f]{64}"/      sha256 "$ENV{ARM_SHA}"/g;
+              s/      # REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256\n      sha256 "[0-9a-f]{64}"/      sha256 "$ENV{INTEL_SHA}"/g;
+            ' generated-homebrew/Formula/sbh.rb
+
+          if grep -q 'REPLACE_WITH_' generated-homebrew/Formula/sbh.rb; then
+            echo "::error::generated Homebrew formula retained checksum markers"
+            exit 1
+          fi
+          grep -q "version \"${version}\"" generated-homebrew/Formula/sbh.rb
+          grep -q "sha256 \"${arm_sha}\"" generated-homebrew/Formula/sbh.rb
+          grep -q "sha256 \"${intel_sha}\"" generated-homebrew/Formula/sbh.rb
+          brew style generated-homebrew/Formula/sbh.rb 2>&1 | tee homebrew-generated-formula-style-output.txt
+      - name: Upload Homebrew formula logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-formula-logs
+          path: |
+            homebrew-formula-style-output.txt
+            homebrew-generated-formula-style-output.txt
+            generated-homebrew/Formula/sbh.rb
+          retention-days: 14
+
   unit:
     name: Unit Tests
     runs-on: ubuntu-latest

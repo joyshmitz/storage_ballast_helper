@@ -214,6 +214,7 @@ DOCS_UPDATE_BASE=origin/main DOCS_UPDATE_HEAD=HEAD bash scripts/ci_docs_update_c
 
 | CI Job | Artifacts | Retention |
 | --- | --- | --- |
+| homebrew-formula | `homebrew-formula-style-output.txt`, `homebrew-generated-formula-style-output.txt`, generated `Formula/sbh.rb` | 14 days |
 | unit | `unit-test-output.txt`, `bin-test-output.txt` | 14 days |
 | integration | `integration-output.txt` | 14 days |
 | decision-plane | `proof-harness-output.txt`, `decision-plane-e2e-output.txt` | 30 days |
@@ -230,6 +231,15 @@ for this project are `macos-latest` for Apple Silicon (`arm64`) and
 `macos-15-intel` for Intel (`x86_64`). The retired `macos-13` label is not used
 in active workflows. The `macos-platform` job asserts `uname -m` so runner-label
 drift is caught before release artifacts are trusted.
+
+**Homebrew formula validation:** The `homebrew-formula` job runs on
+`macos-latest` before release credentials are needed. It runs `brew style` on
+the checked-in `packaging/homebrew/Formula/sbh.rb`, then copies the formula,
+substitutes a synthetic tag and both macOS SHA-256 checksums with the same Perl
+expression used by `.github/workflows/release.yml`, fails if any
+`REPLACE_WITH_` marker remains, and runs `brew style` on the generated formula.
+This keeps the tap PR generation path covered on normal PR/push CI instead of
+discovering formula breakage only during a signed release.
 
 **macOS coverage tracking:** The `macos-coverage` job runs on `macos-latest`
 and installs `cargo-llvm-cov` with `taiki-e/install-action@cargo-llvm-cov`, the
