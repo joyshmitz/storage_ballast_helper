@@ -45,7 +45,7 @@ Classification values:
 | `src/daemon/notifications.rs` | 413 | Sends desktop notifications through Linux `notify-send`. | `cfg-gate-keep` | `N/A` | This is a small OS command adapter. Keep gated unless notification delivery moves into PAL. |
 | `src/daemon/notifications.rs` | 431 | Sends desktop notifications through macOS `osascript`. | `cfg-gate-keep` | `N/A` | Existing macOS branch is appropriate; keep escaping and child reaping local to the adapter. |
 | `src/daemon/notifications.rs` | 447 | Suppresses unused `urgency` on non-Linux. | `cfg-gate-keep` | `N/A` | Incidental to Linux `notify-send` urgency. |
-| `src/daemon/service.rs` | 220 | Chooses `wheel` as recommended root group on macOS and `root` elsewhere. | `PAL-method` | `service_ownership_policy()` | Service-manager abstraction should own recommended owner/group text. |
+| `src/daemon/service.rs` | 28 | Defines `ServiceOwnershipPolicy` for system service binary ownership guidance. Live systemd warnings use `root:root`; live launchd system-scope warnings use `root:wheel`. | `PAL-method` | `service_ownership_policy()` | Closed by `bd-r7m7.6`; ownership guidance is now shared by the service-manager layer instead of a stale inline cfg branch. |
 | `src/platform/pal.rs` | 738 | Detects Linux or macOS by returning the compile-time `platform::current()` PAL backend. | `cfg-gate-keep` | `N/A` | Closed for macOS: `platform::current()` selects `LinuxPal` or `MacOsPal` at compile time. |
 | `src/platform/pal.rs` | 742 | Rejects targets other than Linux/macOS as unsupported. | `cfg-gate-keep` | `N/A` | Correct until another OS is added; Linux and macOS are now the supported runtime set. |
 | `src/cli/wizard.rs` | 176 | Builds wizard defaults from `platform.service_kind()` instead of compile-time service-manager cfg branches. | `PAL-method` | `default_service_choice()` | Closed for auto mode: `WizardPlatformDefaults::from_platform()` maps `ServiceKind` through `ServiceChoice::from_service_kind()`. |
@@ -70,7 +70,7 @@ The repeated sites point to these first-class platform methods or platform-owned
 |---|---|---|---|
 | `detect_platform()` | `LinuxPal` via `platform::current()` | `MacOsPal` via `platform::current()` | Closed for macOS; unsupported targets fail explicitly. |
 | `service_manager_kind()` / `default_service_choice()` | systemd when available | launchd | Closed for install/uninstall/wizard defaults; remaining service text cleanup is tracked separately under `service_ownership_policy()`. |
-| `service_ownership_policy()` | `root:root` | `root:wheel` | Recommendation text is scattered in service code. |
+| `service_ownership_policy()` | `root:root` | `root:wheel` | Closed by `bd-r7m7.6`; `ServiceOwnershipPolicy` owns the recommended owner/group text and both live service managers consume it. |
 | `process_blame_snapshot()` | `/proc/<pid>` | libproc process/cwd/open-file APIs | Closed for macOS; `sbh blame` now uses PAL-backed process and open-file attribution. |
 | `self_stats()` | `/proc/self/status` plus `/proc/self/io` | Mach task usage plus libproc rusage | Closed for macOS; daemon self-monitor consumes the PAL method. |
 | `open_file_keys()` / `open_path_ancestors()` / `is_path_open()` | `/proc/<pid>/fd` | libproc fd/path APIs | Executor preflight parity is closed for macOS by `bd-r7m7.3`; legacy inode-key fallback remains Linux-specific. |

@@ -9,7 +9,7 @@ use std::process::Command;
 use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::ServiceManager;
 
-use super::{SYSTEMD_UNIT_NAME, resolve_sbh_binary};
+use super::{SYSTEMD_UNIT_NAME, ServiceOwnershipPolicy, resolve_sbh_binary};
 
 /// Parameters controlling systemd unit file generation and lifecycle commands.
 #[derive(Debug, Clone)]
@@ -178,23 +178,11 @@ impl SystemdServiceManager {
     fn check_binary_ownership(&self) {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt;
             if !self.config.user_scope
-                && let Ok(meta) = fs::metadata(&self.config.binary_path)
-                && meta.uid() != 0
+                && let Some(warning) = ServiceOwnershipPolicy::systemd_system_binary()
+                    .warning_for_binary(&self.config.binary_path)
             {
-                eprintln!(
-                    "[SBH-WARN] SECURITY RISK: System service binary '{}' is NOT owned by root (uid={}).",
-                    self.config.binary_path.display(),
-                    meta.uid()
-                );
-                eprintln!(
-                    "[SBH-WARN] A non-root user could replace this binary and gain root privileges."
-                );
-                eprintln!(
-                    "[SBH-WARN] Recommendation: 'sudo chown root:root {}'",
-                    self.config.binary_path.display()
-                );
+                warning.print();
             }
         }
     }

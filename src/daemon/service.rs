@@ -25,6 +25,88 @@ pub const LAUNCHD_LABEL: &str = "com.sbh.daemon";
 /// Environment override for tests and isolated launchd installs.
 pub const LAUNCHD_LABEL_ENV: &str = "SBH_LAUNCHD_LABEL";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServiceOwnershipPolicy {
+    owner: &'static str,
+    group: &'static str,
+    uid: u32,
+    gid: u32,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServiceOwnershipWarning {
+    binary_path: PathBuf,
+    actual_uid: u32,
+    actual_gid: u32,
+    policy: ServiceOwnershipPolicy,
+}
+
+impl ServiceOwnershipPolicy {
+    pub(crate) const fn systemd_system_binary() -> Self {
+        Self {
+            owner: "root",
+            group: "root",
+            uid: 0,
+            gid: 0,
+        }
+    }
+
+    pub(crate) const fn launchd_system_binary() -> Self {
+        Self {
+            owner: "root",
+            group: "wheel",
+            uid: 0,
+            gid: 0,
+        }
+    }
+
+    fn chown_command(self, binary_path: &Path) -> String {
+        format!(
+            "sudo chown {}:{} {}",
+            self.owner,
+            self.group,
+            binary_path.display()
+        )
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn warning_for_binary(self, binary_path: &Path) -> Option<ServiceOwnershipWarning> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::metadata(binary_path).ok()?;
+        let observed = (metadata.uid(), metadata.gid());
+        if observed == (self.uid, self.gid) {
+            return None;
+        }
+        Some(ServiceOwnershipWarning {
+            binary_path: binary_path.to_path_buf(),
+            actual_uid: observed.0,
+            actual_gid: observed.1,
+            policy: self,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl ServiceOwnershipWarning {
+    pub(crate) fn print(&self) {
+        eprintln!(
+            "[SBH-WARN] SECURITY RISK: System service binary '{}' is NOT owned by {}:{} (uid={}, gid={}).",
+            self.binary_path.display(),
+            self.policy.owner,
+            self.policy.group,
+            self.actual_uid,
+            self.actual_gid
+        );
+        eprintln!("[SBH-WARN] A non-root user could replace this binary and gain root privileges.");
+        eprintln!(
+            "[SBH-WARN] Recommendation: '{}'",
+            self.policy.chown_command(&self.binary_path)
+        );
+    }
+}
+
 /// Return launchd labels that uninstall/discovery flows should inspect.
 ///
 /// The default production label is always included. A configured label is added
@@ -126,6 +208,60 @@ fn resolve_sbh_binary() -> Result<PathBuf> {
     Err(crate::core::errors::SbhError::Runtime {
         details: "could not locate sbh binary; install it to a PATH directory first".to_string(),
     })
+}
+
+#[cfg(test)]
+mod service_ownership_policy_tests {
+    use super::*;
+
+    #[test]
+    fn service_ownership_policy_formats_platform_groups() {
+        let binary = Path::new("/usr/local/bin/sbh");
+
+        assert_eq!(
+            ServiceOwnershipPolicy::systemd_system_binary().chown_command(binary),
+            "sudo chown root:root /usr/local/bin/sbh"
+        );
+        assert_eq!(
+            ServiceOwnershipPolicy::launchd_system_binary().chown_command(binary),
+            "sudo chown root:wheel /usr/local/bin/sbh"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_ownership_policy_accepts_matching_uid_gid() {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::metadata("/bin/sh").expect("/bin/sh should exist");
+        let policy = ServiceOwnershipPolicy {
+            owner: "current-owner",
+            group: "current-group",
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        };
+
+        assert!(policy.warning_for_binary(Path::new("/bin/sh")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_ownership_policy_warns_on_uid_gid_mismatch() {
+        let binary = Path::new("/bin/sh");
+        let warning = ServiceOwnershipPolicy {
+            owner: "root",
+            group: "wheel",
+            uid: u32::MAX,
+            gid: u32::MAX,
+        }
+        .warning_for_binary(binary)
+        .expect("mismatched uid/gid should produce a warning");
+
+        assert_eq!(
+            warning.policy.chown_command(&warning.binary_path),
+            "sudo chown root:wheel /bin/sh"
+        );
+    }
 }
 
 #[allow(dead_code)]

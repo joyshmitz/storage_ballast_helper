@@ -15,7 +15,7 @@ use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::ServiceManager;
 
 use super::launchctl::{self, LaunchctlDomain, LaunchctlServiceTarget};
-use super::{LAUNCHD_LABEL, LAUNCHD_LABEL_ENV, resolve_sbh_binary};
+use super::{LAUNCHD_LABEL, LAUNCHD_LABEL_ENV, ServiceOwnershipPolicy, resolve_sbh_binary};
 
 /// Detailed launchd service status for CLI and JSON output.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -335,10 +335,24 @@ impl LaunchdServiceManager {
         );
         Value::Dictionary(root)
     }
+
+    fn check_binary_ownership(&self) {
+        #[cfg(unix)]
+        {
+            if !self.config.user_scope
+                && let Some(warning) = ServiceOwnershipPolicy::launchd_system_binary()
+                    .warning_for_binary(&self.config.binary_path)
+            {
+                warning.print();
+            }
+        }
+    }
 }
 
 impl ServiceManager for LaunchdServiceManager {
     fn install(&self) -> Result<()> {
+        self.check_binary_ownership();
+
         let plist_dir = self.config.plist_dir();
         let plist_path = self.config.plist_path();
         let plist_content = self.generate_plist();
