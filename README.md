@@ -1018,7 +1018,7 @@ Before any deletion is executed, a six-point pre-flight check must pass:
 4. **No `.git/` directory**: A final safety net that prevents deletion of any directory containing a Git repository, even if all other signals suggest it's an artifact.
 5. **Not a Cargo source root**: A direct `Cargo.toml` without Cargo build-output markers vetoes deletion, even when a directory name matches `target`, `target_*`, `*_target`, or `*-target`. Broad target-like names outside temporary storage also require Cargo build-output markers before they can become deletion candidates; `/private/tmp` target caches still require open-file checks.
 6. **No stowaway sacred state**: Depth-limited scans reject cleanup candidates that contain protected marker directories or database state such as `.git/`, `.beads/`, `*.db`, `*.sqlite`, or `*.sqlite3`.
-7. **Not open by any process**: On Linux, scans `/proc/*/fd` symlinks to check if any file within the target directory tree is currently held open. Collects up to 20,000 inodes via depth-first traversal and checks each against the process file descriptor table.
+7. **Not open by any process**: The deletion executor checks platform open-file evidence before reclaiming a target tree. Linux scans `/proc/*/fd` symlinks; macOS uses the PAL/libproc open-file collector. If that pre-flight evidence is incomplete, the batch fails conservative instead of deleting an in-use directory.
 
 Any single check failure causes the candidate to be skipped (not failed), so it doesn't trip the circuit breaker.
 
@@ -1337,7 +1337,7 @@ Directories with tens of thousands of entries (e.g., `/data/tmp` with 60K+ child
 
 #### Open-File Detection
 
-Before any candidate is scored for deletion, the walker collects the set of open file descriptors across all processes. On Linux, this scans `/proc/*/fd` symlinks to build a set of `(device_id, inode)` pairs representing currently open files. Two budget limits prevent this scan from hanging the daemon on busy machines:
+Before any candidate is scored for deletion, the walker collects active-reference evidence across visible processes. On Linux, this scans `/proc/*/fd` symlinks to build a set of `(device_id, inode)` pairs representing currently open files. On macOS, it uses PAL/libproc process, fd, executable, and mmap probes to produce the same safety signal. Two budget limits prevent this scan from hanging the daemon on busy machines:
 
 | Budget | Limit | Purpose |
 | --- | --- | --- |
@@ -1761,7 +1761,7 @@ Yes. The index is checkpointed to disk with SHA-256 integrity verification. On r
 Under normal operation, 20-60 MB of RSS. The hard limit is 256 MB (enforced by both the daemon self-monitor and the systemd `MemoryMax` directive). Machines with hundreds of thousands of directories in watched paths will use more due to the Merkle scan index.
 
 ### Is this Linux-only?
-No. It is cross-platform, with service integration for `systemd` (Linux) and `launchd` (macOS). Open-file detection via `/proc/*/fd` is Linux-specific; on other platforms, the open-file veto is skipped but all other safety layers remain active.
+No. It is cross-platform, with service integration for `systemd` (Linux) and `launchd` (macOS). Open-file vetoes are platform-specific internally: Linux uses `/proc/*/fd`, while macOS uses PAL/libproc evidence for visible processes. Other safety layers, including age, sacred-path, protected-path, active executable/mmap, and `.git` guards, remain active on both platforms.
 
 ## About Contributions
 

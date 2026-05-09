@@ -5,7 +5,7 @@
 //!
 //! Safety pre-flight checks before each deletion:
 //! 1. Path still exists (may have been cleaned by another process)
-//! 2. Path is not currently open by any process (Linux: /proc/*/fd)
+//! 2. Path is not currently open by any process (Linux: /proc/*/fd; macOS: PAL/libproc)
 //! 3. Parent directory is writable
 //! 4. Directory does not contain .git/ (final safety net)
 //! 5. Directory is not a Cargo source root misclassified as a target artifact
@@ -42,7 +42,7 @@ pub struct DeletionConfig {
     pub circuit_breaker_threshold: u32,
     /// Cooldown duration after circuit breaker trips.
     pub circuit_breaker_cooldown: Duration,
-    /// Whether to check /proc for open files before deleting (Linux only).
+    /// Whether to check platform open-file evidence before deleting.
     pub check_open_files: bool,
 }
 

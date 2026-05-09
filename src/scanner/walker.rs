@@ -728,8 +728,7 @@ pub fn collect_open_path_ancestors(root_paths: &[PathBuf]) -> (HashSet<PathBuf>,
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = root_paths;
-        (HashSet::new(), true)
+        collect_open_path_ancestors_platform(root_paths)
     }
 }
 
@@ -774,6 +773,59 @@ pub fn collect_open_path_ancestors_cached(
     (paths, complete)
 }
 
+fn normalized_open_roots(root_paths: &[PathBuf]) -> Vec<(PathBuf, usize)> {
+    root_paths
+        .iter()
+        .map(|path| {
+            let normalized = crate::core::paths::resolve_absolute_path(path);
+            let depth = normalized.components().count();
+            (normalized, depth)
+        })
+        .collect()
+}
+
+fn add_open_path_ancestor_chain(
+    ancestors: &mut HashSet<PathBuf>,
+    target: &Path,
+    normalized_roots: &[(PathBuf, usize)],
+) {
+    if !target.is_absolute() {
+        return;
+    }
+    let normalized_target = crate::core::paths::resolve_absolute_path(target);
+    let stop_at = if normalized_roots.is_empty() {
+        None
+    } else {
+        normalized_roots
+            .iter()
+            .filter(|(root, _)| normalized_target.starts_with(root))
+            // Stop at the outermost matching root so nested-root callers
+            // still get ancestor coverage for parent candidates.
+            .min_by_key(|(_, depth)| *depth)
+            .map(|(root, _)| root.as_path())
+    };
+    if !normalized_roots.is_empty() && stop_at.is_none() {
+        return;
+    }
+
+    let mut current = Some(normalized_target.as_path());
+    while let Some(path) = current {
+        if !ancestors.insert(path.to_path_buf()) {
+            break; // Already seen this ancestor chain — skip rest.
+        }
+        if Some(path) == stop_at {
+            break;
+        }
+        let Some(parent) = path.parent() else {
+            break;
+        };
+        if parent == path {
+            break;
+        }
+        current = Some(parent);
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> (HashSet<PathBuf>, bool) {
     use std::os::unix::ffi::OsStrExt;
@@ -784,18 +836,7 @@ fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> (HashSet<PathBuf
         return (ancestors, true);
     };
 
-    let normalized_roots: Vec<(PathBuf, usize)> = if root_paths.is_empty() {
-        Vec::new()
-    } else {
-        root_paths
-            .iter()
-            .map(|path| {
-                let normalized = crate::core::paths::resolve_absolute_path(path);
-                let depth = normalized.components().count();
-                (normalized, depth)
-            })
-            .collect()
-    };
+    let normalized_roots = normalized_open_roots(root_paths);
 
     let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
     let mut pids_scanned: usize = 0;
@@ -830,39 +871,32 @@ fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> (HashSet<PathBuf
             if let Some(stripped) = target.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
                 target = PathBuf::from(stripped);
             }
-            let stop_at = if normalized_roots.is_empty() {
-                None
-            } else {
-                normalized_roots
-                    .iter()
-                    .filter(|(root, _)| target.starts_with(root))
-                    // Stop at the outermost matching root so nested-root callers
-                    // still get ancestor coverage for parent candidates.
-                    .min_by_key(|(_, depth)| *depth)
-                    .map(|(root, _)| root.as_path())
-            };
-            if normalized_roots.is_empty() || stop_at.is_some() {
-                let mut current = Some(target.as_path());
-                while let Some(path) = current {
-                    if !ancestors.insert(path.to_path_buf()) {
-                        break; // Already seen this ancestor chain — skip rest.
-                    }
-                    if Some(path) == stop_at {
-                        break;
-                    }
-                    let Some(parent) = path.parent() else {
-                        break;
-                    };
-                    if parent == path {
-                        break;
-                    }
-                    current = Some(parent);
-                }
-            }
+            add_open_path_ancestor_chain(&mut ancestors, &target, &normalized_roots);
         }
     }
 
     (ancestors, !incomplete)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn collect_open_path_ancestors_platform(root_paths: &[PathBuf]) -> (HashSet<PathBuf>, bool) {
+    let normalized_roots = normalized_open_roots(root_paths);
+    if normalized_roots.is_empty() {
+        return (HashSet::new(), true);
+    }
+
+    let platform = crate::platform::current();
+    let mut ancestors = HashSet::with_capacity(4096);
+    for (root, _) in &normalized_roots {
+        let Ok(open_files) = platform.open_files_under(root) else {
+            return (ancestors, false);
+        };
+        for open_file in open_files {
+            add_open_path_ancestor_chain(&mut ancestors, &open_file.path, &normalized_roots);
+        }
+    }
+
+    (ancestors, true)
 }
 
 #[derive(Debug, Clone)]
@@ -1235,6 +1269,56 @@ mod tests {
     use crate::scanner::protection;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn open_path_ancestor_chain_stops_at_outermost_matching_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let nested_root = root.join("project");
+        let leaf_dir = nested_root.join("target").join("debug");
+        fs::create_dir_all(&leaf_dir).unwrap();
+        let open_file = leaf_dir.join("build.log");
+        fs::write(&open_file, "active").unwrap();
+
+        let roots = normalized_open_roots(&[root.clone(), nested_root.clone()]);
+        let mut ancestors = HashSet::new();
+        add_open_path_ancestor_chain(&mut ancestors, &open_file, &roots);
+
+        assert!(ancestors.contains(&open_file));
+        assert!(ancestors.contains(&leaf_dir));
+        assert!(ancestors.contains(&nested_root));
+        assert!(ancestors.contains(&root));
+        assert!(
+            !ancestors.contains(dir.path()),
+            "ancestor chain should stop at the outermost matching scan root"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn open_path_ancestors_uses_platform_collector_on_macos() {
+        let dir = tempfile::tempdir().unwrap();
+        let active_dir = dir.path().join("active-target");
+        fs::create_dir(&active_dir).unwrap();
+        let active_file = active_dir.join("in-use.bin");
+        fs::write(&active_file, "payload").unwrap();
+        let handle = fs::File::open(&active_file).unwrap();
+
+        let (ancestors, complete) = collect_open_path_ancestors(&[dir.path().to_path_buf()]);
+        assert!(
+            complete,
+            "macOS PAL open-file preflight should complete for a temp root"
+        );
+
+        if !ancestors.contains(&active_file) {
+            drop(handle);
+            return;
+        }
+
+        assert!(ancestors.contains(&active_dir));
+        assert!(is_path_open_by_ancestor(&active_dir, &ancestors));
+        drop(handle);
+    }
 
     #[derive(Debug, Default)]
     struct TestActiveRefPlatform {
