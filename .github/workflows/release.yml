@@ -277,6 +277,36 @@ jobs:
           path: release-artifacts
           merge-multiple: true
 
+      - name: Generate release checksum manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          checksum_files=(sbh-*.sha256)
+          if [ "${checksum_files[0]}" = "sbh-*.sha256" ]; then
+            echo "::error::no release checksum sidecars were downloaded"
+            exit 1
+          fi
+
+          : > ../SHA256SUMS.txt
+          for checksum_file in "${checksum_files[@]}"; do
+            archive="${checksum_file%.sha256}"
+            if [ ! -s "${archive}" ]; then
+              echo "::error::missing archive for checksum sidecar: ${checksum_file}"
+              exit 1
+            fi
+
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum -c "${checksum_file}"
+            else
+              shasum -a 256 -c "${checksum_file}"
+            fi
+            awk '{print $1 "  " $2}' "${checksum_file}" >> ../SHA256SUMS.txt
+          done
+
+          sort -k2,2 ../SHA256SUMS.txt -o ../SHA256SUMS.txt
+          cat ../SHA256SUMS.txt
+
       - name: Collect provenance
         run: |
           echo "{" > release-provenance.json
@@ -294,6 +324,7 @@ jobs:
           files: |
             release-artifacts/sbh-*.tar.xz
             release-artifacts/sbh-*.sha256
+            SHA256SUMS.txt
             release-provenance.json
 
   homebrew-tap:

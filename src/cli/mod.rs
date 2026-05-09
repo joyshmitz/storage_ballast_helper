@@ -1484,6 +1484,21 @@ mod tests {
                 .contains("Quality gate failures should not block release artifact production"),
             "release workflow must not document non-blocking quality gates"
         );
+
+        for required in [
+            "Generate release checksum manifest",
+            "checksum_files=(sbh-*.sha256)",
+            "no release checksum sidecars were downloaded",
+            "missing archive for checksum sidecar",
+            "sha256sum -c \"${checksum_file}\"",
+            "shasum -a 256 -c \"${checksum_file}\"",
+            "SHA256SUMS.txt",
+        ] {
+            assert!(
+                release_workflow.contains(required),
+                "release workflow must publish an aggregate checksum manifest: {required}"
+            );
+        }
     }
 
     #[test]
