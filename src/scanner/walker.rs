@@ -1162,7 +1162,7 @@ pub fn is_path_open_by_ancestor<S: std::hash::BuildHasher>(
 }
 
 /// Memoized open-file detector for repeated path checks during one scan pass.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub struct OpenPathCache<'a, S = std::collections::hash_map::RandomState> {
     open_inodes: &'a HashSet<(u64, u64), S>,
     dir_cache: HashMap<PathBuf, bool>,
@@ -1179,19 +1179,19 @@ impl<'a, S: std::hash::BuildHasher> OpenPathCache<'a, S> {
 
     #[must_use]
     pub fn is_path_open(&mut self, path: &Path) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
-            self.is_path_open_linux(path)
+            self.is_path_open_unix(path)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         {
             let _ = path;
             false
         }
     }
 
-    #[cfg(target_os = "linux")]
-    fn is_path_open_linux(&mut self, path: &Path) -> bool {
+    #[cfg(unix)]
+    fn is_path_open_unix(&mut self, path: &Path) -> bool {
         use std::os::unix::fs::MetadataExt;
         const MAX_SCAN: usize = 20_000;
 
@@ -1283,13 +1283,18 @@ mod tests {
         let roots = normalized_open_roots(&[root.clone(), nested_root.clone()]);
         let mut ancestors = HashSet::new();
         add_open_path_ancestor_chain(&mut ancestors, &open_file, &roots);
+        let normalized_open_file = crate::core::paths::resolve_absolute_path(&open_file);
+        let normalized_leaf_dir = crate::core::paths::resolve_absolute_path(&leaf_dir);
+        let normalized_nested_root = crate::core::paths::resolve_absolute_path(&nested_root);
+        let normalized_root = crate::core::paths::resolve_absolute_path(&root);
+        let normalized_tmp = crate::core::paths::resolve_absolute_path(dir.path());
 
-        assert!(ancestors.contains(&open_file));
-        assert!(ancestors.contains(&leaf_dir));
-        assert!(ancestors.contains(&nested_root));
-        assert!(ancestors.contains(&root));
+        assert!(ancestors.contains(&normalized_open_file));
+        assert!(ancestors.contains(&normalized_leaf_dir));
+        assert!(ancestors.contains(&normalized_nested_root));
+        assert!(ancestors.contains(&normalized_root));
         assert!(
-            !ancestors.contains(dir.path()),
+            !ancestors.contains(&normalized_tmp),
             "ancestor chain should stop at the outermost matching scan root"
         );
     }

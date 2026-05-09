@@ -137,7 +137,8 @@ impl ProtectionRegistry {
             Some(patterns) => patterns
                 .iter()
                 .map(|pat| {
-                    let re = glob_to_regex(pat)?;
+                    let normalized = normalize_protected_pattern_for_matching(pat);
+                    let re = glob_to_regex(&normalized)?;
                     Ok(GlobPattern {
                         original: pat.clone(),
                         compiled: re,
@@ -630,6 +631,29 @@ fn normalize_path_for_matching(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+fn normalize_protected_pattern_for_matching(pattern: &str) -> String {
+    let expanded = expand_home_pattern(pattern);
+    let normalized = expanded.replace('\\', "/");
+    let path = Path::new(&normalized);
+    if !path.is_absolute() {
+        return normalized;
+    }
+
+    if !contains_glob_metachar(&normalized) {
+        return normalize_path_for_matching(&normalize_path_for_protection(path));
+    }
+
+    let Some(prefix) = literal_glob_prefix_path(&normalized) else {
+        return normalized;
+    };
+    let prefix_text = normalize_path_for_matching(&prefix);
+    let Some(suffix) = normalized.strip_prefix(&prefix_text) else {
+        return normalized;
+    };
+    let resolved_prefix = normalize_path_for_matching(&normalize_path_for_protection(&prefix));
+    format!("{resolved_prefix}{suffix}")
+}
+
 fn normalize_path_for_protection(path: &Path) -> PathBuf {
     crate::core::paths::resolve_absolute_path(path)
 }
@@ -658,8 +682,7 @@ fn exact_sacred_overlaps(candidate: &Path, entry: &SacredPath) -> Vec<SacredOver
 }
 
 fn glob_sacred_overlaps(candidate: &Path, entry: &SacredPath) -> Result<Vec<SacredOverlap>> {
-    let expanded = expand_home_pattern(&entry.pattern);
-    let normalized = expanded.replace('\\', "/");
+    let normalized = normalize_protected_pattern_for_matching(&entry.pattern);
     let regex = glob_to_regex(&normalized)?;
     let candidate_text = normalize_path_for_matching(candidate);
     let mut overlaps = Vec::new();
@@ -1267,6 +1290,22 @@ protected_at = "2026-05-07T03:50:00Z"
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn protected_patterns_match_through_existing_parent_aliases() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let patterns = vec![alias.join("critical").to_string_lossy().to_string()];
+        let reg = ProtectionRegistry::new(Some(&patterns)).unwrap();
+
+        assert!(reg.is_protected(&real.join("critical")));
+        assert!(reg.is_protected(&real.join("critical").join("target")));
+    }
+
     #[test]
     fn read_marker_metadata_handles_garbage() {
         let tmp = TempDir::new().unwrap();
@@ -1504,6 +1543,41 @@ protected_at = "2026-05-07T03:50:00Z"
         fs::write(&database, b"sqlite").unwrap();
         let catalog = vec![SacredPath {
             pattern: pictures
+                .join("*.photoslibrary")
+                .to_string_lossy()
+                .to_string(),
+            kind: SacredPathKind::GlobMatch,
+            reason: "Photos libraries are user data".to_string(),
+            source: SacredPathSource::Builtin,
+        }];
+
+        let exact = find_sacred_overlaps(&library, &catalog).unwrap();
+        assert_eq!(exact[0].kind, SacredOverlapKind::GlobMatch);
+
+        let child = find_sacred_overlaps(&database, &catalog).unwrap();
+        assert_eq!(child[0].kind, SacredOverlapKind::ChildOfSacred);
+
+        let parent = find_sacred_overlaps(&pictures, &catalog).unwrap();
+        assert_eq!(parent[0].kind, SacredOverlapKind::ParentOfSacred);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sacred_glob_overlaps_match_through_existing_parent_aliases() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let pictures = real.join("Pictures");
+        let library = pictures.join("Family.photoslibrary");
+        let database = library.join("database").join("Photos.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"sqlite").unwrap();
+        let catalog = vec![SacredPath {
+            pattern: alias
+                .join("Pictures")
                 .join("*.photoslibrary")
                 .to_string_lossy()
                 .to_string(),

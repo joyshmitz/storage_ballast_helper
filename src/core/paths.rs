@@ -22,8 +22,31 @@ pub fn resolve_absolute_path(path: &Path) -> PathBuf {
         return canonical;
     }
 
+    if let Some(resolved) = resolve_existing_ancestor(&absolute) {
+        return resolved;
+    }
+
     // Fallback: syntactic normalization.
     normalize_syntactic(&absolute)
+}
+
+fn resolve_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let normalized = normalize_syntactic(path);
+    let mut missing_components = Vec::new();
+    let mut probe = normalized.as_path();
+
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(probe) {
+            let mut resolved = canonical;
+            for component in missing_components.iter().rev() {
+                resolved.push(component);
+            }
+            return Some(normalize_syntactic(&resolved));
+        }
+
+        missing_components.push(probe.file_name()?.to_os_string());
+        probe = probe.parent()?;
+    }
 }
 
 fn normalize_syntactic(path: &Path) -> PathBuf {
@@ -72,6 +95,20 @@ mod tests {
 
         let resolved = resolve_absolute_path(&input);
         assert_eq!(resolved, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_nonexistent_child_under_existing_symlink_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let resolved = resolve_absolute_path(&alias.join("missing").join("child"));
+
+        assert_eq!(resolved, real.join("missing").join("child"));
     }
 
     #[test]
