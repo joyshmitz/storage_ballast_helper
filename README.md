@@ -1143,7 +1143,7 @@ RAM-backed filesystems (`/dev/shm`, tmpfs, ramfs) require tighter monitoring tha
 
 Priority determines scan order when multiple locations need attention in the same cycle. Higher-priority locations are checked first.
 
-The registry auto-discovers RAM-backed mounts from `/proc/mounts` and adds fallback entries for `/tmp` and `/data/tmp` if they are not already covered. Operator-provided custom paths can override auto-discovered defaults. Duplicate paths are deduplicated, with later entries taking precedence.
+The registry asks the active Platform Abstraction Layer (PAL) for mount inventory. Linux reads `/proc/mounts`; macOS uses its PAL mount inventory from `statfs`/`getmntinfo` and APFS metadata. Fallback entries for `/tmp` and `/data/tmp` are added when they are not already covered. Operator-provided custom paths can override auto-discovered defaults. Duplicate paths are deduplicated, with later entries taking precedence.
 
 #### Swap-Thrash Detection
 
@@ -1246,7 +1246,7 @@ The daemon dispatches alerts through four notification channels, each with indep
 | Desktop | `notify-send` (Linux) / `osascript` (macOS) | Orange |
 | Webhook | HTTP POST via `curl` (5-second timeout) | Red |
 | File | JSONL append to `~/.local/share/sbh/notifications.jsonl` | Info |
-| Journal | systemd structured logging via stderr | Warning |
+| Journal | systemd/launchd stdout and stderr capture | Warning |
 
 Default active channels are `journal` and `file`. Desktop and webhook channels are opt-in.
 On macOS, the desktop channel uses `osascript -e 'display notification ...'` as the
@@ -1404,7 +1404,7 @@ Thread statuses are reported in the state file and displayed on the dashboard Di
 
 #### RSS Memory Tracking
 
-The daemon reads its own RSS (Resident Set Size) from `/proc/self/statm` on each state file write. If RSS exceeds the configured limit (256 MB by default, matching the systemd `MemoryMax` directive), a warning is logged to stderr. The RSS value is included in the state file for external monitoring tools.
+The daemon samples its own RSS through the PAL `self_stats()` method on each state file write. Linux uses `/proc/self` data; macOS uses Mach task and libproc resource usage. If RSS exceeds the configured limit (256 MB by default, matching the systemd `MemoryMax` directive on Linux), a warning is logged to stderr. The RSS value is included in the state file for external monitoring tools.
 
 The 256 MB limit ensures `sbh` never competes with build workloads for memory. On machines with constrained RAM, the limit can be adjusted via the systemd unit file or by direct configuration.
 
@@ -1611,7 +1611,7 @@ src/
     terminal_guard.rs       Raw mode cleanup and signal-safe terminal restore
 
   platform/
-    pal.rs                  Platform abstraction (Linux: procfs, statvfs, mounts)
+    pal.rs                  Platform abstraction (Linux: procfs/statvfs; macOS: statfs/APFS/libproc)
 ```
 
 ### Error Codes

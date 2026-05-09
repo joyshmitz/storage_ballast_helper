@@ -1777,6 +1777,36 @@ mod tests {
     }
 
     #[test]
+    fn readme_platform_sections_stay_cross_platform() {
+        let readme = include_str!("../../README.md");
+
+        for required in [
+            "systemd/launchd stdout and stderr capture",
+            "The registry asks the active Platform Abstraction Layer (PAL) for mount inventory.",
+            "Linux reads `/proc/mounts`; macOS uses its PAL mount inventory from `statfs`/`getmntinfo` and APFS metadata.",
+            "The daemon samples its own RSS through the PAL `self_stats()` method on each state file write.",
+            "Linux uses `/proc/self` data; macOS uses Mach task and libproc resource usage.",
+            "Platform abstraction (Linux: procfs/statvfs; macOS: statfs/APFS/libproc)",
+        ] {
+            assert!(
+                readme.contains(required),
+                "README platform section must document cross-platform fragment: {required}"
+            );
+        }
+
+        for stale in [
+            "auto-discovers RAM-backed mounts from `/proc/mounts`",
+            "reads its own RSS (Resident Set Size) from `/proc/self/statm`",
+            "Platform abstraction (Linux: procfs, statvfs, mounts)",
+        ] {
+            assert!(
+                !readme.contains(stale),
+                "README platform section retained stale Linux-only wording: {stale}"
+            );
+        }
+    }
+
+    #[test]
     fn macos_cleanup_rules_doc_covers_catalog_contract() {
         let doc = include_str!("../../docs/cleanup-rules-macos.md");
 
