@@ -325,14 +325,26 @@ the same secret names, and the selected Team ID is represented by
 Developer ID certificate setup is intentionally outside the repository because
 it handles private key material:
 
-1. Create a `Developer ID Application` certificate in the Apple Developer
-   portal for the selected account or team.
-2. Install the certificate in Keychain Access on a trusted Mac and verify that
+1. Create a certificate signing request on a trusted Mac. The private key should
+   stay in the login keychain. Keychain Access can do this through Certificate
+   Assistant, or you can use the command-line assistant:
+
+   ```bash
+   export CSR_PATH="$HOME/Desktop/sbh-developer-id.certSigningRequest"
+   certtool r "$CSR_PATH"
+   certtool V "$CSR_PATH"
+   open https://developer.apple.com/account/resources/certificates/add
+   ```
+
+2. Upload the CSR in the Apple Developer portal and create a
+   `Developer ID Application` certificate for the selected account or team.
+3. Install the issued certificate in Keychain Access on the same trusted Mac
+   that created the CSR/private key pair and verify that
    `security find-identity -v -p codesigning` lists a `Developer ID
    Application` identity for the selected Team ID.
-3. Export that identity, including the private key, as an encrypted P12 file.
+4. Export that identity, including the private key, as an encrypted P12 file.
    Keep the P12 outside the repository and protect it with a unique password.
-4. Set the release secrets from stdin so the values do not appear in shell
+5. Set the release secrets from stdin so the values do not appear in shell
    history:
 
    ```bash
@@ -414,11 +426,13 @@ Actions secrets as explicit diagnostics so the external Apple/GitHub credential
 setup can be finished without inspecting workflow internals.
 
 The release doctor also prints a non-secret credential setup plan. The plan
-uses placeholder environment variables such as `$P12_PATH`, `$P12_PASSWORD`,
-`$APPLE_ID`, `$APPLE_TEAM_ID`, `$APPLE_APP_SPECIFIC_PASSWORD`, and
-`$HOMEBREW_TAP_TOKEN`; it never prints secret values. The GitHub secret commands
-use `--body-file -` so secret material can be piped from stdin instead of being
-stored in shell history. After completing the plan, rerun:
+starts with the CSR/keychain request step now that Apple Developer Program
+enrollment is confirmed, then uses placeholder environment variables such as
+`$P12_PATH`, `$P12_PASSWORD`, `$APPLE_ID`, `$APPLE_TEAM_ID`,
+`$APPLE_APP_SPECIFIC_PASSWORD`, and `$HOMEBREW_TAP_TOKEN`; it never prints
+secret values. The GitHub secret commands use `--body-file -` so secret material
+can be piped from stdin instead of being stored in shell history. After
+completing the plan, rerun:
 
 ```bash
 sbh doctor --release --json

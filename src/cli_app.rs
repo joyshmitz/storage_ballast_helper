@@ -4283,9 +4283,21 @@ fn parse_github_secret_names(raw: &str) -> std::result::Result<HashSet<String>, 
 fn release_doctor_setup_steps() -> Vec<ReleaseDoctorSetupStep> {
     vec![
         ReleaseDoctorSetupStep {
+            id: "developer_id_csr",
+            title: "Developer ID certificate request",
+            reason: "Create the local keychain-backed CSR that Apple uses to issue the Developer ID Application certificate.",
+            docs: "docs/macos.md#code-signing-and-hardened-runtime",
+            commands: vec![
+                "export CSR_PATH=\"$HOME/Desktop/sbh-developer-id.certSigningRequest\"".to_string(),
+                "certtool r \"$CSR_PATH\"".to_string(),
+                "certtool V \"$CSR_PATH\"".to_string(),
+                "open https://developer.apple.com/account/resources/certificates/add".to_string(),
+            ],
+        },
+        ReleaseDoctorSetupStep {
             id: "developer_id_certificate",
             title: "Developer ID certificate",
-            reason: "Create/export the Developer ID Application identity and store the signing secrets for tagged macOS releases.",
+            reason: "Install/export the issued Developer ID Application identity and store the signing secrets for tagged macOS releases.",
             docs: "docs/macos.md#code-signing-and-hardened-runtime",
             commands: vec![
                 "security find-identity -v -p codesigning".to_string(),
@@ -9187,6 +9199,10 @@ mod tests {
             .join("\n");
 
         for required in [
+            "export CSR_PATH=\"$HOME/Desktop/sbh-developer-id.certSigningRequest\"",
+            "certtool r \"$CSR_PATH\"",
+            "certtool V \"$CSR_PATH\"",
+            "open https://developer.apple.com/account/resources/certificates/add",
             "security find-identity -v -p codesigning",
             "base64 < \"$P12_PATH\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64",
             "printf '%s' \"$P12_PASSWORD\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD",
