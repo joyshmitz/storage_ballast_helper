@@ -415,9 +415,8 @@ signals:
    `HOMEBREW_TAP_TOKEN`.
 4. `gh repo view Dicklesworthstone/homebrew-sbh --json nameWithOwner,defaultBranchRef`
    must be able to see the Homebrew tap repository and report `main` as
-   `defaultBranchRef.name`. The doctor also probes `Formula/sbh.rb` and reports
-   a warning, not a hard failure, when the tap exists but the initial formula
-   has not been published yet.
+   `defaultBranchRef.name`. The doctor also probes `Formula/sbh.rb` and reports a warning, not a hard failure,
+   when the tap exists but the initial formula has not been published yet.
 
 For automation or handoff checks, use:
 
