@@ -113,7 +113,12 @@ jobs:
 
           existing_keychains="$(security list-keychains -d user | tr -d '\"' || true)"
           security list-keychains -d user -s "${keychain}" ${existing_keychains}
-          security find-identity -v -p codesigning "${keychain}"
+          identity_list="sbh-${{ matrix.target }}-identity-list.txt"
+          security find-identity -v -p codesigning "${keychain}" | tee "${identity_list}"
+          if ! grep -Fq "${APPLE_DEVELOPER_ID_IDENTITY}" "${identity_list}"; then
+            echo "::error::APPLE_DEVELOPER_ID_IDENTITY was not found in the imported Developer ID keychain"
+            exit 1
+          fi
 
       - name: Sign macOS release binary with Developer ID and hardened runtime
         if: contains(matrix.target, 'apple-darwin')
