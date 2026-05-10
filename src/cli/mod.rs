@@ -1328,6 +1328,21 @@ mod tests {
     }
 
     #[test]
+    fn ci_workflow_ignores_beads_only_branch_and_pr_updates() {
+        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
+
+        for required in [
+            "push:\n    branches: [main]\n    paths-ignore:\n      - '.beads/**'",
+            "pull_request:\n    branches: [main]\n    paths-ignore:\n      - '.beads/**'",
+        ] {
+            assert!(
+                ci_workflow.contains(required),
+                "CI workflow must avoid restarting expensive platform gates for tracker-only updates: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn release_workflow_imports_developer_id_certificate_before_signing() {
         let release_workflow = include_str!("../../.github/workflows/release.yml");
         let macos_guide = include_str!("../../docs/macos.md");
