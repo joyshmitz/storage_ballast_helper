@@ -10148,7 +10148,7 @@ mod tests {
                 exit_code: Some(0),
                 stdout: json!({
                     "nameWithOwner": RELEASE_HOMEBREW_TAP_REPOSITORY,
-                    "defaultBranchRef": { "name": "master" }
+                    "defaultBranchRef": { "name": "legacy-default" }
                 })
                 .to_string(),
                 stderr: String::new(),
@@ -10170,7 +10170,7 @@ mod tests {
         assert_eq!(tap.status, "FAIL");
         assert!(
             tap.message
-                .contains("default branch is master, expected main"),
+                .contains("default branch is legacy-default, expected main"),
             "tap failure should explain default branch mismatch: {}",
             tap.message
         );
