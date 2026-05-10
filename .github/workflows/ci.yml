@@ -463,10 +463,17 @@ jobs:
           set -e
           echo "exit_status=${doctor_status}" | tee macos-release-doctor-status.txt
 
-          python3 - <<'PY'
+          DOCTOR_STATUS="${doctor_status}" python3 - <<'PY'
           import json
+          import os
           import pathlib
           import sys
+
+          try:
+              doctor_status = int(os.environ["DOCTOR_STATUS"])
+          except Exception as error:
+              print(f"::error::release doctor exit status was not available: {error}")
+              sys.exit(1)
 
           output = pathlib.Path("macos-release-doctor-output.json")
           try:
@@ -581,6 +588,14 @@ jobs:
               print(
                   f"::error::release doctor JSON ok={report.get('ok')!r} "
                   f"does not match failed/warnings counts"
+              )
+              sys.exit(1)
+
+          expected_status = 1 if expected_counts["failed"] > 0 else 0
+          if doctor_status != expected_status:
+              print(
+                  f"::error::release doctor exit status {doctor_status} "
+                  f"does not match failed-check count {expected_counts['failed']}"
               )
               sys.exit(1)
 

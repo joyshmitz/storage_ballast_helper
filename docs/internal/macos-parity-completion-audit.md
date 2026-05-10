@@ -176,7 +176,9 @@ operator-visible outcomes:
   `macos-release-doctor-summary.txt`; warning-only artifacts therefore cannot
   look release-ready in CI evidence. The same harness also rejects malformed
   top-level summary fields, malformed check entries, duplicate check IDs, and
-  unknown statuses before trusting aggregate counts. Focused proof
+  unknown statuses before trusting aggregate counts, and it checks that the
+  release-doctor process exits nonzero exactly when `FAIL` checks are present.
+  Focused proof
   passed with Ruby YAML parsing for `.github/workflows/ci.yml`,
   `cargo fmt --check`, `git diff --check`, and
   `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-release-doctor-ci-summary-test cargo test --lib ci_workflow_spot_checks_macos_release_builds_without_notarization -- --nocapture"`;
