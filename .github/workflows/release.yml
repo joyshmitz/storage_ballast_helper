@@ -155,9 +155,9 @@ jobs:
         if: contains(matrix.target, 'apple-darwin')
         shell: bash
         env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
         run: |
           set -euo pipefail
           bin="target/${{ matrix.target }}/release/sbh"
@@ -166,7 +166,7 @@ jobs:
           info_plist="sbh-${{ matrix.target }}-notary-info.plist"
           log_json="sbh-${{ matrix.target }}-notary-log.json"
 
-          for secret_name in APPLE_ID APPLE_TEAM_ID APPLE_APP_SPECIFIC_PASSWORD; do
+          for secret_name in APPLE_NOTARY_KEY_P8_BASE64 APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID; do
             if [ -z "${!secret_name:-}" ]; then
               echo "::error::${secret_name} is required for macOS notarization"
               exit 1
@@ -181,12 +181,31 @@ jobs:
             exit 1
           fi
 
+          notary_key="${RUNNER_TEMP}/sbh-notary-api-key.p8"
+          export NOTARY_KEY_PATH="${notary_key}"
+          python3 - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          Path(os.environ["NOTARY_KEY_PATH"]).write_bytes(
+              base64.b64decode(os.environ["APPLE_NOTARY_KEY_P8_BASE64"])
+          )
+          PY
+          chmod 600 "${notary_key}"
+          if ! grep -q "BEGIN PRIVATE KEY" "${notary_key}"; then
+            echo "::error::APPLE_NOTARY_KEY_P8_BASE64 did not decode to an App Store Connect private key"
+            exit 1
+          fi
+
+          notary_args=(
+            --key "${notary_key}"
+            --key-id "${APPLE_NOTARY_KEY_ID}"
+            --issuer "${APPLE_NOTARY_ISSUER_ID}"
+          )
+
           ditto -c -k --keepParent "${bin}" "${upload}"
-          xcrun notarytool submit "${upload}" \
-            --apple-id "${APPLE_ID}" \
-            --team-id "${APPLE_TEAM_ID}" \
-            --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
-            --output-format plist > "${submit_plist}"
+          xcrun notarytool submit "${upload}" "${notary_args[@]}" --output-format plist > "${submit_plist}"
 
           submission_id="$(plutil -extract id raw -o - "${submit_plist}")"
           if [ -z "${submission_id}" ]; then
@@ -198,22 +217,14 @@ jobs:
           deadline=$((SECONDS + 1800))
           status=""
           while [ "${SECONDS}" -lt "${deadline}" ]; do
-            xcrun notarytool info "${submission_id}" \
-              --apple-id "${APPLE_ID}" \
-              --team-id "${APPLE_TEAM_ID}" \
-              --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
-              --output-format plist > "${info_plist}"
+            xcrun notarytool info "${submission_id}" "${notary_args[@]}" --output-format plist > "${info_plist}"
             status="$(plutil -extract status raw -o - "${info_plist}")"
             case "${status}" in
               Accepted)
                 break
                 ;;
               Invalid|Rejected)
-                xcrun notarytool log "${submission_id}" \
-                  --apple-id "${APPLE_ID}" \
-                  --team-id "${APPLE_TEAM_ID}" \
-                  --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
-                  "${log_json}" || true
+                xcrun notarytool log "${submission_id}" "${notary_args[@]}" "${log_json}" || true
                 cat "${log_json}" || true
                 echo "::error::notarization ${status} for ${submission_id}"
                 exit 1
@@ -223,21 +234,13 @@ jobs:
           done
 
           if [ "${status}" != "Accepted" ]; then
-            xcrun notarytool log "${submission_id}" \
-              --apple-id "${APPLE_ID}" \
-              --team-id "${APPLE_TEAM_ID}" \
-              --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
-              "${log_json}" || true
+            xcrun notarytool log "${submission_id}" "${notary_args[@]}" "${log_json}" || true
             cat "${log_json}" || true
             echo "::error::notarization timed out after 30 minutes for ${submission_id}"
             exit 1
           fi
 
-          xcrun notarytool log "${submission_id}" \
-            --apple-id "${APPLE_ID}" \
-            --team-id "${APPLE_TEAM_ID}" \
-            --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
-            "${log_json}" || true
+          xcrun notarytool log "${submission_id}" "${notary_args[@]}" "${log_json}" || true
           cat "${log_json}" || true
           if ! spctl -a -t execute -vv "${bin}"; then
             echo "::error::Gatekeeper assessment failed after notarization"

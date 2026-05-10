@@ -309,9 +309,9 @@ The release workflow uses these GitHub secrets:
 APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64
 APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD
 APPLE_DEVELOPER_ID_IDENTITY
-APPLE_ID
-APPLE_TEAM_ID
-APPLE_APP_SPECIFIC_PASSWORD
+APPLE_NOTARY_KEY_P8_BASE64
+APPLE_NOTARY_KEY_ID
+APPLE_NOTARY_ISSUER_ID
 HOMEBREW_TAP_TOKEN
 ```
 
@@ -319,8 +319,8 @@ Apple Developer Program enrollment is confirmed for this project. Use the
 already-enrolled Apple Developer account or team that owns the Developer ID
 Application certificate and notarization credentials. The repository workflow is
 intentionally team-agnostic: Organization and Individual memberships both use
-the same secret names, and the selected Team ID is represented by
-`APPLE_TEAM_ID` rather than by branching release logic.
+the same secret names, and notarization uses an App Store Connect API key rather
+than branching release logic around Apple ID account passwords.
 
 Developer ID certificate setup is intentionally outside the repository because
 it handles private key material:
@@ -349,25 +349,36 @@ it handles private key material:
 
    ```bash
    base64 < "$P12_PATH" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 \
-     -R Dicklesworthstone/storage_ballast_helper --body-file -
+     -R Dicklesworthstone/storage_ballast_helper
    printf '%s' "$P12_PASSWORD" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD \
-     -R Dicklesworthstone/storage_ballast_helper --body-file -
+     -R Dicklesworthstone/storage_ballast_helper
    printf '%s' "$DEVELOPER_ID_IDENTITY" | gh secret set APPLE_DEVELOPER_ID_IDENTITY \
-     -R Dicklesworthstone/storage_ballast_helper --body-file -
-   printf '%s' "$APPLE_ID" | gh secret set APPLE_ID \
-     -R Dicklesworthstone/storage_ballast_helper --body-file -
-   printf '%s' "$APPLE_TEAM_ID" | gh secret set APPLE_TEAM_ID \
-     -R Dicklesworthstone/storage_ballast_helper --body-file -
-   printf '%s' "$APPLE_APP_SPECIFIC_PASSWORD" | gh secret set APPLE_APP_SPECIFIC_PASSWORD \
-     -R Dicklesworthstone/storage_ballast_helper --body-file -
+     -R Dicklesworthstone/storage_ballast_helper
+   base64 < "$APPLE_NOTARY_KEY_PATH" | gh secret set APPLE_NOTARY_KEY_P8_BASE64 \
+     -R Dicklesworthstone/storage_ballast_helper
+   printf '%s' "$APPLE_NOTARY_KEY_ID" | gh secret set APPLE_NOTARY_KEY_ID \
+     -R Dicklesworthstone/storage_ballast_helper
+   printf '%s' "$APPLE_NOTARY_ISSUER_ID" | gh secret set APPLE_NOTARY_ISSUER_ID \
+     -R Dicklesworthstone/storage_ballast_helper
    printf '%s' "$HOMEBREW_TAP_TOKEN" | gh secret set HOMEBREW_TAP_TOKEN \
-     -R Dicklesworthstone/storage_ballast_helper --body-file -
+     -R Dicklesworthstone/storage_ballast_helper
    gh secret list -R Dicklesworthstone/storage_ballast_helper
    ```
 
-Rotate the Developer ID certificate and app-specific password every 12 months,
-or immediately after any maintainer, runner, or secret exposure incident. During
-rotation, create and store the replacement secrets first, run the
+   The notary key path should point at the `.p8` App Store Connect API key
+   downloaded from Apple. Store the same key in the local keychain profile used
+   by release readiness diagnostics:
+
+   ```bash
+   xcrun notarytool store-credentials sbh-notary \
+     --key "$APPLE_NOTARY_KEY_PATH" \
+     --key-id "$APPLE_NOTARY_KEY_ID" \
+     --issuer "$APPLE_NOTARY_ISSUER_ID"
+   ```
+
+Rotate the Developer ID certificate and App Store Connect API key every 12
+months, or immediately after any maintainer, runner, or secret exposure
+incident. During rotation, create and store the replacement secrets first, run the
 `Developer ID Certificate Expiration` workflow manually, then publish the next
 tagged release only after the release workflow signs, notarizes, and verifies
 the binary with the new identity.
@@ -379,14 +390,15 @@ codesigning identity string, for example `Developer ID Application: Example LLC
 (TEAMID)`. When all credentials are present, the workflow imports the P12 into a
 temporary keychain, signs with Hardened Runtime, verifies that the binary was
 signed by a `Developer ID Application` authority, then submits the temporary ZIP
-with `xcrun notarytool submit`, extracts the submission id, polls `xcrun
-notarytool info` every 30 seconds for up to 30 minutes, and downloads `xcrun
-notarytool log` output on both success and failure. After Apple accepts the
-submission, the workflow runs `spctl -a -t execute -vv` against the signed
-binary before packaging the tarball, so Gatekeeper rejection fails the release
-instead of being discovered by an installer later. `Invalid`, `Rejected`, and
-timeout states fail the release with the notary log printed into the Actions
-output.
+with `xcrun notarytool submit --key "$APPLE_NOTARY_KEY_PATH" --key-id
+"$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID"`, extracts the
+submission id, polls `xcrun notarytool info` every 30 seconds for up to 30
+minutes, and downloads `xcrun notarytool log` output on both success and failure.
+After Apple accepts the submission, the workflow runs `spctl -a -t execute -vv`
+against the signed binary before packaging the tarball, so Gatekeeper rejection
+fails the release instead of being discovered by an installer later. `Invalid`,
+`Rejected`, and timeout states fail the release with the notary log printed into
+the Actions output.
 
 The `Developer ID Certificate Expiration` workflow runs nightly and on manual
 dispatch. It decodes `APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64`, extracts the
@@ -442,11 +454,11 @@ without scraping terminal text.
 The release doctor also prints a non-secret credential setup plan. The plan
 starts with the CSR/keychain request step now that Apple Developer Program
 enrollment is confirmed, then uses placeholder environment variables such as
-`$P12_PATH`, `$P12_PASSWORD`, `$APPLE_ID`, `$APPLE_TEAM_ID`,
-`$APPLE_APP_SPECIFIC_PASSWORD`, and `$HOMEBREW_TAP_TOKEN`; it never prints
-secret values. The GitHub secret commands use `--body-file -` so secret material
-can be piped from stdin instead of being stored in shell history. After
-completing the plan, rerun:
+`$P12_PATH`, `$P12_PASSWORD`, `$APPLE_NOTARY_KEY_PATH`,
+`$APPLE_NOTARY_KEY_ID`, `$APPLE_NOTARY_ISSUER_ID`, and
+`$HOMEBREW_TAP_TOKEN`; it never prints secret values. The GitHub secret commands
+read secret material from piped stdin instead of storing values in shell history.
+After completing the plan, rerun:
 
 ```bash
 sbh doctor --release --json

@@ -4309,9 +4309,9 @@ const RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS: &[&str] = &[
     "APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64",
     "APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD",
     "APPLE_DEVELOPER_ID_IDENTITY",
-    "APPLE_ID",
-    "APPLE_TEAM_ID",
-    "APPLE_APP_SPECIFIC_PASSWORD",
+    "APPLE_NOTARY_KEY_P8_BASE64",
+    "APPLE_NOTARY_KEY_ID",
+    "APPLE_NOTARY_ISSUER_ID",
     "HOMEBREW_TAP_TOKEN",
 ];
 
@@ -4474,7 +4474,7 @@ where
                 command_detail(&outcome)
             ),
             Some(format!(
-                "Create the profile with `xcrun notarytool store-credentials {RELEASE_DOCTOR_NOTARY_PROFILE}` using the Apple ID, Team ID, and app-specific password from docs/macos.md.",
+                "Create the profile with `xcrun notarytool store-credentials {RELEASE_DOCTOR_NOTARY_PROFILE}` using the App Store Connect API key from docs/macos.md.",
             )),
         ),
         Err(error) => doctor_check(
@@ -4799,33 +4799,33 @@ fn release_doctor_setup_steps() -> Vec<ReleaseDoctorSetupStep> {
             commands: vec![
                 "security find-identity -v -p codesigning".to_string(),
                 format!(
-                    "base64 < \"$P12_PATH\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 -R {RELEASE_REPOSITORY} --body-file -",
+                    "base64 < \"$P12_PATH\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 -R {RELEASE_REPOSITORY}",
                 ),
                 format!(
-                    "printf '%s' \"$P12_PASSWORD\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD -R {RELEASE_REPOSITORY} --body-file -",
+                    "printf '%s' \"$P12_PASSWORD\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD -R {RELEASE_REPOSITORY}",
                 ),
                 format!(
-                    "printf '%s' \"$DEVELOPER_ID_IDENTITY\" | gh secret set APPLE_DEVELOPER_ID_IDENTITY -R {RELEASE_REPOSITORY} --body-file -",
+                    "printf '%s' \"$DEVELOPER_ID_IDENTITY\" | gh secret set APPLE_DEVELOPER_ID_IDENTITY -R {RELEASE_REPOSITORY}",
                 ),
             ],
         },
         ReleaseDoctorSetupStep {
             id: "notary_credentials",
             title: "Notary credentials",
-            reason: "Create the local notarytool profile used by release readiness checks and store CI notarization credentials.",
+            reason: "Create the local notarytool profile used by release readiness checks and store App Store Connect API key secrets for CI notarization.",
             docs: "docs/macos.md#release-readiness-diagnostics",
             commands: vec![
                 format!(
-                    "xcrun notarytool store-credentials {RELEASE_DOCTOR_NOTARY_PROFILE} --apple-id \"$APPLE_ID\" --team-id \"$APPLE_TEAM_ID\" --password \"$APPLE_APP_SPECIFIC_PASSWORD\"",
+                    "xcrun notarytool store-credentials {RELEASE_DOCTOR_NOTARY_PROFILE} --key \"$APPLE_NOTARY_KEY_PATH\" --key-id \"$APPLE_NOTARY_KEY_ID\" --issuer \"$APPLE_NOTARY_ISSUER_ID\"",
                 ),
                 format!(
-                    "printf '%s' \"$APPLE_ID\" | gh secret set APPLE_ID -R {RELEASE_REPOSITORY} --body-file -",
+                    "base64 < \"$APPLE_NOTARY_KEY_PATH\" | gh secret set APPLE_NOTARY_KEY_P8_BASE64 -R {RELEASE_REPOSITORY}",
                 ),
                 format!(
-                    "printf '%s' \"$APPLE_TEAM_ID\" | gh secret set APPLE_TEAM_ID -R {RELEASE_REPOSITORY} --body-file -",
+                    "printf '%s' \"$APPLE_NOTARY_KEY_ID\" | gh secret set APPLE_NOTARY_KEY_ID -R {RELEASE_REPOSITORY}",
                 ),
                 format!(
-                    "printf '%s' \"$APPLE_APP_SPECIFIC_PASSWORD\" | gh secret set APPLE_APP_SPECIFIC_PASSWORD -R {RELEASE_REPOSITORY} --body-file -",
+                    "printf '%s' \"$APPLE_NOTARY_ISSUER_ID\" | gh secret set APPLE_NOTARY_ISSUER_ID -R {RELEASE_REPOSITORY}",
                 ),
             ],
         },
@@ -4836,7 +4836,7 @@ fn release_doctor_setup_steps() -> Vec<ReleaseDoctorSetupStep> {
             docs: "docs/macos.md#homebrew-and-install-paths",
             commands: vec![
                 format!(
-                    "printf '%s' \"$HOMEBREW_TAP_TOKEN\" | gh secret set HOMEBREW_TAP_TOKEN -R {RELEASE_REPOSITORY} --body-file -",
+                    "printf '%s' \"$HOMEBREW_TAP_TOKEN\" | gh secret set HOMEBREW_TAP_TOKEN -R {RELEASE_REPOSITORY}",
                 ),
                 format!("gh secret list -R {RELEASE_REPOSITORY} --json name,updatedAt,visibility",),
                 "sbh doctor --release --json".to_string(),
@@ -9867,6 +9867,7 @@ mod tests {
                 .message
                 .contains("APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64")
         );
+        assert!(secrets.message.contains("APPLE_NOTARY_KEY_P8_BASE64"));
         assert!(secrets.message.contains("HOMEBREW_TAP_TOKEN"));
         let tap = release_check_by_id(&report, "release.homebrew_tap");
         assert_eq!(tap.status, "WARN");
@@ -10211,13 +10212,12 @@ mod tests {
             "printf '%s' \"$P12_PASSWORD\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD",
             "printf '%s' \"$DEVELOPER_ID_IDENTITY\" | gh secret set APPLE_DEVELOPER_ID_IDENTITY",
             "xcrun notarytool store-credentials sbh-notary",
-            "printf '%s' \"$APPLE_ID\" | gh secret set APPLE_ID",
-            "printf '%s' \"$APPLE_TEAM_ID\" | gh secret set APPLE_TEAM_ID",
-            "printf '%s' \"$APPLE_APP_SPECIFIC_PASSWORD\" | gh secret set APPLE_APP_SPECIFIC_PASSWORD",
+            "base64 < \"$APPLE_NOTARY_KEY_PATH\" | gh secret set APPLE_NOTARY_KEY_P8_BASE64",
+            "printf '%s' \"$APPLE_NOTARY_KEY_ID\" | gh secret set APPLE_NOTARY_KEY_ID",
+            "printf '%s' \"$APPLE_NOTARY_ISSUER_ID\" | gh secret set APPLE_NOTARY_ISSUER_ID",
             "printf '%s' \"$HOMEBREW_TAP_TOKEN\" | gh secret set HOMEBREW_TAP_TOKEN",
             "gh secret list -R Dicklesworthstone/storage_ballast_helper --json name,updatedAt,visibility",
             "sbh doctor --release --json",
-            "--body-file -",
         ] {
             assert!(
                 all_commands.contains(required),
