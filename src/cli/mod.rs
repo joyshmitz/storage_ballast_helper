@@ -1969,7 +1969,7 @@ mod tests {
             "macos-platform",
             "macos-15-intel",
             "Do not treat queued CI as",
-            "0 valid identities found",
+            "one valid local",
             "spctl -a -t execute -vv",
             "sbh-notary",
             "HOMEBREW_TAP_SSH_KEY",

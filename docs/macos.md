@@ -472,8 +472,7 @@ enrollment is confirmed, then uses placeholder environment variables such as
 `$P12_PATH`, `$P12_PASSWORD`, `$APPLE_NOTARY_KEY_PATH`,
 `$APPLE_NOTARY_KEY_ID`, `$APPLE_NOTARY_ISSUER_ID`, and the generated
 `$HOME/.ssh/sbh-homebrew-tap-release` deploy key path; it never prints secret
-values. The GitHub secret commands read secret material from redirected stdin
-instead of storing values in shell history.
+values. The GitHub secret commands use redirected stdin instead of storing values in shell history.
 After completing the plan, rerun:
 
 ```bash
