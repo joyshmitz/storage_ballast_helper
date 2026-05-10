@@ -1021,6 +1021,87 @@ fn apply_resolved_service_to_wizard_answers(
     }
 }
 
+fn run_install_auto_dry_run_json(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
+    use storage_ballast_helper::cli::install::{InstallOptions, run_install_sequence_with_bundle};
+    use storage_ballast_helper::cli::update::run_update_sequence;
+    use storage_ballast_helper::cli::wizard::{WizardSummary, auto_answers_for_platform};
+
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+    let service_kind = platform.service_kind();
+    let sudo_command = format_sudo_rerun_command(cli, service_kind);
+    let service = resolve_install_service(args, service_kind, running_as_root(), &sudo_command)?;
+
+    let mut answers = auto_answers_for_platform(platform.as_ref());
+    apply_resolved_service_to_wizard_answers(&mut answers, service);
+    let config = answers.to_config();
+    let summary = WizardSummary {
+        config_path: config.paths.config_file.clone(),
+        config_written: false,
+        answers,
+        warnings: vec![],
+    };
+
+    let release_install = if service_kind == ServiceKind::Launchd && !args.from_source {
+        let opts = build_macos_release_install_options(args, &config, service);
+        let report = run_update_sequence(&opts);
+        let install_path = report.install_path.clone();
+        let validation = validate_macos_release_install_report(args, &report, install_path);
+        Some((report, validation))
+    } else {
+        None
+    };
+
+    let auto_answers = &summary.answers;
+    let install_report = run_install_sequence_with_bundle(
+        &InstallOptions {
+            config,
+            ballast_count: auto_answers.ballast_file_count,
+            ballast_size_bytes: auto_answers.ballast_file_size_bytes,
+            ballast_path: args.ballast_path.clone(),
+            dry_run: true,
+        },
+        args.offline.as_deref(),
+    );
+
+    let release_success = release_install
+        .as_ref()
+        .is_none_or(|(report, validation)| report.success && validation.is_ok());
+    let success = release_success && install_report.success;
+    let release_error = release_install
+        .as_ref()
+        .and_then(|(_, validation)| validation.as_ref().err())
+        .map(ToString::to_string);
+    let release_payload = release_install
+        .as_ref()
+        .map(|(report, _)| serde_json::to_value(report))
+        .transpose()?;
+
+    let payload = json!({
+        "command": "install",
+        "dry_run": true,
+        "auto": true,
+        "from_source": args.from_source,
+        "service": service.map(|service| {
+            json!({
+                "kind": service_kind_name(service.kind),
+                "scope": service.scope_name(),
+            })
+        }),
+        "wizard": summary,
+        "release_install": release_payload,
+        "release_error": release_error,
+        "install": install_report,
+        "success": success,
+    });
+    write_json_line(&payload)?;
+
+    if success {
+        Ok(())
+    } else {
+        Err(CliError::Runtime("install dry-run failed".to_string()))
+    }
+}
+
 fn resolve_uninstall_kind(
     args: &UninstallArgs,
     detected_kind: ServiceKind,
@@ -1282,6 +1363,10 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
         }
 
         return Ok(());
+    }
+
+    if args.auto && args.dry_run && output_mode(cli) == OutputMode::Json {
+        return run_install_auto_dry_run_json(cli, args);
     }
 
     // -- early platform gates -------------------------------------------------

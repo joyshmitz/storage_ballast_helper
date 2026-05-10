@@ -260,6 +260,50 @@ fn release_doctor_json_failure_exits_nonzero_after_parseable_report() {
 }
 
 #[test]
+fn install_auto_dry_run_json_is_single_payload() {
+    let result = common::run_cli_case(
+        "install_auto_dry_run_json_is_single_payload",
+        &["--json", "install", "--auto", "--dry-run", "--from-source"],
+    );
+
+    assert!(
+        result.status.success(),
+        "install --auto --dry-run --json should succeed without building or writing; stderr={:?}; log={}",
+        result.stderr,
+        result.log_path.display()
+    );
+    let stdout = result.stdout.trim();
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "JSON install dry-run must emit one machine-parseable payload, not a stream; stdout={stdout:?}; log={}",
+        result.log_path.display()
+    );
+
+    let payload: Value = serde_json::from_str(stdout).unwrap_or_else(|err| {
+        panic!(
+            "install dry-run JSON should parse as one object: {err}; stdout={stdout:?}; stderr={:?}; log={}",
+            result.stderr,
+            result.log_path.display()
+        )
+    });
+    assert_eq!(payload["command"].as_str(), Some("install"));
+    assert_eq!(payload["auto"].as_bool(), Some(true));
+    assert_eq!(payload["dry_run"].as_bool(), Some(true));
+    assert_eq!(payload["from_source"].as_bool(), Some(true));
+    assert_eq!(payload["success"].as_bool(), Some(true));
+    assert_eq!(
+        payload["wizard"]["answers"]["auto_mode"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(payload["install"]["dry_run"].as_bool(), Some(true));
+    assert!(
+        payload["release_install"].is_null(),
+        "from-source dry-run should not perform release metadata checks"
+    );
+}
+
+#[test]
 fn json_flag_accepted_by_status() {
     let result = common::run_cli_case("json_flag_accepted_by_status", &["status", "--json"]);
     // Status may succeed or fail depending on system state, but
