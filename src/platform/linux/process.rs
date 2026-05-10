@@ -4,10 +4,13 @@
 #![allow(missing_docs)]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::core::errors::{Result, SbhError};
-use crate::platform::types::{PalError, ProcessInfo, ProcessIo, SelfStats};
+use crate::core::paths::resolve_absolute_path;
+use crate::platform::types::{
+    MappedRegion, OpenFile, OpenFileKind, OpenFileMode, PalError, ProcessInfo, ProcessIo, SelfStats,
+};
 
 const PROC_SELF_STATUS: &str = "/proc/self/status";
 const PROC_SELF_STAT: &str = "/proc/self/stat";
@@ -34,23 +37,13 @@ struct IoCounters {
 }
 
 pub(super) fn read_process_list() -> Result<Vec<ProcessInfo>> {
-    let proc_dir = fs::read_dir(PROC_ROOT).map_err(|source| SbhError::Io {
-        path: PathBuf::from(PROC_ROOT),
-        source,
-    })?;
     let current_pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
     let boot_time_unix_ms = read_proc_file(PROC_STAT)
         .ok()
         .and_then(|raw| parse_proc_boot_time_unix_ms(&raw).ok());
     let mut processes = Vec::new();
 
-    for entry in proc_dir {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let Some(pid) = pid_from_proc_entry_name(&entry.file_name().to_string_lossy()) else {
-            continue;
-        };
+    for pid in proc_pids()? {
         if pid <= 0 || pid == current_pid {
             continue;
         }
@@ -65,6 +58,64 @@ pub(super) fn read_process_list() -> Result<Vec<ProcessInfo>> {
             .then_with(|| left.name.cmp(&right.name))
     });
     Ok(processes)
+}
+
+pub(super) fn read_open_files_under(root: &Path) -> Result<Vec<OpenFile>> {
+    let root = resolve_absolute_path(root);
+    let mut open_files = Vec::new();
+    for pid in proc_pids()? {
+        if pid > 0 {
+            open_files.extend(open_files_for_pid_under(pid, &root));
+        }
+    }
+    open_files.sort_by(|left, right| {
+        left.pid
+            .cmp(&right.pid)
+            .then_with(|| left.fd.cmp(&right.fd))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(open_files)
+}
+
+pub(super) fn read_executables_under(root: &Path) -> Result<Vec<ProcessInfo>> {
+    let root = resolve_absolute_path(root);
+    let boot_time_unix_ms = read_proc_file(PROC_STAT)
+        .ok()
+        .and_then(|raw| parse_proc_boot_time_unix_ms(&raw).ok());
+    let mut processes = proc_pids()?
+        .into_iter()
+        .filter(|pid| *pid > 0)
+        .filter_map(|pid| process_info_for_pid(pid, boot_time_unix_ms))
+        .filter(|process| {
+            process
+                .executable
+                .as_deref()
+                .is_some_and(|executable| resolve_absolute_path(executable).starts_with(&root))
+        })
+        .collect::<Vec<_>>();
+    processes.sort_by(|left, right| {
+        left.pid
+            .cmp(&right.pid)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(processes)
+}
+
+pub(super) fn read_mmap_regions_under(root: &Path) -> Result<Vec<MappedRegion>> {
+    let root = resolve_absolute_path(root);
+    let mut regions = Vec::new();
+    for pid in proc_pids()? {
+        if pid > 0 {
+            regions.extend(mapped_regions_for_pid_under(pid, &root));
+        }
+    }
+    regions.sort_by(|left, right| {
+        left.pid
+            .cmp(&right.pid)
+            .then_with(|| left.start_address.cmp(&right.start_address))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(regions)
 }
 
 pub(super) fn read_process_io(pid: i32) -> Result<ProcessIo> {
@@ -108,6 +159,19 @@ fn read_proc_file(path: &str) -> Result<String> {
         path: PathBuf::from(path),
         source,
     })
+}
+
+fn proc_pids() -> Result<Vec<i32>> {
+    let proc_dir = fs::read_dir(PROC_ROOT).map_err(|source| SbhError::Io {
+        path: PathBuf::from(PROC_ROOT),
+        source,
+    })?;
+    Ok(proc_dir
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            pid_from_proc_entry_name(&entry.file_name().to_string_lossy())
+        })
+        .collect())
 }
 
 fn pid_from_proc_entry_name(name: &str) -> Option<i32> {
@@ -172,6 +236,157 @@ fn read_command_line(proc_path: &std::path::Path) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(|part| String::from_utf8_lossy(part).into_owned())
         .collect()
+}
+
+fn open_files_for_pid_under(pid: i32, root: &Path) -> Vec<OpenFile> {
+    let proc_path = pid_proc_path(pid);
+    let fd_dir = proc_path.join("fd");
+    let Ok(entries) = fs::read_dir(&fd_dir) else {
+        return Vec::new();
+    };
+
+    entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            open_file_for_fd_under(pid, &proc_path, entry.path(), root)
+        })
+        .collect()
+}
+
+fn open_file_for_fd_under(
+    pid: i32,
+    proc_path: &Path,
+    fd_path: PathBuf,
+    root: &Path,
+) -> Option<OpenFile> {
+    let fd = fd_path
+        .file_name()
+        .and_then(|name| name.to_str())?
+        .parse::<i32>()
+        .ok()?;
+    let path = resolve_absolute_path(&fs::read_link(&fd_path).ok()?);
+    if !path.starts_with(root) {
+        return None;
+    }
+    Some(OpenFile {
+        pid,
+        path,
+        fd: Some(fd),
+        kind: open_file_kind_for_fd(&fd_path),
+        mode: open_file_mode_for_fd(proc_path, fd),
+    })
+}
+
+fn open_file_kind_for_fd(fd_path: &Path) -> OpenFileKind {
+    use std::os::unix::fs::FileTypeExt;
+
+    let Ok(metadata) = fs::metadata(fd_path) else {
+        return OpenFileKind::Unknown;
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_file() {
+        OpenFileKind::Regular
+    } else if file_type.is_dir() {
+        OpenFileKind::Directory
+    } else if file_type.is_socket() {
+        OpenFileKind::Socket
+    } else if file_type.is_fifo() {
+        OpenFileKind::Pipe
+    } else if file_type.is_char_device() || file_type.is_block_device() {
+        OpenFileKind::Device
+    } else {
+        OpenFileKind::Unknown
+    }
+}
+
+fn open_file_mode_for_fd(proc_path: &Path, fd: i32) -> OpenFileMode {
+    let fdinfo = proc_path.join("fdinfo").join(fd.to_string());
+    let Some(flags) = fs::read_to_string(fdinfo)
+        .ok()
+        .and_then(|raw| parse_fdinfo_flags(&raw))
+    else {
+        return OpenFileMode::Unknown;
+    };
+
+    if flags & u64::try_from(libc::O_PATH).unwrap_or(0) != 0 {
+        return OpenFileMode::Unknown;
+    }
+
+    match flags & u64::try_from(libc::O_ACCMODE).unwrap_or(0) {
+        value if value == u64::try_from(libc::O_WRONLY).unwrap_or(u64::MAX) => OpenFileMode::Write,
+        value if value == u64::try_from(libc::O_RDWR).unwrap_or(u64::MAX) => {
+            OpenFileMode::ReadWrite
+        }
+        _ => OpenFileMode::Read,
+    }
+}
+
+fn parse_fdinfo_flags(raw: &str) -> Option<u64> {
+    raw.lines().find_map(|line| {
+        let value = line.strip_prefix("flags:")?.trim();
+        u64::from_str_radix(value, 8)
+            .ok()
+            .or_else(|| value.parse::<u64>().ok())
+    })
+}
+
+fn mapped_regions_for_pid_under(pid: i32, root: &Path) -> Vec<MappedRegion> {
+    let maps_path = pid_proc_path(pid).join("maps");
+    let Ok(raw) = fs::read_to_string(maps_path) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .filter_map(|line| mapped_region_from_maps_line(pid, line, root))
+        .collect()
+}
+
+fn mapped_region_from_maps_line(pid: i32, line: &str, root: &Path) -> Option<MappedRegion> {
+    let (range, rest) = take_whitespace_field(line)?;
+    let (perms, rest) = take_whitespace_field(rest)?;
+    let (_, rest) = take_whitespace_field(rest)?;
+    let (_, rest) = take_whitespace_field(rest)?;
+    let (_, rest) = take_whitespace_field(rest)?;
+    let raw_path = rest.trim_start();
+    if raw_path.is_empty() || raw_path.starts_with('[') {
+        return None;
+    }
+    let (start, end) = parse_maps_address_range(range)?;
+    let path = resolve_absolute_path(Path::new(raw_path));
+    if !path.starts_with(root) {
+        return None;
+    }
+    Some(MappedRegion {
+        pid,
+        path,
+        start_address: Some(start),
+        end_address: Some(end),
+        protection: Some(maps_protection(perms)),
+    })
+}
+
+fn take_whitespace_field(input: &str) -> Option<(&str, &str)> {
+    let trimmed = input.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    Some((&trimmed[..end], &trimmed[end..]))
+}
+
+fn parse_maps_address_range(range: &str) -> Option<(u64, u64)> {
+    let (start, end) = range.split_once('-')?;
+    Some((
+        u64::from_str_radix(start, 16).ok()?,
+        u64::from_str_radix(end, 16).ok()?,
+    ))
+}
+
+fn maps_protection(perms: &str) -> String {
+    let mut protection = perms.chars().take(3).collect::<String>();
+    while protection.len() < 3 {
+        protection.push('-');
+    }
+    protection
 }
 
 fn parse_status_i32_field(raw: &str, key: &'static str) -> Option<i32> {
@@ -368,10 +583,13 @@ fn process_parse_error(method: &'static str, details: impl Into<String>) -> SbhE
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_proc_boot_time_unix_ms, parse_proc_io, parse_proc_self_stat, parse_proc_self_status,
-        parse_proc_start_time_unix_ms, read_process_io, read_process_list, read_self_stats,
-        ticks_to_micros,
+        mapped_region_from_maps_line, parse_fdinfo_flags, parse_proc_boot_time_unix_ms,
+        parse_proc_io, parse_proc_self_stat, parse_proc_self_status, parse_proc_start_time_unix_ms,
+        read_executables_under, read_mmap_regions_under, read_open_files_under, read_process_io,
+        read_process_list, read_self_stats, ticks_to_micros,
     };
+    use crate::core::paths::resolve_absolute_path;
+    use crate::platform::types::{OpenFileKind, OpenFileMode};
 
     #[test]
     fn parses_proc_status_memory_fields() {
@@ -476,5 +694,94 @@ mod tests {
         assert_eq!(io.pid, current_pid);
         assert_eq!(io.bytes_read_recent_15m, None);
         assert_eq!(io.bytes_written_recent_15m, None);
+    }
+
+    #[test]
+    fn parses_fdinfo_octal_flags() {
+        assert_eq!(
+            parse_fdinfo_flags("pos:\t0\nflags:\t0100002\nmnt_id:\t1\n"),
+            Some(0o100002)
+        );
+    }
+
+    #[test]
+    fn parses_linux_maps_line_with_path_containing_spaces() {
+        let root = std::path::Path::new("/tmp/sbh maps");
+        let region = mapped_region_from_maps_line(
+            42,
+            "7f0000000000-7f0000001000 r-xp 00000000 00:00 1 /tmp/sbh maps/bin",
+            root,
+        )
+        .expect("mapped region should parse under root");
+
+        assert_eq!(region.pid, 42);
+        assert_eq!(region.start_address, Some(0x7f0000000000));
+        assert_eq!(region.end_address, Some(0x7f0000001000));
+        assert_eq!(region.protection.as_deref(), Some("r-x"));
+        assert!(region.path.ends_with("bin"));
+    }
+
+    #[test]
+    fn linux_open_files_under_reports_current_process_tempfile_fd() {
+        let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        let path = dir.path().join("open.txt");
+        let _file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("temp file should open");
+        let resolved_path = resolve_absolute_path(&path);
+        let current_pid = i32::try_from(std::process::id()).expect("pid should fit i32");
+
+        let open_files =
+            read_open_files_under(dir.path()).expect("open files should be readable from /proc");
+        let actual = open_files
+            .iter()
+            .find(|open_file| open_file.pid == current_pid && open_file.path == resolved_path)
+            .unwrap_or_else(|| {
+                panic!("current process open file was not reported; open_files={open_files:?}")
+            });
+
+        assert_eq!(actual.kind, OpenFileKind::Regular);
+        assert_eq!(actual.mode, OpenFileMode::ReadWrite);
+        assert!(actual.fd.is_some());
+    }
+
+    #[test]
+    fn linux_executables_under_reports_current_process_executable() {
+        let exe = std::env::current_exe().expect("current executable should be known");
+        let root = exe
+            .parent()
+            .expect("current executable should have a parent");
+        let resolved_exe = resolve_absolute_path(&exe);
+        let current_pid = i32::try_from(std::process::id()).expect("pid should fit i32");
+
+        let processes =
+            read_executables_under(root).expect("executables should be readable from /proc");
+
+        assert!(processes.iter().any(|process| {
+            process.pid == current_pid && process.executable.as_ref() == Some(&resolved_exe)
+        }));
+    }
+
+    #[test]
+    fn linux_mmap_regions_under_reports_current_process_executable_mapping() {
+        let exe = std::env::current_exe().expect("current executable should be known");
+        let resolved_exe = resolve_absolute_path(&exe);
+        let current_pid = i32::try_from(std::process::id()).expect("pid should fit i32");
+
+        let regions =
+            read_mmap_regions_under(&resolved_exe).expect("maps should be readable from /proc");
+
+        assert!(regions.iter().any(|region| {
+            region.pid == current_pid
+                && region.path == resolved_exe
+                && region
+                    .protection
+                    .as_deref()
+                    .is_some_and(|mode| mode.contains('x'))
+        }));
     }
 }

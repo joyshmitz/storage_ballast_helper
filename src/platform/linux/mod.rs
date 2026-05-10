@@ -145,6 +145,18 @@ impl Platform for LinuxPal {
         process::read_process_io(pid)
     }
 
+    fn open_files_under(&self, path: &Path) -> Result<Vec<crate::platform::types::OpenFile>> {
+        process::read_open_files_under(path)
+    }
+
+    fn executables_under(&self, path: &Path) -> Result<Vec<ProcessInfo>> {
+        process::read_executables_under(path)
+    }
+
+    fn mmap_regions_under(&self, path: &Path) -> Result<Vec<crate::platform::types::MappedRegion>> {
+        process::read_mmap_regions_under(path)
+    }
+
     fn self_stats(&self) -> Result<SelfStats> {
         process::read_self_stats()
     }
