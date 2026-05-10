@@ -413,6 +413,10 @@ signals:
 3. `gh secret list -R Dicklesworthstone/storage_ballast_helper --json name` must
    report every release secret used by the GitHub Actions workflow, including
    `HOMEBREW_TAP_TOKEN`.
+4. `gh repo view Dicklesworthstone/homebrew-sbh --json nameWithOwner,defaultBranchRef`
+   must be able to see the Homebrew tap repository. The doctor also probes
+   `Formula/sbh.rb` and reports a warning, not a hard failure, when the tap
+   exists but the initial formula has not been published yet.
 
 For automation or handoff checks, use:
 
@@ -422,8 +426,9 @@ sbh doctor --release --json
 
 Treat any `FAIL` result as a release blocker. The command intentionally reports
 missing local signing identity, missing notary profile, and missing GitHub
-Actions secrets as explicit diagnostics so the external Apple/GitHub credential
-setup can be finished without inspecting workflow internals.
+Actions secrets or tap access as explicit diagnostics so the external
+Apple/GitHub credential setup can be finished without inspecting workflow
+internals.
 The JSON report includes an aggregate `ok` boolean plus `passed`, `warnings`, and
 `failed` counts so automation can gate on a stable summary before drilling into
 individual `checks`.

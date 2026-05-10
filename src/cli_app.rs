@@ -4292,6 +4292,7 @@ fn print_doctor_checks(checks: &[DoctorCheck]) {
 }
 
 const RELEASE_DOCTOR_NOTARY_PROFILE: &str = "sbh-notary";
+const RELEASE_HOMEBREW_TAP_REPOSITORY: &str = "Dicklesworthstone/homebrew-sbh";
 const RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS: &[&str] = &[
     "APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64",
     "APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD",
@@ -4314,6 +4315,7 @@ where
         release_developer_id_identity_check(run_command),
         release_notary_profile_check(run_command),
         release_github_secrets_check(run_command),
+        release_homebrew_tap_check(run_command),
     ];
     let failed = doctor_check_status_count(&checks, "FAIL");
 
@@ -4484,6 +4486,77 @@ where
             "FAIL",
             format!("failed to run gh secret list: {error}"),
             Some("Install GitHub CLI and authenticate before checking release secrets.".to_string()),
+        ),
+    }
+}
+
+fn release_homebrew_tap_check<F>(run_command: &F) -> DoctorCheck
+where
+    F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
+{
+    let repo_args = vec![
+        "repo".to_string(),
+        "view".to_string(),
+        RELEASE_HOMEBREW_TAP_REPOSITORY.to_string(),
+        "--json".to_string(),
+        "nameWithOwner,defaultBranchRef".to_string(),
+    ];
+
+    match run_command("gh", &repo_args) {
+        Ok(outcome) if outcome.success => {
+            let formula_args = vec![
+                "api".to_string(),
+                format!("repos/{RELEASE_HOMEBREW_TAP_REPOSITORY}/contents/Formula/sbh.rb"),
+                "--jq".to_string(),
+                ".name".to_string(),
+            ];
+
+            match run_command("gh", &formula_args) {
+                Ok(formula) if formula.success => doctor_check(
+                    "release.homebrew_tap",
+                    "Homebrew tap formula",
+                    "PASS",
+                    format!("{RELEASE_HOMEBREW_TAP_REPOSITORY} publishes Formula/sbh.rb"),
+                    None,
+                ),
+                Ok(formula) => doctor_check(
+                    "release.homebrew_tap",
+                    "Homebrew tap formula",
+                    "WARN",
+                    format!(
+                        "{RELEASE_HOMEBREW_TAP_REPOSITORY} is reachable, but Formula/sbh.rb is not published yet: {}",
+                        command_detail(&formula)
+                    ),
+                    Some("After the first signed release, verify that the Homebrew tap PR creates Formula/sbh.rb and brew install works from the tap.".to_string()),
+                ),
+                Err(error) => doctor_check(
+                    "release.homebrew_tap",
+                    "Homebrew tap formula",
+                    "WARN",
+                    format!(
+                        "{RELEASE_HOMEBREW_TAP_REPOSITORY} is reachable, but Formula/sbh.rb could not be checked: {error}"
+                    ),
+                    Some("Re-run with GitHub CLI network access, then verify the release workflow's Homebrew tap PR.".to_string()),
+                ),
+            }
+        }
+        Ok(outcome) => doctor_check(
+            "release.homebrew_tap",
+            "Homebrew tap formula",
+            "FAIL",
+            format!(
+                "Homebrew tap repository {RELEASE_HOMEBREW_TAP_REPOSITORY} is not accessible: {}",
+                command_detail(&outcome)
+            ),
+            Some("Create or grant access to the Homebrew tap repository before cutting a macOS release.".to_string()),
+        ),
+        Err(error) => doctor_check(
+            "release.homebrew_tap",
+            "Homebrew tap formula",
+            "FAIL",
+            format!("failed to run gh repo view for Homebrew tap: {error}"),
+            Some("Install GitHub CLI and authenticate before checking Homebrew tap readiness."
+                .to_string()),
         ),
     }
 }
@@ -9376,6 +9449,14 @@ mod tests {
             .expect("release doctor check should be present")
     }
 
+    fn args_start_with(args: &[String], prefix: &[&str]) -> bool {
+        args.len() >= prefix.len()
+            && args
+                .iter()
+                .zip(prefix.iter())
+                .all(|(arg, expected)| arg.as_str() == *expected)
+    }
+
     #[test]
     fn pal_doctor_report_includes_macos_specific_checks() {
         let platform = macos_doctor_mock(2 * 1024 * 1024 * 1024, FullDiskAccessState::Granted);
@@ -9450,7 +9531,7 @@ mod tests {
             .map(|name| json!({ "name": name }))
             .collect::<Vec<_>>();
         let secrets_json = serde_json::to_string(&secrets).unwrap();
-        let command = |program: &str, _args: &[String]| match program {
+        let command = |program: &str, args: &[String]| match program {
             "security" => Ok(DoctorCommandOutcome {
                 success: true,
                 exit_code: Some(0),
@@ -9463,10 +9544,26 @@ mod tests {
                 stdout: "{\"history\":[]}".to_string(),
                 stderr: String::new(),
             }),
-            "gh" => Ok(DoctorCommandOutcome {
+            "gh" if args_start_with(args, &["secret", "list"]) => Ok(DoctorCommandOutcome {
                 success: true,
                 exit_code: Some(0),
                 stdout: secrets_json.clone(),
+                stderr: String::new(),
+            }),
+            "gh" if args_start_with(args, &["repo", "view"]) => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: json!({
+                    "nameWithOwner": RELEASE_HOMEBREW_TAP_REPOSITORY,
+                    "defaultBranchRef": { "name": "main" }
+                })
+                .to_string(),
+                stderr: String::new(),
+            }),
+            "gh" if args_start_with(args, &["api"]) => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: "sbh.rb\n".to_string(),
                 stderr: String::new(),
             }),
             other => panic!("unexpected release doctor command: {other}"),
@@ -9475,7 +9572,7 @@ mod tests {
         let report = release_doctor_report_with_command_runner(&command);
 
         assert!(report.ok);
-        assert_eq!(report.passed, 3);
+        assert_eq!(report.passed, 4);
         assert_eq!(report.warnings, 0);
         assert_eq!(report.failed, 0);
         assert_eq!(report.repository, RELEASE_REPOSITORY);
@@ -9499,7 +9596,7 @@ mod tests {
 
     #[test]
     fn release_doctor_report_flags_missing_external_credentials() {
-        let command = |program: &str, _args: &[String]| match program {
+        let command = |program: &str, args: &[String]| match program {
             "security" => Ok(DoctorCommandOutcome {
                 success: true,
                 exit_code: Some(0),
@@ -9512,11 +9609,27 @@ mod tests {
                 stdout: String::new(),
                 stderr: "No Keychain password item found for profile: sbh-notary".to_string(),
             }),
-            "gh" => Ok(DoctorCommandOutcome {
+            "gh" if args_start_with(args, &["secret", "list"]) => Ok(DoctorCommandOutcome {
                 success: true,
                 exit_code: Some(0),
                 stdout: "[]".to_string(),
                 stderr: String::new(),
+            }),
+            "gh" if args_start_with(args, &["repo", "view"]) => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: json!({
+                    "nameWithOwner": RELEASE_HOMEBREW_TAP_REPOSITORY,
+                    "defaultBranchRef": { "name": "main" }
+                })
+                .to_string(),
+                stderr: String::new(),
+            }),
+            "gh" if args_start_with(args, &["api"]) => Ok(DoctorCommandOutcome {
+                success: false,
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: "Not Found".to_string(),
             }),
             other => panic!("unexpected release doctor command: {other}"),
         };
@@ -9525,7 +9638,7 @@ mod tests {
 
         assert!(!report.ok);
         assert_eq!(report.passed, 0);
-        assert_eq!(report.warnings, 0);
+        assert_eq!(report.warnings, 1);
         assert_eq!(report.failed, 3);
         assert_eq!(
             release_check_by_id(&report, "release.developer_id_identity").status,
@@ -9553,6 +9666,13 @@ mod tests {
                 .contains("APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64")
         );
         assert!(secrets.message.contains("HOMEBREW_TAP_TOKEN"));
+        let tap = release_check_by_id(&report, "release.homebrew_tap");
+        assert_eq!(tap.status, "WARN");
+        assert!(
+            tap.message.contains("Formula/sbh.rb is not published yet"),
+            "tap warning should explain missing formula: {}",
+            tap.message
+        );
     }
 
     #[test]

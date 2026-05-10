@@ -214,7 +214,7 @@ fn release_doctor_json_failure_exits_nonzero_after_parseable_report() {
     assert_eq!(payload["ok"].as_bool(), Some(false));
     assert_eq!(payload["passed"].as_u64(), Some(0));
     assert_eq!(payload["warnings"].as_u64(), Some(0));
-    assert_eq!(payload["failed"].as_u64(), Some(3));
+    assert_eq!(payload["failed"].as_u64(), Some(4));
 
     let checks = payload["checks"].as_array().unwrap_or_else(|| {
         panic!(
@@ -226,6 +226,7 @@ fn release_doctor_json_failure_exits_nonzero_after_parseable_report() {
         "release.developer_id_identity",
         "release.notary_profile",
         "release.github_secrets",
+        "release.homebrew_tap",
     ] {
         let status = checks
             .iter()

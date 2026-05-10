@@ -537,7 +537,7 @@ mod tests {
             HintVerbosity::Minimal,
         );
         assert_eq!(hints.len(), 1);
-        assert!(hints[0].shortcut == "!");
+        assert_eq!(hints[0].shortcut, "!");
     }
 
     // ── Incident banner ──

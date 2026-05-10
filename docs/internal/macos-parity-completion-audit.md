@@ -3,7 +3,7 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`
 Parent: `bd-r7m7`
-Last audited: 2026-05-10 02:55 UTC
+Last audited: 2026-05-10 04:14 UTC
 Evidence snapshot: the audit records the live head and run state observed at
 refresh time, but every audit-only commit makes those literals stale. Before any
 close decision, refresh the live head and newest run with:
@@ -255,7 +255,7 @@ operator-visible outcomes:
 | Blame attributes macOS disk growth to processes | `tests/integration_tests.rs::macos_synthetic_writer_surfaces_in_blame_top_rows`, `src/cli_app.rs::collect_blame_report_at`, macOS PAL libproc process I/O and open-file code | Covered by macOS integration test and PAL-backed implementation. |
 | CI validates Linux and macOS | `.github/workflows/ci.yml` jobs `check`, `unit`, `integration`, `linux-arm64`, `decision-plane`, `dashboard`, `e2e`, `macos-platform`, `macos-coverage`, `macos-benchmarks`, `stress`, `artifact-contract`, `provenance`, and `Homebrew Formula Validation` | Infrastructure exists. The macOS platform, coverage, and benchmark jobs are independent from the Ubuntu `check` job so Linux runner queueing cannot hide missing macOS proof. The inspected Intel macOS platform proof on `macos-15-intel` includes 54 integration tests, E2E smoke, APFS JSON status, ad-hoc hardened-runtime codesign, temporary-tap Homebrew install/test, release-doctor JSON capture, and diagnostic binary artifact verification. Final goal cannot close until the final head completes all required jobs green. `macos-13` has been replaced with `macos-15-intel` because GitHub retired the old runner label; `macos-latest` remains the arm64 lane. |
 | Docs explain install, configure, verify, and diagnose | `README.md`, `docs/macos.md`, `docs/macos-full-disk-access.md`, `docs/cleanup-rules-macos.md`, `docs/testing-and-logging.md`, sample configs in `docs/configs/` | Covered in docs. Keep docs update lint green for future CLI/config changes. |
-| Release is signed, notarized, Gatekeeper-assessed, and distributed through Homebrew | `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, `.github/macos/sbh.entitlements.plist`, `packaging/homebrew/Formula/sbh.rb`, `docs/macos.md` release diagnostics, `src/cli/mod.rs::release_workflow_notarizes_macos_binaries_asynchronously` | Workflow and docs exist. `bd-ykwh.20` added release-side `spctl -a -t execute -vv` before packaging. Live credentials and a successful tag release are still missing, so this is not complete. |
+| Release is signed, notarized, Gatekeeper-assessed, and distributed through Homebrew | `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, `.github/macos/sbh.entitlements.plist`, `packaging/homebrew/Formula/sbh.rb`, `docs/macos.md` release diagnostics, `src/cli/mod.rs::release_workflow_notarizes_macos_binaries_asynchronously` | Workflow and docs exist. `bd-ykwh.20` added release-side `spctl -a -t execute -vv` before packaging. `sbh doctor --release` now checks Homebrew tap access and warns when `Formula/sbh.rb` has not been published yet. Live credentials, a live tap formula, and a successful tag release are still missing, so this is not complete. |
 
 ## Protected-Path Daemon Regression
 
@@ -284,13 +284,19 @@ containing `bd-twgw` and `bd-j40b`, then restore the protected worktree files.
 ## Live Release Blocker Evidence
 
 The user confirmed Apple Developer Program enrollment, so enrollment itself is
-not the current blocker. Live checks at 2026-05-10 02:44 UTC still showed:
+not the current blocker. Live checks at 2026-05-10 04:14 UTC still showed:
 
 - `security find-identity -v -p codesigning`: `0 valid identities found`
 - `xcrun notarytool history --keychain-profile sbh-notary --output-format json`:
   missing `sbh-notary` keychain profile
 - `gh secret list --repo Dicklesworthstone/storage_ballast_helper --json name,updatedAt`:
   `[]`
+- `gh repo view Dicklesworthstone/homebrew-sbh --json nameWithOwner,defaultBranchRef,isPrivate`:
+  tap repository exists on `main`
+- `gh api repos/Dicklesworthstone/homebrew-sbh/contents/Formula`: only
+  `Formula/.gitkeep`; no live `Formula/sbh.rb` yet
+- `gh release list --repo Dicklesworthstone/storage_ballast_helper --limit 5`:
+  latest published release is still `v0.4.6`, not the current macOS parity head
 
 Remaining release blockers:
 
@@ -298,6 +304,7 @@ Remaining release blockers:
 - Configure the local `sbh-notary` notary profile.
 - Configure GitHub Actions secrets for release signing and notarization.
 - Configure `HOMEBREW_TAP_TOKEN` for the Homebrew formula PR workflow.
+- Publish or verify the Homebrew tap formula after the first signed release.
 - Run `sbh doctor --release --json` from the current build and require all
   release diagnostics to pass.
 
