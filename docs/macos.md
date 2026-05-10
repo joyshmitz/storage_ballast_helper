@@ -407,7 +407,8 @@ The release doctor does not print secret values. It checks only readiness
 signals:
 
 1. `security find-identity -v -p codesigning` must list a `Developer ID
-   Application` identity.
+   Application` identity. When `APPLE_DEVELOPER_ID_IDENTITY` is exported, that
+   exact configured identity must appear in the available signing identities.
 2. `xcrun notarytool history --keychain-profile sbh-notary --output-format json`
    must authenticate successfully with the configured keychain profile.
 3. `gh secret list -R Dicklesworthstone/storage_ballast_helper --json name` must

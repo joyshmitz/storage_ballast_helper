@@ -1380,6 +1380,8 @@ mod tests {
             "the same secret names",
             "APPLE_TEAM_ID",
             "security find-identity -v -p codesigning",
+            "When `APPLE_DEVELOPER_ID_IDENTITY` is exported",
+            "exact configured identity must appear",
             "base64 < \"$P12_PATH\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64",
             "gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD",
             "gh secret set APPLE_APP_SPECIFIC_PASSWORD",

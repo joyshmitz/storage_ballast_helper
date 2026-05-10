@@ -4324,7 +4324,7 @@ fn release_doctor_report_with_command_runner<F>(run_command: &F) -> ReleaseDocto
 where
     F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
 {
-    release_doctor_report_with_command_runner_and_env(run_command, &release_doctor_env_var)
+    release_doctor_report_with_command_runner_and_env(run_command, &|_| None)
 }
 
 fn release_doctor_report_with_command_runner_and_env<F, E>(
@@ -4336,7 +4336,7 @@ where
     E: Fn(&str) -> Option<String>,
 {
     let checks = vec![
-        release_developer_id_identity_check(run_command),
+        release_developer_id_identity_check(run_command, read_env),
         release_notary_profile_check(run_command),
         release_github_secrets_check(run_command, read_env),
         release_homebrew_tap_check(run_command),
@@ -4361,9 +4361,10 @@ fn release_doctor_env_var(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
-fn release_developer_id_identity_check<F>(run_command: &F) -> DoctorCheck
+fn release_developer_id_identity_check<F, E>(run_command: &F, read_env: &E) -> DoctorCheck
 where
     F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
+    E: Fn(&str) -> Option<String>,
 {
     let args = vec![
         "find-identity".to_string(),
@@ -4371,15 +4372,55 @@ where
         "-p".to_string(),
         "codesigning".to_string(),
     ];
+    let configured_identity = read_env("APPLE_DEVELOPER_ID_IDENTITY")
+        .map(|identity| identity.trim().to_string())
+        .filter(|identity| !identity.is_empty());
 
     match run_command("security", &args) {
-        Ok(outcome) if outcome.success && command_text(&outcome).contains("Developer ID Application") => {
+        Ok(outcome) if outcome.success => {
+            let output = command_text(&outcome);
+            if let Some(identity) = &configured_identity
+                && !output.contains(identity)
+            {
+                return doctor_check(
+                    "release.developer_id_identity",
+                    "Developer ID identity",
+                    "FAIL",
+                    format!(
+                        "configured APPLE_DEVELOPER_ID_IDENTITY was not found in available signing identities: {}",
+                        command_detail(&outcome)
+                    ),
+                    Some("Import the matching Developer ID Application certificate or update APPLE_DEVELOPER_ID_IDENTITY before cutting a release.".to_string()),
+                );
+            }
+
+            if output.contains("Developer ID Application") {
+                let message = configured_identity.as_ref().map_or_else(
+                    || "found a Developer ID Application signing identity".to_string(),
+                    |identity| {
+                        format!(
+                            "found configured Developer ID Application signing identity: {identity}"
+                        )
+                    },
+                );
+                return doctor_check(
+                    "release.developer_id_identity",
+                    "Developer ID identity",
+                    "PASS",
+                    message,
+                    None,
+                );
+            }
+
             doctor_check(
                 "release.developer_id_identity",
                 "Developer ID identity",
-                "PASS",
-                "found a Developer ID Application signing identity",
-                None,
+                "FAIL",
+                format!(
+                    "no Developer ID Application signing identity is available: {}",
+                    command_detail(&outcome)
+                ),
+                Some("Create a Developer ID Application certificate in the Apple Developer portal, export it as a password-protected .p12 with the private key, and set the release workflow secrets documented in docs/macos.md.".to_string()),
             )
         }
         Ok(outcome) => doctor_check(
@@ -9833,6 +9874,72 @@ mod tests {
             tap.message.contains("Formula/sbh.rb is not published yet"),
             "tap warning should explain missing formula: {}",
             tap.message
+        );
+    }
+
+    #[test]
+    fn release_doctor_report_fails_when_configured_developer_id_identity_is_absent() {
+        let secrets = RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS
+            .iter()
+            .map(|name| json!({ "name": name }))
+            .collect::<Vec<_>>();
+        let secrets_json = serde_json::to_string(&secrets).unwrap();
+        let command = |program: &str, args: &[String]| match program {
+            "security" => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: "1) ABCDEF \"Developer ID Application: Other LLC (OTHERID)\"".to_string(),
+                stderr: String::new(),
+            }),
+            "xcrun" => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: "{\"history\":[]}".to_string(),
+                stderr: String::new(),
+            }),
+            "gh" if args_start_with(args, &["secret", "list"]) => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: secrets_json.clone(),
+                stderr: String::new(),
+            }),
+            "gh" if args_start_with(args, &["repo", "view"]) => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: json!({
+                    "nameWithOwner": RELEASE_HOMEBREW_TAP_REPOSITORY,
+                    "defaultBranchRef": { "name": "main" }
+                })
+                .to_string(),
+                stderr: String::new(),
+            }),
+            "gh" if args_start_with(args, &["api"]) => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: "sbh.rb\n".to_string(),
+                stderr: String::new(),
+            }),
+            other => panic!("unexpected release doctor command: {other}"),
+        };
+
+        let report = release_doctor_report_with_command_runner_and_env(&command, &|key| {
+            (key == "APPLE_DEVELOPER_ID_IDENTITY")
+                .then(|| "Developer ID Application: Example LLC (TEAMID)".to_string())
+        });
+
+        assert!(!report.ok);
+        assert_eq!(report.passed, 3);
+        assert_eq!(report.warnings, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(release_readiness_label(&report), "blocked");
+        let identity = release_check_by_id(&report, "release.developer_id_identity");
+        assert_eq!(identity.status, "FAIL");
+        assert!(
+            identity
+                .message
+                .contains("configured APPLE_DEVELOPER_ID_IDENTITY"),
+            "identity failure should name the mismatched configured identity: {}",
+            identity.message
         );
     }
 
