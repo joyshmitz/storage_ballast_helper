@@ -1540,8 +1540,8 @@ mod tests {
             "full release workflow must not run on PRs"
         );
         assert!(
-            release_workflow.contains("needs: quality-gate"),
-            "release artifact builds must depend on the reusable CI quality gate"
+            release_workflow.contains("needs: [quality-gate, homebrew-tap-token-preflight]"),
+            "release artifact builds must depend on the reusable CI quality gate and tap-token preflight"
         );
         assert!(
             !release_workflow.contains("if: always() && !cancelled()"),
@@ -1777,6 +1777,11 @@ mod tests {
         let macos_guide = include_str!("../../docs/macos.md");
 
         for required in [
+            "homebrew-tap-token-preflight:",
+            "Homebrew Tap Token Preflight",
+            "Validate tap token before release work",
+            "HOMEBREW_TAP_TOKEN is required before release artifacts are built",
+            "needs: [quality-gate, homebrew-tap-token-preflight]",
             "homebrew-tap:",
             "Update Homebrew Tap",
             "HOMEBREW_TAP_REPOSITORY: Dicklesworthstone/homebrew-sbh",

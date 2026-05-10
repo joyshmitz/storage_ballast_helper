@@ -170,7 +170,8 @@ Homebrew is supported by the packaged formula skeleton and the
 SHA-256 placeholders from the release artifacts, and open a formula update PR
 using the `HOMEBREW_TAP_TOKEN` release secret. That secret must be a
 fine-grained PAT or GitHub App credential scoped to the tap; the release
-workflow rejects broad classic OAuth scopes before creating the formula update PR.
+workflow rejects broad classic OAuth scopes before building release artifacts or
+creating the formula update PR.
 After that PR is merged, the
 operator path is:
 

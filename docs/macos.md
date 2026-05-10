@@ -249,7 +249,8 @@ tap, and open or update a formula update PR. The release workflow requires a
 `HOMEBREW_TAP_TOKEN` secret with write access to the tap repository. Use a
 fine-grained PAT or GitHub App credential scoped to `Dicklesworthstone/homebrew-sbh`;
 the release workflow rejects broad classic OAuth scopes such as `repo`,
-`delete_repo`, `admin:org`, and `workflow`. The formula installs the prebuilt `sbh` binary, runs
+`delete_repo`, `admin:org`, and `workflow` before release artifacts are built or
+the formula update PR is created. The formula installs the prebuilt `sbh` binary, runs
 `sbh setup --verify --bin-dir <keg>/bin` as a post-install sanity check, defines
 a `brew services` daemon entry, and prints the Full Disk Access reminder in its
 caveats.
@@ -431,9 +432,10 @@ signals:
 4. `gh repo view Dicklesworthstone/homebrew-sbh --json nameWithOwner,defaultBranchRef`
    must be able to see the Homebrew tap repository and report `main` as
    `defaultBranchRef.name`. The release workflow additionally validates the
-   `HOMEBREW_TAP_TOKEN` secret with the REST API before checkout: the token must
-   resolve to `Dicklesworthstone/homebrew-sbh`, see `main` as the default branch,
-   have write-capable repository permissions, and avoid broad classic OAuth scopes.
+   `HOMEBREW_TAP_TOKEN` secret with the REST API in an early preflight before
+   release builds start, and again before tap checkout: the token must resolve to
+   `Dicklesworthstone/homebrew-sbh`, see `main` as the default branch, have
+   write-capable repository permissions, and avoid broad classic OAuth scopes.
    The doctor also probes `Formula/sbh.rb` and reports a warning, not a hard failure,
    when the tap exists but the initial formula has not been published yet.
 

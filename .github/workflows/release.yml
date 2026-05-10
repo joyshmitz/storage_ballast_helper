@@ -20,9 +20,65 @@ jobs:
     name: Quality Gate
     uses: ./.github/workflows/ci.yml
 
+  homebrew-tap-token-preflight:
+    name: Homebrew Tap Token Preflight
+    runs-on: ubuntu-latest
+    env:
+      HOMEBREW_TAP_REPOSITORY: Dicklesworthstone/homebrew-sbh
+      GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Validate tap token before release work
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is required before release artifacts are built"
+            exit 1
+          fi
+          gh api "repos/${HOMEBREW_TAP_REPOSITORY}" > homebrew-tap-token-repository.json
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          expected = os.environ["HOMEBREW_TAP_REPOSITORY"]
+          repo = json.loads(Path("homebrew-tap-token-repository.json").read_text())
+          if repo.get("full_name") != expected:
+              print(f"::error::HOMEBREW_TAP_TOKEN resolved {repo.get('full_name')!r}, expected {expected}")
+              sys.exit(1)
+          if repo.get("default_branch") != "main":
+              print(f"::error::{expected} default branch is {repo.get('default_branch')!r}, expected 'main'")
+              sys.exit(1)
+          permissions = repo.get("permissions") or {}
+          if not any(permissions.get(key) for key in ("admin", "maintain", "push")):
+              print(f"::error::HOMEBREW_TAP_TOKEN cannot push to {expected}; use a fine-grained token or GitHub App credential scoped to the tap")
+              sys.exit(1)
+          PY
+
+          gh api -i "repos/${HOMEBREW_TAP_REPOSITORY}" > homebrew-tap-token-api-response.txt
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+
+          response = Path("homebrew-tap-token-api-response.txt").read_text(errors="replace")
+          oauth_scopes = ""
+          for line in response.splitlines():
+              if line.lower().startswith("x-oauth-scopes:"):
+                  oauth_scopes = line.split(":", 1)[1].strip()
+                  break
+          scope_set = {scope.strip() for scope in oauth_scopes.split(",") if scope.strip()}
+          broad_scopes = {"repo", "delete_repo", "admin:org", "workflow"} & scope_set
+          Path("homebrew-tap-token-scope-summary.txt").write_text((oauth_scopes or "none") + "\n")
+          if broad_scopes:
+              print("::error::HOMEBREW_TAP_TOKEN uses broad classic OAuth scopes: " + ", ".join(sorted(broad_scopes)))
+              print("::error::Use a fine-grained PAT or GitHub App credential limited to Dicklesworthstone/homebrew-sbh")
+              sys.exit(1)
+          PY
+
   build:
     name: Build (${{ matrix.target }})
-    needs: quality-gate
+    needs: [quality-gate, homebrew-tap-token-preflight]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
