@@ -10104,6 +10104,19 @@ mod tests {
         assert_eq!(payload["command"].as_str(), Some("install"));
         assert_eq!(payload["service"]["kind"].as_str(), Some("launchd"));
         assert_eq!(payload["service"]["scope"].as_str(), Some("user"));
+        assert_eq!(payload["wizard"]["config_written"].as_bool(), Some(false));
+        assert_eq!(
+            payload["wizard"]["answers"]["service"].as_str(),
+            Some("Launchd")
+        );
+        assert_eq!(
+            payload["wizard"]["answers"]["user_scope"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            payload["wizard"]["answers"]["auto_mode"].as_bool(),
+            Some(true)
+        );
         assert_eq!(payload["release_install"]["dry_run"].as_bool(), Some(true));
         assert_eq!(
             payload["release_install"]["install_path"].as_str(),

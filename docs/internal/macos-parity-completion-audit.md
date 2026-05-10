@@ -3,7 +3,7 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`
 Parent: `bd-r7m7`
-Last audited: 2026-05-10 02:44 UTC
+Last audited: 2026-05-10 02:55 UTC
 Evidence snapshot: the audit records the live head and run state observed at
 refresh time, but every audit-only commit makes those literals stale. Before any
 close decision, refresh the live head and newest run with:
@@ -79,9 +79,11 @@ operator-visible outcomes:
   `bd-ykwh.13`.
 - `bd-ykwh.20` is closed; release CI now runs `spctl -a -t execute -vv` after
   notarization acceptance and before packaging macOS tarballs.
-- Live recheck at 2026-05-10 02:44 UTC showed the current pushed head
+- Live recheck at 2026-05-10 02:44 UTC inspected pushed head
   `0da51406462098b02aa58ee150a0ae632433981f`
-  (`bd-r7m7 refresh macos parity audit`). The newest CI run for that head,
+  (`bd-r7m7 refresh macos parity audit`). That was point-in-time evidence
+  before later audit-only commits and must not be read as the durable current
+  head. The newest CI run for that inspected head,
   `25617688046`, had completed `macOS Platform Tests (intel)` successfully on
   `macos-15-intel`; `Format + Lint`, `macOS Platform Tests (apple-silicon)`,
   `Homebrew Formula Validation`, `macOS Performance Budgets`, and
@@ -126,14 +128,15 @@ operator-visible outcomes:
   transform dry-run, `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_homebrew_signed_install_contract cargo test --lib ci_validates_homebrew_formula_generation -- --nocapture`,
   `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_homebrew_install_check cargo check --all-targets`, and
   `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_homebrew_install_clippy cargo clippy --all-targets -- -D warnings`.
-- Supplemental current-head proof while hosted CI was queued: local
+- Supplemental proof for the inspected source snapshot while hosted CI was
+  queued: local
   `cargo fmt --check` passed, and
   `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-ci-format-lint-0da5140 cargo clippy --no-default-features --features cli,daemon,sqlite --lib --bin sbh -- -D warnings"`
   returned remote exit 0. This does not replace hosted CI green status.
 - Local reproduction of the queued Homebrew Formula Validation lane also passed:
   `ruby -c packaging/homebrew/Formula/sbh.rb`, `brew style
   packaging/homebrew/Formula/sbh.rb`, generated-formula checksum placeholder
-  replacement in `/tmp/sbh-homebrew-validation.cHgudl`, `ruby -c` on the
+  replacement in a `/tmp/sbh-homebrew-validation.*` directory, `ruby -c` on the
   generated formula, and `brew style` on the generated formula all reported
   success. This does not replace the hosted `Homebrew Formula Validation` job or
   the real signed-release tap update.

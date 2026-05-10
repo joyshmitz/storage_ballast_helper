@@ -296,10 +296,15 @@ fn install_auto_dry_run_json_is_single_payload() {
         payload["wizard"]["answers"]["auto_mode"].as_bool(),
         Some(true)
     );
+    assert_eq!(payload["wizard"]["config_written"].as_bool(), Some(false));
     assert_eq!(payload["install"]["dry_run"].as_bool(), Some(true));
     assert!(
         payload["release_install"].is_null(),
         "from-source dry-run should not perform release metadata checks"
+    );
+    assert!(
+        payload["release_error"].is_null(),
+        "successful from-source dry-run should not include a release error"
     );
 }
 
