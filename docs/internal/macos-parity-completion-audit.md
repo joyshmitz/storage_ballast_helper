@@ -200,12 +200,14 @@ operator-visible outcomes:
   `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_ci_artifact_check cargo check --all-targets`
   and
   `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_ci_artifact_clippy cargo clippy --all-targets -- -D warnings`.
-- The JSON install dry-run regression found in the current-head macOS diagnostic
+- The JSON install dry-run regression found in the inspected macOS diagnostic
   artifact is fixed in source. `sbh --json install --auto --dry-run` now uses a
   single aggregate payload instead of emitting multiple top-level JSON objects,
   and a helper-level regression covers the macOS launchd/release-install shape
   where `release_install`, `wizard`, and `install` must remain nested in one
-  object. Focused proof passed with
+  object. Treat the artifact head/run as point-in-time evidence; refresh the
+  latest pushed head before using this as closeout proof. Focused proof passed
+  with
   `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-install-json-payload-test2 cargo test --no-default-features --features cli,daemon,sqlite --bin sbh install_auto_dry_run_json_payload_nests_macos_release_report -- --nocapture"`
   and
   `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-install-json-integration2 cargo test --no-default-features --features cli,daemon,sqlite --test integration_tests install_auto_dry_run_json_is_single_payload -- --nocapture"`.

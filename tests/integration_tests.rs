@@ -211,6 +211,10 @@ fn release_doctor_json_failure_exits_nonzero_after_parseable_report() {
     });
     assert_eq!(payload["repository"].as_str(), Some(RELEASE_REPOSITORY));
     assert_eq!(payload["notary_profile"].as_str(), Some("sbh-notary"));
+    assert_eq!(payload["ok"].as_bool(), Some(false));
+    assert_eq!(payload["passed"].as_u64(), Some(0));
+    assert_eq!(payload["warnings"].as_u64(), Some(0));
+    assert_eq!(payload["failed"].as_u64(), Some(3));
 
     let checks = payload["checks"].as_array().unwrap_or_else(|| {
         panic!(
