@@ -1007,6 +1007,42 @@ fn resolve_install_service(
     Ok(Some(ResolvedInstallService { kind, user_scope }))
 }
 
+fn resolve_wizard_install_service(
+    answers: &storage_ballast_helper::cli::wizard::WizardAnswers,
+    detected_kind: ServiceKind,
+    is_root: bool,
+    sudo_command: &str,
+) -> Result<Option<ResolvedInstallService>, CliError> {
+    use storage_ballast_helper::cli::wizard::ServiceChoice;
+
+    let kind = match answers.service {
+        ServiceChoice::Systemd => ServiceKind::Systemd,
+        ServiceChoice::Launchd => ServiceKind::Launchd,
+        ServiceChoice::None => return Ok(None),
+    };
+
+    if kind != detected_kind {
+        return Err(CliError::User(format!(
+            "Error: wizard selected {}, but this platform uses {}. Rerun the wizard and choose the detected service backend.",
+            service_kind_name(kind),
+            service_kind_name(detected_kind)
+        )));
+    }
+
+    if !answers.user_scope && !is_root {
+        return Err(CliError::User(service_system_scope_root_message(
+            "install",
+            kind,
+            sudo_command,
+        )));
+    }
+
+    Ok(Some(ResolvedInstallService {
+        kind,
+        user_scope: answers.user_scope,
+    }))
+}
+
 fn apply_resolved_service_to_wizard_answers(
     answers: &mut storage_ballast_helper::cli::wizard::WizardAnswers,
     service: Option<ResolvedInstallService>,
@@ -1344,13 +1380,23 @@ fn resolve_uninstall_user_scope(
 
 #[allow(clippy::too_many_lines)]
 fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
-    // -- wizard / auto mode ---------------------------------------------------
-    if args.wizard {
+    if args.auto && args.dry_run && output_mode(cli) == OutputMode::Json {
+        return run_install_auto_dry_run_json(cli, args);
+    }
+
+    // -- early platform gates -------------------------------------------------
+    // Validate service flags against the current platform BEFORE any expensive
+    // work (config loading, ballast provisioning, from-source builds).
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+    let service_kind = platform.service_kind();
+    let sudo_command = format_sudo_rerun_command(cli, service_kind);
+    let mut service =
+        resolve_install_service(args, service_kind, running_as_root(), &sudo_command)?;
+    let guided_install = if args.wizard {
         use storage_ballast_helper::cli::wizard::{
             WizardSummary, format_summary, run_interactive_for_platform, write_config,
         };
 
-        let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
         let stdin = io::stdin();
         let mut reader = stdin.lock();
         let mut writer = io::stderr();
@@ -1358,15 +1404,24 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
             .map_err(|e| CliError::User(format!("wizard cancelled: {e}")))?;
         drop(reader);
 
-        let config_path = answers.to_config().paths.config_file;
-
-        let config_written = write_config(&answers, &config_path)
-            .map_err(|e| CliError::Runtime(format!("failed to write config: {e}")))?;
-
+        service = resolve_wizard_install_service(
+            &answers,
+            service_kind,
+            running_as_root(),
+            &sudo_command,
+        )?;
+        let config = answers.to_config();
+        let config_path = config.paths.config_file.clone();
+        let config_written = if args.dry_run {
+            config_path
+        } else {
+            write_config(&answers, &config_path)
+                .map_err(|e| CliError::Runtime(format!("failed to write config: {e}")))?
+        };
         let summary = WizardSummary {
             answers,
             config_path: config_written,
-            config_written: true,
+            config_written: !args.dry_run,
             warnings: vec![],
         };
 
@@ -1380,21 +1435,8 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
             }
         }
 
-        return Ok(());
-    }
-
-    if args.auto && args.dry_run && output_mode(cli) == OutputMode::Json {
-        return run_install_auto_dry_run_json(cli, args);
-    }
-
-    // -- early platform gates -------------------------------------------------
-    // Validate service flags against the current platform BEFORE any expensive
-    // work (config loading, ballast provisioning, from-source builds).
-    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
-    let service_kind = platform.service_kind();
-    let sudo_command = format_sudo_rerun_command(cli, service_kind);
-    let service = resolve_install_service(args, service_kind, running_as_root(), &sudo_command)?;
-    let auto_install = if args.auto {
+        Some((summary, config))
+    } else if args.auto {
         use storage_ballast_helper::cli::wizard::{
             WizardSummary, auto_answers_for_platform, format_summary, write_config,
         };
@@ -1430,7 +1472,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     } else {
         None
     };
-    let config = auto_install.as_ref().map_or_else(
+    let config = guided_install.as_ref().map_or_else(
         || load_install_config(cli, service),
         |(_, config)| config.clone(),
     );
@@ -1512,7 +1554,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
             InstallOptions, format_install_report, run_install_sequence_with_bundle,
         };
 
-        let auto_answers = auto_install.as_ref().map(|(summary, _)| &summary.answers);
+        let auto_answers = guided_install.as_ref().map(|(summary, _)| &summary.answers);
         let ballast_count =
             auto_answers.map_or(args.ballast_count, |answers| answers.ballast_file_count);
         let ballast_size_bytes = if let Some(answers) = auto_answers {
@@ -10949,6 +10991,98 @@ mod tests {
 
         assert!(err.to_string().contains("requires root"));
         assert!(err.to_string().contains("--scope user"));
+        assert!(err.to_string().contains("sudo sbh install --scope system"));
+    }
+
+    fn test_wizard_answers(
+        service: storage_ballast_helper::cli::wizard::ServiceChoice,
+        user_scope: bool,
+    ) -> storage_ballast_helper::cli::wizard::WizardAnswers {
+        storage_ballast_helper::cli::wizard::WizardAnswers {
+            service,
+            user_scope,
+            watched_paths: vec![PathBuf::from("/tmp")],
+            ballast_preset: storage_ballast_helper::cli::wizard::BallastPreset::Medium,
+            ballast_file_count: 10,
+            ballast_file_size_bytes: 1_073_741_824,
+            auto_mode: false,
+        }
+    }
+
+    #[test]
+    fn wizard_selected_launchd_resolves_service_registration() {
+        let answers = test_wizard_answers(
+            storage_ballast_helper::cli::wizard::ServiceChoice::Launchd,
+            true,
+        );
+
+        let service = resolve_wizard_install_service(
+            &answers,
+            ServiceKind::Launchd,
+            false,
+            "sudo sbh install --scope system",
+        )
+        .expect("wizard launchd selection should resolve")
+        .expect("launchd selection should request service registration");
+
+        assert_eq!(service.kind, ServiceKind::Launchd);
+        assert!(service.user_scope);
+    }
+
+    #[test]
+    fn wizard_selected_none_skips_service_registration() {
+        let answers = test_wizard_answers(
+            storage_ballast_helper::cli::wizard::ServiceChoice::None,
+            true,
+        );
+
+        assert!(
+            resolve_wizard_install_service(
+                &answers,
+                ServiceKind::Launchd,
+                false,
+                "sudo sbh install --scope system",
+            )
+            .expect("wizard none selection should resolve")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn wizard_selected_wrong_service_errors_before_installing() {
+        let answers = test_wizard_answers(
+            storage_ballast_helper::cli::wizard::ServiceChoice::Systemd,
+            true,
+        );
+
+        let err = resolve_wizard_install_service(
+            &answers,
+            ServiceKind::Launchd,
+            false,
+            "sudo sbh install --scope system",
+        )
+        .expect_err("wizard should reject a service backend for a different platform");
+
+        assert!(err.to_string().contains("wizard selected systemd"));
+        assert!(err.to_string().contains("platform uses launchd"));
+    }
+
+    #[test]
+    fn wizard_system_scope_still_requires_root() {
+        let answers = test_wizard_answers(
+            storage_ballast_helper::cli::wizard::ServiceChoice::Launchd,
+            false,
+        );
+
+        let err = resolve_wizard_install_service(
+            &answers,
+            ServiceKind::Launchd,
+            false,
+            "sudo sbh install --scope system",
+        )
+        .expect_err("wizard system-scope launchd should require root");
+
+        assert!(err.to_string().contains("requires root"));
         assert!(err.to_string().contains("sudo sbh install --scope system"));
     }
 
