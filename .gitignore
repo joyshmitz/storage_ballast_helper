@@ -30,7 +30,6 @@ tmp/
 
 # Local planning state and caches
 .bv/
-.beads/
 
 # Ephemeral agent/runtime artifacts
 storage.sqlite3

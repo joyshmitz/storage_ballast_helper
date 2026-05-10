@@ -9,3 +9,7 @@
 # Temporary
 last-touched
 *.tmp
+
+# Local history and repair backups
+.br_history/
+.br_recovery/
