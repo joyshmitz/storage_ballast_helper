@@ -248,7 +248,8 @@ fn open_files_for_pid_under(pid: i32, root: &Path) -> Vec<OpenFile> {
     entries
         .filter_map(|entry| {
             let entry = entry.ok()?;
-            open_file_for_fd_under(pid, &proc_path, entry.path(), root)
+            let fd_path = entry.path();
+            open_file_for_fd_under(pid, &proc_path, &fd_path, root)
         })
         .collect()
 }
@@ -256,7 +257,7 @@ fn open_files_for_pid_under(pid: i32, root: &Path) -> Vec<OpenFile> {
 fn open_file_for_fd_under(
     pid: i32,
     proc_path: &Path,
-    fd_path: PathBuf,
+    fd_path: &Path,
     root: &Path,
 ) -> Option<OpenFile> {
     let fd = fd_path
@@ -264,7 +265,7 @@ fn open_file_for_fd_under(
         .and_then(|name| name.to_str())?
         .parse::<i32>()
         .ok()?;
-    let path = resolve_absolute_path(&fs::read_link(&fd_path).ok()?);
+    let path = resolve_absolute_path(&fs::read_link(fd_path).ok()?);
     if !path.starts_with(root) {
         return None;
     }
@@ -272,7 +273,7 @@ fn open_file_for_fd_under(
         pid,
         path,
         fd: Some(fd),
-        kind: open_file_kind_for_fd(&fd_path),
+        kind: open_file_kind_for_fd(fd_path),
         mode: open_file_mode_for_fd(proc_path, fd),
     })
 }
@@ -700,7 +701,7 @@ mod tests {
     fn parses_fdinfo_octal_flags() {
         assert_eq!(
             parse_fdinfo_flags("pos:\t0\nflags:\t0100002\nmnt_id:\t1\n"),
-            Some(0o100002)
+            Some(0o100_002)
         );
     }
 
@@ -715,8 +716,8 @@ mod tests {
         .expect("mapped region should parse under root");
 
         assert_eq!(region.pid, 42);
-        assert_eq!(region.start_address, Some(0x7f0000000000));
-        assert_eq!(region.end_address, Some(0x7f0000001000));
+        assert_eq!(region.start_address, Some(0x7f00_0000_0000));
+        assert_eq!(region.end_address, Some(0x7f00_0000_1000));
         assert_eq!(region.protection.as_deref(), Some("r-x"));
         assert!(region.path.ends_with("bin"));
     }
