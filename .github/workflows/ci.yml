@@ -5,10 +5,12 @@ on:
     branches: [main]
     paths-ignore:
       - '.beads/**'
+      - 'docs/internal/macos-parity-completion-audit.md'
   pull_request:
     branches: [main]
     paths-ignore:
       - '.beads/**'
+      - 'docs/internal/macos-parity-completion-audit.md'
   workflow_call:
 
 concurrency:

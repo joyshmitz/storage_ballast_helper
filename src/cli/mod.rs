@@ -1885,10 +1885,11 @@ mod tests {
             "group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
             "cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}",
             "workflow_call:",
+            "docs/internal/macos-parity-completion-audit.md",
         ] {
             assert!(
                 ci_workflow.contains(required),
-                "CI workflow must cancel superseded branch/PR runs without disabling workflow_call: {required}"
+                "CI workflow must cancel superseded branch/PR runs without disabling workflow_call or churning internal audit-only pushes: {required}"
             );
         }
 
