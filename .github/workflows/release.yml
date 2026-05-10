@@ -68,7 +68,7 @@ jobs:
                   oauth_scopes = line.split(":", 1)[1].strip()
                   break
           scope_set = {scope.strip() for scope in oauth_scopes.split(",") if scope.strip()}
-          broad_scopes = {"repo", "delete_repo", "admin:org", "workflow"} & scope_set
+          broad_scopes = {"repo", "public_repo", "delete_repo", "admin:org", "workflow"} & scope_set
           Path("homebrew-tap-token-scope-summary.txt").write_text((oauth_scopes or "none") + "\n")
           if broad_scopes:
               print("::error::HOMEBREW_TAP_TOKEN uses broad classic OAuth scopes: " + ", ".join(sorted(broad_scopes)))
@@ -441,7 +441,7 @@ jobs:
                   oauth_scopes = line.split(":", 1)[1].strip()
                   break
           scope_set = {scope.strip() for scope in oauth_scopes.split(",") if scope.strip()}
-          broad_scopes = {"repo", "delete_repo", "admin:org", "workflow"} & scope_set
+          broad_scopes = {"repo", "public_repo", "delete_repo", "admin:org", "workflow"} & scope_set
           Path("homebrew-tap-token-scope-summary.txt").write_text((oauth_scopes or "none") + "\n")
           if broad_scopes:
               print("::error::HOMEBREW_TAP_TOKEN uses broad classic OAuth scopes: " + ", ".join(sorted(broad_scopes)))

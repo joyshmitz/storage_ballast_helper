@@ -249,8 +249,8 @@ tap, and open or update a formula update PR. The release workflow requires a
 `HOMEBREW_TAP_TOKEN` secret with write access to the tap repository. Use a
 fine-grained PAT or GitHub App credential scoped to `Dicklesworthstone/homebrew-sbh`;
 the release workflow rejects broad classic OAuth scopes such as `repo`,
-`delete_repo`, `admin:org`, and `workflow` before release artifacts are built or
-the formula update PR is created. The formula installs the prebuilt `sbh` binary, runs
+`public_repo`, `delete_repo`, `admin:org`, and `workflow` before release
+artifacts are built or the formula update PR is created. The formula installs the prebuilt `sbh` binary, runs
 `sbh setup --verify --bin-dir <keg>/bin` as a post-install sanity check, defines
 a `brew services` daemon entry, and prints the Full Disk Access reminder in its
 caveats.

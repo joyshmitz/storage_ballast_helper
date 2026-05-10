@@ -1792,6 +1792,7 @@ mod tests {
             "HOMEBREW_TAP_TOKEN cannot push",
             "broad classic OAuth scopes",
             "delete_repo",
+            "public_repo",
             "admin:org",
             "Use a fine-grained PAT or GitHub App credential",
             "repository: ${{ env.HOMEBREW_TAP_REPOSITORY }}",
