@@ -3,7 +3,7 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`, `bd-r7m7.17`
 Parent: `bd-r7m7`
-Last audited: 2026-05-10 14:50 UTC
+Last audited: 2026-05-10 21:29 UTC
 Evidence snapshot: the audit records the live head and run state observed at
 refresh time, but every audit-only commit makes those literals stale. Before any
 close decision, refresh the live head and newest run with:
@@ -62,7 +62,7 @@ operator-visible outcomes:
 | Prompt requirement | Concrete artifacts inspected | Current audit result |
 |---|---|---|
 | "support mac os in addition to linux" | `src/platform/pal.rs`, `src/platform/linux`, `src/platform/macos`, Linux and macOS CI workflow lanes, macOS integration tests, existing Linux unit/integration lanes | Repo-side platform implementation exists for both OS families. Final proof still requires the final pushed head to complete all Linux and macOS CI jobs green. |
-| "everything automatically detected during installation" | `src/cli/install.rs`, `src/daemon/service.rs`, launchd/systemd workflow tests, `docs/macos.md`, Homebrew formula and release workflow | Installer/service detection is implemented and documented. Signed/notarized release install remains blocked by Developer ID, notary, Homebrew token, and final tag-release proof. |
+| "everything automatically detected during installation" | `src/cli/install.rs`, `src/daemon/service.rs`, launchd/systemd workflow tests, `docs/macos.md`, Homebrew formula and release workflow | Installer/service detection is implemented and documented. Developer ID and App Store Connect notary credentials are now configured, but signed/notarized release install still lacks a least-privilege Homebrew tap token, published tap formula, final tag-release proof, and green hosted CI for the final head. |
 | "while running" automatic platform behavior | PAL-backed status/check/scan/clean/blame/daemon paths, APFS/Mach/libproc macOS implementations, Linux PAL preservation, focused protection regression tests | Runtime behavior is routed through platform-specific implementations behind the shared CLI/PAL surface. Final proof still depends on queued hosted CI and live release diagnostics. |
 | "always does the right thing" / "just works" | Protected-path daemon tests, active-reference/open-file checks, sacred-path catalog, APFS accounting tests, launchd lifecycle test, docs and doctor diagnostics | Safety and diagnostics are covered in source and tests. Installed sbh 0.4.6 daemons must be upgraded/restarted because they predate the daemon protection fix. |
 | "additional testing infrastructure" | `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, macOS platform/coverage/benchmark jobs, Homebrew validation, release-doctor tests, protected-path tests | Infrastructure exists and focused local/rch proof passed, but the current hosted run is still queued and cannot be treated as final green proof. |
@@ -71,25 +71,29 @@ operator-visible outcomes:
 
 - `bd-r7m7` remains open. Use live `br epic status --json` output before any
   close decision because audit refresh beads change child counts.
-- `bd-ykwh` remains open. The remaining work is release-credential and Homebrew
-  distribution plumbing.
+- `bd-ykwh` remains open. Developer ID certificate/CI secret storage is now
+  complete, while Homebrew least-privilege token replacement, tap publication,
+  and signed/notarized tag-release proof remain open.
 - `br ready --json` returned `[]`; remaining open actionable release work was
   blocked or already assigned at audit time.
-- In-progress release blockers are `bd-ykwh.2`, `bd-ykwh.3`, `bd-ykwh.10`, and
-  `bd-ykwh.13`.
+- In-progress release blockers are `bd-r7m7.17`, `bd-ykwh.3`, `bd-ykwh.10`, and
+  `bd-ykwh.13`. `bd-ykwh.2` is now closed based on live Developer ID identity,
+  P12/signing secrets, App Store Connect notary API-key secrets, rotation docs,
+  and certificate-expiration workflow evidence.
 - `bd-r7m7.17` tracks the current hosted CI queue as an explicit external
   blocker for final macOS parity proof.
 - `bd-ykwh.20` is closed; release CI now runs `spctl -a -t execute -vv` after
   notarization acceptance and before packaging macOS tarballs.
-- Live recheck at 2026-05-10 14:50 UTC inspected current branch head
-  `1fea1347ba99ce6a444c78105c1e4f776b434a8f`. That head is Beads-only tracker
-  evidence, so the latest source CI run remains `25630326420` for source head
-  `35ab04dee7c0840742edbb83a70e10165bc187bf`.
-- Run `25630326420` is still queued overall. `macOS Platform Tests (intel)` is
-  completed success on `macos-15-intel`, while `Format + Lint`,
-  `Homebrew Formula Validation`, `macOS Coverage`, `macOS Performance Budgets`,
-  and `macOS Platform Tests (apple-silicon)` remain queued with no runner
-  assignment. This is not final green CI proof.
+- Live recheck at 2026-05-10 21:29 UTC inspected current branch head
+  `9fa4dbae7aade6332217c546abfec0983bb2961d`. The newest CI run for that head
+  is `25640194122`; it is still queued, and every job listed by GitHub remains
+  queued with no conclusion: `Homebrew Formula Validation`, `macOS Platform
+  Tests (apple-silicon)`, `Format + Lint`, `macOS Platform Tests (intel)`,
+  `macOS Performance Budgets`, and `macOS Coverage`. This is not final green CI
+  proof.
+- The previous source run `25630326420` reached useful partial macOS Intel
+  evidence, but it is no longer the latest source head and cannot close the
+  active objective by itself.
 - The Beads-only pushes through `1fea1347ba99ce6a444c78105c1e4f776b434a8f` did not
   start a new source CI run, confirming the current `.beads/**` path-ignore
   guard is working for tracker-only evidence updates.
@@ -104,6 +108,21 @@ operator-visible outcomes:
 - Additional CI gate checks found `pending_deployments` empty and workflow
   permissions set to `default_workflow_permissions=read`, so the run is not
   waiting on a GitHub environment approval or selected-actions policy gate.
+- Live release credential recheck at 2026-05-10 21:29 UTC found one valid local
+  signing identity, `Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)`,
+  and `xcrun notarytool history --keychain-profile sbh-notary --output-format
+  json` returned parseable history JSON. GitHub Actions secrets now include the
+  Developer ID P12, P12 password, signing identity, Team ID, and App Store
+  Connect API-key notarization secrets.
+- `HOMEBREW_TAP_TOKEN` is present but still not acceptable closeout evidence:
+  the currently authenticated local token reports broad classic scopes
+  `delete_repo`, `repo`, and `workflow`, and bead `bd-ykwh.13` requires replacing
+  the release secret with a fine-grained PAT or GitHub App credential scoped to
+  `Dicklesworthstone/homebrew-sbh`. The release workflow now rejects broad
+  classic OAuth scopes before tap checkout, so a signed release would fail this
+  gate until the token is replaced.
+- `Dicklesworthstone/homebrew-sbh` still returns HTTP 404 for
+  `Formula/sbh.rb`, so the public tap formula is not published yet.
 - Live recheck at 2026-05-10 02:44 UTC inspected pushed head
   `0da51406462098b02aa58ee150a0ae632433981f`
   (`bd-r7m7 refresh macos parity audit`). That was point-in-time evidence
