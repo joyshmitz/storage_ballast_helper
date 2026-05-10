@@ -3,10 +3,13 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`
 Parent: `bd-r7m7`
-Last audited: 2026-05-10 00:40 UTC
-Evidence snapshot: the audit intentionally avoids pinning exact commit hashes or
-GitHub Actions run ids because every audit-only commit would make those literals
-stale. Before any close decision, refresh the live head and newest run with:
+Last audited: 2026-05-10 02:23 UTC
+Evidence snapshot: the audit records the live head and run state observed at
+refresh time, but every audit-only commit makes those literals stale. Before any
+close decision, refresh the live head and newest run with:
+
+The audit avoids pinning exact commit hashes or GitHub Actions run ids as
+durable completion proof; any literal below is a point-in-time observation only.
 
 ```bash
 git rev-parse HEAD
@@ -76,12 +79,19 @@ operator-visible outcomes:
   `bd-ykwh.13`.
 - `bd-ykwh.20` is closed; release CI now runs `spctl -a -t execute -vv` after
   notarization acceptance and before packaging macOS tarballs.
-- Live recheck at 2026-05-10 00:40 UTC showed the newest CI run for the current
-  head still fully queued: `Format + Lint`, `macOS Platform Tests (intel)`,
+- Live recheck at 2026-05-10 02:23 UTC showed the then-current pushed head
+  `c6d82f1fe92c5c1667a818a90d25298eaabba8c4`
+  (`bd-r7m7 cover macos install dry-run payload`) with a clean worktree.
+  The newest CI run for that head, `25617532980`, was still fully queued:
+  `Format + Lint`, `macOS Platform Tests (intel)`,
   `macOS Platform Tests (apple-silicon)`, `Homebrew Formula Validation`,
   `macOS Performance Budgets`, and `macOS Coverage` had no runner assigned.
   Do not treat queued CI as proof; inspect the latest run for the final pushed
   head before closing.
+- The current CI runner labels were cross-checked against GitHub's hosted runner
+  reference at refresh time: `macos-latest` is an arm64/M1 macOS runner and
+  `macos-15-intel` is an Intel macOS runner, so the macOS matrix still covers
+  both architectures with current labels.
 - `br ready --json` returned `[]` at the same refresh. The open release beads
   remained blocked by live Apple/GitHub credentials or signed-release proof
   rather than by an unclaimed repo-side implementation task.
@@ -169,6 +179,19 @@ operator-visible outcomes:
   `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_ci_artifact_check cargo check --all-targets`
   and
   `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_ci_artifact_clippy cargo clippy --all-targets -- -D warnings`.
+- The JSON install dry-run regression found in the current-head macOS diagnostic
+  artifact is fixed in source. `sbh --json install --auto --dry-run` now uses a
+  single aggregate payload instead of emitting multiple top-level JSON objects,
+  and a helper-level regression covers the macOS launchd/release-install shape
+  where `release_install`, `wizard`, and `install` must remain nested in one
+  object. Focused proof passed with
+  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-install-json-payload-test2 cargo test --no-default-features --features cli,daemon,sqlite --bin sbh install_auto_dry_run_json_payload_nests_macos_release_report -- --nocapture"`
+  and
+  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-install-json-integration2 cargo test --no-default-features --features cli,daemon,sqlite --test integration_tests install_auto_dry_run_json_is_single_payload -- --nocapture"`.
+  Required compiler gates passed with `cargo fmt --check`, `git diff --check`,
+  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-install-json-payload-check cargo check --all-targets"`,
+  and
+  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-install-json-payload-clippy2 cargo clippy --all-targets -- -D warnings"`.
 - Static workflow validation passed locally with Ruby YAML parsing for
   `.github/workflows/ci.yml`, `.github/workflows/release.yml`, and
   `.github/workflows/cert-expiration.yml`. The expected CI quality gate,
@@ -184,7 +207,9 @@ operator-visible outcomes:
   `franken_node`, and `agentic_coding_flywheel_setup`. This makes the current
   `storage_ballast_helper` hosted-runner delay look account-wide rather than an
   isolated workflow syntax or repository-permission issue.
-- `storage_ballast_helper` has no self-hosted Actions runners registered, so
+- Live `gh api repos/Dicklesworthstone/storage_ballast_helper/actions/runners`
+  returned `total_count = 0`; `storage_ballast_helper` has no self-hosted
+  Actions runners registered, so
   the final CI gate currently depends entirely on GitHub-hosted runner capacity.
   Registering a self-hosted runner or canceling queued runs in other repositories
   would be remote state changes and needs explicit operator approval.
@@ -236,15 +261,13 @@ containing `bd-twgw` and `bd-j40b`, then restore the protected worktree files.
 ## Live Release Blocker Evidence
 
 The user confirmed Apple Developer Program enrollment, so enrollment itself is
-not the current blocker. Live checks at 2026-05-10 00:40 UTC still showed:
+not the current blocker. Live checks at 2026-05-10 02:23 UTC still showed:
 
 - `security find-identity -v -p codesigning`: `0 valid identities found`
 - `xcrun notarytool history --keychain-profile sbh-notary --output-format json`:
   missing `sbh-notary` keychain profile
 - `gh secret list --repo Dicklesworthstone/storage_ballast_helper --json name,updatedAt`:
   `[]`
-- No existing `~/Desktop/sbh-developer-id.certSigningRequest` file or keychain
-  item labeled `sbh Developer ID` was present.
 
 Remaining release blockers:
 
