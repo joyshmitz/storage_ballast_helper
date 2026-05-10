@@ -275,6 +275,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.2
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8.0.1

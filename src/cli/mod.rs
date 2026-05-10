@@ -1558,12 +1558,28 @@ mod tests {
             "sha256sum -c \"${checksum_file}\"",
             "shasum -a 256 -c \"${checksum_file}\"",
             "SHA256SUMS.txt",
+            "Collect provenance",
+            "dtolnay/rust-toolchain@stable",
+            "rustc --version",
+            "release-provenance.json",
         ] {
             assert!(
                 release_workflow.contains(required),
-                "release workflow must publish an aggregate checksum manifest: {required}"
+                "release workflow must publish release artifacts with deterministic provenance: {required}"
             );
         }
+
+        let publish_release = workflow_block(release_workflow, "  release:\n", "\n  homebrew-tap:");
+        let toolchain_setup = publish_release
+            .find("dtolnay/rust-toolchain@stable")
+            .expect("publish release job must install the Rust toolchain");
+        let provenance = publish_release
+            .find("Collect provenance")
+            .expect("publish release job must collect provenance");
+        assert!(
+            toolchain_setup < provenance,
+            "release provenance must not rely on ambient runner rustc"
+        );
     }
 
     #[test]
