@@ -4354,7 +4354,7 @@ const RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS: &[&str] = &[
     "APPLE_NOTARY_KEY_P8_BASE64",
     "APPLE_NOTARY_KEY_ID",
     "APPLE_NOTARY_ISSUER_ID",
-    "HOMEBREW_TAP_TOKEN",
+    "HOMEBREW_TAP_SSH_KEY",
 ];
 
 fn release_doctor_report() -> ReleaseDoctorReport {
@@ -4747,7 +4747,7 @@ where
                         "{RELEASE_HOMEBREW_TAP_REPOSITORY} is reachable, but Formula/sbh.rb is not published yet: {}",
                         command_detail(&formula)
                     ),
-                    Some("After the first signed release, verify that the Homebrew tap PR creates Formula/sbh.rb and brew install works from the tap.".to_string()),
+                    Some("After the first signed release, verify that the Homebrew tap update creates Formula/sbh.rb and brew install works from the tap.".to_string()),
                 ),
                 Err(error) => doctor_check(
                     "release.homebrew_tap",
@@ -4756,7 +4756,7 @@ where
                     format!(
                         "{RELEASE_HOMEBREW_TAP_REPOSITORY} is reachable, but Formula/sbh.rb could not be checked: {error}"
                     ),
-                    Some("Re-run with GitHub CLI network access, then verify the release workflow's Homebrew tap PR.".to_string()),
+                    Some("Re-run with GitHub CLI network access, then verify the release workflow's Homebrew tap update.".to_string()),
                 ),
             }
         }
@@ -4872,13 +4872,17 @@ fn release_doctor_setup_steps() -> Vec<ReleaseDoctorSetupStep> {
             ],
         },
         ReleaseDoctorSetupStep {
-            id: "homebrew_tap_token",
-            title: "Homebrew tap token",
-            reason: "Store the least-privilege token that lets the release workflow open formula update pull requests.",
+            id: "homebrew_tap_deploy_key",
+            title: "Homebrew tap deploy key",
+            reason: "Store the repository-scoped deploy key that lets the release workflow publish formula updates to the Homebrew tap.",
             docs: "docs/macos.md#homebrew-and-install-paths",
             commands: vec![
                 format!(
-                    "printf '%s' \"$HOMEBREW_TAP_TOKEN\" | gh secret set HOMEBREW_TAP_TOKEN -R {RELEASE_REPOSITORY}",
+                    "ssh-keygen -t ed25519 -C \"sbh Homebrew tap release\" -f \"$HOME/.ssh/sbh-homebrew-tap-release\" -N \"\"",
+                ),
+                "gh api -X POST repos/Dicklesworthstone/homebrew-sbh/keys -f title=\"sbh release workflow\" -f key=\"$(cat \"$HOME/.ssh/sbh-homebrew-tap-release.pub\")\" -F read_only=false".to_string(),
+                format!(
+                    "gh secret set HOMEBREW_TAP_SSH_KEY -R {RELEASE_REPOSITORY} < \"$HOME/.ssh/sbh-homebrew-tap-release\"",
                 ),
                 format!("gh secret list -R {RELEASE_REPOSITORY} --json name,updatedAt,visibility",),
                 "sbh doctor --release --json".to_string(),
@@ -9832,7 +9836,7 @@ mod tests {
                 "developer_id_csr",
                 "developer_id_certificate",
                 "notary_credentials",
-                "homebrew_tap_token"
+                "homebrew_tap_deploy_key"
             ]
         );
     }
@@ -9910,7 +9914,7 @@ mod tests {
                 .contains("APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64")
         );
         assert!(secrets.message.contains("APPLE_NOTARY_KEY_P8_BASE64"));
-        assert!(secrets.message.contains("HOMEBREW_TAP_TOKEN"));
+        assert!(secrets.message.contains("HOMEBREW_TAP_SSH_KEY"));
         let tap = release_check_by_id(&report, "release.homebrew_tap");
         assert_eq!(tap.status, "WARN");
         assert!(
@@ -9993,7 +9997,7 @@ mod tests {
             .map(|secret| (release_secret_presence_env_key(secret), "true".to_string()))
             .collect::<HashMap<_, _>>();
         env.insert(
-            release_secret_presence_env_key("HOMEBREW_TAP_TOKEN"),
+            release_secret_presence_env_key("HOMEBREW_TAP_SSH_KEY"),
             "false".to_string(),
         );
 
@@ -10043,13 +10047,13 @@ mod tests {
         let secrets = release_check_by_id(&report, "release.github_secrets");
         assert_eq!(secrets.status, "FAIL");
         assert!(secrets.message.contains("CI secret presence flags"));
-        assert!(secrets.message.contains("HOMEBREW_TAP_TOKEN"));
+        assert!(secrets.message.contains("HOMEBREW_TAP_SSH_KEY"));
     }
 
     #[test]
     fn release_doctor_report_rejects_invalid_ci_secret_presence_flags() {
         let env = std::iter::once((
-            release_secret_presence_env_key("HOMEBREW_TAP_TOKEN"),
+            release_secret_presence_env_key("HOMEBREW_TAP_SSH_KEY"),
             "maybe".to_string(),
         ))
         .collect::<HashMap<_, _>>();
@@ -10257,7 +10261,9 @@ mod tests {
             "base64 < \"$APPLE_NOTARY_KEY_PATH\" | gh secret set APPLE_NOTARY_KEY_P8_BASE64",
             "printf '%s' \"$APPLE_NOTARY_KEY_ID\" | gh secret set APPLE_NOTARY_KEY_ID",
             "printf '%s' \"$APPLE_NOTARY_ISSUER_ID\" | gh secret set APPLE_NOTARY_ISSUER_ID",
-            "printf '%s' \"$HOMEBREW_TAP_TOKEN\" | gh secret set HOMEBREW_TAP_TOKEN",
+            "ssh-keygen -t ed25519 -C \"sbh Homebrew tap release\"",
+            "gh api -X POST repos/Dicklesworthstone/homebrew-sbh/keys",
+            "gh secret set HOMEBREW_TAP_SSH_KEY",
             "gh secret list -R Dicklesworthstone/storage_ballast_helper --json name,updatedAt,visibility",
             "sbh doctor --release --json",
         ] {

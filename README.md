@@ -167,13 +167,12 @@ sudo sbh doctor --pal
 Homebrew is supported by the packaged formula skeleton and the
 `Dicklesworthstone/homebrew-sbh` tap. Tagged releases copy
 `packaging/homebrew/Formula/sbh.rb` into the tap, replace the per-architecture
-SHA-256 placeholders from the release artifacts, and open a formula update PR
-using the `HOMEBREW_TAP_TOKEN` release secret. That secret must be a
-fine-grained PAT or GitHub App credential scoped to the tap; the release
-workflow rejects broad classic OAuth scopes such as `repo`, `public_repo`, and
-`workflow` before building release artifacts or creating the formula update PR.
-After that PR is merged, the
-operator path is:
+SHA-256 placeholders from the release artifacts, and publish the formula
+update to the tap using the `HOMEBREW_TAP_SSH_KEY` release secret. That secret is
+the private half of a write-enabled deploy key scoped only to the tap repository;
+the release workflow verifies the key can see `main` and dry-runs a branch push
+before building release artifacts. After the tap update lands, the operator path
+is:
 
 ```bash
 brew tap Dicklesworthstone/sbh

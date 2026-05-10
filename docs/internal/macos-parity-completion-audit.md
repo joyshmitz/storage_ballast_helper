@@ -3,7 +3,7 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`, `bd-r7m7.17`
 Parent: `bd-r7m7`
-Last audited: 2026-05-10 21:29 UTC
+Last audited: 2026-05-10 23:10 UTC
 Evidence snapshot: the audit records the live head and run state observed at
 refresh time, but every audit-only commit makes those literals stale. Before any
 close decision, refresh the live head and newest run with:
@@ -62,7 +62,7 @@ operator-visible outcomes:
 | Prompt requirement | Concrete artifacts inspected | Current audit result |
 |---|---|---|
 | "support mac os in addition to linux" | `src/platform/pal.rs`, `src/platform/linux`, `src/platform/macos`, Linux and macOS CI workflow lanes, macOS integration tests, existing Linux unit/integration lanes | Repo-side platform implementation exists for both OS families. Final proof still requires the final pushed head to complete all Linux and macOS CI jobs green. |
-| "everything automatically detected during installation" | `src/cli/install.rs`, `src/daemon/service.rs`, launchd/systemd workflow tests, `docs/macos.md`, Homebrew formula and release workflow | Installer/service detection is implemented and documented. Developer ID and App Store Connect notary credentials are now configured, but signed/notarized release install still lacks a least-privilege Homebrew tap token, published tap formula, final tag-release proof, and green hosted CI for the final head. |
+| "everything automatically detected during installation" | `src/cli/install.rs`, `src/daemon/service.rs`, launchd/systemd workflow tests, `docs/macos.md`, Homebrew formula and release workflow | Installer/service detection is implemented and documented. Developer ID, App Store Connect notary credentials, and a repository-scoped Homebrew tap deploy key are now configured, but signed/notarized release install still lacks a published tap formula, final tag-release proof, and green hosted CI for the final head. |
 | "while running" automatic platform behavior | PAL-backed status/check/scan/clean/blame/daemon paths, APFS/Mach/libproc macOS implementations, Linux PAL preservation, focused protection regression tests | Runtime behavior is routed through platform-specific implementations behind the shared CLI/PAL surface. Final proof still depends on queued hosted CI and live release diagnostics. |
 | "always does the right thing" / "just works" | Protected-path daemon tests, active-reference/open-file checks, sacred-path catalog, APFS accounting tests, launchd lifecycle test, docs and doctor diagnostics | Safety and diagnostics are covered in source and tests. Installed sbh 0.4.6 daemons must be upgraded/restarted because they predate the daemon protection fix. |
 | "additional testing infrastructure" | `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, macOS platform/coverage/benchmark jobs, Homebrew validation, release-doctor tests, protected-path tests | Infrastructure exists and focused local/rch proof passed, but the current hosted run is still queued and cannot be treated as final green proof. |
@@ -72,8 +72,9 @@ operator-visible outcomes:
 - `bd-r7m7` remains open. Use live `br epic status --json` output before any
   close decision because audit refresh beads change child counts.
 - `bd-ykwh` remains open. Developer ID certificate/CI secret storage is now
-  complete, while Homebrew least-privilege token replacement, tap publication,
-  and signed/notarized tag-release proof remain open.
+  complete, and the Homebrew release credential has been replaced with a
+  repository-scoped deploy key. Tap publication and signed/notarized tag-release
+  proof remain open.
 - `br ready --json` returned `[]`; remaining open actionable release work was
   blocked or already assigned at audit time.
 - In-progress release blockers are `bd-r7m7.17`, `bd-ykwh.3`, `bd-ykwh.10`, and
@@ -108,19 +109,19 @@ operator-visible outcomes:
 - Additional CI gate checks found `pending_deployments` empty and workflow
   permissions set to `default_workflow_permissions=read`, so the run is not
   waiting on a GitHub environment approval or selected-actions policy gate.
-- Live release credential recheck at 2026-05-10 21:29 UTC found one valid local
+- Live release credential recheck at 2026-05-10 23:10 UTC found one valid local
   signing identity, `Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)`,
   and `xcrun notarytool history --keychain-profile sbh-notary --output-format
   json` returned parseable history JSON. GitHub Actions secrets now include the
   Developer ID P12, P12 password, signing identity, Team ID, and App Store
   Connect API-key notarization secrets.
-- `HOMEBREW_TAP_TOKEN` is present but still not acceptable closeout evidence:
-  the currently authenticated local token reports broad classic scopes
-  `delete_repo`, `repo`, and `workflow`, and bead `bd-ykwh.13` requires replacing
-  the release secret with a fine-grained PAT or GitHub App credential scoped to
-  `Dicklesworthstone/homebrew-sbh`. The release workflow now rejects broad
-  classic OAuth scopes before tap checkout, so a signed release would fail this
-  gate until the token is replaced.
+- `HOMEBREW_TAP_SSH_KEY` is now configured in GitHub Actions. The tap repository
+  has a write-enabled deploy key named `sbh release workflow deploy key
+  2026-05-10`, and local Git/SSH validation confirmed the key sees `main` and
+  passes a dry-run branch push to `Dicklesworthstone/homebrew-sbh` without
+  mutating the remote. The old tap-token secret may still exist as an unused
+  legacy secret, but the workflows and release doctor now require the SSH deploy
+  key instead.
 - `Dicklesworthstone/homebrew-sbh` still returns HTTP 404 for
   `Formula/sbh.rb`, so the public tap formula is not published yet.
 - Live recheck at 2026-05-10 02:44 UTC inspected pushed head
@@ -157,8 +158,8 @@ operator-visible outcomes:
   Intel macOS lane's `Exercise Homebrew formula install from current signed
   binary` step passed after creating a temporary `sbh/local-ci` tap, validating
   generated formula syntax, installing from the current ad-hoc-signed binary,
-  and running `brew test`. The real tap install still depends on signed release
-  credentials, `HOMEBREW_TAP_TOKEN`, and a published `Formula/sbh.rb`.
+  and running `brew test`. The real tap install still depends on a signed tag
+  release publishing `Formula/sbh.rb` through the configured deploy key.
 - The current CI runner labels were cross-checked against GitHub's hosted runner
   reference at refresh time: `macos-latest` is an arm64/M1 macOS runner and
   `macos-15-intel` is an Intel macOS runner, so the macOS matrix still covers
@@ -245,12 +246,12 @@ operator-visible outcomes:
 - Focused release workflow contract proof passed with
   `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_workflow_contract_proof cargo test --lib workflow -- --nocapture`.
   The run reported 13 passed tests, including Developer ID import, hardened
-  runtime signing, async notarization, PR ad-hoc signing, Homebrew tap PR update,
+  runtime signing, async notarization, PR ad-hoc signing, Homebrew tap update,
   and CI cancellation behavior.
 - Focused Homebrew contract proof passed with
   `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_homebrew_contract_proof cargo test --lib homebrew -- --nocapture`.
   The run reported 5 passed tests covering formula skeleton asset names,
-  checksum marker replacement, CI formula generation, tap PR updates, and
+  checksum marker replacement, CI formula generation, tap updates, and
   Homebrew install-path discovery.
 - Focused macOS CLI auto-detection proof passed with
   `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_bin_macos_proof cargo test --bin sbh macos -- --nocapture`.
@@ -367,15 +368,15 @@ containing `bd-twgw` and `bd-j40b`, then restore the protected worktree files.
 ## Live Release Blocker Evidence
 
 The user confirmed Apple Developer Program enrollment, so enrollment itself is
-not the current blocker. Live checks at 2026-05-10 14:07 UTC still showed:
+not the current blocker. Live checks at 2026-05-10 23:10 UTC now show:
 
-- `security find-identity -v -p codesigning`: `0 valid identities found`
+- `security find-identity -v -p codesigning`: one valid Developer ID
+  Application identity for `Jeffrey Emanuel (AU8V2Z6NKY)`
 - `xcrun notarytool history --keychain-profile sbh-notary --output-format json`:
-  missing `sbh-notary` keychain profile
-- `gh secret list --repo Dicklesworthstone/storage_ballast_helper --json name,updatedAt,visibility`:
-  `[]`
-- `gh repo view Dicklesworthstone/homebrew-sbh --json nameWithOwner,defaultBranchRef,isPrivate`:
-  tap repository exists on `main`
+  parseable history JSON, confirming the notary profile authenticates
+- `gh secret list --repo Dicklesworthstone/storage_ballast_helper`: release
+  signing, notarization, identity, team, and Homebrew tap deploy-key secrets are
+  present
 - `gh api repos/Dicklesworthstone/homebrew-sbh/contents/Formula`: only
   `Formula/.gitkeep`; no live `Formula/sbh.rb` yet
 - `gh release list --repo Dicklesworthstone/storage_ballast_helper --limit 5`:
@@ -383,10 +384,6 @@ not the current blocker. Live checks at 2026-05-10 14:07 UTC still showed:
 
 Remaining release blockers:
 
-- Create/import a `Developer ID Application` certificate and private key.
-- Configure the local `sbh-notary` notary profile.
-- Configure GitHub Actions secrets for release signing and notarization.
-- Configure `HOMEBREW_TAP_TOKEN` for the Homebrew formula PR workflow.
 - Publish or verify the Homebrew tap formula after the first signed release.
 - Run `sbh doctor --release --json` from the current build and require all
   release diagnostics to pass.
@@ -400,7 +397,8 @@ release done until all of these are true:
 2. A `Developer ID Application` identity is present and release secrets are
    configured in GitHub Actions.
 3. The notary profile `sbh-notary` authenticates successfully.
-4. `HOMEBREW_TAP_TOKEN` is configured and the formula PR path is verified.
+4. `HOMEBREW_TAP_SSH_KEY` is configured and the deploy-key tap update path is
+   verified.
 5. The release workflow succeeds on a tag and produces signed/notarized macOS
    artifacts.
 6. The final pushed head completes CI green, including Apple Silicon

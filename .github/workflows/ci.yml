@@ -101,62 +101,42 @@ jobs:
             generated-homebrew/Formula/sbh.rb
           retention-days: 14
 
-  homebrew-tap-token-preflight:
-    name: Homebrew Tap Token Preflight
+  homebrew-tap-deploy-key-preflight:
+    name: Homebrew Tap Deploy Key Preflight
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     env:
-      HOMEBREW_TAP_REPOSITORY: Dicklesworthstone/homebrew-sbh
-      GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      HOMEBREW_TAP_REPOSITORY: git@github.com:Dicklesworthstone/homebrew-sbh.git
+      HOMEBREW_TAP_SSH_KEY: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}
     steps:
-      - name: Validate tap token before mainline release readiness
+      - name: Validate tap deploy key before mainline release readiness
         shell: bash
         run: |
           set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::HOMEBREW_TAP_TOKEN is required before macOS release readiness can pass"
+          if [ -z "${HOMEBREW_TAP_SSH_KEY:-}" ]; then
+            echo "::error::HOMEBREW_TAP_SSH_KEY is required before macOS release readiness can pass"
             exit 1
           fi
-          gh api "repos/${HOMEBREW_TAP_REPOSITORY}" > homebrew-tap-token-repository.json
-          python3 - <<'PY'
-          import json
-          import os
-          import sys
-          from pathlib import Path
+          mkdir -p "${HOME}/.ssh"
+          chmod 700 "${HOME}/.ssh"
+          key_path="${RUNNER_TEMP}/sbh-homebrew-tap-key"
+          printf '%s\n' "${HOMEBREW_TAP_SSH_KEY}" > "${key_path}"
+          chmod 600 "${key_path}"
+          ssh-keygen -y -f "${key_path}" > homebrew-tap-deploy-key.pub
+          ssh-keyscan github.com >> "${HOME}/.ssh/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i ${key_path} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
 
-          expected = os.environ["HOMEBREW_TAP_REPOSITORY"]
-          repo = json.loads(Path("homebrew-tap-token-repository.json").read_text())
-          if repo.get("full_name") != expected:
-              print(f"::error::HOMEBREW_TAP_TOKEN resolved {repo.get('full_name')!r}, expected {expected}")
-              sys.exit(1)
-          if repo.get("default_branch") != "main":
-              print(f"::error::{expected} default branch is {repo.get('default_branch')!r}, expected 'main'")
-              sys.exit(1)
-          permissions = repo.get("permissions") or {}
-          if not any(permissions.get(key) for key in ("admin", "maintain", "push")):
-              print(f"::error::HOMEBREW_TAP_TOKEN cannot push to {expected}; use a fine-grained token or GitHub App credential scoped to the tap")
-              sys.exit(1)
-          PY
+          git ls-remote --symref "${HOMEBREW_TAP_REPOSITORY}" HEAD > homebrew-tap-head.txt
+          grep -F $'ref: refs/heads/main\tHEAD' homebrew-tap-head.txt
 
-          gh api -i "repos/${HOMEBREW_TAP_REPOSITORY}" > homebrew-tap-token-api-response.txt
-          python3 - <<'PY'
-          import sys
-          from pathlib import Path
-
-          response = Path("homebrew-tap-token-api-response.txt").read_text(errors="replace")
-          oauth_scopes = ""
-          for line in response.splitlines():
-              if line.lower().startswith("x-oauth-scopes:"):
-                  oauth_scopes = line.split(":", 1)[1].strip()
-                  break
-          scope_set = {scope.strip() for scope in oauth_scopes.split(",") if scope.strip()}
-          broad_scopes = {"repo", "public_repo", "delete_repo", "admin:org", "workflow"} & scope_set
-          Path("homebrew-tap-token-scope-summary.txt").write_text((oauth_scopes or "none") + "\n")
-          if broad_scopes:
-              print("::error::HOMEBREW_TAP_TOKEN uses broad classic OAuth scopes: " + ", ".join(sorted(broad_scopes)))
-              print("::error::Use a fine-grained PAT or GitHub App credential limited to Dicklesworthstone/homebrew-sbh")
-              sys.exit(1)
-          PY
+          git init homebrew-tap-preflight
+          cd homebrew-tap-preflight
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          printf 'sbh deploy key preflight\n' > README.md
+          git add README.md
+          git commit -m "Validate sbh tap deploy key"
+          git push --dry-run "${HOMEBREW_TAP_REPOSITORY}" HEAD:refs/heads/sbh-deploy-key-preflight-${GITHUB_RUN_ID}
 
   unit:
     name: Unit Tests
@@ -520,7 +500,7 @@ jobs:
           SBH_RELEASE_SECRET_APPLE_NOTARY_KEY_P8_BASE64_PRESENT: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 != '' }}
           SBH_RELEASE_SECRET_APPLE_NOTARY_KEY_ID_PRESENT: ${{ secrets.APPLE_NOTARY_KEY_ID != '' }}
           SBH_RELEASE_SECRET_APPLE_NOTARY_ISSUER_ID_PRESENT: ${{ secrets.APPLE_NOTARY_ISSUER_ID != '' }}
-          SBH_RELEASE_SECRET_HOMEBREW_TAP_TOKEN_PRESENT: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+          SBH_RELEASE_SECRET_HOMEBREW_TAP_SSH_KEY_PRESENT: ${{ secrets.HOMEBREW_TAP_SSH_KEY != '' }}
         run: |
           set -euo pipefail
           bin="./target/release/sbh"

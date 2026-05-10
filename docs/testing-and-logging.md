@@ -252,9 +252,10 @@ substitutes a synthetic tag and both macOS SHA-256 checksums with the same Perl
 expression used by `.github/workflows/release.yml`, fails if any
 `REPLACE_WITH_` marker remains, and runs `brew style` on the generated formula.
 The tagged release workflow repeats the checksum substitution against the real
-release artifacts and runs `ruby -c homebrew-sbh/Formula/sbh.rb` before opening
-the tap PR. This keeps the tap PR generation path covered on normal PR/push CI
-and still catches malformed generated Ruby during a signed release.
+release artifacts and runs `ruby -c homebrew-sbh/Formula/sbh.rb` before pushing
+the tap update with the repository-scoped deploy key. This keeps the tap formula
+generation path covered on normal PR/push CI and still catches malformed
+generated Ruby during a signed release.
 
 **macOS coverage tracking:** The `macos-coverage` job runs on `macos-latest`
 and installs `cargo-llvm-cov` with `taiki-e/install-action@cargo-llvm-cov`, the

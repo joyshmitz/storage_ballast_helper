@@ -1387,7 +1387,7 @@ mod tests {
             "gh secret set APPLE_NOTARY_KEY_P8_BASE64",
             "gh secret set APPLE_NOTARY_KEY_ID",
             "gh secret set APPLE_NOTARY_ISSUER_ID",
-            "gh secret set HOMEBREW_TAP_TOKEN",
+            "gh secret set HOMEBREW_TAP_SSH_KEY",
             "gh secret list -R Dicklesworthstone/storage_ballast_helper",
             "gh repo view Dicklesworthstone/homebrew-sbh --json nameWithOwner,defaultBranchRef",
             "`defaultBranchRef.name`",
@@ -1401,8 +1401,8 @@ mod tests {
             "non-secret credential setup plan",
             "`$P12_PATH`",
             "`$APPLE_NOTARY_KEY_PATH`",
-            "`$HOMEBREW_TAP_TOKEN`",
-            "piped stdin instead of storing values in shell history",
+            "`$HOME/.ssh/sbh-homebrew-tap-release`",
+            "redirected stdin instead of storing values in shell history",
             "Treat `WARN` as an attention state",
             "remains false until every release check passes",
             "aggregate `ok` boolean",
@@ -1478,7 +1478,7 @@ mod tests {
             "SBH_RELEASE_SECRET_APPLE_NOTARY_KEY_P8_BASE64_PRESENT: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 != '' }}",
             "SBH_RELEASE_SECRET_APPLE_NOTARY_KEY_ID_PRESENT: ${{ secrets.APPLE_NOTARY_KEY_ID != '' }}",
             "SBH_RELEASE_SECRET_APPLE_NOTARY_ISSUER_ID_PRESENT: ${{ secrets.APPLE_NOTARY_ISSUER_ID != '' }}",
-            "SBH_RELEASE_SECRET_HOMEBREW_TAP_TOKEN_PRESENT: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}",
+            "SBH_RELEASE_SECRET_HOMEBREW_TAP_SSH_KEY_PRESENT: ${{ secrets.HOMEBREW_TAP_SSH_KEY != '' }}",
             "\"${bin}\" --json doctor --release > macos-release-doctor-output.json",
             "DOCTOR_STATUS=\"${doctor_status}\" python3",
             "import os",
@@ -1540,8 +1540,8 @@ mod tests {
             "full release workflow must not run on PRs"
         );
         assert!(
-            release_workflow.contains("needs: [quality-gate, homebrew-tap-token-preflight]"),
-            "release artifact builds must depend on the reusable CI quality gate and tap-token preflight"
+            release_workflow.contains("needs: [quality-gate, homebrew-tap-deploy-key-preflight]"),
+            "release artifact builds must depend on the reusable CI quality gate and tap deploy-key preflight"
         );
         assert!(
             !release_workflow.contains("if: always() && !cancelled()"),
@@ -1771,58 +1771,51 @@ mod tests {
     }
 
     #[test]
-    fn ci_preflights_homebrew_tap_token_on_mainline_pushes() {
+    fn ci_preflights_homebrew_tap_deploy_key_on_mainline_pushes() {
         let ci_workflow = include_str!("../../.github/workflows/ci.yml");
 
         for required in [
-            "homebrew-tap-token-preflight:",
-            "Homebrew Tap Token Preflight",
+            "homebrew-tap-deploy-key-preflight:",
+            "Homebrew Tap Deploy Key Preflight",
             "if: github.event_name == 'push' && github.ref == 'refs/heads/main'",
-            "Validate tap token before mainline release readiness",
-            "HOMEBREW_TAP_REPOSITORY: Dicklesworthstone/homebrew-sbh",
-            "GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}",
-            "HOMEBREW_TAP_TOKEN is required before macOS release readiness can pass",
-            "gh api \"repos/${HOMEBREW_TAP_REPOSITORY}\" > homebrew-tap-token-repository.json",
-            "homebrew-tap-token-api-response.txt",
-            "homebrew-tap-token-scope-summary.txt",
-            "HOMEBREW_TAP_TOKEN cannot push",
-            "broad classic OAuth scopes",
-            "\"repo\", \"public_repo\", \"delete_repo\", \"admin:org\", \"workflow\"",
-            "Use a fine-grained PAT or GitHub App credential limited to Dicklesworthstone/homebrew-sbh",
+            "Validate tap deploy key before mainline release readiness",
+            "HOMEBREW_TAP_REPOSITORY: git@github.com:Dicklesworthstone/homebrew-sbh.git",
+            "HOMEBREW_TAP_SSH_KEY: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}",
+            "HOMEBREW_TAP_SSH_KEY is required before macOS release readiness can pass",
+            "ssh-keygen -y -f \"${key_path}\" > homebrew-tap-deploy-key.pub",
+            "git ls-remote --symref \"${HOMEBREW_TAP_REPOSITORY}\" HEAD",
+            "ref: refs/heads/main\\tHEAD",
+            "git push --dry-run \"${HOMEBREW_TAP_REPOSITORY}\" HEAD:refs/heads/sbh-deploy-key-preflight-${GITHUB_RUN_ID}",
         ] {
             assert!(
                 ci_workflow.contains(required),
-                "CI workflow must preflight Homebrew tap token quality on mainline pushes: {required}"
+                "CI workflow must preflight Homebrew tap deploy key quality on mainline pushes: {required}"
             );
         }
     }
 
     #[test]
-    fn release_workflow_updates_homebrew_tap_by_pr() {
+    fn release_workflow_updates_homebrew_tap_with_deploy_key() {
         let release_workflow = include_str!("../../.github/workflows/release.yml");
         let readme = include_str!("../../README.md");
         let macos_guide = include_str!("../../docs/macos.md");
 
         for required in [
-            "homebrew-tap-token-preflight:",
-            "Homebrew Tap Token Preflight",
-            "Validate tap token before release work",
-            "HOMEBREW_TAP_TOKEN is required before release artifacts are built",
-            "needs: [quality-gate, homebrew-tap-token-preflight]",
+            "homebrew-tap-deploy-key-preflight:",
+            "Homebrew Tap Deploy Key Preflight",
+            "Validate tap deploy key before release work",
+            "HOMEBREW_TAP_SSH_KEY is required before release artifacts are built",
+            "needs: [quality-gate, homebrew-tap-deploy-key-preflight]",
             "homebrew-tap:",
             "Update Homebrew Tap",
-            "HOMEBREW_TAP_REPOSITORY: Dicklesworthstone/homebrew-sbh",
-            "GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}",
-            "gh api \"repos/${HOMEBREW_TAP_REPOSITORY}\" > homebrew-tap-token-repository.json",
-            "homebrew-tap-token-api-response.txt",
-            "homebrew-tap-token-scope-summary.txt",
-            "HOMEBREW_TAP_TOKEN cannot push",
-            "broad classic OAuth scopes",
-            "delete_repo",
-            "public_repo",
-            "admin:org",
-            "Use a fine-grained PAT or GitHub App credential",
-            "repository: ${{ env.HOMEBREW_TAP_REPOSITORY }}",
+            "HOMEBREW_TAP_REPOSITORY: git@github.com:Dicklesworthstone/homebrew-sbh.git",
+            "HOMEBREW_TAP_SLUG: Dicklesworthstone/homebrew-sbh",
+            "HOMEBREW_TAP_SSH_KEY: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}",
+            "ssh-keygen -y -f \"${key_path}\" > homebrew-tap-deploy-key.pub",
+            "git ls-remote --symref \"${HOMEBREW_TAP_REPOSITORY}\" HEAD",
+            "git push --dry-run \"${HOMEBREW_TAP_REPOSITORY}\" HEAD:refs/heads/sbh-deploy-key-preflight-${GITHUB_RUN_ID}",
+            "repository: ${{ env.HOMEBREW_TAP_SLUG }}",
+            "ssh-key: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}",
             "sbh-source/packaging/homebrew/Formula/sbh.rb",
             "homebrew-sbh/Formula/sbh.rb",
             "REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256",
@@ -1830,14 +1823,13 @@ mod tests {
             "sha256 \"[0-9a-f]{64}\"",
             "grep -q 'REPLACE_WITH_' homebrew-sbh/Formula/sbh.rb",
             "ruby -c homebrew-sbh/Formula/sbh.rb",
-            "branch=\"update-sbh-${GITHUB_REF_NAME}\"",
-            "gh pr list",
-            "gh pr create",
-            "--base main",
+            "Publish Homebrew formula update",
+            "git checkout -B main origin/main",
+            "git push origin HEAD:main",
         ] {
             assert!(
                 release_workflow.contains(required),
-                "release workflow must automate Homebrew tap PR updates: {required}"
+                "release workflow must automate Homebrew tap updates: {required}"
             );
         }
 
@@ -1845,10 +1837,10 @@ mod tests {
             for required in [
                 "Dicklesworthstone/homebrew-sbh",
                 "packaging/homebrew/Formula/sbh.rb",
-                "HOMEBREW_TAP_TOKEN",
-                "fine-grained PAT or GitHub App credential",
-                "broad classic OAuth scopes",
-                "formula update PR",
+                "HOMEBREW_TAP_SSH_KEY",
+                "deploy key",
+                "dry-runs a branch push",
+                "tap update",
             ] {
                 assert!(
                     doc.contains(required),
@@ -1980,7 +1972,7 @@ mod tests {
             "0 valid identities found",
             "spctl -a -t execute -vv",
             "sbh-notary",
-            "HOMEBREW_TAP_TOKEN",
+            "HOMEBREW_TAP_SSH_KEY",
             "Not Complete",
             "sbh doctor --release --json",
             "aggregate `ok` boolean",

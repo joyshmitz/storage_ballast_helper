@@ -244,13 +244,13 @@ packaging/homebrew/Formula/sbh.rb
 Tagged releases copy that file into
 `Dicklesworthstone/homebrew-sbh/Formula/sbh.rb`, replace the placeholder SHA-256
 values with the per-architecture checksums for the released
-`sbh-v<version>-<target>.tar.xz` archives, push an `update-sbh-v*` branch to the
-tap, and open or update a formula update PR. The release workflow requires a
-`HOMEBREW_TAP_TOKEN` secret with write access to the tap repository. Use a
-fine-grained PAT or GitHub App credential scoped to `Dicklesworthstone/homebrew-sbh`;
-the release workflow rejects broad classic OAuth scopes such as `repo`,
-`public_repo`, `delete_repo`, `admin:org`, and `workflow` before release
-artifacts are built or the formula update PR is created. The formula installs the prebuilt `sbh` binary, runs
+`sbh-v<version>-<target>.tar.xz` archives, and push the tap update containing
+the formula. The release workflow requires a `HOMEBREW_TAP_SSH_KEY` secret
+containing the private half of a write-enabled deploy key scoped only to
+`Dicklesworthstone/homebrew-sbh`. Before release artifacts are built, the
+workflow derives the public key, verifies the tap's default branch is `main`,
+and dry-runs a branch push over SSH so a read-only or wrong-repository deploy key
+fails early. The formula installs the prebuilt `sbh` binary, runs
 `sbh setup --verify --bin-dir <keg>/bin` as a post-install sanity check, defines
 a `brew services` daemon entry, and prints the Full Disk Access reminder in its
 caveats.
@@ -315,7 +315,7 @@ APPLE_DEVELOPER_ID_IDENTITY
 APPLE_NOTARY_KEY_P8_BASE64
 APPLE_NOTARY_KEY_ID
 APPLE_NOTARY_ISSUER_ID
-HOMEBREW_TAP_TOKEN
+HOMEBREW_TAP_SSH_KEY
 ```
 
 Apple Developer Program enrollment is confirmed for this project. Use the
@@ -363,8 +363,15 @@ it handles private key material:
      -R Dicklesworthstone/storage_ballast_helper
    printf '%s' "$APPLE_NOTARY_ISSUER_ID" | gh secret set APPLE_NOTARY_ISSUER_ID \
      -R Dicklesworthstone/storage_ballast_helper
-   printf '%s' "$HOMEBREW_TAP_TOKEN" | gh secret set HOMEBREW_TAP_TOKEN \
-     -R Dicklesworthstone/storage_ballast_helper
+   ssh-keygen -t ed25519 -C "sbh Homebrew tap release" \
+     -f "$HOME/.ssh/sbh-homebrew-tap-release" -N ""
+   gh api -X POST repos/Dicklesworthstone/homebrew-sbh/keys \
+     -f title="sbh release workflow" \
+     -f key="$(cat "$HOME/.ssh/sbh-homebrew-tap-release.pub")" \
+     -F read_only=false
+   gh secret set HOMEBREW_TAP_SSH_KEY \
+     -R Dicklesworthstone/storage_ballast_helper \
+     < "$HOME/.ssh/sbh-homebrew-tap-release"
    gh secret list -R Dicklesworthstone/storage_ballast_helper
    ```
 
@@ -428,14 +435,14 @@ signals:
    must authenticate successfully with the configured keychain profile.
 3. `gh secret list -R Dicklesworthstone/storage_ballast_helper --json name` must
    report every release secret used by the GitHub Actions workflow, including
-   `HOMEBREW_TAP_TOKEN`.
+   `HOMEBREW_TAP_SSH_KEY`.
 4. `gh repo view Dicklesworthstone/homebrew-sbh --json nameWithOwner,defaultBranchRef`
    must be able to see the Homebrew tap repository and report `main` as
    `defaultBranchRef.name`. The release workflow additionally validates the
-   `HOMEBREW_TAP_TOKEN` secret with the REST API in an early preflight before
-   release builds start, and again before tap checkout: the token must resolve to
-   `Dicklesworthstone/homebrew-sbh`, see `main` as the default branch, have
-   write-capable repository permissions, and avoid broad classic OAuth scopes.
+   `HOMEBREW_TAP_SSH_KEY` secret with Git over SSH in an early preflight before
+   release builds start, and again before tap checkout: the key must authenticate
+   to `Dicklesworthstone/homebrew-sbh`, see `main` as the default branch, and
+   pass a dry-run branch push so read-only deploy keys fail before packaging.
    The doctor also probes `Formula/sbh.rb` and reports a warning, not a hard failure,
    when the tap exists but the initial formula has not been published yet.
 
@@ -463,9 +470,10 @@ The release doctor also prints a non-secret credential setup plan. The plan
 starts with the CSR/keychain request step now that Apple Developer Program
 enrollment is confirmed, then uses placeholder environment variables such as
 `$P12_PATH`, `$P12_PASSWORD`, `$APPLE_NOTARY_KEY_PATH`,
-`$APPLE_NOTARY_KEY_ID`, `$APPLE_NOTARY_ISSUER_ID`, and
-`$HOMEBREW_TAP_TOKEN`; it never prints secret values. The GitHub secret commands
-read secret material from piped stdin instead of storing values in shell history.
+`$APPLE_NOTARY_KEY_ID`, `$APPLE_NOTARY_ISSUER_ID`, and the generated
+`$HOME/.ssh/sbh-homebrew-tap-release` deploy key path; it never prints secret
+values. The GitHub secret commands read secret material from redirected stdin
+instead of storing values in shell history.
 After completing the plan, rerun:
 
 ```bash
