@@ -174,7 +174,8 @@ operator-visible outcomes:
   statuses and requires the Developer ID identity, notary profile, GitHub
   secrets, and Homebrew tap check IDs before uploading
   `macos-release-doctor-summary.txt`; warning-only artifacts therefore cannot
-  look release-ready in CI evidence. Focused proof
+  look release-ready in CI evidence. The same harness also rejects unknown check
+  statuses before trusting aggregate counts. Focused proof
   passed with Ruby YAML parsing for `.github/workflows/ci.yml`,
   `cargo fmt --check`, `git diff --check`, and
   `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-release-doctor-ci-summary-test cargo test --lib ci_workflow_spot_checks_macos_release_builds_without_notarization -- --nocapture"`;

@@ -504,6 +504,12 @@ jobs:
               sys.exit(1)
 
           statuses = [check.get("status") for check in report["checks"]]
+          allowed_statuses = {"PASS", "WARN", "FAIL"}
+          unknown_statuses = sorted({status for status in statuses if status not in allowed_statuses})
+          if unknown_statuses:
+              print(f"::error::release doctor JSON has unknown check statuses: {unknown_statuses}")
+              sys.exit(1)
+
           expected_counts = {
               "passed": statuses.count("PASS"),
               "warnings": statuses.count("WARN"),

@@ -1451,6 +1451,8 @@ mod tests {
             "\"passed\"",
             "\"warnings\"",
             "\"failed\"",
+            "allowed_statuses = {\"PASS\", \"WARN\", \"FAIL\"}",
+            "unknown_statuses",
             "expected_counts = {",
             "statuses.count(\"WARN\")",
             "report.get(\"ok\") != expected_ok",
