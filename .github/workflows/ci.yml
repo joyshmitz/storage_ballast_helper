@@ -491,6 +491,30 @@ jobs:
               print(f"::error::release doctor JSON missing keys: {missing_top}")
               sys.exit(1)
 
+          if not isinstance(report["ok"], bool):
+              print("::error::release doctor JSON ok must be a boolean")
+              sys.exit(1)
+
+          for count_key in ["passed", "warnings", "failed"]:
+              if type(report[count_key]) is not int or report[count_key] < 0:
+                  print(f"::error::release doctor JSON {count_key} must be a non-negative integer")
+                  sys.exit(1)
+
+          for string_key in ["repository", "notary_profile"]:
+              if not isinstance(report[string_key], str) or not report[string_key]:
+                  print(f"::error::release doctor JSON {string_key} must be a non-empty string")
+                  sys.exit(1)
+
+          if not isinstance(report["required_github_secrets"], list) or not all(
+              isinstance(secret, str) and secret for secret in report["required_github_secrets"]
+          ):
+              print("::error::release doctor JSON required_github_secrets must be a string array")
+              sys.exit(1)
+
+          if not isinstance(report["setup_steps"], list):
+              print("::error::release doctor JSON setup_steps must be an array")
+              sys.exit(1)
+
           if not isinstance(report["checks"], list):
               print("::error::release doctor JSON checks must be an array")
               sys.exit(1)
