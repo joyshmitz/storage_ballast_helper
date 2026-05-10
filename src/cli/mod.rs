@@ -1740,6 +1740,7 @@ mod tests {
             "REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256",
             "sha256 \"[0-9a-f]{64}\"",
             "grep -q 'REPLACE_WITH_' homebrew-sbh/Formula/sbh.rb",
+            "ruby -c homebrew-sbh/Formula/sbh.rb",
             "branch=\"update-sbh-${GITHUB_REF_NAME}\"",
             "gh pr list",
             "gh pr create",
