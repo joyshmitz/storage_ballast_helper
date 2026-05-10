@@ -1857,6 +1857,10 @@ mod tests {
             "HOMEBREW_TAP_TOKEN",
             "Not Complete",
             "sbh doctor --release --json",
+            "aggregate `ok` boolean",
+            "`passed`,",
+            "`warnings`,",
+            "`failed` counts",
             "Developer ID Application",
         ] {
             assert!(

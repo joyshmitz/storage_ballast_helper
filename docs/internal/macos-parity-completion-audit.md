@@ -3,7 +3,7 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`
 Parent: `bd-r7m7`
-Last audited: 2026-05-09 21:00 UTC
+Last audited: 2026-05-10 00:40 UTC
 Evidence snapshot: the audit intentionally avoids pinning exact commit hashes or
 GitHub Actions run ids because every audit-only commit would make those literals
 stale. Before any close decision, refresh the live head and newest run with:
@@ -76,7 +76,7 @@ operator-visible outcomes:
   `bd-ykwh.13`.
 - `bd-ykwh.20` is closed; release CI now runs `spctl -a -t execute -vv` after
   notarization acceptance and before packaging macOS tarballs.
-- Live recheck at 2026-05-09 21:00 UTC showed the newest CI run for the current
+- Live recheck at 2026-05-10 00:40 UTC showed the newest CI run for the current
   head still fully queued: `Format + Lint`, `macOS Platform Tests (intel)`,
   `macOS Platform Tests (apple-silicon)`, `Homebrew Formula Validation`,
   `macOS Performance Budgets`, and `macOS Coverage` had no runner assigned.
@@ -117,6 +117,17 @@ operator-visible outcomes:
   `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_release_doctor_proof cargo test --bin sbh release_doctor -- --nocapture`.
   The run reported 3 passed tests covering missing external credentials,
   credential-present success, and stdin-based release-secret setup steps.
+- The release doctor JSON now exposes an aggregate `ok` boolean plus `passed`,
+  `warnings`, and `failed` counts, and the human report prints the same
+  readiness summary. Focused proof for that current-source update passed with
+  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-release-doctor-summary-bin cargo test --bin sbh release_doctor -- --nocapture"`
+  and
+  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-release-doctor-summary-lib cargo test --lib developer_id -- --nocapture"`.
+  Required compiler gates also passed for the update:
+  `cargo fmt --check`, `git diff --check`,
+  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-release-doctor-summary-check cargo check --all-targets"`,
+  and
+  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-release-doctor-summary-clippy cargo clippy --all-targets -- -D warnings"`.
 - Focused release workflow contract proof passed with
   `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_workflow_contract_proof cargo test --lib workflow -- --nocapture`.
   The run reported 13 passed tests, including Developer ID import, hardened
@@ -225,7 +236,7 @@ containing `bd-twgw` and `bd-j40b`, then restore the protected worktree files.
 ## Live Release Blocker Evidence
 
 The user confirmed Apple Developer Program enrollment, so enrollment itself is
-not the current blocker. Live checks at 2026-05-09 21:00 UTC still showed:
+not the current blocker. Live checks at 2026-05-10 00:40 UTC still showed:
 
 - `security find-identity -v -p codesigning`: `0 valid identities found`
 - `xcrun notarytool history --keychain-profile sbh-notary --output-format json`:
