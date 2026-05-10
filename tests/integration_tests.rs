@@ -1234,17 +1234,8 @@ fn macos_foreground_daemon_handles_term_hup_and_siginfo() {
     );
 
     send_signal(daemon.child.id(), "INFO");
-    let stderr = wait_for_stderr_contains(
-        &stderr_path,
-        "\"event\":\"siginfo_status\"",
-        Duration::from_secs(15),
-        &mut daemon.child,
-    );
-    let status_dump = stderr
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .find(|payload| payload["event"] == "siginfo_status")
-        .unwrap_or_else(|| panic!("missing valid SIGINFO status JSON in stderr:\n{stderr}"));
+    let status_dump =
+        wait_for_siginfo_status_dump(&stderr_path, Duration::from_secs(15), &mut daemon.child);
     assert!(
         status_dump["pressure"]["causing_mount"]
             .as_str()
@@ -1801,6 +1792,31 @@ fn wait_for_stderr_contains(
     child: &mut Child,
 ) -> String {
     wait_for_file_contains(stderr_path, needle, timeout, child)
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_siginfo_status_dump(stderr_path: &Path, timeout: Duration, child: &mut Child) -> Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let content = fs::read_to_string(stderr_path).unwrap_or_default();
+        if let Some(payload) = content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|payload| payload["event"] == "siginfo_status")
+        {
+            return payload;
+        }
+        assert_child_still_running(
+            child,
+            "daemon exited before SIGINFO status JSON was complete",
+        );
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for parseable SIGINFO status JSON in {}; content:\n{content}",
+            stderr_path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[cfg(target_os = "macos")]
