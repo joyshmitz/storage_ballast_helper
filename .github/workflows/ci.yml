@@ -491,7 +491,37 @@ jobs:
               print(f"::error::release doctor JSON missing keys: {missing_top}")
               sys.exit(1)
 
-          checks = {check.get("id"): check.get("status") for check in report["checks"]}
+          if not isinstance(report["checks"], list):
+              print("::error::release doctor JSON checks must be an array")
+              sys.exit(1)
+
+          checks = {}
+          duplicate_check_ids = set()
+          statuses = []
+          for index, check in enumerate(report["checks"]):
+              if not isinstance(check, dict):
+                  print(f"::error::release doctor JSON check at index {index} is not an object")
+                  sys.exit(1)
+
+              check_id = check.get("id")
+              if not isinstance(check_id, str) or not check_id:
+                  print(f"::error::release doctor JSON check at index {index} has invalid id")
+                  sys.exit(1)
+
+              status = check.get("status")
+              if not isinstance(status, str) or not status:
+                  print(f"::error::release doctor JSON check {check_id} has invalid status")
+                  sys.exit(1)
+
+              if check_id in checks:
+                  duplicate_check_ids.add(check_id)
+              checks[check_id] = status
+              statuses.append(status)
+
+          if duplicate_check_ids:
+              print(f"::error::release doctor JSON has duplicate checks: {sorted(duplicate_check_ids)}")
+              sys.exit(1)
+
           required_checks = [
               "release.developer_id_identity",
               "release.notary_profile",
@@ -503,7 +533,6 @@ jobs:
               print(f"::error::release doctor JSON missing checks: {missing_checks}")
               sys.exit(1)
 
-          statuses = [check.get("status") for check in report["checks"]]
           allowed_statuses = {"PASS", "WARN", "FAIL"}
           unknown_statuses = sorted({status for status in statuses if status not in allowed_statuses})
           if unknown_statuses:
