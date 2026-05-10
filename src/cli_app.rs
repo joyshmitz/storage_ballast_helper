@@ -4515,6 +4515,35 @@ where
 
     match run_command("gh", &repo_args) {
         Ok(outcome) if outcome.success => {
+            let default_branch = match parse_homebrew_tap_default_branch(&outcome.stdout) {
+                Ok(branch) => branch,
+                Err(error) => {
+                    return doctor_check(
+                        "release.homebrew_tap",
+                        "Homebrew tap formula",
+                        "FAIL",
+                        format!(
+                            "Homebrew tap repository metadata could not be verified: {error}"
+                        ),
+                        Some(
+                            "Re-run `gh repo view Dicklesworthstone/homebrew-sbh --json nameWithOwner,defaultBranchRef` and confirm the tap repository uses main."
+                                .to_string(),
+                        ),
+                    );
+                }
+            };
+            if default_branch != "main" {
+                return doctor_check(
+                    "release.homebrew_tap",
+                    "Homebrew tap formula",
+                    "FAIL",
+                    format!(
+                        "{RELEASE_HOMEBREW_TAP_REPOSITORY} default branch is {default_branch}, expected main"
+                    ),
+                    Some("Change the Homebrew tap default branch to main before cutting a macOS release.".to_string()),
+                );
+            }
+
             let formula_args = vec![
                 "api".to_string(),
                 format!("repos/{RELEASE_HOMEBREW_TAP_REPOSITORY}/contents/Formula/sbh.rb"),
@@ -4570,6 +4599,28 @@ where
                 .to_string()),
         ),
     }
+}
+
+fn parse_homebrew_tap_default_branch(raw: &str) -> std::result::Result<String, String> {
+    let value = serde_json::from_str::<Value>(raw).map_err(|error| error.to_string())?;
+    let name_with_owner = value
+        .get("nameWithOwner")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "repository metadata missing string field 'nameWithOwner'".to_string())?;
+    if name_with_owner != RELEASE_HOMEBREW_TAP_REPOSITORY {
+        return Err(format!(
+            "expected repository {RELEASE_HOMEBREW_TAP_REPOSITORY}, got {name_with_owner}"
+        ));
+    }
+
+    value
+        .get("defaultBranchRef")
+        .and_then(|branch| branch.get("name"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            "repository metadata missing string field 'defaultBranchRef.name'".to_string()
+        })
 }
 
 fn parse_github_secret_names(raw: &str) -> std::result::Result<HashSet<String>, String> {
@@ -9745,6 +9796,65 @@ mod tests {
         assert!(
             tap.message.contains("Formula/sbh.rb is not published yet"),
             "tap warning should explain missing formula: {}",
+            tap.message
+        );
+    }
+
+    #[test]
+    fn release_doctor_report_fails_when_homebrew_tap_default_branch_is_not_main() {
+        let secrets = RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS
+            .iter()
+            .map(|name| json!({ "name": name }))
+            .collect::<Vec<_>>();
+        let secrets_json = serde_json::to_string(&secrets).unwrap();
+        let command = |program: &str, args: &[String]| match program {
+            "security" => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: "1) ABCDEF \"Developer ID Application: Example LLC (TEAMID)\"".to_string(),
+                stderr: String::new(),
+            }),
+            "xcrun" => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: "{\"history\":[]}".to_string(),
+                stderr: String::new(),
+            }),
+            "gh" if args_start_with(args, &["secret", "list"]) => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: secrets_json.clone(),
+                stderr: String::new(),
+            }),
+            "gh" if args_start_with(args, &["repo", "view"]) => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: json!({
+                    "nameWithOwner": RELEASE_HOMEBREW_TAP_REPOSITORY,
+                    "defaultBranchRef": { "name": "master" }
+                })
+                .to_string(),
+                stderr: String::new(),
+            }),
+            "gh" if args_start_with(args, &["api"]) => {
+                panic!("formula check should not run after a default-branch failure")
+            }
+            other => panic!("unexpected release doctor command: {other}"),
+        };
+
+        let report = release_doctor_report_with_command_runner(&command);
+
+        assert!(!report.ok);
+        assert_eq!(report.passed, 3);
+        assert_eq!(report.warnings, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(release_readiness_label(&report), "blocked");
+        let tap = release_check_by_id(&report, "release.homebrew_tap");
+        assert_eq!(tap.status, "FAIL");
+        assert!(
+            tap.message
+                .contains("default branch is master, expected main"),
+            "tap failure should explain default branch mismatch: {}",
             tap.message
         );
     }

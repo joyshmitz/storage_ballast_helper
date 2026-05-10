@@ -1368,6 +1368,7 @@ mod tests {
             "gh secret set HOMEBREW_TAP_TOKEN",
             "gh secret list -R Dicklesworthstone/storage_ballast_helper",
             "gh repo view Dicklesworthstone/homebrew-sbh --json nameWithOwner,defaultBranchRef",
+            "`defaultBranchRef.name`",
             "Formula/sbh.rb",
             "reports a warning, not a hard failure",
             "Rotate the Developer ID certificate and app-specific password every 12 months",
