@@ -171,11 +171,15 @@ operator-visible outcomes:
   `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-release-doctor-attention-clippy cargo clippy --all-targets -- -D warnings"`.
 - The hosted macOS release-doctor diagnostic harness now validates the aggregate
   `ok`, `passed`, `warnings`, and `failed` fields against the per-check
-  statuses before uploading `macos-release-doctor-summary.txt`; warning-only
-  artifacts therefore cannot look release-ready in CI evidence. Focused proof
+  statuses and requires the Developer ID identity, notary profile, GitHub
+  secrets, and Homebrew tap check IDs before uploading
+  `macos-release-doctor-summary.txt`; warning-only artifacts therefore cannot
+  look release-ready in CI evidence. Focused proof
   passed with Ruby YAML parsing for `.github/workflows/ci.yml`,
   `cargo fmt --check`, `git diff --check`, and
-  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-release-doctor-ci-summary-test cargo test --lib ci_workflow_spot_checks_macos_release_builds_without_notarization -- --nocapture"`.
+  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-release-doctor-ci-summary-test cargo test --lib ci_workflow_spot_checks_macos_release_builds_without_notarization -- --nocapture"`;
+  the required Homebrew tap check-ID guard was then re-verified with
+  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-release-doctor-ci-homebrew-test2 cargo test --lib ci_workflow_spot_checks_macos_release_builds_without_notarization -- --nocapture"`.
 - Focused release workflow contract proof passed with
   `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_workflow_contract_proof cargo test --lib workflow -- --nocapture`.
   The run reported 13 passed tests, including Developer ID import, hardened

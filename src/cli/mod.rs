@@ -1454,6 +1454,7 @@ mod tests {
             "expected_counts = {",
             "statuses.count(\"WARN\")",
             "report.get(\"ok\") != expected_ok",
+            "\"release.homebrew_tap\"",
             "macos-release-doctor-summary.txt",
             "ok={report['ok']}",
             "warnings={report['warnings']}",

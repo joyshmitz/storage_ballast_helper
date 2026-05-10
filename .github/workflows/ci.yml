@@ -496,6 +496,7 @@ jobs:
               "release.developer_id_identity",
               "release.notary_profile",
               "release.github_secrets",
+              "release.homebrew_tap",
           ]
           missing_checks = [check for check in required_checks if check not in checks]
           if missing_checks:
