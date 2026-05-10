@@ -782,7 +782,141 @@ SKILL_EOF
   finish_phase "inline skill installed"
 }
 
-sync_system_service() {
+is_safe_launchd_label() {
+  local label="$1"
+  [[ -n "$label" && "$label" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+launchd_labels_for_sync() {
+  printf '%s\n' "com.sbh.daemon"
+  if is_safe_launchd_label "${SBH_LAUNCHD_LABEL:-}" && [[ "${SBH_LAUNCHD_LABEL}" != "com.sbh.daemon" ]]; then
+    printf '%s\n' "${SBH_LAUNCHD_LABEL}"
+  fi
+}
+
+launchd_plist_binary() {
+  local plist="$1"
+  awk '
+    /<key>ProgramArguments<\/key>/ { in_args = 1; next }
+    in_args && /<\/array>/ { exit }
+    in_args && /<string>/ {
+      line = $0
+      sub(/^[[:space:]]*<string>/, "", line)
+      sub(/<\/string>.*/, "", line)
+      print line
+      exit
+    }
+  ' "$plist"
+}
+
+launchd_loaded_target() {
+  local label="$1"
+
+  local gui_target
+  gui_target="gui/$(id -u)/${label}"
+  if launchctl print "$gui_target" >/dev/null 2>&1; then
+    printf '%s' "$gui_target"
+    return 0
+  fi
+
+  local user_target
+  user_target="user/$(id -u)/${label}"
+  if launchctl print "$user_target" >/dev/null 2>&1; then
+    printf '%s' "$user_target"
+    return 0
+  fi
+
+  return 1
+}
+
+sync_launchd_service() {
+  [[ "$(uname -s)" == "Darwin" ]] || return 0
+  command -v launchctl >/dev/null 2>&1 || return 0
+
+  local target_path="${DEST_DIR}/${PROGRAM}"
+  local service_binary=""
+  local plist_path=""
+  local unit_scope=""
+  local label=""
+
+  while IFS= read -r candidate_label; do
+    local user_plist="${HOME}/Library/LaunchAgents/${candidate_label}.plist"
+    if [[ -f "$user_plist" ]]; then
+      service_binary="$(launchd_plist_binary "$user_plist")"
+      plist_path="$user_plist"
+      unit_scope="user"
+      label="$candidate_label"
+      break
+    fi
+
+    local system_plist="/Library/LaunchDaemons/${candidate_label}.plist"
+    if [[ -f "$system_plist" ]]; then
+      service_binary="$(launchd_plist_binary "$system_plist")"
+      plist_path="$system_plist"
+      unit_scope="system"
+      label="$candidate_label"
+      break
+    fi
+  done < <(launchd_labels_for_sync)
+
+  [[ -n "$service_binary" ]] || return 0
+  [[ "$service_binary" != "$target_path" ]] || return 0
+
+  if [[ -f "$service_binary" ]] && cmp -s "$target_path" "$service_binary" 2>/dev/null; then
+    return 0
+  fi
+
+  start_phase "sync_service" "syncing launchd service binary"
+  log_header "Syncing launchd service binary"
+  log_info "Service (${unit_scope}) plist: ${plist_path}"
+  log_info "Service ProgramArguments binary: ${service_binary}"
+  log_info "Installer installed to: ${target_path}"
+
+  if [[ "$unit_scope" == "system" ]]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+      log_warn "Cannot update ${service_binary} without sudo — restart the daemon manually"
+      finish_phase "skipped: sudo not available"
+      return 0
+    fi
+
+    if sudo install -m 0755 "$target_path" "$service_binary" 2>/dev/null; then
+      log_info "Updated ${service_binary}"
+    else
+      log_warn "Failed to update ${service_binary} — restart the daemon manually"
+      finish_phase "failed to update launchd service binary"
+      return 0
+    fi
+
+    if sudo launchctl print "system/${label}" >/dev/null 2>&1; then
+      if sudo launchctl kickstart -k "system/${label}" 2>/dev/null; then
+        log_info "LaunchDaemon restarted with updated binary"
+      else
+        log_warn "LaunchDaemon restart failed — may need manual intervention"
+      fi
+    fi
+  else
+    if install -m 0755 "$target_path" "$service_binary" 2>/dev/null; then
+      log_info "Updated ${service_binary}"
+    else
+      log_warn "Failed to update ${service_binary}"
+      finish_phase "failed to update launchd user service binary"
+      return 0
+    fi
+
+    local loaded_target=""
+    if loaded_target="$(launchd_loaded_target "$label")"; then
+      if launchctl kickstart -k "$loaded_target" 2>/dev/null; then
+        log_info "LaunchAgent restarted with updated binary"
+      else
+        log_warn "LaunchAgent restart failed — may need manual intervention"
+      fi
+    fi
+  fi
+
+  finish_phase "launchd service binary synced"
+}
+
+sync_systemd_service() {
   # After installing the binary to the primary destination, check if a systemd
   # service exists whose ExecStart points to a DIFFERENT path. If so, update
   # that binary and restart the service so the running daemon picks up the new
@@ -889,6 +1023,13 @@ sync_system_service() {
   fi
 
   finish_phase "service binary synced"
+}
+
+sync_system_service() {
+  case "$(uname -s)" in
+    Linux) sync_systemd_service ;;
+    Darwin) sync_launchd_service ;;
+  esac
 }
 
 print_summary() {

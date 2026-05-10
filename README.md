@@ -131,6 +131,12 @@ Ballast files address the worst case: a completely full disk where nothing works
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/storage_ballast_helper/main/scripts/install.sh | bash
 ```
 
+The one-liner detects Linux versus macOS, downloads the matching release
+artifact, installs the `sbh` binary, and updates an existing systemd or launchd
+service binary when one is already registered. First-time daemon registration is
+still handled by `sbh install --auto`, which chooses systemd on Linux and
+launchd on macOS.
+
 Pin a specific version:
 
 ```bash

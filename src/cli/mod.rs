@@ -2447,6 +2447,32 @@ mod tests {
     }
 
     #[test]
+    fn unix_installer_syncs_existing_platform_service_binary() {
+        let installer = include_str!("../../scripts/install.sh");
+
+        for required in [
+            "sync_systemd_service()",
+            "sync_launchd_service()",
+            "Linux) sync_systemd_service",
+            "Darwin) sync_launchd_service",
+            "launchd_labels_for_sync()",
+            "SBH_LAUNCHD_LABEL",
+            "com.sbh.daemon",
+            "${HOME}/Library/LaunchAgents/${candidate_label}.plist",
+            "/Library/LaunchDaemons/${candidate_label}.plist",
+            "launchd_plist_binary",
+            "ProgramArguments<\\/key>",
+            "launchctl kickstart -k",
+            "sudo launchctl kickstart -k",
+        ] {
+            assert!(
+                installer.contains(required),
+                "Unix installer must preserve cross-platform service sync fragment: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn ci_release_targets_are_not_empty() {
         assert!(
             !CI_RELEASE_TARGETS.is_empty(),
