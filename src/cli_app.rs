@@ -1071,12 +1071,37 @@ fn run_install_auto_dry_run_json(cli: &Cli, args: &InstallArgs) -> Result<(), Cl
         .as_ref()
         .and_then(|(_, validation)| validation.as_ref().err())
         .map(ToString::to_string);
-    let release_payload = release_install
-        .as_ref()
-        .map(|(report, _)| serde_json::to_value(report))
-        .transpose()?;
+    let release_report = release_install.as_ref().map(|(report, _)| report);
+    let payload = build_install_auto_dry_run_json_payload(
+        args,
+        service,
+        &summary,
+        release_report,
+        release_error.as_deref(),
+        &install_report,
+        success,
+    )?;
+    write_json_line(&payload)?;
 
-    let payload = json!({
+    if success {
+        Ok(())
+    } else {
+        Err(CliError::Runtime("install dry-run failed".to_string()))
+    }
+}
+
+fn build_install_auto_dry_run_json_payload(
+    args: &InstallArgs,
+    service: Option<ResolvedInstallService>,
+    summary: &storage_ballast_helper::cli::wizard::WizardSummary,
+    release_report: Option<&UpdateReport>,
+    release_error: Option<&str>,
+    install_report: &storage_ballast_helper::cli::install::InstallReport,
+    success: bool,
+) -> std::result::Result<Value, serde_json::Error> {
+    let release_payload = release_report.map(serde_json::to_value).transpose()?;
+
+    Ok(json!({
         "command": "install",
         "dry_run": true,
         "auto": true,
@@ -1092,14 +1117,7 @@ fn run_install_auto_dry_run_json(cli: &Cli, args: &InstallArgs) -> Result<(), Cl
         "release_error": release_error,
         "install": install_report,
         "success": success,
-    });
-    write_json_line(&payload)?;
-
-    if success {
-        Ok(())
-    } else {
-        Err(CliError::Runtime("install dry-run failed".to_string()))
-    }
+    }))
 }
 
 fn resolve_uninstall_kind(
@@ -10024,6 +10042,76 @@ mod tests {
 
         let path = validate_macos_release_install_report(&args, &report, None).unwrap();
         assert_eq!(path, None);
+    }
+
+    #[test]
+    fn install_auto_dry_run_json_payload_nests_macos_release_report() {
+        let args = InstallArgs {
+            auto: true,
+            dry_run: true,
+            ..InstallArgs::default()
+        };
+        let service = Some(ResolvedInstallService {
+            kind: ServiceKind::Launchd,
+            user_scope: true,
+        });
+        let mut answers = storage_ballast_helper::cli::wizard::auto_answers();
+        apply_resolved_service_to_wizard_answers(&mut answers, service);
+        let summary = storage_ballast_helper::cli::wizard::WizardSummary {
+            config_path: answers.to_config().paths.config_file,
+            config_written: false,
+            answers,
+            warnings: Vec::new(),
+        };
+        let release_report = UpdateReport {
+            current_version: "0.4.7".to_string(),
+            target_version: Some("v0.4.8".to_string()),
+            update_available: true,
+            applied: false,
+            check_only: false,
+            dry_run: true,
+            artifact_url: Some("https://example.invalid/sbh-macos-arm64.tar.gz".to_string()),
+            notices_enabled: true,
+            install_path: Some(PathBuf::from("/Users/jane/.local/bin/sbh")),
+            backup_id: None,
+            steps: Vec::new(),
+            success: true,
+            follow_up: Vec::new(),
+            service_restart: None,
+        };
+        let install_report = storage_ballast_helper::cli::install::InstallReport {
+            steps: Vec::new(),
+            success: true,
+            config_path: None,
+            data_dir: None,
+            ballast_dir: None,
+            ballast_files_created: 0,
+            ballast_bytes: 0,
+            dry_run: true,
+        };
+
+        let payload = build_install_auto_dry_run_json_payload(
+            &args,
+            service,
+            &summary,
+            Some(&release_report),
+            None,
+            &install_report,
+            true,
+        )
+        .expect("payload should serialize");
+
+        assert_eq!(payload["command"].as_str(), Some("install"));
+        assert_eq!(payload["service"]["kind"].as_str(), Some("launchd"));
+        assert_eq!(payload["service"]["scope"].as_str(), Some("user"));
+        assert_eq!(payload["release_install"]["dry_run"].as_bool(), Some(true));
+        assert_eq!(
+            payload["release_install"]["install_path"].as_str(),
+            Some("/Users/jane/.local/bin/sbh")
+        );
+        assert_eq!(payload["install"]["dry_run"].as_bool(), Some(true));
+        assert!(payload["release_error"].is_null());
+        assert_eq!(payload["success"].as_bool(), Some(true));
     }
 
     #[test]
