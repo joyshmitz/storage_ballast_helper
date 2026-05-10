@@ -3,7 +3,7 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`
 Parent: `bd-r7m7`
-Last audited: 2026-05-10 04:14 UTC
+Last audited: 2026-05-10 04:39 UTC
 Evidence snapshot: the audit records the live head and run state observed at
 refresh time, but every audit-only commit makes those literals stale. Before any
 close decision, refresh the live head and newest run with:
@@ -159,6 +159,23 @@ operator-visible outcomes:
   `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-release-doctor-summary-check cargo check --all-targets"`,
   and
   `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-release-doctor-summary-clippy cargo clippy --all-targets -- -D warnings"`.
+- Fresh-eyes release-doctor hardening on 2026-05-10 fixed warning-only release
+  readiness: `WARN` checks now make aggregate `ok` false and human readiness
+  `attention` instead of `ready`. Focused proof passed with
+  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-release-doctor-attention-bin cargo test --no-default-features --features cli,daemon,sqlite --bin sbh release_doctor -- --nocapture"`
+  and
+  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-release-doctor-attention-doc2 cargo test --lib release_workflow_imports_developer_id_certificate_before_signing -- --nocapture"`;
+  full gates also passed with `cargo fmt --check`, `git diff --check`,
+  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-release-doctor-attention-check cargo check --all-targets"`,
+  and
+  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-release-doctor-attention-clippy cargo clippy --all-targets -- -D warnings"`.
+- The hosted macOS release-doctor diagnostic harness now validates the aggregate
+  `ok`, `passed`, `warnings`, and `failed` fields against the per-check
+  statuses before uploading `macos-release-doctor-summary.txt`; warning-only
+  artifacts therefore cannot look release-ready in CI evidence. Focused proof
+  passed with Ruby YAML parsing for `.github/workflows/ci.yml`,
+  `cargo fmt --check`, `git diff --check`, and
+  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-release-doctor-ci-summary-test cargo test --lib ci_workflow_spot_checks_macos_release_builds_without_notarization -- --nocapture"`.
 - Focused release workflow contract proof passed with
   `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_workflow_contract_proof cargo test --lib workflow -- --nocapture`.
   The run reported 13 passed tests, including Developer ID import, hardened

@@ -476,6 +476,10 @@ jobs:
               sys.exit(1)
 
           required_top = {
+              "ok",
+              "passed",
+              "warnings",
+              "failed",
               "repository",
               "notary_profile",
               "required_github_secrets",
@@ -498,8 +502,39 @@ jobs:
               print(f"::error::release doctor JSON missing checks: {missing_checks}")
               sys.exit(1)
 
+          statuses = [check.get("status") for check in report["checks"]]
+          expected_counts = {
+              "passed": statuses.count("PASS"),
+              "warnings": statuses.count("WARN"),
+              "failed": statuses.count("FAIL"),
+          }
+          for key, expected in expected_counts.items():
+              if report.get(key) != expected:
+                  print(
+                      f"::error::release doctor JSON {key}={report.get(key)!r} "
+                      f"does not match check count {expected}"
+                  )
+                  sys.exit(1)
+
+          expected_ok = expected_counts["failed"] == 0 and expected_counts["warnings"] == 0
+          if report.get("ok") != expected_ok:
+              print(
+                  f"::error::release doctor JSON ok={report.get('ok')!r} "
+                  f"does not match failed/warnings counts"
+              )
+              sys.exit(1)
+
           pathlib.Path("macos-release-doctor-summary.txt").write_text(
-              "\n".join(f"{check}={checks[check]}" for check in required_checks) + "\n",
+              "\n".join(
+                  [
+                      f"ok={report['ok']}",
+                      f"passed={report['passed']}",
+                      f"warnings={report['warnings']}",
+                      f"failed={report['failed']}",
+                  ]
+                  + [f"{check}={checks[check]}" for check in required_checks]
+              )
+              + "\n",
               encoding="utf-8",
           )
           PY
