@@ -1376,6 +1376,9 @@ mod tests {
             "`$P12_PATH`",
             "`$HOMEBREW_TAP_TOKEN`",
             "--body-file -",
+            "aggregate `ok` boolean",
+            "`passed`, `warnings`, and",
+            "`failed` counts",
             "JSON `setup_steps` field",
         ] {
             assert!(

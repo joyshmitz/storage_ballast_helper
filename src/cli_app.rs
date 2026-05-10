@@ -3990,6 +3990,10 @@ struct PalDoctorReport {
 
 #[derive(Debug, Clone, Serialize)]
 struct ReleaseDoctorReport {
+    ok: bool,
+    passed: usize,
+    warnings: usize,
+    failed: usize,
     repository: &'static str,
     notary_profile: &'static str,
     required_github_secrets: Vec<&'static str>,
@@ -4098,6 +4102,10 @@ fn doctor_checks_have_failures(checks: &[DoctorCheck]) -> bool {
     checks.iter().any(|check| check.status == "FAIL")
 }
 
+fn doctor_check_status_count(checks: &[DoctorCheck], status: &str) -> usize {
+    checks.iter().filter(|check| check.status == status).count()
+}
+
 fn print_pal_doctor_report(report: &PalDoctorReport) {
     println!("PAL doctor: {}", report.platform);
     println!(
@@ -4144,6 +4152,13 @@ fn print_pal_doctor_report(report: &PalDoctorReport) {
 
 fn print_release_doctor_report(report: &ReleaseDoctorReport) {
     println!("Release doctor: {}", report.repository);
+    println!(
+        "  readiness={} passed={} warnings={} failed={}",
+        if report.ok { "ready" } else { "blocked" },
+        report.passed,
+        report.warnings,
+        report.failed
+    );
     println!("  notary_profile={}", report.notary_profile);
     println!(
         "  required_github_secrets={}",
@@ -4192,16 +4207,23 @@ fn release_doctor_report_with_command_runner<F>(run_command: &F) -> ReleaseDocto
 where
     F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
 {
+    let checks = vec![
+        release_developer_id_identity_check(run_command),
+        release_notary_profile_check(run_command),
+        release_github_secrets_check(run_command),
+    ];
+    let failed = doctor_check_status_count(&checks, "FAIL");
+
     ReleaseDoctorReport {
+        ok: failed == 0,
+        passed: doctor_check_status_count(&checks, "PASS"),
+        warnings: doctor_check_status_count(&checks, "WARN"),
+        failed,
         repository: RELEASE_REPOSITORY,
         notary_profile: RELEASE_DOCTOR_NOTARY_PROFILE,
         required_github_secrets: RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS.to_vec(),
         setup_steps: release_doctor_setup_steps(),
-        checks: vec![
-            release_developer_id_identity_check(run_command),
-            release_notary_profile_check(run_command),
-            release_github_secrets_check(run_command),
-        ],
+        checks,
     }
 }
 
@@ -9349,6 +9371,10 @@ mod tests {
 
         let report = release_doctor_report_with_command_runner(&command);
 
+        assert!(report.ok);
+        assert_eq!(report.passed, 3);
+        assert_eq!(report.warnings, 0);
+        assert_eq!(report.failed, 0);
         assert_eq!(report.repository, RELEASE_REPOSITORY);
         assert_eq!(report.notary_profile, RELEASE_DOCTOR_NOTARY_PROFILE);
         assert!(report.checks.iter().all(|check| check.status == "PASS"));
@@ -9394,6 +9420,10 @@ mod tests {
 
         let report = release_doctor_report_with_command_runner(&command);
 
+        assert!(!report.ok);
+        assert_eq!(report.passed, 0);
+        assert_eq!(report.warnings, 0);
+        assert_eq!(report.failed, 3);
         assert_eq!(
             release_check_by_id(&report, "release.developer_id_identity").status,
             "FAIL"
