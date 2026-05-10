@@ -1771,6 +1771,33 @@ mod tests {
     }
 
     #[test]
+    fn ci_preflights_homebrew_tap_token_on_mainline_pushes() {
+        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
+
+        for required in [
+            "homebrew-tap-token-preflight:",
+            "Homebrew Tap Token Preflight",
+            "if: github.event_name == 'push' && github.ref == 'refs/heads/main'",
+            "Validate tap token before mainline release readiness",
+            "HOMEBREW_TAP_REPOSITORY: Dicklesworthstone/homebrew-sbh",
+            "GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}",
+            "HOMEBREW_TAP_TOKEN is required before macOS release readiness can pass",
+            "gh api \"repos/${HOMEBREW_TAP_REPOSITORY}\" > homebrew-tap-token-repository.json",
+            "homebrew-tap-token-api-response.txt",
+            "homebrew-tap-token-scope-summary.txt",
+            "HOMEBREW_TAP_TOKEN cannot push",
+            "broad classic OAuth scopes",
+            "\"repo\", \"public_repo\", \"delete_repo\", \"admin:org\", \"workflow\"",
+            "Use a fine-grained PAT or GitHub App credential limited to Dicklesworthstone/homebrew-sbh",
+        ] {
+            assert!(
+                ci_workflow.contains(required),
+                "CI workflow must preflight Homebrew tap token quality on mainline pushes: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn release_workflow_updates_homebrew_tap_by_pr() {
         let release_workflow = include_str!("../../.github/workflows/release.yml");
         let readme = include_str!("../../README.md");
