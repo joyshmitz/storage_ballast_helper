@@ -1437,6 +1437,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn ci_workflow_spot_checks_macos_release_builds_without_notarization() {
         let ci_workflow = include_str!("../../.github/workflows/ci.yml");
         let release_workflow = include_str!("../../.github/workflows/release.yml");
@@ -1448,6 +1449,13 @@ mod tests {
             "cargo build $CI_FEATURES --release 2>&1 | tee macos-release-build-output.txt",
             "Capture release doctor diagnostics",
             "GH_TOKEN: ${{ github.token }}",
+            "SBH_RELEASE_SECRET_APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64_PRESENT: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 != '' }}",
+            "SBH_RELEASE_SECRET_APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD_PRESENT: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD != '' }}",
+            "SBH_RELEASE_SECRET_APPLE_DEVELOPER_ID_IDENTITY_PRESENT: ${{ secrets.APPLE_DEVELOPER_ID_IDENTITY != '' }}",
+            "SBH_RELEASE_SECRET_APPLE_ID_PRESENT: ${{ secrets.APPLE_ID != '' }}",
+            "SBH_RELEASE_SECRET_APPLE_TEAM_ID_PRESENT: ${{ secrets.APPLE_TEAM_ID != '' }}",
+            "SBH_RELEASE_SECRET_APPLE_APP_SPECIFIC_PASSWORD_PRESENT: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}",
+            "SBH_RELEASE_SECRET_HOMEBREW_TAP_TOKEN_PRESENT: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}",
             "\"${bin}\" --json doctor --release > macos-release-doctor-output.json",
             "DOCTOR_STATUS=\"${doctor_status}\" python3",
             "import os",
@@ -1491,7 +1499,7 @@ mod tests {
 
         for forbidden in [
             "notarytool",
-            "APPLE_APP_SPECIFIC_PASSWORD",
+            "APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}",
             "Notarize macOS release binary",
         ] {
             assert!(

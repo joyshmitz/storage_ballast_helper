@@ -451,6 +451,13 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          SBH_RELEASE_SECRET_APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64_PRESENT: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 != '' }}
+          SBH_RELEASE_SECRET_APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD_PRESENT: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD != '' }}
+          SBH_RELEASE_SECRET_APPLE_DEVELOPER_ID_IDENTITY_PRESENT: ${{ secrets.APPLE_DEVELOPER_ID_IDENTITY != '' }}
+          SBH_RELEASE_SECRET_APPLE_ID_PRESENT: ${{ secrets.APPLE_ID != '' }}
+          SBH_RELEASE_SECRET_APPLE_TEAM_ID_PRESENT: ${{ secrets.APPLE_TEAM_ID != '' }}
+          SBH_RELEASE_SECRET_APPLE_APP_SPECIFIC_PASSWORD_PRESENT: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
+          SBH_RELEASE_SECRET_HOMEBREW_TAP_TOKEN_PRESENT: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
         run: |
           set -euo pipefail
           bin="./target/release/sbh"

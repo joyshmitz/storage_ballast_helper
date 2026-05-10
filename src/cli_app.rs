@@ -4303,6 +4303,8 @@ fn release_readiness_label(report: &ReleaseDoctorReport) -> &'static str {
 
 const RELEASE_DOCTOR_NOTARY_PROFILE: &str = "sbh-notary";
 const RELEASE_HOMEBREW_TAP_REPOSITORY: &str = "Dicklesworthstone/homebrew-sbh";
+const RELEASE_SECRET_PRESENT_ENV_PREFIX: &str = "SBH_RELEASE_SECRET_";
+const RELEASE_SECRET_PRESENT_ENV_SUFFIX: &str = "_PRESENT";
 const RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS: &[&str] = &[
     "APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64",
     "APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD",
@@ -4314,17 +4316,29 @@ const RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS: &[&str] = &[
 ];
 
 fn release_doctor_report() -> ReleaseDoctorReport {
-    release_doctor_report_with_command_runner(&run_doctor_command)
+    release_doctor_report_with_command_runner_and_env(&run_doctor_command, &release_doctor_env_var)
 }
 
+#[cfg(test)]
 fn release_doctor_report_with_command_runner<F>(run_command: &F) -> ReleaseDoctorReport
 where
     F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
 {
+    release_doctor_report_with_command_runner_and_env(run_command, &release_doctor_env_var)
+}
+
+fn release_doctor_report_with_command_runner_and_env<F, E>(
+    run_command: &F,
+    read_env: &E,
+) -> ReleaseDoctorReport
+where
+    F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
+    E: Fn(&str) -> Option<String>,
+{
     let checks = vec![
         release_developer_id_identity_check(run_command),
         release_notary_profile_check(run_command),
-        release_github_secrets_check(run_command),
+        release_github_secrets_check(run_command, read_env),
         release_homebrew_tap_check(run_command),
     ];
     let failed = doctor_check_status_count(&checks, "FAIL");
@@ -4341,6 +4355,10 @@ where
         setup_steps: release_doctor_setup_steps(),
         checks,
     }
+}
+
+fn release_doctor_env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok()
 }
 
 fn release_developer_id_identity_check<F>(run_command: &F) -> DoctorCheck
@@ -4431,10 +4449,35 @@ where
     }
 }
 
-fn release_github_secrets_check<F>(run_command: &F) -> DoctorCheck
+fn release_github_secrets_check<F, E>(run_command: &F, read_env: &E) -> DoctorCheck
 where
     F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
+    E: Fn(&str) -> Option<String>,
 {
+    match release_secret_names_from_presence_env(read_env) {
+        Ok(Some(secret_names)) => {
+            return release_secret_names_check(
+                &secret_names,
+                "CI secret presence flags reported all required release secrets are configured",
+                "CI secret presence flags reported missing required secrets",
+                "Set the missing secrets on the release repository, then rerun CI and sbh doctor --release.",
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return doctor_check(
+                "release.github_secrets",
+                "GitHub release secrets",
+                "FAIL",
+                format!("CI release secret presence flags are invalid: {error}"),
+                Some(
+                    "Fix the SBH_RELEASE_SECRET_*_PRESENT environment values in the CI release doctor diagnostic step."
+                        .to_string(),
+                ),
+            );
+        }
+    }
+
     let args = vec![
         "secret".to_string(),
         "list".to_string(),
@@ -4458,31 +4501,15 @@ where
                     );
                 }
             };
-            let missing = RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS
-                .iter()
-                .copied()
-                .filter(|secret| !secret_names.contains(*secret))
-                .collect::<Vec<_>>();
-
-            if missing.is_empty() {
-                doctor_check(
-                    "release.github_secrets",
-                    "GitHub release secrets",
-                    "PASS",
-                    "all required release secrets are configured",
-                    None,
-                )
-            } else {
-                doctor_check(
-                    "release.github_secrets",
-                    "GitHub release secrets",
-                    "FAIL",
-                    format!("missing required secrets: {}", missing.join(", ")),
-                    Some(format!(
-                        "Set the missing secrets on {RELEASE_REPOSITORY} with the commands documented in docs/macos.md.",
-                    )),
-                )
-            }
+            let secret_names = secret_names.iter().map(String::as_str).collect::<Vec<_>>();
+            release_secret_names_check(
+                &secret_names,
+                "all required release secrets are configured",
+                "missing required secrets",
+                &format!(
+                    "Set the missing secrets on {RELEASE_REPOSITORY} with the commands documented in docs/macos.md."
+                ),
+            )
         }
         Ok(outcome) => doctor_check(
             "release.github_secrets",
@@ -4498,6 +4525,76 @@ where
             format!("failed to run gh secret list: {error}"),
             Some("Install GitHub CLI and authenticate before checking release secrets.".to_string()),
         ),
+    }
+}
+
+fn release_secret_names_from_presence_env<E>(
+    read_env: &E,
+) -> Result<Option<Vec<&'static str>>, String>
+where
+    E: Fn(&str) -> Option<String>,
+{
+    let mut observed_any = false;
+    let mut present = Vec::new();
+
+    for secret in RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS {
+        let env_key = release_secret_presence_env_key(secret);
+        let Some(value) = read_env(&env_key) else {
+            continue;
+        };
+        observed_any = true;
+        match parse_release_secret_presence_flag(&value) {
+            Some(true) => present.push(*secret),
+            Some(false) => {}
+            None => {
+                return Err(format!("{env_key} must be true or false, got {value:?}"));
+            }
+        }
+    }
+
+    Ok(observed_any.then_some(present))
+}
+
+fn release_secret_presence_env_key(secret: &str) -> String {
+    format!("{RELEASE_SECRET_PRESENT_ENV_PREFIX}{secret}{RELEASE_SECRET_PRESENT_ENV_SUFFIX}")
+}
+
+fn parse_release_secret_presence_flag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Some(true),
+        "0" | "false" | "no" | "" => Some(false),
+        _ => None,
+    }
+}
+
+fn release_secret_names_check(
+    secret_names: &[&str],
+    pass_message: &str,
+    missing_prefix: &str,
+    remediation: &str,
+) -> DoctorCheck {
+    let missing = RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS
+        .iter()
+        .copied()
+        .filter(|secret| !secret_names.iter().any(|name| name == secret))
+        .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        doctor_check(
+            "release.github_secrets",
+            "GitHub release secrets",
+            "PASS",
+            pass_message,
+            None,
+        )
+    } else {
+        doctor_check(
+            "release.github_secrets",
+            "GitHub release secrets",
+            "FAIL",
+            format!("{missing_prefix}: {}", missing.join(", ")),
+            Some(remediation.to_string()),
+        )
     }
 }
 
@@ -9737,6 +9834,119 @@ mod tests {
             "tap warning should explain missing formula: {}",
             tap.message
         );
+    }
+
+    #[test]
+    fn release_doctor_report_uses_ci_secret_presence_flags_before_gh_secret_list() {
+        let mut env = RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS
+            .iter()
+            .map(|secret| (release_secret_presence_env_key(secret), "true".to_string()))
+            .collect::<HashMap<_, _>>();
+        env.insert(
+            release_secret_presence_env_key("HOMEBREW_TAP_TOKEN"),
+            "false".to_string(),
+        );
+
+        let command = |program: &str, args: &[String]| match program {
+            "security" => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: "1) ABCDEF \"Developer ID Application: Example LLC (TEAMID)\"".to_string(),
+                stderr: String::new(),
+            }),
+            "xcrun" => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: "{\"history\":[]}".to_string(),
+                stderr: String::new(),
+            }),
+            "gh" if args_start_with(args, &["secret", "list"]) => {
+                panic!("CI secret presence flags should avoid gh secret list")
+            }
+            "gh" if args_start_with(args, &["repo", "view"]) => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: json!({
+                    "nameWithOwner": RELEASE_HOMEBREW_TAP_REPOSITORY,
+                    "defaultBranchRef": { "name": "main" }
+                })
+                .to_string(),
+                stderr: String::new(),
+            }),
+            "gh" if args_start_with(args, &["api"]) => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: "sbh.rb\n".to_string(),
+                stderr: String::new(),
+            }),
+            other => panic!("unexpected release doctor command: {other}"),
+        };
+
+        let report = release_doctor_report_with_command_runner_and_env(&command, &|key| {
+            env.get(key).cloned()
+        });
+
+        assert!(!report.ok);
+        assert_eq!(report.passed, 3);
+        assert_eq!(report.warnings, 0);
+        assert_eq!(report.failed, 1);
+        let secrets = release_check_by_id(&report, "release.github_secrets");
+        assert_eq!(secrets.status, "FAIL");
+        assert!(secrets.message.contains("CI secret presence flags"));
+        assert!(secrets.message.contains("HOMEBREW_TAP_TOKEN"));
+    }
+
+    #[test]
+    fn release_doctor_report_rejects_invalid_ci_secret_presence_flags() {
+        let env = std::iter::once((
+            release_secret_presence_env_key("HOMEBREW_TAP_TOKEN"),
+            "maybe".to_string(),
+        ))
+        .collect::<HashMap<_, _>>();
+
+        let command = |program: &str, args: &[String]| match program {
+            "security" => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: "1) ABCDEF \"Developer ID Application: Example LLC (TEAMID)\"".to_string(),
+                stderr: String::new(),
+            }),
+            "xcrun" => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: "{\"history\":[]}".to_string(),
+                stderr: String::new(),
+            }),
+            "gh" if args_start_with(args, &["secret", "list"]) => {
+                panic!("invalid CI secret presence flags should avoid gh secret list")
+            }
+            "gh" if args_start_with(args, &["repo", "view"]) => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: json!({
+                    "nameWithOwner": RELEASE_HOMEBREW_TAP_REPOSITORY,
+                    "defaultBranchRef": { "name": "main" }
+                })
+                .to_string(),
+                stderr: String::new(),
+            }),
+            "gh" if args_start_with(args, &["api"]) => Ok(DoctorCommandOutcome {
+                success: true,
+                exit_code: Some(0),
+                stdout: "sbh.rb\n".to_string(),
+                stderr: String::new(),
+            }),
+            other => panic!("unexpected release doctor command: {other}"),
+        };
+
+        let report = release_doctor_report_with_command_runner_and_env(&command, &|key| {
+            env.get(key).cloned()
+        });
+
+        assert!(!report.ok);
+        let secrets = release_check_by_id(&report, "release.github_secrets");
+        assert_eq!(secrets.status, "FAIL");
+        assert!(secrets.message.contains("must be true or false"));
     }
 
     #[test]
