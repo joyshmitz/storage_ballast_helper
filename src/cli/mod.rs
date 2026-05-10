@@ -1447,6 +1447,7 @@ mod tests {
             "Build release binary",
             "cargo build $CI_FEATURES --release 2>&1 | tee macos-release-build-output.txt",
             "Capture release doctor diagnostics",
+            "GH_TOKEN: ${{ github.token }}",
             "\"${bin}\" --json doctor --release > macos-release-doctor-output.json",
             "DOCTOR_STATUS=\"${doctor_status}\" python3",
             "import os",

@@ -449,6 +449,8 @@ jobs:
       - name: Capture release doctor diagnostics
         if: always()
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           bin="./target/release/sbh"
