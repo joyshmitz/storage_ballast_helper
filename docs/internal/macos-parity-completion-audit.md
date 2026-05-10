@@ -3,7 +3,7 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`, `bd-r7m7.17`
 Parent: `bd-r7m7`
-Last audited: 2026-05-10 14:07 UTC
+Last audited: 2026-05-10 14:50 UTC
 Evidence snapshot: the audit records the live head and run state observed at
 refresh time, but every audit-only commit makes those literals stale. Before any
 close decision, refresh the live head and newest run with:
@@ -81,8 +81,8 @@ operator-visible outcomes:
   blocker for final macOS parity proof.
 - `bd-ykwh.20` is closed; release CI now runs `spctl -a -t execute -vv` after
   notarization acceptance and before packaging macOS tarballs.
-- Live recheck at 2026-05-10 14:07 UTC inspected current branch head
-  `cf1b1dedc86960b993fb131e0776744040881030`. That head is Beads-only tracker
+- Live recheck at 2026-05-10 14:50 UTC inspected current branch head
+  `1fea1347ba99ce6a444c78105c1e4f776b434a8f`. That head is Beads-only tracker
   evidence, so the latest source CI run remains `25630326420` for source head
   `35ab04dee7c0840742edbb83a70e10165bc187bf`.
 - Run `25630326420` is still queued overall. `macOS Platform Tests (intel)` is
@@ -90,9 +90,20 @@ operator-visible outcomes:
   `Homebrew Formula Validation`, `macOS Coverage`, `macOS Performance Budgets`,
   and `macOS Platform Tests (apple-silicon)` remain queued with no runner
   assignment. This is not final green CI proof.
-- The Beads-only pushes through `cf1b1dedc86960b993fb131e0776744040881030` did not
+- The Beads-only pushes through `1fea1347ba99ce6a444c78105c1e4f776b434a8f` did not
   start a new source CI run, confirming the current `.beads/**` path-ignore
   guard is working for tracker-only evidence updates.
+- Hosted queue diagnosis at 2026-05-10 14:48 UTC found no repository-side
+  workflow/policy gate explaining the queued run: CI concurrency is scoped to
+  workflow/ref and leaves `25630326420` as the active source run,
+  GitHub Status reports Actions operational, repository Actions permissions are
+  enabled with `allowed_actions=all`, run timing shows zero billable duration
+  for the queued jobs, and the jobs API still reports empty
+  `runner_name`/`runner_group_name` for the queued `ubuntu-latest` and
+  `macos-latest` jobs.
+- Additional CI gate checks found `pending_deployments` empty and workflow
+  permissions set to `default_workflow_permissions=read`, so the run is not
+  waiting on a GitHub environment approval or selected-actions policy gate.
 - Live recheck at 2026-05-10 02:44 UTC inspected pushed head
   `0da51406462098b02aa58ee150a0ae632433981f`
   (`bd-r7m7 refresh macos parity audit`). That was point-in-time evidence
