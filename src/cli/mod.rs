@@ -1379,6 +1379,8 @@ mod tests {
             "`$P12_PATH`",
             "`$HOMEBREW_TAP_TOKEN`",
             "--body-file -",
+            "Treat `WARN` as an attention state",
+            "remains false until every release check passes",
             "aggregate `ok` boolean",
             "`passed`, `warnings`, and",
             "`failed` counts",

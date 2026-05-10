@@ -424,11 +424,13 @@ For automation or handoff checks, use:
 sbh doctor --release --json
 ```
 
-Treat any `FAIL` result as a release blocker. The command intentionally reports
-missing local signing identity, missing notary profile, and missing GitHub
-Actions secrets or tap access as explicit diagnostics so the external
-Apple/GitHub credential setup can be finished without inspecting workflow
-internals.
+Treat any `FAIL` result as a release blocker. Treat `WARN` as an attention state:
+it does not make the doctor command fail by itself, but the aggregate `ok`
+boolean remains false until every release check passes. The command
+intentionally reports missing local signing identity, missing notary profile,
+and missing GitHub Actions secrets or tap access as explicit diagnostics so the
+external Apple/GitHub credential setup can be finished without inspecting
+workflow internals.
 The JSON report includes an aggregate `ok` boolean plus `passed`, `warnings`, and
 `failed` counts so automation can gate on a stable summary before drilling into
 individual `checks`.
