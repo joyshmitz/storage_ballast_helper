@@ -1781,6 +1781,14 @@ mod tests {
             "Update Homebrew Tap",
             "HOMEBREW_TAP_REPOSITORY: Dicklesworthstone/homebrew-sbh",
             "GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}",
+            "gh api \"repos/${HOMEBREW_TAP_REPOSITORY}\" > homebrew-tap-token-repository.json",
+            "homebrew-tap-token-api-response.txt",
+            "homebrew-tap-token-scope-summary.txt",
+            "HOMEBREW_TAP_TOKEN cannot push",
+            "broad classic OAuth scopes",
+            "delete_repo",
+            "admin:org",
+            "Use a fine-grained PAT or GitHub App credential",
             "repository: ${{ env.HOMEBREW_TAP_REPOSITORY }}",
             "sbh-source/packaging/homebrew/Formula/sbh.rb",
             "homebrew-sbh/Formula/sbh.rb",
@@ -1805,6 +1813,8 @@ mod tests {
                 "Dicklesworthstone/homebrew-sbh",
                 "packaging/homebrew/Formula/sbh.rb",
                 "HOMEBREW_TAP_TOKEN",
+                "fine-grained PAT or GitHub App credential",
+                "broad classic OAuth scopes",
                 "formula update PR",
             ] {
                 assert!(
