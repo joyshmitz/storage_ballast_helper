@@ -494,6 +494,91 @@ artifact. The release workflow keeps the accepted notary log with ticket
 contents for the signed binary. A future `.pkg` or `.dmg` distribution path
 should staple and validate that package after notarization.
 
+## Manual Release Fallback
+
+The normal release path is the tagged GitHub Actions workflow. Use a manual
+fallback only when the hosted release run is stuck before runner assignment and
+the operator has explicitly approved publishing outside the workflow. Do not
+publish from chat notes, historical provenance, or a missing `/tmp` directory:
+the complete artifact set must exist on disk and pass verification immediately
+before upload.
+
+Use a durable working directory outside `/tmp` so cleanup tools do not remove
+the prepared bundle before publication:
+
+```bash
+export VERSION=0.4.14
+export TAG="v${VERSION}"
+export SOURCE_SHA="$(git rev-parse "${TAG}^{commit}")"
+export ARTIFACT_DIR="$HOME/release-work/storage_ballast_helper/releases/${TAG}"
+mkdir -p "$ARTIFACT_DIR"
+```
+
+The fallback artifact set is complete only when all of these files exist:
+
+- `sbh-${TAG}-aarch64-apple-darwin.tar.xz`
+- `sbh-${TAG}-aarch64-apple-darwin.tar.xz.sha256`
+- `sbh-${TAG}-x86_64-apple-darwin.tar.xz`
+- `sbh-${TAG}-x86_64-apple-darwin.tar.xz.sha256`
+- `sbh-${TAG}-aarch64-unknown-linux-gnu.tar.xz`
+- `sbh-${TAG}-aarch64-unknown-linux-gnu.tar.xz.sha256`
+- `sbh-${TAG}-x86_64-unknown-linux-gnu.tar.xz`
+- `sbh-${TAG}-x86_64-unknown-linux-gnu.tar.xz.sha256`
+- `SHA256SUMS.txt`
+- `release-provenance.json`
+
+For macOS artifacts, build the exact tag, sign with the Developer ID Application
+identity, verify the hardened-runtime signature, submit the signed binary to
+notarytool, download the accepted notary log, and verify the log's
+`ticketContents` contains the binary architecture and CDHash before packaging.
+For Linux artifacts, use the same no-default-feature release profile as the
+workflow and verify each extracted binary reports the expected `sbh --version`.
+
+After all four archives and sidecars are present, regenerate the aggregate
+manifest from the sidecars and verify it from inside the artifact directory:
+
+```bash
+cd "$ARTIFACT_DIR"
+: > SHA256SUMS.txt
+for checksum_file in sbh-"${TAG}"-*.sha256; do
+  archive="${checksum_file%.sha256}"
+  test -s "$archive"
+  shasum -a 256 -c "$checksum_file"
+  awk '{print $1 "  " $2}' "$checksum_file" >> SHA256SUMS.txt
+done
+sort -k2,2 SHA256SUMS.txt -o SHA256SUMS.txt
+shasum -a 256 -c SHA256SUMS.txt
+```
+
+Record provenance next to the artifacts:
+
+```bash
+cat > release-provenance.json <<EOF
+{
+  "tag": "${TAG}",
+  "sha": "${SOURCE_SHA}",
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "rustc_version": "$(rustc --version)",
+  "release_path": "manual-fallback"
+}
+EOF
+```
+
+Before publication, rerun:
+
+```bash
+sbh doctor --release --json
+gh release view "$TAG" -R Dicklesworthstone/storage_ballast_helper
+```
+
+The doctor must pass. The release view should fail only when the goal is to
+create a new release; if it already exists, inspect the existing assets before
+uploading anything. Publication is the irreversible handoff point: create the
+GitHub Release, upload the verified artifact set, update
+`Dicklesworthstone/homebrew-sbh` `Formula/sbh.rb` to the same tag and macOS
+checksums, then verify the public tap with `brew fetch`, `brew audit`, `brew
+install`, and `brew test`.
+
 ## Self-Update Verification
 
 `sbh update` verifies the downloaded archive checksum before extraction. On
