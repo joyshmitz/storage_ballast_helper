@@ -1,7 +1,7 @@
 class Sbh < Formula
   desc "Disk-pressure defense system for AI coding workloads"
   homepage "https://github.com/Dicklesworthstone/storage_ballast_helper"
-  version "0.4.7"
+  version "0.4.8"
   license "MIT"
 
   # Release automation copies this skeleton into Dicklesworthstone/homebrew-sbh

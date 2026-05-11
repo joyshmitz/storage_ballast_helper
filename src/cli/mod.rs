@@ -1710,7 +1710,7 @@ mod tests {
 
         for required in [
             "class Sbh < Formula",
-            "version \"0.4.7\"",
+            "version \"0.4.8\"",
             "on_macos do",
             "on_arm do",
             "on_intel do",
@@ -1742,7 +1742,7 @@ mod tests {
         let intel_sha = "1".repeat(64);
 
         let generated = formula
-            .replace("version \"0.4.7\"", "version \"9.8.7\"")
+            .replace("version \"0.4.8\"", "version \"9.8.7\"")
             .replace(
                 "      # REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256\n      sha256 \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
                 &format!("      sha256 \"{arm_sha}\""),
