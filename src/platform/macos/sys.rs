@@ -6,17 +6,17 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io;
-use std::io::Cursor;
+use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use nix::mount::MntFlags;
 use nix::sys::statfs::{Statfs, statfs as nix_statfs};
 use parking_lot::RwLock;
 use plist::Value;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, mpsc};
 
 const STATFS_STRUCT_SIZE_BYTES: usize = core::mem::size_of::<libc::statfs>();
 const STATFS_MOUNT_NAME_BYTES: usize = core::mem::size_of::<[libc::c_char; 1024]>();
@@ -30,9 +30,20 @@ const _: [(); 16] = [(); STATFS_TYPE_NAME_BYTES];
 
 const APFS_CACHE_TTL_SECS: u64 = 5 * 60;
 const APFS_CACHE_TTL: Duration = Duration::from_secs(APFS_CACHE_TTL_SECS);
+const MOUNTED_FILESYSTEMS_CACHE_TTL: Duration = Duration::from_secs(5);
+const MOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
+const DISKUTIL_APFS_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const TMUTIL_LIST_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const TMUTIL_THIN_COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
+const MACOS_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const MACOS_COMMAND_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const MACOS_COMMAND_KILL_REAP_ATTEMPTS: usize = 10;
 pub const LOCAL_SNAPSHOT_THIN_AMOUNT_BYTES: u64 = 9_999_999_999_999_999;
 pub const LOCAL_SNAPSHOT_THIN_URGENCY: u8 = 4;
+type MountedFilesystemsCache = RwLock<Option<(Instant, Vec<StatfsSnapshot>)>>;
+
 static APFS_INVENTORY_CACHE: OnceLock<RwLock<Option<(Instant, ApfsInventory)>>> = OnceLock::new();
+static MOUNTED_FILESYSTEMS_CACHE: OnceLock<MountedFilesystemsCache> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatfsSnapshot {
@@ -50,6 +61,7 @@ pub struct StatfsSnapshot {
 struct MountCommandEntry {
     device: String,
     mount_point: PathBuf,
+    is_local: bool,
 }
 
 impl StatfsSnapshot {
@@ -303,8 +315,21 @@ pub fn statfs(path: &Path) -> io::Result<StatfsSnapshot> {
 }
 
 pub fn mounted_filesystems() -> io::Result<Vec<StatfsSnapshot>> {
+    let cache = MOUNTED_FILESYSTEMS_CACHE.get_or_init(|| RwLock::new(None));
+    {
+        let cached = cache.read();
+        if let Some((collected_at, filesystems)) = &*cached
+            && collected_at.elapsed() < MOUNTED_FILESYSTEMS_CACHE_TTL
+        {
+            return Ok(filesystems.clone());
+        }
+    }
+
     let mut filesystems = Vec::new();
     for mount in mount_command_entries()? {
+        if !mount.is_local {
+            continue;
+        }
         match statfs_for_mount(&mount.mount_point, OsStr::new(&mount.device)) {
             Ok(snapshot) => filesystems.push(snapshot),
             Err(error) => eprintln!(
@@ -321,13 +346,14 @@ pub fn mounted_filesystems() -> io::Result<Vec<StatfsSnapshot>> {
             .cmp(&left.mount_point.as_os_str().len())
             .then_with(|| left.mount_point.cmp(&right.mount_point))
     });
+    *cache.write() = Some((Instant::now(), filesystems.clone()));
     Ok(filesystems)
 }
 
 fn mount_command_entries() -> io::Result<Vec<MountCommandEntry>> {
-    let output = Command::new("/sbin/mount").output();
-    match output {
-        Ok(output) if output.status.success() => {
+    let mut command = Command::new("/sbin/mount");
+    match command_output_with_timeout(&mut command, MOUNT_COMMAND_TIMEOUT) {
+        Ok(Some(output)) if output.status.success() => {
             let entries = parse_mount_command_output(&String::from_utf8_lossy(&output.stdout));
             if entries.is_empty() {
                 whichdisk_mount_entries()
@@ -335,7 +361,7 @@ fn mount_command_entries() -> io::Result<Vec<MountCommandEntry>> {
                 Ok(entries)
             }
         }
-        Ok(output) => {
+        Ok(Some(output)) => {
             let detail = String::from_utf8_lossy(&output.stderr);
             eprintln!(
                 "[sbh] warning: /sbin/mount failed with status {}: {}; falling back to whichdisk",
@@ -344,10 +370,94 @@ fn mount_command_entries() -> io::Result<Vec<MountCommandEntry>> {
             );
             whichdisk_mount_entries()
         }
+        Ok(None) => {
+            eprintln!(
+                "[sbh] warning: /sbin/mount timed out after {MOUNT_COMMAND_TIMEOUT:?}; mount inventory unavailable"
+            );
+            Ok(Vec::new())
+        }
         Err(error) => {
             eprintln!("[sbh] warning: /sbin/mount unavailable: {error}; falling back to whichdisk");
             whichdisk_mount_entries()
         }
+    }
+}
+
+fn command_timeout_error(command_name: &str, timeout: Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("{command_name} timed out after {timeout:?}"),
+    )
+}
+
+fn command_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> io::Result<Option<Output>> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take().map(spawn_command_stream_reader);
+    let mut stderr = child.stderr.take().map(spawn_command_stream_reader);
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let Some(stdout) =
+                receive_command_stream(stdout.take(), MACOS_COMMAND_OUTPUT_DRAIN_TIMEOUT)?
+            else {
+                return Ok(None);
+            };
+            let Some(stderr) =
+                receive_command_stream(stderr.take(), MACOS_COMMAND_OUTPUT_DRAIN_TIMEOUT)?
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(Output {
+                status,
+                stdout,
+                stderr,
+            }));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            for _ in 0..MACOS_COMMAND_KILL_REAP_ATTEMPTS {
+                if child.try_wait()?.is_some() {
+                    break;
+                }
+                thread::sleep(MACOS_COMMAND_POLL_INTERVAL);
+            }
+            return Ok(None);
+        }
+        thread::sleep(MACOS_COMMAND_POLL_INTERVAL);
+    }
+}
+
+fn spawn_command_stream_reader<R>(mut reader: R) -> mpsc::Receiver<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = reader.read_to_end(&mut output).map(|_| output);
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn receive_command_stream(
+    receiver: Option<mpsc::Receiver<io::Result<Vec<u8>>>>,
+    timeout: Duration,
+) -> io::Result<Option<Vec<u8>>> {
+    let Some(receiver) = receiver else {
+        return Ok(Some(Vec::new()));
+    };
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result.map(Some),
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(Some(Vec::new())),
     }
 }
 
@@ -358,6 +468,7 @@ fn whichdisk_mount_entries() -> io::Result<Vec<MountCommandEntry>> {
             .map(|mount| MountCommandEntry {
                 device: os_str_to_string(mount.device()),
                 mount_point: mount.mount_point().to_path_buf(),
+                is_local: true,
             })
             .collect()
     })
@@ -369,17 +480,23 @@ fn parse_mount_command_output(raw: &str) -> Vec<MountCommandEntry> {
         let Some((device, rest)) = line.split_once(" on ") else {
             continue;
         };
-        let Some((mount_point, _options)) = rest.rsplit_once(" (") else {
+        let Some((mount_point, options)) = rest.rsplit_once(" (") else {
             continue;
         };
-        by_mount_point.insert(PathBuf::from(mount_point), device.to_string());
+        let is_local = options
+            .trim_end_matches(')')
+            .split(',')
+            .map(str::trim)
+            .any(|option| option == "local");
+        by_mount_point.insert(PathBuf::from(mount_point), (device.to_string(), is_local));
     }
 
     by_mount_point
         .into_iter()
-        .map(|(mount_point, device)| MountCommandEntry {
+        .map(|(mount_point, (device, is_local))| MountCommandEntry {
             device,
             mount_point,
+            is_local,
         })
         .collect()
 }
@@ -395,9 +512,15 @@ pub fn apfs_inventory() -> io::Result<ApfsInventory> {
         }
     }
 
-    let output = Command::new("/usr/sbin/diskutil")
-        .args(["apfs", "list", "-plist"])
-        .output()?;
+    let mut command = Command::new("/usr/sbin/diskutil");
+    command.args(["apfs", "list", "-plist"]);
+    let Some(output) = command_output_with_timeout(&mut command, DISKUTIL_APFS_COMMAND_TIMEOUT)?
+    else {
+        return Err(command_timeout_error(
+            "diskutil apfs list -plist",
+            DISKUTIL_APFS_COMMAND_TIMEOUT,
+        ));
+    };
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "diskutil apfs list -plist failed with status {}: {}",
@@ -416,10 +539,15 @@ pub fn local_time_machine_snapshots(
     inventory: Option<&ApfsInventory>,
     volume: Option<&ApfsVolume>,
 ) -> io::Result<Vec<LocalSnapshotInfo>> {
-    let output = Command::new("/usr/bin/tmutil")
-        .arg("listlocalsnapshots")
-        .arg(mount)
-        .output()?;
+    let mut command = Command::new("/usr/bin/tmutil");
+    command.arg("listlocalsnapshots").arg(mount);
+    let Some(output) = command_output_with_timeout(&mut command, TMUTIL_LIST_COMMAND_TIMEOUT)?
+    else {
+        return Err(command_timeout_error(
+            "tmutil listlocalsnapshots",
+            TMUTIL_LIST_COMMAND_TIMEOUT,
+        ));
+    };
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "tmutil listlocalsnapshots {} failed with status {}: {}",
@@ -455,13 +583,19 @@ pub fn thin_local_time_machine_snapshots_with(
     requested_bytes: u64,
     urgency: u8,
 ) -> io::Result<LocalSnapshotThinReport> {
-    let output = Command::new("/usr/bin/tmutil")
-        .args(tmutil_thinlocalsnapshots_args(
-            mount,
-            requested_bytes,
-            urgency,
-        ))
-        .output()?;
+    let mut command = Command::new("/usr/bin/tmutil");
+    command.args(tmutil_thinlocalsnapshots_args(
+        mount,
+        requested_bytes,
+        urgency,
+    ));
+    let Some(output) = command_output_with_timeout(&mut command, TMUTIL_THIN_COMMAND_TIMEOUT)?
+    else {
+        return Err(command_timeout_error(
+            "tmutil thinlocalsnapshots",
+            TMUTIL_THIN_COMMAND_TIMEOUT,
+        ));
+    };
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if !output.status.success() {
@@ -1289,12 +1423,14 @@ impl ApfsVolumeRole {
 mod tests {
     use std::ffi::OsString;
     use std::path::Path;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
 
     use super::{
         ApfsVolumeRole, FirmlinkSource, LOCAL_SNAPSHOT_THIN_AMOUNT_BYTES,
-        LOCAL_SNAPSHOT_THIN_URGENCY, SwapUsage, SwapUsageInfo, firmlink_map,
-        firmlink_map_from_paths, important_usage_available_bytes, mounted_filesystems,
-        parent_apfs_volume_device, parse_apfs_inventory, parse_firmlink_map,
+        LOCAL_SNAPSHOT_THIN_URGENCY, SwapUsage, SwapUsageInfo, command_output_with_timeout,
+        firmlink_map, firmlink_map_from_paths, important_usage_available_bytes,
+        mounted_filesystems, parent_apfs_volume_device, parse_apfs_inventory, parse_firmlink_map,
         parse_tmutil_local_snapshots, parse_vm_stat, parse_vm_swapusage, read_vm_stats,
         resolve_firmlinked_path, statfs, sysctl, tmutil_thinlocalsnapshots_args, vm_swapusage,
     };
@@ -1309,6 +1445,43 @@ mod tests {
 
     const fn tib(value: u64) -> u64 {
         value * 1_099_511_627_776
+    }
+
+    #[test]
+    fn command_output_with_timeout_captures_fast_command() {
+        let mut command = Command::new("/bin/echo");
+        command.arg("sbh-ok");
+
+        let output = command_output_with_timeout(&mut command, Duration::from_secs(1))
+            .expect("echo should execute")
+            .expect("echo should complete before timeout");
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "sbh-ok\n");
+    }
+
+    #[test]
+    fn command_output_with_timeout_kills_slow_command() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 2"]);
+
+        let output = command_output_with_timeout(&mut command, Duration::from_millis(50))
+            .expect("sleep should spawn and be killed cleanly");
+
+        assert!(output.is_none());
+    }
+
+    #[test]
+    fn command_output_with_timeout_rejects_inherited_pipe_after_exit() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 2 & echo sbh-ok"]);
+
+        let started_at = Instant::now();
+        let output = command_output_with_timeout(&mut command, Duration::from_secs(1))
+            .expect("shell should spawn cleanly");
+
+        assert!(output.is_none());
+        assert!(started_at.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
@@ -1356,17 +1529,21 @@ map -static on /Volumes/trj-data (autofs, automounted, nobrowse)
         let entries = super::parse_mount_command_output(raw);
 
         assert!(entries.iter().any(|entry| {
-            entry.device == "/dev/disk3s5" && entry.mount_point == Path::new("/System/Volumes/Data")
+            entry.device == "/dev/disk3s5"
+                && entry.mount_point == Path::new("/System/Volumes/Data")
+                && entry.is_local
         }));
         assert!(entries.iter().any(|entry| {
             entry.device == "10.10.10.1:/data"
                 && entry.mount_point == Path::new("/Volumes/trj-data")
+                && !entry.is_local
         }));
         assert!(!entries.iter().any(|entry| entry.device == "map -static"
             && entry.mount_point == Path::new("/Volumes/trj-data")));
     }
 
     #[test]
+    #[ignore = "Foundation CacheDelete capacity queries can block on unhealthy automounts"]
     fn important_usage_available_capacity_reports_for_root_volume() {
         let capacity = important_usage_available_bytes(Path::new("/"))
             .expect("Foundation should report root capacity");

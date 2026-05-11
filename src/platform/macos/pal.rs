@@ -5,12 +5,11 @@
 
 use std::fs::{self, File};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::core::errors::Result;
-use crate::core::paths::resolve_absolute_path;
 use crate::platform::macos::libproc::{
     ProcFdInfo, ProcFdType, ProcRegionWithPathInfo, ProcTaskAllInfo, VnodeFdInfoWithPath,
     proc_listpids_safe, proc_pid_command_line, proc_pid_list_fds, proc_pid_region_path,
@@ -37,6 +36,7 @@ const FDA_CACHE_TTL: Duration = Duration::from_secs(FDA_CACHE_TTL_SECS);
 const OPEN_FILES_CACHE_TTL_SECS: u64 = 30;
 const OPEN_FILES_CACHE_TTL: Duration = Duration::from_secs(OPEN_FILES_CACHE_TTL_SECS);
 const OPEN_FILES_CACHE_MAX_ENTRIES: usize = 64;
+const MMAP_REGIONS_SCAN_TIMEOUT: Duration = Duration::from_secs(12);
 const MEMORY_PRESSURE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 static FDA_STATUS_CACHE: OnceLock<RwLock<Option<(Instant, FullDiskAccessStatus)>>> =
     OnceLock::new();
@@ -180,7 +180,7 @@ impl Platform for MacOsPal {
             .map_err(|error| macos_method_error("process_list", &error))?
             .into_iter()
             .filter(|pid| *pid > 0 && *pid != current_pid)
-            .filter_map(process_info_for_pid)
+            .filter_map(process_info_for_pid_without_command_line)
             .collect();
         Ok(processes)
     }
@@ -198,18 +198,18 @@ impl Platform for MacOsPal {
     }
 
     fn open_files_under(&self, path: &Path) -> Result<Vec<OpenFile>> {
-        let root = resolve_absolute_path(path);
+        let root = process_observed_path(path);
         cached_open_files_under(&root)
     }
 
     fn executables_under(&self, path: &Path) -> Result<Vec<ProcessInfo>> {
-        let root = resolve_absolute_path(path);
-        let mut processes: Vec<ProcessInfo> = proc_listpids_safe()
+        let root = process_observed_path(path);
+        let root_variants = macos_process_path_variants(&root);
+        let mut processes: Vec<ProcessInfo> = process_pids_current_first()
             .map_err(|error| macos_method_error("executables_under", &error))?
             .into_iter()
-            .filter(|pid| *pid > 0)
-            .filter_map(process_info_for_pid)
-            .filter(|process| executable_is_under(process, &root))
+            .filter_map(process_info_for_pid_without_command_line)
+            .filter(|process| executable_is_under(process, &root_variants))
             .collect();
         processes.sort_by(|left, right| {
             left.pid
@@ -220,13 +220,21 @@ impl Platform for MacOsPal {
     }
 
     fn mmap_regions_under(&self, path: &Path) -> Result<Vec<MappedRegion>> {
-        let root = resolve_absolute_path(path);
-        let mut regions: Vec<MappedRegion> = proc_listpids_safe()
+        let root = process_observed_path(path);
+        let root_variants = macos_process_path_variants(&root);
+        let deadline = Instant::now() + MMAP_REGIONS_SCAN_TIMEOUT;
+        let mut regions = Vec::new();
+        for pid in process_pids_current_first()
             .map_err(|error| macos_method_error("mmap_regions_under", &error))?
-            .into_iter()
-            .filter(|pid| *pid > 0)
-            .flat_map(|pid| mapped_regions_for_pid_under(pid, &root))
-            .collect();
+        {
+            if Instant::now() >= deadline {
+                return Err(macos_scan_timeout(
+                    "mmap_regions_under",
+                    MMAP_REGIONS_SCAN_TIMEOUT,
+                ));
+            }
+            regions.extend(mapped_regions_for_pid_under(pid, &root_variants, deadline)?);
+        }
         regions.sort_by(|left, right| {
             left.pid
                 .cmp(&right.pid)
@@ -359,6 +367,13 @@ fn macos_method_error(
     error: &impl ToString,
 ) -> crate::core::errors::SbhError {
     PalError::method_failed("macos", method, error.to_string()).into()
+}
+
+fn macos_scan_timeout(method: &'static str, timeout: Duration) -> crate::core::errors::SbhError {
+    macos_method_error(
+        method,
+        &format!("{method} exceeded {timeout:?} scan budget"),
+    )
 }
 
 fn macos_total_memory_bytes(method: &'static str) -> Result<u64> {
@@ -733,14 +748,18 @@ fn local_snapshot_bytes_for_capacity(
     stats: &StatfsSnapshot,
     inventory: Option<&ApfsInventory>,
 ) -> Option<u64> {
-    let volume = inventory.and_then(|inventory| inventory.volume_for_device(&stats.device));
-    let snapshots =
-        sys::local_time_machine_snapshots(&stats.mount_point, inventory, volume).ok()?;
-    let total = snapshots
-        .iter()
-        .filter_map(|snapshot| snapshot.retained_bytes_estimate)
-        .fold(0_u64, u64::saturating_add);
-    (total > 0).then_some(total)
+    let inventory = inventory?;
+    let volume = inventory.volume_for_device(&stats.device)?;
+    let is_data_volume = volume.has_role(&ApfsVolumeRole::Data)
+        || (stats.fs_type.eq_ignore_ascii_case("apfs")
+            && stats.mount_point == Path::new("/System/Volumes/Data"));
+    if !is_data_volume {
+        return None;
+    }
+
+    inventory
+        .unattributed_container_used_bytes(&volume.container_id)
+        .filter(|bytes| *bytes > 0)
 }
 
 fn local_snapshot_info_from_sys(snapshot: sys::LocalSnapshotInfo) -> LocalSnapshotInfo {
@@ -804,11 +823,17 @@ fn purgeable_bytes_for_volume(
     inventory: Option<&ApfsInventory>,
     container_id: Option<&str>,
 ) -> Option<u64> {
-    let foundation_estimate = sys::important_usage_available_bytes(mount_point)
-        .ok()
-        .flatten()
-        .and_then(|important_available| {
-            purgeable_bytes_from_important_available(important_available, counted_available_bytes)
+    let foundation_estimate =
+        std::env::var_os("SBH_MACOS_QUERY_FOUNDATION_PURGEABLE").and_then(|_| {
+            sys::important_usage_available_bytes(mount_point)
+                .ok()
+                .flatten()
+                .and_then(|important_available| {
+                    purgeable_bytes_from_important_available(
+                        important_available,
+                        counted_available_bytes,
+                    )
+                })
         });
 
     foundation_estimate.or_else(|| purgeable_bytes_from_apfs_inventory(inventory, container_id))
@@ -837,15 +862,29 @@ fn current_process_pid() -> i32 {
     i32::try_from(std::process::id()).expect("current process id should fit in i32")
 }
 
+#[cfg(test)]
 fn process_info_for_pid(pid: i32) -> Option<ProcessInfo> {
     let raw = proc_pidinfo_task_all(pid).ok()?;
-    Some(process_info_from_task_all(pid, raw))
+    Some(process_info_from_task_all(pid, raw, true))
 }
 
-fn process_info_from_task_all(pid: i32, raw: ProcTaskAllInfo) -> ProcessInfo {
+fn process_info_for_pid_without_command_line(pid: i32) -> Option<ProcessInfo> {
+    let raw = proc_pidinfo_task_all(pid).ok()?;
+    Some(process_info_from_task_all(pid, raw, false))
+}
+
+fn process_info_from_task_all(
+    pid: i32,
+    raw: ProcTaskAllInfo,
+    include_command_line: bool,
+) -> ProcessInfo {
     let name = process_name(&raw);
     let executable = proc_pidpath_safe(pid).ok();
-    let command_line = proc_pid_command_line(pid).unwrap_or_default();
+    let command_line = if include_command_line {
+        proc_pid_command_line(pid).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     ProcessInfo {
         pid,
         parent_pid: positive_pid(raw.pbsd.pbi_ppid.0),
@@ -898,33 +937,43 @@ fn nanos_to_micros(nanos: u64) -> u64 {
     nanos / 1_000
 }
 
-fn executable_is_under(process: &ProcessInfo, root: &Path) -> bool {
+fn process_pids_current_first() -> io::Result<Vec<i32>> {
+    let current_pid = current_process_pid();
+    let mut pids: Vec<i32> = proc_listpids_safe()?
+        .into_iter()
+        .filter(|pid| *pid > 0)
+        .collect();
+    pids.sort_by_key(|pid| (*pid != current_pid, *pid));
+    pids.dedup();
+    Ok(pids)
+}
+
+fn executable_is_under(process: &ProcessInfo, root_variants: &[PathBuf]) -> bool {
     process
         .executable
         .as_deref()
-        .is_some_and(|path| resolve_absolute_path(path).starts_with(root))
+        .and_then(|path| observed_process_path_under_root(path, root_variants))
+        .is_some()
 }
 
 fn open_files_for_pid_under(pid: i32, root: &Path) -> Vec<OpenFile> {
     let Ok(fds) = proc_pid_list_fds(pid) else {
         return Vec::new();
     };
+    let root_variants = macos_process_path_variants(root);
     fds.into_iter()
-        .filter_map(|fd| open_file_for_fd_under(pid, fd, root))
+        .filter_map(|fd| open_file_for_fd_under(pid, fd, &root_variants))
         .collect()
 }
 
-fn open_file_for_fd_under(pid: i32, fd: ProcFdInfo, root: &Path) -> Option<OpenFile> {
+fn open_file_for_fd_under(pid: i32, fd: ProcFdInfo, root_variants: &[PathBuf]) -> Option<OpenFile> {
     if fd.fd_type().ok()? != ProcFdType::VNODE {
         return None;
     }
     let info = proc_pidfdinfo_vnode_path(pid, fd.proc_fd.0)
         .ok()
         .flatten()?;
-    let path = resolve_absolute_path(info.path().ok()?);
-    if !path.starts_with(root) {
-        return None;
-    }
+    let path = observed_process_path_under_root(info.path().ok()?, root_variants)?;
     Some(OpenFile {
         pid,
         path,
@@ -956,12 +1005,22 @@ fn open_file_mode(open_flags: u32) -> OpenFileMode {
     }
 }
 
-fn mapped_regions_for_pid_under(pid: i32, root: &Path) -> Vec<MappedRegion> {
+fn mapped_regions_for_pid_under(
+    pid: i32,
+    root_variants: &[PathBuf],
+    deadline: Instant,
+) -> Result<Vec<MappedRegion>> {
     const MAX_REGIONS_PER_PID: usize = 16_384;
 
     let mut address = 0;
     let mut regions = Vec::new();
     for _ in 0..MAX_REGIONS_PER_PID {
+        if Instant::now() >= deadline {
+            return Err(macos_scan_timeout(
+                "mmap_regions_under",
+                MMAP_REGIONS_SCAN_TIMEOUT,
+            ));
+        }
         let Ok(info) = proc_pid_region_path(pid, address) else {
             break;
         };
@@ -970,7 +1029,7 @@ fn mapped_regions_for_pid_under(pid: i32, root: &Path) -> Vec<MappedRegion> {
         if size == 0 {
             break;
         }
-        if let Some(region) = mapped_region_under(pid, &info, root) {
+        if let Some(region) = mapped_region_under(pid, &info, root_variants) {
             regions.push(region);
         }
         let Some(next_address) = start.checked_add(size) else {
@@ -981,18 +1040,15 @@ fn mapped_regions_for_pid_under(pid: i32, root: &Path) -> Vec<MappedRegion> {
         }
         address = next_address;
     }
-    regions
+    Ok(regions)
 }
 
 fn mapped_region_under(
     pid: i32,
     info: &ProcRegionWithPathInfo,
-    root: &Path,
+    root_variants: &[PathBuf],
 ) -> Option<MappedRegion> {
-    let path = resolve_absolute_path(info.prp_vip.path().ok()?);
-    if !path.starts_with(root) {
-        return None;
-    }
+    let path = observed_process_path_under_root(info.prp_vip.path().ok()?, root_variants)?;
     let start = info.prp_prinfo.pri_address;
     let end = start.checked_add(info.prp_prinfo.pri_size);
     Some(MappedRegion {
@@ -1002,6 +1058,86 @@ fn mapped_region_under(
         end_address: end,
         protection: Some(region_protection(info.prp_prinfo.pri_protection)),
     })
+}
+
+#[cfg(test)]
+fn process_path_is_under_root(path: &Path, root: &Path) -> bool {
+    let root_variants = macos_process_path_variants(root);
+    observed_process_path_under_root(path, &root_variants).is_some()
+}
+
+fn observed_process_path_under_root(path: &Path, root_variants: &[PathBuf]) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    if process_path_matches_root_variants(path, root_variants) {
+        return Some(normalize_process_path(path));
+    }
+    let alias = macos_private_mount_alias(path)?;
+    if process_path_matches_root_variants(&alias, root_variants) {
+        return Some(normalize_process_path(path));
+    }
+    None
+}
+
+fn process_path_matches_root_variants(path: &Path, root_variants: &[PathBuf]) -> bool {
+    root_variants
+        .iter()
+        .any(|root| path.starts_with(root.as_path()))
+}
+
+fn macos_process_path_variants(path: &Path) -> Vec<PathBuf> {
+    let normalized = process_observed_path(path);
+    let mut variants = vec![normalized.clone()];
+    if let Some(alias) = macos_private_mount_alias(&normalized) {
+        variants.push(alias);
+    }
+    variants.sort();
+    variants.dedup();
+    variants
+}
+
+fn macos_private_mount_alias(path: &Path) -> Option<PathBuf> {
+    for (visible, private) in [
+        (Path::new("/tmp"), Path::new("/private/tmp")),
+        (Path::new("/var"), Path::new("/private/var")),
+        (Path::new("/etc"), Path::new("/private/etc")),
+    ] {
+        if let Ok(rest) = path.strip_prefix(visible) {
+            return Some(private.join(rest));
+        }
+        if let Ok(rest) = path.strip_prefix(private) {
+            return Some(visible.join(rest));
+        }
+    }
+    None
+}
+
+fn process_observed_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    };
+    normalize_process_path(&absolute)
+}
+
+fn normalize_process_path(path: &Path) -> PathBuf {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(..) | Component::RootDir | Component::Normal(_) => {
+                components.push(component);
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if let Some(Component::Normal(_)) = components.last() {
+                    components.pop();
+                }
+            }
+        }
+    }
+    components.into_iter().collect()
 }
 
 fn region_protection(bits: u32) -> String {
@@ -1393,6 +1529,46 @@ mod tests {
     }
 
     #[test]
+    fn local_snapshot_capacity_probe_skips_unidentified_or_non_data_volumes() {
+        let stats = StatfsSnapshot {
+            mount_point: PathBuf::from("/"),
+            device: "/dev/disk3s1".to_string(),
+            fs_type: "apfs".to_string(),
+            block_size: 1,
+            blocks: 400,
+            blocks_free: 120,
+            blocks_available: 100,
+            is_readonly: true,
+        };
+
+        assert_eq!(super::local_snapshot_bytes_for_capacity(&stats, None), None);
+
+        let inventory = ApfsInventory {
+            containers: vec![ApfsContainer {
+                container_id: "/dev/disk3".to_string(),
+                uuid: Some("container-uuid".to_string()),
+                capacity_total_bytes: Some(1_000),
+                capacity_available_bytes: Some(250),
+                physical_stores: vec!["/dev/disk0s2".to_string()],
+            }],
+            volumes: vec![ApfsVolume {
+                device_id: "/dev/disk3s1".to_string(),
+                container_id: "/dev/disk3".to_string(),
+                name: Some("Macintosh HD".to_string()),
+                roles: vec![ApfsVolumeRole::System],
+                capacity_in_use_bytes: Some(200),
+                container_total_bytes: Some(1_000),
+                container_available_bytes: Some(250),
+            }],
+        };
+
+        assert_eq!(
+            super::local_snapshot_bytes_for_capacity(&stats, Some(&inventory)),
+            None
+        );
+    }
+
+    #[test]
     fn mount_info_uses_apfs_container_metadata_and_snapshot_estimate() {
         let stats = StatfsSnapshot {
             mount_point: PathBuf::from("/Volumes/TestData"),
@@ -1627,6 +1803,26 @@ mod tests {
         assert!(!process.command_line.is_empty());
         assert!(process.cpu_user_micros.is_some());
         assert!(process.cpu_system_micros.is_some());
+    }
+
+    #[test]
+    fn process_path_matching_handles_private_mount_aliases_without_realpath() {
+        assert!(super::process_path_is_under_root(
+            Path::new("/private/tmp/sbh/open-file"),
+            Path::new("/tmp/sbh")
+        ));
+        assert!(super::process_path_is_under_root(
+            Path::new("/tmp/sbh/open-file"),
+            Path::new("/private/tmp/sbh")
+        ));
+        assert!(super::process_path_is_under_root(
+            Path::new("/private/var/folders/sbh/open-file"),
+            Path::new("/var/folders/sbh")
+        ));
+        assert!(!super::process_path_is_under_root(
+            Path::new("/private/tmp/sbh-other/open-file"),
+            Path::new("/tmp/sbh")
+        ));
     }
 
     #[test]
