@@ -3,7 +3,7 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`, `bd-r7m7.17`
 Parent: `bd-r7m7`
-Last audited: 2026-05-11 23:04 UTC
+Last audited: 2026-05-11 23:31 UTC
 Evidence snapshot: the audit records the live head and run state observed at
 refresh time, but every audit-only commit makes those literals stale. Before any
 close decision, refresh the live head and newest run with:
@@ -69,10 +69,11 @@ operator-visible outcomes:
 
 ## Current Tracker And CI State
 
-- Live refresh at 2026-05-11 23:04 UTC inspected current `main` at
-  `b741aae262baf8623255ac10c8dbd280849b5455`. This is an audit/tracker-only
-  commit ahead of the `v0.4.14` tag; `origin/main` and the legacy compatibility
-  branch are synchronized to the same commit. The only unstaged local change is
+- Live refresh at 2026-05-11 23:31 UTC inspected current `main` at
+  `f70d1201a7bfc693ec1a8ac7e986302f0d9c7f33`. This is a Beads evidence-only
+  commit ahead of the latest docs/static-test commit `f73e911` and the
+  `v0.4.14` tag. `origin/main` and the legacy compatibility branch are
+  synchronized to the same commit. The only unstaged local change is
   `.beads/beads.db`, which is database state and not a release artifact.
 - The current hosted release proof is tag `v0.4.14`, pointing at
   `02e0c678a8e28831cf17efd1c30d7fa879de5c57`. Release workflow run
@@ -86,20 +87,25 @@ operator-visible outcomes:
   `macOS Coverage`, `macOS Performance Budgets`, and
   `Homebrew Formula Validation` jobs remain queued before runner assignment.
   No `v0.4.14` GitHub Release exists yet.
-- Matching main CI run `25693489066` is still queued for
-  `02e0c678a8e28831cf17efd1c30d7fa879de5c57`. Its Intel macOS platform lane
-  completed successfully, while `ubuntu-latest` and `macos-latest` jobs remain
-  queued before runner assignment. Do not count this as final green proof.
+- The newest visible main CI run is `25703274370` for `f73e911`. It is queued
+  before runner assignment. The later Beads-only `f70d120` push did not create a
+  newer visible CI run, consistent with the CI path-ignore rules for tracker
+  metadata. Do not count queued CI as final green proof.
 - A non-mutating queue sanity check found repository Actions enabled with
   `allowed_actions=all`, no pending deployments for the `v0.4.14` Release run,
   and zero repository self-hosted runners. The queued release and CI jobs still
   have no runner assignment, so the current blocker remains hosted runner
   capacity or queue policy rather than an in-repo dependency graph failure.
-- The commit-scoped GitHub check-suite API for
-  `02e0c678a8e28831cf17efd1c30d7fa879de5c57` still reports both GitHub Actions
-  check suites queued, plus external app suites for Vercel, Cloudflare Workers
-  and Pages, Supabase, Cursor, and Claude queued with zero check runs. This is
-  non-green status, not completion evidence.
+- Current source proof for the latest non-Beads head is healthy outside hosted
+  GitHub runners. Local macOS runtime checks against the installed public binary
+  showed platform auto-detection working for `sbh status --json`,
+  `sbh check --need 5G --json`, `sbh install --auto --dry-run --json`, and
+  `sbh doctor --pal --json`. Remote Linux proof on `vmi1152480` passed
+  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-f73e911-check cargo check --all-targets"`
+  and
+  `rch exec "env CARGO_TARGET_DIR=/tmp/sbh-f73e911-clippy cargo clippy --all-targets -- -D warnings"`.
+  This is strong source evidence, but it is not a substitute for hosted release
+  publication, hosted macOS Apple Silicon jobs, or public tap advancement.
 - The user approved the stale release queue intervention with `proceed` after
   the exact stale runs were listed. Release runs for `v0.4.10` (`25666074747`),
   `v0.4.11` (`25675218864`), `v0.4.12` (`25677465183`), and `v0.4.13`
@@ -576,7 +582,7 @@ containing `bd-twgw` and `bd-j40b`, then restore the protected worktree files.
 ## Live Release Blocker Evidence
 
 The user confirmed Apple Developer Program enrollment, so enrollment itself is
-not the current blocker. Live checks at 2026-05-11 23:04 UTC now show:
+not the current blocker. Live checks at 2026-05-11 23:31 UTC now show:
 
 - `security find-identity -v -p codesigning`: one valid Developer ID
   Application identity for `Jeffrey Emanuel (AU8V2Z6NKY)`.
@@ -597,9 +603,10 @@ not the current blocker. Live checks at 2026-05-11 23:04 UTC now show:
   archives, checksum sidecars, `SHA256SUMS.txt`, and provenance.
 - GitHub release/tag checks: `v0.4.14` is tagged and Release run
   `25693688419` exists, but no `v0.4.14` release assets are published yet.
-- GitHub check-suite checks for the `v0.4.14` source SHA still show queued
-  GitHub Actions suites and queued zero-run external app suites; this remains
-  non-green status, not completion evidence.
+- GitHub Actions checks still show queued hosted CI/release work: Release run
+  `25693688419` is queued for `v0.4.14`, and main CI run `25703274370` is queued
+  for the latest visible non-Beads head `f73e911`. This remains non-green
+  status, not completion evidence.
 - Local Homebrew validation: the public tap install/test path passed for
   `v0.4.8`, and local generated-formula validation passed for `v0.4.14`.
 
