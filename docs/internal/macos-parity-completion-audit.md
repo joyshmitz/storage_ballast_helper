@@ -3,7 +3,7 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`, `bd-r7m7.17`
 Parent: `bd-r7m7`
-Last audited: 2026-05-11 02:00 UTC
+Last audited: 2026-05-11 03:25 UTC
 Evidence snapshot: the audit records the live head and run state observed at
 refresh time, but every audit-only commit makes those literals stale. Before any
 close decision, refresh the live head and newest run with:
@@ -69,6 +69,35 @@ operator-visible outcomes:
 
 ## Current Tracker And CI State
 
+- Live recheck at 2026-05-11 03:25 UTC inspected current pushed head
+  `b8bedb9a9634693b8c9904d5528ebb4ff0c934d4`
+  (`Harden macOS PAL probes against stuck filesystem services`). The newest CI
+  run for that head is `25648597514`; it is queued overall. Every listed job is
+  still queued with no conclusion: `macOS Platform Tests (intel)`,
+  `Homebrew Tap Deploy Key Preflight`, `Homebrew Formula Validation`,
+  `macOS Coverage`, `macOS Performance Budgets`,
+  `macOS Platform Tests (apple-silicon)`, and `Format + Lint`. This is not
+  final green CI proof.
+- The current-head local/rch proof for `b8bedb9` passed before this refresh:
+  local macOS `sbh --json doctor --pal` from the current debug build exited 0
+  with 23 implemented PAL methods, 0 failed methods, and only environment
+  warnings for `macos.spctl` and `macos.launchd`; local macOS
+  `cargo clippy --no-default-features --features cli,daemon,sqlite --lib -- -D warnings`
+  passed; `cargo fmt --check` and `git diff --check` passed; remote Linux
+  `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_macos_mount_timeout_check2 cargo check --all-targets`
+  passed; and remote Linux
+  `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_macos_mount_timeout_clippy2 cargo clippy --all-targets -- -D warnings`
+  passed. This is strong local/source proof, but it does not replace hosted CI
+  green status.
+- The `b8bedb9` fix closes a live macOS doctor hang class in current source:
+  macOS mount, APFS, and Time Machine subprocess probes now have bounded
+  deadlines and bounded output drains; default capacity paths no longer call the
+  blocking Foundation CacheDelete probe; process/open-file/mmap PAL probes avoid
+  unbounded `realpath` calls on automount-sensitive paths; and mmap region scans
+  have a bounded scan budget. Focused local regressions cover command timeout,
+  inherited-pipe timeout, private `/tmp` and `/var` mount alias matching,
+  current-process open file reporting, current-process mmap reporting, APFS
+  snapshot fallback behavior, and non-local `/sbin/mount` parsing.
 - `bd-r7m7` remains open. Live `br epic status --json` on 2026-05-11 02:00 UTC
   reported 32 of 34 children closed, and the epic was not eligible for closure.
   Use live `br epic status --json` output before any close decision because
@@ -80,6 +109,7 @@ operator-visible outcomes:
   closed, and the epic was not eligible for closure.
 - `br ready --json` returned `[]`; remaining open actionable release work was
   blocked or already assigned at audit time.
+- Live `br ready --json` at 2026-05-11 03:25 UTC also returned `[]`.
 - Open release/parity blockers are `bd-r7m7.17`, `bd-ykwh.3`, `bd-ykwh.7`, and
   `bd-ykwh.10`. `bd-ykwh.2` and `bd-ykwh.13` are closed based on live Developer
   ID identity, P12/signing secrets, App Store Connect notary API-key secrets,
@@ -154,6 +184,13 @@ operator-visible outcomes:
   key instead.
 - `Dicklesworthstone/homebrew-sbh` still returns HTTP 404 for
   `Formula/sbh.rb`, so the public tap formula is not published yet.
+- Live release recheck at 2026-05-11 03:25 UTC still found latest published
+  release `v0.4.6` and no `v0.4.7` tag. The tap repository still contains only
+  `Formula/.gitkeep`. Current-source `sbh --json doctor --release` exited 0 as
+  a command but reported `ok=false`, `passed=3`, `warnings=1`, and `failed=0`:
+  Developer ID identity, notary profile, and GitHub release secrets passed; the
+  only remaining diagnostic warning was `release.homebrew_tap` because
+  `Formula/sbh.rb` has not been published yet.
 - Live recheck at 2026-05-10 02:44 UTC inspected pushed head
   `0da51406462098b02aa58ee150a0ae632433981f`
   (`bd-r7m7 refresh macos parity audit`). That was point-in-time evidence
