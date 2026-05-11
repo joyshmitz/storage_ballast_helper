@@ -74,7 +74,8 @@ jobs:
 
           VERSION="${version}" ARM_SHA="${arm_sha}" INTEL_SHA="${intel_sha}" \
             perl -0pi -e '
-              s/version "[^"]+"/version "$ENV{VERSION}"/;
+              s/releases\/download\/v[0-9]+\.[0-9]+\.[0-9]+\//releases\/download\/v$ENV{VERSION}\//g;
+              s/sbh-v[0-9]+\.[0-9]+\.[0-9]+-/sbh-v$ENV{VERSION}-/g;
               s/      # REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256\n      sha256 "[0-9a-f]{64}"/      sha256 "$ENV{ARM_SHA}"/g;
               s/      # REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256\n      sha256 "[0-9a-f]{64}"/      sha256 "$ENV{INTEL_SHA}"/g;
             ' generated-homebrew/Formula/sbh.rb
@@ -83,7 +84,9 @@ jobs:
             echo "::error::generated Homebrew formula retained checksum markers"
             exit 1
           fi
-          grep -q "version \"${version}\"" generated-homebrew/Formula/sbh.rb
+          grep -q "releases/download/v${version}/" generated-homebrew/Formula/sbh.rb
+          grep -q "sbh-v${version}-aarch64-apple-darwin.tar.xz" generated-homebrew/Formula/sbh.rb
+          grep -q "sbh-v${version}-x86_64-apple-darwin.tar.xz" generated-homebrew/Formula/sbh.rb
           grep -q "sha256 \"${arm_sha}\"" generated-homebrew/Formula/sbh.rb
           grep -q "sha256 \"${intel_sha}\"" generated-homebrew/Formula/sbh.rb
           ruby -c generated-homebrew/Formula/sbh.rb 2>&1 | tee homebrew-generated-formula-syntax-output.txt
@@ -473,7 +476,7 @@ jobs:
           formula = File.read("packaging/homebrew/Formula/sbh.rb")
           formula = formula.sub("class Sbh < Formula", "class SbhCi < Formula")
           formula = formula.gsub(
-            %r{url "https://github\.com/Dicklesworthstone/storage_ballast_helper/releases/download/v#\{version\}/" \\\n\s+"sbh-v#\{version\}-(?:aarch64|x86_64)-apple-darwin\.tar\.xz"},
+            %r{url "https://github\.com/Dicklesworthstone/storage_ballast_helper/releases/download/v[^/]+/" \\\n\s+"sbh-v[^"]+-(?:aarch64|x86_64)-apple-darwin\.tar\.xz"},
             %(url "#{ENV.fetch("ARCHIVE_URL")}"),
           )
           formula = formula.gsub(
