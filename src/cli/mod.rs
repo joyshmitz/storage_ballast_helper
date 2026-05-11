@@ -1710,12 +1710,12 @@ mod tests {
 
         for required in [
             "class Sbh < Formula",
-            "version \"0.4.8\"",
             "on_macos do",
             "on_arm do",
             "on_intel do",
-            "sbh-v#{version}-aarch64-apple-darwin.tar.xz",
-            "sbh-v#{version}-x86_64-apple-darwin.tar.xz",
+            "releases/download/v0.4.8/",
+            "sbh-v0.4.8-aarch64-apple-darwin.tar.xz",
+            "sbh-v0.4.8-x86_64-apple-darwin.tar.xz",
             "REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256",
             "REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256",
             "sha256 \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
@@ -1742,7 +1742,6 @@ mod tests {
         let intel_sha = "1".repeat(64);
 
         let generated = formula
-            .replace("version \"0.4.8\"", "version \"9.8.7\"")
             .replace(
                 "      # REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256\n      sha256 \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
                 &format!("      sha256 \"{arm_sha}\""),
@@ -1757,8 +1756,8 @@ mod tests {
             "generated Homebrew formula must not retain checksum marker comments"
         );
         assert!(
-            generated.contains("version \"9.8.7\""),
-            "generated Homebrew formula must use the release tag version"
+            generated.contains("sbh-v0.4.8-aarch64-apple-darwin.tar.xz"),
+            "generated Homebrew formula must contain the release archive version"
         );
         assert!(
             generated.contains(&format!("sha256 \"{arm_sha}\"")),
