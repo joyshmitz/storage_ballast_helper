@@ -3,7 +3,7 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`, `bd-r7m7.17`
 Parent: `bd-r7m7`
-Last audited: 2026-05-11 20:36 UTC
+Last audited: 2026-05-11 20:51 UTC
 Evidence snapshot: the audit records the live head and run state observed at
 refresh time, but every audit-only commit makes those literals stale. Before any
 close decision, refresh the live head and newest run with:
@@ -69,8 +69,8 @@ operator-visible outcomes:
 
 ## Current Tracker And CI State
 
-- Live refresh at 2026-05-11 20:36 UTC inspected current `main` at
-  `7d39bceead7c9320c3e92ae1e743df2a8a644b7f`. This is an audit/tracker-only
+- Live refresh at 2026-05-11 20:51 UTC inspected current `main` at
+  `84221b53e451d283571f6f90d11e35f05f6a2e65`. This is an audit/tracker-only
   commit ahead of the `v0.4.14` tag; `origin/main` and the legacy compatibility
   branch are synchronized to the same commit. The only unstaged local change is
   `.beads/beads.db`, which is database state and not a release artifact.
@@ -90,6 +90,11 @@ operator-visible outcomes:
   `02e0c678a8e28831cf17efd1c30d7fa879de5c57`. Its Intel macOS platform lane
   completed successfully, while `ubuntu-latest` and `macos-latest` jobs remain
   queued before runner assignment. Do not count this as final green proof.
+- A non-mutating queue sanity check found repository Actions enabled with
+  `allowed_actions=all`, no pending deployments for the `v0.4.14` Release run,
+  and zero repository self-hosted runners. The queued release and CI jobs still
+  have no runner assignment, so the current blocker remains hosted runner
+  capacity or queue policy rather than an in-repo dependency graph failure.
 - Older release runs for `v0.4.10`, `v0.4.11`, `v0.4.12`, and `v0.4.13` remain
   queued. They are stale relative to the current release proof and must not be
   allowed to publish over newer evidence without an explicit operator decision.
