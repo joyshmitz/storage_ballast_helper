@@ -3,7 +3,7 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`, `bd-r7m7.17`
 Parent: `bd-r7m7`
-Last audited: 2026-05-11 11:27 UTC
+Last audited: 2026-05-11 20:36 UTC
 Evidence snapshot: the audit records the live head and run state observed at
 refresh time, but every audit-only commit makes those literals stale. Before any
 close decision, refresh the live head and newest run with:
@@ -62,54 +62,95 @@ operator-visible outcomes:
 | Prompt requirement | Concrete artifacts inspected | Current audit result |
 |---|---|---|
 | "support mac os in addition to linux" | `src/platform/pal.rs`, `src/platform/linux`, `src/platform/macos`, Linux and macOS CI workflow lanes, macOS integration tests, existing Linux unit/integration lanes | Repo-side platform implementation exists for both OS families. Final proof still requires the final pushed head to complete all Linux and macOS CI jobs green. |
-| "everything automatically detected during installation" | `src/cli/install.rs`, `src/daemon/service.rs`, launchd/systemd workflow tests, `docs/macos.md`, Homebrew formula and release workflow | Installer/service detection is implemented and documented. Developer ID, App Store Connect notary credentials, the repository-scoped Homebrew tap deploy key, the public tap formula, a manually published signed/notarized `v0.4.8` release, and live self-update E2E proof are now present. Final proof still requires hosted CI green for the fixed final head and automated hosted release-workflow proof. |
+| "everything automatically detected during installation" | `src/cli/install.rs`, `src/daemon/service.rs`, launchd/systemd workflow tests, `docs/macos.md`, Homebrew formula and release workflow | Installer/service detection is implemented and documented. Developer ID, App Store Connect notary credentials, the repository-scoped Homebrew tap deploy key, the public tap formula, a manually published signed/notarized `v0.4.8` release, manual signed/notarized `v0.4.14` staging artifacts, and live self-update E2E proof are now present. Final proof still requires hosted CI green for the fixed final head and automated hosted release-workflow proof. |
 | "while running" automatic platform behavior | PAL-backed status/check/scan/clean/blame/daemon paths, APFS/Mach/libproc macOS implementations, Linux PAL preservation, focused protection regression tests | Runtime behavior is routed through platform-specific implementations behind the shared CLI/PAL surface. Final proof still depends on queued hosted CI and live release diagnostics. |
 | "always does the right thing" / "just works" | Protected-path daemon tests, active-reference/open-file checks, sacred-path catalog, APFS accounting tests, launchd lifecycle test, docs and doctor diagnostics | Safety and diagnostics are covered in source and tests. Installed sbh 0.4.6 daemons must be upgraded/restarted because they predate the daemon protection fix. |
-| "additional testing infrastructure" | `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, macOS platform/coverage/benchmark jobs, Homebrew validation, release-doctor tests, protected-path tests | Infrastructure exists and focused local/rch proof passed. The CI and release Homebrew formula rewrite paths now both rewrite static release URLs, archive names, and checksum placeholders before validation or tap publication, and the CI temporary `sbh-ci` formula injects an explicit Cargo-derived version before testing local `file://` archives. Final proof still requires the hosted release quality gate and hosted release workflow to succeed. |
+| "additional testing infrastructure" | `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, macOS platform/coverage/benchmark jobs, Homebrew validation, release-doctor tests, protected-path tests | Infrastructure exists and focused local/rch proof passed. The CI and release Homebrew formula rewrite paths now both rewrite static release URLs, archive names, and checksum placeholders before validation or tap publication, and the CI temporary `sbh-ci` formula injects an explicit Cargo-derived version before testing local `file://` archives. The queued release tap deploy-key preflight and generated `v0.4.14` formula validation have also been reproduced locally. Final proof still requires the hosted release quality gate and hosted release workflow to succeed. |
 
 ## Current Tracker And CI State
 
-- Live refresh at 2026-05-11 14:00 UTC inspected fixed source commit
-  `a0de17009ca4cd7d723d714c4b2ba6f5c96dd63a` plus the package version metadata
-  prepared for a `v0.4.11` release attempt. Main CI run `25674846499` was
-  queued for the fixed source commit with all jobs still unassigned. Do not
-  count queued jobs as final green proof.
-- The previous automated release proof tag `v0.4.10` points at older source
-  commit `b280b9a`, before the macOS `/sbin/mount` timeout fallback fix.
-  Release workflow run `25666074747` is still queued for that stale tag. Its
-  reusable `Quality Gate / macOS Platform Tests (intel)` job completed
-  successfully on `macos-15-intel`, including unit tests, integration tests,
-  release build, ad-hoc signing, temporary Homebrew formula install/test from
-  the signed binary, release doctor diagnostics, selected E2E smoke,
-  unsupported-PAL guard, and artifact uploads. The release-level
-  `Homebrew Tap Deploy Key Preflight` plus reusable quality-gate Ubuntu and
-  `macos-latest` jobs remain queued before runner assignment; no `v0.4.10`
-  release assets have been published yet. Because the tag is not fixed-head,
-  it cannot close this audit even if it later succeeds. Do not treat the manual
-  `v0.4.8` release as automated hosted release proof.
-- The previous `v0.4.9` attempt exposed a second CI harness regression after
-  the static URL/checksum rewrite fix: the temporary `sbh-ci` Homebrew formula
-  rewrote release URLs to a local `file://` archive whose name did not let
-  current Homebrew infer `version`, so the Intel macOS lane failed with
-  `invalid attribute for formula 'sbh/local-ci/sbh-ci': version (nil)`.
-  Current source fixes `.github/workflows/ci.yml` to derive
-  `CI_FORMULA_VERSION` from `Cargo.toml` and inject an explicit `version` line
-  into the temporary formula before local install tests. `src/cli/mod.rs` locks
-  that workflow contract. Focused proof passed with local formula-generation
-  simulation, `cargo fmt --check`, `git diff --check`, Ruby YAML parsing, `rch`
-  focused Homebrew workflow tests, and full `rch cargo check --all-targets`
-  plus `rch cargo clippy --all-targets -- -D warnings` on the pre-`v0.4.11`
-  source state.
-- Release `v0.4.8` is now published, not draft or prerelease, at
+- Live refresh at 2026-05-11 20:36 UTC inspected current `main` at
+  `7d39bceead7c9320c3e92ae1e743df2a8a644b7f`. This is an audit/tracker-only
+  commit ahead of the `v0.4.14` tag; `origin/main` and the legacy compatibility
+  branch are synchronized to the same commit. The only unstaged local change is
+  `.beads/beads.db`, which is database state and not a release artifact.
+- The current hosted release proof is tag `v0.4.14`, pointing at
+  `02e0c678a8e28831cf17efd1c30d7fa879de5c57`. Release workflow run
+  `25693688419` is still queued overall. Its reusable
+  `Quality Gate / macOS Platform Tests (intel)` job completed successfully on
+  `macos-15-intel`: unit, binary, and integration tests passed; the release
+  binary built; ad-hoc codesign verification passed; temporary Homebrew formula
+  install/test passed; selected E2E smoke passed; and the unsupported-PAL guard
+  passed. The release-level `Homebrew Tap Deploy Key Preflight`, reusable
+  `Quality Gate / Format + Lint`, Apple Silicon `macOS Platform Tests`,
+  `macOS Coverage`, `macOS Performance Budgets`, and
+  `Homebrew Formula Validation` jobs remain queued before runner assignment.
+  No `v0.4.14` GitHub Release exists yet.
+- Matching main CI run `25693489066` is still queued for
+  `02e0c678a8e28831cf17efd1c30d7fa879de5c57`. Its Intel macOS platform lane
+  completed successfully, while `ubuntu-latest` and `macos-latest` jobs remain
+  queued before runner assignment. Do not count this as final green proof.
+- Older release runs for `v0.4.10`, `v0.4.11`, `v0.4.12`, and `v0.4.13` remain
+  queued. They are stale relative to the current release proof and must not be
+  allowed to publish over newer evidence without an explicit operator decision.
+  Canceling/rerunning hosted workflows or manually publishing the prepared
+  artifacts is a remote-state change and still requires explicit approval.
+- The `v0.4.14` release credential gap found during this audit has been fixed:
+  the first OpenSSL-modern P12 parsed with OpenSSL but failed macOS
+  `security import`, so it was replaced with
+  `/Users/jemanuel/release-work/storage_ballast_helper/credentials/sbh-developer-id-application-20260511T203111Z-pbe-sha1-3des.p12`
+  (sha256 `0040f9636bd573d1b95c81b9ce949fb0502b029216910b564981184722a8b5de`).
+  The generated password is stored in the macOS login Keychain as
+  `service=sbh-developer-id-p12-password`, `account=storage_ballast_helper`.
+  The final P12 imports with macOS `security`, parses with OpenSSL 3, exposes
+  the Developer ID Application certificate expiring May 11, 2031, and was used
+  to Developer-ID sign both staged `v0.4.14` macOS binaries with hardened
+  runtime.
+- The repaired GitHub signing secrets
+  `APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64`,
+  `APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD`, and
+  `APPLE_DEVELOPER_ID_IDENTITY` were updated at 2026-05-11T20:31Z. The App
+  Store Connect notary secrets were updated at 2026-05-11T20:25Z; notarytool
+  history works with the local `Q29MJ3WM99` API key. HashiCorp Vault was not a
+  usable backing store during this refresh because reads/lists returned
+  `local node not active but active cluster node not found`.
+- Manual fallback artifacts for `v0.4.14` are staged under
+  `/tmp/sbh-v0414-manual-release-artifacts-20260511T195841Z`. The directory
+  contains four platform archives, checksum sidecars, `SHA256SUMS.txt`, and
+  `release-provenance.json`; `shasum -a 256 -c SHA256SUMS.txt` passed. The
+  macOS arm64 notarization id is `13d0624e-16b9-4b1a-a75d-e346907a8fce` with
+  cdhash `06845d8410e7a90a52901f967fb6f7fce`; the macOS x86_64 notarization id
+  is `f28c1cdb-9804-4305-a52b-bbf8228b4d62` with cdhash
+  `648b1b1c7e7f213e736369856cba5b07c8dbec54`. These artifacts are useful
+  fallback evidence, but they are not published and do not replace hosted
+  release workflow completion.
+- Local reproduction of queued release gates passed without mutating remotes:
+  the Homebrew tap deploy-key preflight performed a dry-run push successfully
+  under `/tmp/sbh-homebrew-tap-preflight-local-20260511T203417Z`; the source
+  formula passed `ruby -c` and `brew style`; and a generated `v0.4.14` formula
+  using arm64 macOS checksum
+  `c164894817f03fa9e7ff6db8f3e3f61aa6ae663e04d7698f5fccdaa042707903` plus
+  Intel macOS checksum
+  `00ae9da512b96072d2ed6534b9b5ac2606ded219d22458a0dfcbb15cdae99281` passed
+  validation under
+  `/tmp/sbh-homebrew-formula-validation-local-20260511T203417Z`.
+- The previous `v0.4.9` attempt exposed a CI harness regression after the static
+  URL/checksum rewrite fix: the temporary `sbh-ci` Homebrew formula rewrote
+  release URLs to a local `file://` archive whose name did not let current
+  Homebrew infer `version`. Current source fixes `.github/workflows/ci.yml` to
+  derive `CI_FORMULA_VERSION` from `Cargo.toml` and inject an explicit
+  `version` line into the temporary formula before local install tests.
+  `src/cli/mod.rs` locks that workflow contract. Focused proof passed with
+  local formula-generation simulation, `cargo fmt --check`, `git diff --check`,
+  Ruby YAML parsing, `rch` focused Homebrew workflow tests, and full
+  `rch cargo check --all-targets` plus
+  `rch cargo clippy --all-targets -- -D warnings` on the relevant source state.
+- Release `v0.4.8` remains the latest public release, not draft or prerelease,
+  at
   `https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.8`.
   It contains four platform archives, four checksum sidecars, `SHA256SUMS.txt`,
-  and `release-provenance.json`. The manually built macOS archives were signed
-  with `Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)`, notarized, and
-  checked against Apple notary log ticketContents before upload. The recorded
-  accepted notary submissions were `9c78af86-5257-44e1-bffb-5dc60e4b0cf7`
-  for arm64 cdhash `4f267c18dd2c2e1f0af162fb322d0fd728098c65` and
-  `20a61991-d5fd-490e-af8f-af939ad8013c` for x86_64 cdhash
-  `78ef0de708a3683e058b8878dee6888310453911`.
+  and `release-provenance.json`. The public Homebrew tap still points at this
+  `v0.4.8` release; it has not been updated to `v0.4.14`.
 - The public tap now has `Formula/sbh.rb` on `main`
   (`Dicklesworthstone/homebrew-sbh`, content SHA
   `6e4c74f521b3a2f58e2f8a216d04bc0da3164fef`). Local proof after publication
@@ -482,14 +523,14 @@ avoids pinning exact commit hashes or GitHub Actions run ids as durable proof.
 
 | Requirement | Evidence | Current Status |
 |---|---|---|
-| Fresh macOS install auto-detects launchd and status works | `src/platform/macos/pal.rs`, `src/daemon/service.rs`, `tests/integration_tests.rs::macos_launchd_user_service_lifecycle_bootstrap_kickstart_bootout`, `.github/workflows/ci.yml` `macos-platform`, `docs/macos.md` | Repo-side implementation and CI coverage exist. Signed release install now has manual `v0.4.8`, Homebrew tap proof, and live self-update E2E proof in `bd-ykwh.10`; final closure still depends on hosted CI green for the fixed head and automated release-workflow proof. |
+| Fresh macOS install auto-detects launchd and status works | `src/platform/macos/pal.rs`, `src/daemon/service.rs`, `tests/integration_tests.rs::macos_launchd_user_service_lifecycle_bootstrap_kickstart_bootout`, `.github/workflows/ci.yml` `macos-platform`, `docs/macos.md` | Repo-side implementation and CI coverage exist. Signed release install has manual `v0.4.8`, Homebrew tap proof, live self-update E2E proof in `bd-ykwh.10`, and staged `v0.4.14` signed/notarized artifacts; final closure still depends on hosted CI green for the fixed head and automated release-workflow proof. |
 | Status/check JSON shape and APFS accounting match macOS reality | `tests/integration_tests.rs::macos_status_json_matches_diskutil_apfs_capacity`, `tests/integration_tests.rs::macos_check_json_matches_diskutil_apfs_capacity`, `docs/macos.md` | Covered in macOS integration tests and docs. Requires final CI green on the shipped head. |
 | Scan finds and ranks macOS reclaim candidates | `src/platform/macos/cleanup_catalog.rs`, `tests/common/mod.rs::SyntheticMacTree`, `src/scanner/patterns.rs` macOS cleanup tests, `docs/macos-incident-case-study.md` | Covered for Xcode, CoreSimulator, Electron caches, `/private/tmp/*-target`, `*_target`, `target_*`, user trash, and sacred paths. |
 | Clean/daemon deletion respects protected paths and active builds | `src/daemon/loop_main.rs::should_skip_protected_daemon_candidate`, `src/scanner/walker.rs`, `src/scanner/deletion.rs`, `bd-twgw`, `bd-j40b`, `daemon::loop_main::tests::scanner_prescan_does_not_dispatch_protected_rust_fuzz_target`, `daemon::loop_main::tests::executor_preflight_skips_config_protected_daemon_candidate` | Fixed in current source. Installed sbh 0.4.6 daemons must be upgraded/restarted because they can still delete protected artifact-looking paths. |
 | Blame attributes macOS disk growth to processes | `tests/integration_tests.rs::macos_synthetic_writer_surfaces_in_blame_top_rows`, `src/cli_app.rs::collect_blame_report_at`, macOS PAL libproc process I/O and open-file code | Covered by macOS integration test and PAL-backed implementation. |
-| CI validates Linux and macOS | `.github/workflows/ci.yml` jobs `check`, `unit`, `integration`, `linux-arm64`, `decision-plane`, `dashboard`, `e2e`, `macos-platform`, `macos-coverage`, `macos-benchmarks`, `stress`, `artifact-contract`, `provenance`, and `Homebrew Formula Validation` | Infrastructure exists. The macOS platform, coverage, and benchmark jobs are independent from the Ubuntu `check` job so Linux runner queueing cannot hide missing macOS proof. The latest inspected Intel macOS platform run on `macos-15-intel` exposed a temporary-formula checksum rewrite bug after tests/build/signing had passed; the local fix is covered by focused proof, but final goal cannot close until the final head completes all required jobs green. `macos-13` has been replaced with `macos-15-intel` because GitHub retired the old runner label; `macos-latest` remains the arm64 lane. |
+| CI validates Linux and macOS | `.github/workflows/ci.yml` jobs `check`, `unit`, `integration`, `linux-arm64`, `decision-plane`, `dashboard`, `e2e`, `macos-platform`, `macos-coverage`, `macos-benchmarks`, `stress`, `artifact-contract`, `provenance`, and `Homebrew Formula Validation` | Infrastructure exists. The macOS platform, coverage, and benchmark jobs are independent from the Ubuntu `check` job so Linux runner queueing cannot hide missing macOS proof. The latest inspected `v0.4.14` Intel macOS platform lanes passed on `macos-15-intel`, and local reproductions of the queued tap-preflight and formula-validation lanes passed. Final goal cannot close until the final head completes all required hosted jobs green. `macos-15-intel` is the Intel lane; `macos-latest` remains the arm64 lane. |
 | Docs explain install, configure, verify, and diagnose | `README.md`, `docs/macos.md`, `docs/macos-full-disk-access.md`, `docs/cleanup-rules-macos.md`, `docs/testing-and-logging.md`, sample configs in `docs/configs/` | Covered in docs. Keep docs update lint green for future CLI/config changes. |
-| Release is signed, notarized, notary-ticket verified, and distributed through Homebrew | `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, `.github/macos/sbh.entitlements.plist`, `packaging/homebrew/Formula/sbh.rb`, `docs/macos.md` release diagnostics, `src/cli/mod.rs::release_workflow_notarizes_macos_binaries_asynchronously` | Workflow and docs exist. `bd-ykwh.20` now verifies Apple notary log ticketContents before packaging. Manual `v0.4.8` release artifacts are signed/notarized and the public Homebrew tap formula installs, audits, tests, and passes `sbh doctor --release`. Automated hosted release workflow proof remains open under `bd-ykwh.3`, so the release system is not fully closeable yet. |
+| Release is signed, notarized, notary-ticket verified, and distributed through Homebrew | `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, `.github/macos/sbh.entitlements.plist`, `packaging/homebrew/Formula/sbh.rb`, `docs/macos.md` release diagnostics, `src/cli/mod.rs::release_workflow_notarizes_macos_binaries_asynchronously` | Workflow and docs exist. `bd-ykwh.20` verifies Apple notary log ticketContents before packaging. Manual `v0.4.8` release artifacts are signed/notarized and the public Homebrew tap formula installs, audits, tests, and passes `sbh doctor --release`. Manual `v0.4.14` artifacts are also signed/notarized and checksum-verified, and the repaired Developer ID P12 imports through the same macOS `security` path used by the workflow. Automated hosted release workflow proof and tap publication remain open under `bd-ykwh.3`, so the release system is not fully closeable yet. |
 
 ## Protected-Path Daemon Regression
 
@@ -518,42 +559,38 @@ containing `bd-twgw` and `bd-j40b`, then restore the protected worktree files.
 ## Live Release Blocker Evidence
 
 The user confirmed Apple Developer Program enrollment, so enrollment itself is
-not the current blocker. Live checks at 2026-05-11 14:00 UTC now show:
+not the current blocker. Live checks at 2026-05-11 20:36 UTC now show:
 
 - `security find-identity -v -p codesigning`: one valid Developer ID
-  Application identity for `Jeffrey Emanuel (AU8V2Z6NKY)`
-- `xcrun notarytool history --keychain-profile sbh-notary --output-format json`:
-  parseable history JSON, confirming the notary profile authenticates
-- `gh secret list --repo Dicklesworthstone/storage_ballast_helper`: release
-  signing, notarization, identity, team, and Homebrew tap deploy-key secrets are
-  present
+  Application identity for `Jeffrey Emanuel (AU8V2Z6NKY)`.
+- `xcrun notarytool history --keychain-profile sbh-notary --output-format json`
+  and the local `.p8` API-key invocation both return parseable history JSON.
+- `gh secret list --repo Dicklesworthstone/storage_ballast_helper`: signing
+  secrets were updated at 2026-05-11T20:31Z, notary secrets at
+  2026-05-11T20:25Z, and Homebrew tap credentials are present.
+- The final Developer ID P12 is compatible with both OpenSSL 3 certificate
+  extraction and macOS `security import`, and local workflow emulation used it
+  to Developer-ID sign both staged `v0.4.14` macOS binaries.
 - `gh api repos/Dicklesworthstone/homebrew-sbh/contents/Formula/sbh.rb`: live
-  public tap formula exists on `main`
+  public tap formula exists on `main` but still points at `v0.4.8`.
 - GitHub release/tag checks: `v0.4.8` is published with macOS and Linux
-  archives, checksum sidecars, `SHA256SUMS.txt`, and provenance
-- GitHub release/tag checks: `v0.4.10` is tagged at source commit `b280b9a`,
-  before the fixed-head mount-timeout fallback, and release workflow run
-  `25666074747` is queued, but no `v0.4.10` release assets are published yet
-- GitHub release/tag checks: package metadata has advanced to `0.4.13` for the
-  fixed-head release attempt after the `v0.4.11` release quality gate exposed a
-  reusable-workflow secret inheritance gap. The `v0.4.11` run `25675218864`
-  completed `Quality Gate / macOS Platform Tests (intel)` successfully, but
-  release-doctor diagnostics in that reusable quality gate could not see the
-  release secrets. The corrected `v0.4.13` workflow must be the final hosted
-  release proof.
-- local Homebrew validation: `brew fetch`, `brew audit --strict --online`,
-  `brew install`, `brew test`, `sbh version --verbose`, and
-  `sbh --json doctor --release` passed for the public tap
+  archives, checksum sidecars, `SHA256SUMS.txt`, and provenance.
+- GitHub release/tag checks: `v0.4.14` is tagged and Release run
+  `25693688419` exists, but no `v0.4.14` release assets are published yet.
+- Local Homebrew validation: the public tap install/test path passed for
+  `v0.4.8`, and local generated-formula validation passed for `v0.4.14`.
 
 Remaining release blockers:
 
 - Complete the hosted reusable release quality gate on the fixed final source
-  commit and version metadata, including inherited release secrets for hosted
-  release-doctor diagnostics.
-- Run the automated signed/notarized tag release workflow for `v0.4.13` or a
-  later fixed-head tag and verify it completes through upload and tap
-  publication rather than relying on stale queued `v0.4.10`/`v0.4.11` attempts
-  or the manual `v0.4.8` release.
+  commit and version metadata.
+- Let an automated signed/notarized tag release workflow for `v0.4.14` or a
+  later fixed-head tag complete through upload and tap publication, or get
+  explicit operator approval to cancel stale queued release runs and manually
+  publish the prepared `v0.4.14` artifacts.
+- Verify the public Homebrew tap advances from `v0.4.8` to the final release
+  version and that formula install/test still passes from the published release
+  assets.
 
 ## Not Complete
 
