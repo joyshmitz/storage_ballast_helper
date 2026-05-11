@@ -465,8 +465,12 @@ avoids pinning exact commit hashes or GitHub Actions run ids as durable proof.
   returned `total_count = 0`; `storage_ballast_helper` has no self-hosted
   Actions runners registered, so
   the final CI gate currently depends entirely on GitHub-hosted runner capacity.
-  Registering a self-hosted runner or canceling queued runs in other repositories
-  would be remote state changes and needs explicit operator approval.
+  The active `v0.4.10` workflow snapshot routes queued jobs to GitHub-hosted
+  labels such as `ubuntu-latest` and `macos-latest`; registering a self-hosted
+  runner would therefore not rescue that already-queued run without an
+  authorized workflow/routing change and a fresh release attempt. Registering a
+  self-hosted runner or canceling queued runs in other repositories would be
+  remote state changes and needs explicit operator approval.
 - A narrower queue triage found the largest queued-run sources were
   `asupersync` (858 queued), `pi_agent_rust` (239 queued), `franken_node` (116
   queued), `agentic_coding_flywheel_setup` (104 queued), and
