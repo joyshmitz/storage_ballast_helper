@@ -1562,6 +1562,16 @@ mod tests {
             release_workflow.contains("tags:") && release_workflow.contains("- 'v*'"),
             "full release workflow must remain tag-triggered"
         );
+        let quality_gate = workflow_block(
+            release_workflow,
+            "  quality-gate:\n",
+            "\n  homebrew-tap-deploy-key-preflight:",
+        );
+        assert!(
+            quality_gate.contains("uses: ./.github/workflows/ci.yml")
+                && quality_gate.contains("secrets: inherit"),
+            "release workflow quality gate must inherit release secrets for hosted macOS release-doctor diagnostics"
+        );
         assert!(
             !release_workflow.contains("pull_request:"),
             "full release workflow must not run on PRs"

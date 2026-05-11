@@ -19,6 +19,7 @@ jobs:
   quality-gate:
     name: Quality Gate
     uses: ./.github/workflows/ci.yml
+    secrets: inherit
 
   homebrew-tap-deploy-key-preflight:
     name: Homebrew Tap Deploy Key Preflight

@@ -534,12 +534,13 @@ not the current blocker. Live checks at 2026-05-11 14:00 UTC now show:
 - GitHub release/tag checks: `v0.4.10` is tagged at source commit `b280b9a`,
   before the fixed-head mount-timeout fallback, and release workflow run
   `25666074747` is queued, but no `v0.4.10` release assets are published yet
-- GitHub release/tag checks: package metadata has advanced to `0.4.11` for the
-  fixed-head release attempt, but no `v0.4.11` tag workflow has completed yet
-- GitHub Actions checks: release run `25666074747` has completed
-  `Quality Gate / macOS Platform Tests (intel)` successfully; the remaining
-  release-level preflight and quality-gate Ubuntu/`macos-latest` jobs are still
-  queued before runner assignment
+- GitHub release/tag checks: package metadata has advanced to `0.4.12` for the
+  fixed-head release attempt after the `v0.4.11` release quality gate exposed a
+  reusable-workflow secret inheritance gap. The `v0.4.11` run `25675218864`
+  completed `Quality Gate / macOS Platform Tests (intel)` successfully, but
+  release-doctor diagnostics in that reusable quality gate could not see the
+  release secrets. The corrected `v0.4.12` workflow must be the final hosted
+  release proof.
 - local Homebrew validation: `brew fetch`, `brew audit --strict --online`,
   `brew install`, `brew test`, `sbh version --verbose`, and
   `sbh --json doctor --release` passed for the public tap
@@ -547,12 +548,12 @@ not the current blocker. Live checks at 2026-05-11 14:00 UTC now show:
 Remaining release blockers:
 
 - Complete the hosted reusable release quality gate on the fixed final source
-  commit and version metadata; the latest fixed-source branch run is
-  `25674846499`, currently queued before runner assignment.
-- Run the automated signed/notarized tag release workflow for `v0.4.11` or a
+  commit and version metadata, including inherited release secrets for hosted
+  release-doctor diagnostics.
+- Run the automated signed/notarized tag release workflow for `v0.4.12` or a
   later fixed-head tag and verify it completes through upload and tap
-  publication rather than relying on the stale queued `v0.4.10` attempt or the
-  manual `v0.4.8` release.
+  publication rather than relying on stale queued `v0.4.10`/`v0.4.11` attempts
+  or the manual `v0.4.8` release.
 
 ## Not Complete
 
