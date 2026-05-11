@@ -372,9 +372,9 @@ fn mount_command_entries() -> io::Result<Vec<MountCommandEntry>> {
         }
         Ok(None) => {
             eprintln!(
-                "[sbh] warning: /sbin/mount timed out after {MOUNT_COMMAND_TIMEOUT:?}; mount inventory unavailable"
+                "[sbh] warning: /sbin/mount timed out after {MOUNT_COMMAND_TIMEOUT:?}; falling back to whichdisk"
             );
-            Ok(Vec::new())
+            whichdisk_mount_entries()
         }
         Err(error) => {
             eprintln!("[sbh] warning: /sbin/mount unavailable: {error}; falling back to whichdisk");

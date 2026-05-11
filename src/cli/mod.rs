@@ -925,6 +925,33 @@ mod tests {
     }
 
     #[test]
+    fn macos_mount_timeout_uses_whichdisk_fallback() {
+        let macos_sys = include_str!("../platform/macos/sys.rs");
+        let timeout_branch = workflow_block(
+            macos_sys,
+            "        Ok(None) => {",
+            "        Err(error) => {",
+        );
+
+        assert!(
+            timeout_branch.contains("falling back to whichdisk"),
+            "macOS mount timeout warning must describe the fallback"
+        );
+        assert!(
+            timeout_branch.contains("whichdisk_mount_entries()"),
+            "macOS mount timeout must use whichdisk instead of returning an empty inventory"
+        );
+        assert!(
+            !timeout_branch.contains("Ok(Vec::new())"),
+            "macOS mount timeout must not erase mount inventory"
+        );
+        assert!(
+            !timeout_branch.contains("mount inventory unavailable"),
+            "macOS mount timeout must not report inventory unavailable when fallback is available"
+        );
+    }
+
+    #[test]
     fn parses_aliases_for_os_arch_and_abi() {
         let host = HostSpecifier::from_parts("darwin", "arm64", Some("none")).unwrap();
         assert_eq!(
