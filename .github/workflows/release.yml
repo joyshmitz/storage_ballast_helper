@@ -278,10 +278,50 @@ jobs:
 
           xcrun notarytool log "${submission_id}" "${notary_args[@]}" "${log_json}" || true
           cat "${log_json}" || true
-          if ! spctl -a -t execute -vv "${bin}"; then
-            echo "::error::Gatekeeper assessment failed after notarization"
-            exit 1
-          fi
+          expected_cdhash="$(awk -F= '/^CDHash=/ {print $2; exit}' "sbh-${{ matrix.target }}-codesign-authority.txt")"
+          expected_arch="${{ matrix.target }}"
+          case "${expected_arch}" in
+            aarch64-apple-darwin)
+              expected_arch="arm64"
+              ;;
+            x86_64-apple-darwin)
+              expected_arch="x86_64"
+              ;;
+          esac
+          EXPECTED_CDHASH="${expected_cdhash}" EXPECTED_ARCH="${expected_arch}" NOTARY_LOG_JSON="${log_json}" python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          log_path = Path(os.environ["NOTARY_LOG_JSON"])
+          report = json.loads(log_path.read_text(encoding="utf-8"))
+          if report.get("status") != "Accepted":
+              print(f"::error::notary log status was not Accepted: {report.get('status')}")
+              sys.exit(1)
+          if report.get("issues") not in (None, []):
+              print(f"::error::notary log contained issues: {report.get('issues')}")
+              sys.exit(1)
+
+          expected_cdhash = os.environ["EXPECTED_CDHASH"].lower()
+          expected_arch = os.environ["EXPECTED_ARCH"]
+          ticket_contents = report.get("ticketContents")
+          if not isinstance(ticket_contents, list):
+              print("::error::notary log ticketContents was not an array")
+              sys.exit(1)
+
+          for ticket in ticket_contents:
+              if not isinstance(ticket, dict):
+                  continue
+              if ticket.get("arch") == expected_arch and str(ticket.get("cdhash", "")).lower() == expected_cdhash:
+                  break
+          else:
+              print(
+                  "::error::notary log did not contain the signed binary ticket "
+                  f"for arch={expected_arch} cdhash={expected_cdhash}"
+              )
+              sys.exit(1)
+          PY
 
       - name: Package archive
         run: |

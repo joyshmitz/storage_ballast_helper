@@ -295,8 +295,10 @@ certificate secrets are absent or the resulting binary is not signed by a
 The Unix one-liner installer keeps checksum verification enabled by default.
 On macOS, that same `--verify` path also runs
 `codesign --verify --strict --verbose=2` and
-`spctl -a -t execute -vv` against the downloaded `sbh` binary before writing it
-to the destination directory. The explicit `--no-verify` flag bypasses these
+`codesign --display --verbose=4` against the downloaded `sbh` binary before
+writing it to the destination directory. The display output must identify the
+exact authority `Authority=Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)`
+and `TeamIdentifier=AU8V2Z6NKY`. The explicit `--no-verify` flag bypasses these
 installer trust checks and should only be used for deliberate recovery from a
 trusted local artifact.
 
@@ -404,9 +406,12 @@ with `xcrun notarytool submit --key "$APPLE_NOTARY_KEY_PATH" --key-id
 "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID"`, extracts the
 submission id, polls `xcrun notarytool info` every 30 seconds for up to 30
 minutes, and downloads `xcrun notarytool log` output on both success and failure.
-After Apple accepts the submission, the workflow runs `spctl -a -t execute -vv`
-against the signed binary before packaging the tarball, so Gatekeeper rejection
-fails the release instead of being discovered by an installer later. `Invalid`,
+After Apple accepts the submission, the workflow parses the downloaded notary
+log and verifies that `ticketContents` contains the signed binary CDHash and
+architecture before packaging the tarball. Raw CLI executables distributed in
+tarballs do not produce a useful `spctl -t execute` assessment on all supported
+macOS versions even when the notary service accepts the submission, so the
+release gate verifies Apple's accepted notary ticket directly. `Invalid`,
 `Rejected`, and timeout states fail the release with the notary log printed into
 the Actions output.
 
@@ -485,9 +490,9 @@ commands without scraping this document.
 
 The current CLI tarball flow does not staple a ticket because `stapler` supports
 app bundles, disk images, and signed flat packages rather than the `.tar.xz`
-artifact. Gatekeeper can still find the online notary ticket for the signed
-binary. A future `.pkg` or `.dmg` distribution path should staple and validate
-that package after notarization.
+artifact. The release workflow keeps the accepted notary log with ticket
+contents for the signed binary. A future `.pkg` or `.dmg` distribution path
+should staple and validate that package after notarization.
 
 ## Self-Update Verification
 
@@ -498,12 +503,12 @@ macOS, it also verifies the extracted candidate binary before the atomic replace
    linker failures.
 2. Run `codesign --verify --strict --verbose=2 <candidate>` to reject unsigned
    or malformed signatures.
-3. Run `spctl -a -t execute -vv <candidate>` so Gatekeeper accepts the signed
-   and notarized binary.
+3. Run `codesign --display --verbose=4 <candidate>` and require the expected
+   Developer ID Application identity and `TeamIdentifier=AU8V2Z6NKY`.
 4. Rename the verified candidate into place atomically and roll back to the
    previous binary if any pre-swap check or rename fails.
 
-The unsafe `sbh update --no-verify` escape hatch bypasses checksum, Sigstore, codesign, and Gatekeeper checks. Use it only for deliberate recovery from a trusted local bundle.
+The unsafe `sbh update --no-verify` escape hatch bypasses checksum, Sigstore, and Developer ID checks. Use it only for deliberate recovery from a trusted local bundle.
 
 ## Watched Paths
 

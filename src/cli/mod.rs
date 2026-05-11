@@ -1955,7 +1955,7 @@ mod tests {
             "bd-r7m7.16",
             "bd-ykwh",
             "bd-ykwh.20",
-            "release CI now runs `spctl -a -t execute -vv`",
+            "release CI now verifies Apple notary log ticketContents",
             "avoids pinning exact commit hashes",
             "GitHub Actions run ids",
             "git rev-parse HEAD",
@@ -1970,7 +1970,7 @@ mod tests {
             "macos-15-intel",
             "Do not treat queued CI as",
             "one valid local",
-            "spctl -a -t execute -vv",
+            "notary log ticketContents",
             "sbh-notary",
             "HOMEBREW_TAP_SSH_KEY",
             "Not Complete",
@@ -2348,8 +2348,8 @@ mod tests {
             "plutil -extract status raw -o - \"${info_plist}\"",
             "sleep 30",
             "xcrun notarytool log \"${submission_id}\"",
-            "spctl -a -t execute -vv \"${bin}\"",
-            "Gatekeeper assessment failed after notarization",
+            "EXPECTED_CDHASH=\"${expected_cdhash}\" EXPECTED_ARCH=\"${expected_arch}\" NOTARY_LOG_JSON=\"${log_json}\" python3 - <<'PY'",
+            "notary log did not contain the signed binary ticket",
             "notarization timed out after 30 minutes",
             "sbh-*-notary-*.plist",
             "sbh-*-notary-*.json",
@@ -2361,15 +2361,15 @@ mod tests {
             );
         }
 
-        let gatekeeper_assessment = release_workflow
-            .find("spctl -a -t execute -vv \"${bin}\"")
-            .expect("release workflow must assess Gatekeeper acceptance");
+        let notary_ticket_verification = release_workflow
+            .find("notary log did not contain the signed binary ticket")
+            .expect("release workflow must verify notary ticket contents");
         let package_archive = release_workflow
             .find("- name: Package archive")
             .expect("release workflow must package archives after verification");
         assert!(
-            gatekeeper_assessment < package_archive,
-            "release workflow must assess Gatekeeper acceptance before packaging"
+            notary_ticket_verification < package_archive,
+            "release workflow must verify the accepted notary ticket before packaging"
         );
 
         assert!(
@@ -2487,12 +2487,13 @@ mod tests {
             "[[ \"${TARGET_TRIPLE:-}\" == *-apple-darwin ]]",
             "start_phase \"verify_macos_trust\"",
             "command -v codesign",
-            "command -v spctl",
             "codesign --verify --strict --verbose=2 \"$binary_path\"",
-            "spctl -a -t execute -vv \"$binary_path\"",
+            "codesign --display --verbose=4 \"$binary_path\"",
+            "Authority=Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)",
+            "TeamIdentifier=AU8V2Z6NKY",
             "macOS code signature verification failed",
-            "macOS Gatekeeper assessment failed",
-            "finish_phase \"macOS code signature and Gatekeeper assessment verified\"",
+            "macOS release binary was not signed by the expected Developer ID Application identity",
+            "finish_phase \"macOS Developer ID signature verified\"",
         ] {
             assert!(
                 installer.contains(required),
@@ -2513,7 +2514,8 @@ mod tests {
 
         for required in [
             "codesign --verify --strict --verbose=2",
-            "spctl -a -t execute -vv",
+            "codesign --display --verbose=4",
+            "Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)",
             "The explicit `--no-verify` flag bypasses these",
             "installer trust checks",
         ] {
@@ -2527,7 +2529,7 @@ mod tests {
             "Skip artifact verification, including macOS trust checks",
             "macOS binary trust checks",
             "codesign --verify --strict --verbose=2",
-            "spctl -a -t execute -vv",
+            "Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)",
             "including checksum, signature, and macOS trust checks",
         ] {
             assert!(

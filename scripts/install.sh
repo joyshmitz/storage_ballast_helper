@@ -524,28 +524,32 @@ is_macos_target() {
 
 verify_macos_binary_trust() {
   local binary_path="$1"
+  local codesign_detail
 
   if ! is_macos_target; then
     return 0
   fi
 
-  start_phase "verify_macos_trust" "verifying macOS code signature and Gatekeeper assessment"
+  start_phase "verify_macos_trust" "verifying macOS Developer ID signature"
   log_header "Verifying macOS binary trust"
 
   if ! command -v codesign >/dev/null 2>&1; then
     die "codesign is required to verify macOS release binaries. Install Xcode Command Line Tools or retry only with --no-verify if you trust the artifact."
   fi
-  if ! command -v spctl >/dev/null 2>&1; then
-    die "spctl is required to verify macOS Gatekeeper assessment. Install Xcode Command Line Tools or retry only with --no-verify if you trust the artifact."
-  fi
   if ! codesign --verify --strict --verbose=2 "$binary_path"; then
     die "macOS code signature verification failed for ${ASSET_NAME}. Refusing to install."
   fi
-  if ! spctl -a -t execute -vv "$binary_path"; then
-    die "macOS Gatekeeper assessment failed for ${ASSET_NAME}. Refusing to install."
+  if ! codesign_detail="$(codesign --display --verbose=4 "$binary_path" 2>&1)"; then
+    die "macOS code signature detail inspection failed for ${ASSET_NAME}. Refusing to install."
+  fi
+  if ! grep -Fq "Authority=Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)" <<<"$codesign_detail"; then
+    die "macOS release binary was not signed by the expected Developer ID Application identity. Refusing to install."
+  fi
+  if ! grep -Fq "TeamIdentifier=AU8V2Z6NKY" <<<"$codesign_detail"; then
+    die "macOS release binary was not signed by the expected Apple Developer team. Refusing to install."
   fi
 
-  finish_phase "macOS code signature and Gatekeeper assessment verified"
+  finish_phase "macOS Developer ID signature verified"
 }
 
 verify_mode_label() {

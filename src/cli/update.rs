@@ -148,6 +148,13 @@ struct BinaryTrustCommandOutput {
     stderr: String,
 }
 
+#[cfg(any(target_os = "macos", test))]
+const MACOS_RELEASE_DEVELOPER_ID_AUTHORITY: &str =
+    "Authority=Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)";
+
+#[cfg(any(target_os = "macos", test))]
+const MACOS_RELEASE_TEAM_IDENTIFIER: &str = "TeamIdentifier=AU8V2Z6NKY";
+
 /// Structured outcome for activating a freshly installed update in the service.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct UpdateServiceRestart {
@@ -1368,20 +1375,28 @@ where
         ));
     }
 
-    let spctl_args = vec![
-        "-a".to_string(),
-        "-t".to_string(),
-        "execute".to_string(),
-        "-vv".to_string(),
-        path_arg,
-    ];
-    let spctl = run_command("spctl", &spctl_args)
-        .map_err(|error| format!("failed to run spctl: {error}"))?;
-    if !spctl.success {
+    let display_args = vec!["--display".to_string(), "--verbose=4".to_string(), path_arg];
+    let display = run_command("codesign", &display_args)
+        .map_err(|error| format!("failed to inspect codesign detail: {error}"))?;
+    if !display.success {
         return Err(format!(
-            "Gatekeeper rejected {} before update: {}",
+            "codesign detail inspection failed for {} before update: {}",
             path.display(),
-            binary_trust_command_detail(&spctl)
+            binary_trust_command_detail(&display)
+        ));
+    }
+
+    let display_detail = binary_trust_command_detail(&display);
+    if !display_detail.contains(MACOS_RELEASE_DEVELOPER_ID_AUTHORITY) {
+        return Err(format!(
+            "candidate {} was not signed by the expected Developer ID Application identity",
+            path.display()
+        ));
+    }
+    if !display_detail.contains(MACOS_RELEASE_TEAM_IDENTIFIER) {
+        return Err(format!(
+            "candidate {} was not signed by the expected Apple Developer team",
+            path.display()
         ));
     }
 
@@ -1587,13 +1602,22 @@ mod tests {
     }
 
     #[test]
-    fn macos_binary_trust_verifier_checks_codesign_then_gatekeeper() {
+    fn macos_binary_trust_verifier_checks_codesign_then_developer_id_detail() {
         let candidate = PathBuf::from("/tmp/sbh.new");
         let mut calls: Vec<(String, Vec<String>)> = Vec::new();
 
         verify_macos_binary_trust_with_runner(&candidate, |program, args| {
             calls.push((program.to_string(), args.to_vec()));
-            Ok(trust_output(true, 0, "", "accepted"))
+            if args.iter().any(|arg| arg == "--display") {
+                Ok(trust_output(
+                    true,
+                    0,
+                    "",
+                    "Authority=Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)\nTeamIdentifier=AU8V2Z6NKY",
+                ))
+            } else {
+                Ok(trust_output(true, 0, "", "valid on disk"))
+            }
         })
         .unwrap();
 
@@ -1608,14 +1632,12 @@ mod tests {
                 "/tmp/sbh.new".to_string(),
             ]
         );
-        assert_eq!(calls[1].0, "spctl");
+        assert_eq!(calls[1].0, "codesign");
         assert_eq!(
             calls[1].1,
             vec![
-                "-a".to_string(),
-                "-t".to_string(),
-                "execute".to_string(),
-                "-vv".to_string(),
+                "--display".to_string(),
+                "--verbose=4".to_string(),
                 "/tmp/sbh.new".to_string(),
             ]
         );
@@ -1661,10 +1683,11 @@ mod tests {
             "before the atomic replacement step",
             "sbh --version",
             "codesign --verify --strict --verbose=2 <candidate>",
-            "spctl -a -t execute -vv <candidate>",
+            "codesign --display --verbose=4 <candidate>",
+            "Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)",
             "Rename the verified candidate into place atomically",
             "sbh update --no-verify",
-            "bypasses checksum, Sigstore, codesign, and Gatekeeper checks",
+            "bypasses checksum, Sigstore, and Developer ID checks",
         ] {
             assert!(
                 doc.contains(required),

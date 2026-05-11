@@ -117,8 +117,8 @@ operator-visible outcomes:
   workflow evidence.
 - `bd-r7m7.17` tracks the current hosted CI queue as an explicit external
   blocker for final macOS parity proof.
-- `bd-ykwh.20` is closed; release CI now runs `spctl -a -t execute -vv` after
-  notarization acceptance and before packaging macOS tarballs.
+- `bd-ykwh.20` is closed; release CI now verifies Apple notary log ticketContents
+  after notarization acceptance and before packaging macOS tarballs.
 - Live recheck at 2026-05-11 02:00 UTC inspected current tracker-only branch
   head `aa6c03f69ac8ed6ff7e002fdc795e3e1dd5fa0af` and current source CI run
   `25644934638` for source head `9e438e74c77f6385e0ad28bd2709947a83b6bad9`.
@@ -185,12 +185,16 @@ operator-visible outcomes:
 - `Dicklesworthstone/homebrew-sbh` still returns HTTP 404 for
   `Formula/sbh.rb`, so the public tap formula is not published yet.
 - Live release recheck at 2026-05-11 03:25 UTC still found latest published
-  release `v0.4.6` and no `v0.4.7` tag. The tap repository still contains only
-  `Formula/.gitkeep`. Current-source `sbh --json doctor --release` exited 0 as
-  a command but reported `ok=false`, `passed=3`, `warnings=1`, and `failed=0`:
-  Developer ID identity, notary profile, and GitHub release secrets passed; the
-  only remaining diagnostic warning was `release.homebrew_tap` because
-  `Formula/sbh.rb` has not been published yet.
+- Live release recheck at 2026-05-11 03:25 UTC still found latest published
+  release `v0.4.6`. A later `v0.4.7` tag exists, but the corrected release
+  candidate is now `v0.4.8` because the raw CLI `spctl` release gate was
+  replaced with direct accepted-notary-ticket validation. The tap repository
+  still contains only `Formula/.gitkeep`. Current-source
+  `sbh --json doctor --release` exited 0 as a command but reported `ok=false`,
+  `passed=3`, `warnings=1`, and `failed=0`: Developer ID identity, notary
+  profile, and GitHub release secrets passed; the only remaining diagnostic
+  warning was `release.homebrew_tap` because `Formula/sbh.rb` has not been
+  published yet.
 - Live recheck at 2026-05-10 02:44 UTC inspected pushed head
   `0da51406462098b02aa58ee150a0ae632433981f`
   (`bd-r7m7 refresh macos parity audit`). That was point-in-time evidence
@@ -370,7 +374,8 @@ operator-visible outcomes:
   `.github/workflows/ci.yml`, `.github/workflows/release.yml`, and
   `.github/workflows/cert-expiration.yml`. The expected CI quality gate,
   macOS platform, coverage, benchmark, Homebrew formula, Developer ID signing,
-  notarization, Gatekeeper, and Homebrew tap workflow anchors are present.
+  notarization, notary-ticket verification, and Homebrew tap workflow anchors
+  are present.
 - Local packaging-input validation passed at refresh time:
   `plutil -lint .github/macos/sbh.entitlements.plist`,
   `ruby -c packaging/homebrew/Formula/sbh.rb`, and
@@ -406,7 +411,7 @@ operator-visible outcomes:
 | Blame attributes macOS disk growth to processes | `tests/integration_tests.rs::macos_synthetic_writer_surfaces_in_blame_top_rows`, `src/cli_app.rs::collect_blame_report_at`, macOS PAL libproc process I/O and open-file code | Covered by macOS integration test and PAL-backed implementation. |
 | CI validates Linux and macOS | `.github/workflows/ci.yml` jobs `check`, `unit`, `integration`, `linux-arm64`, `decision-plane`, `dashboard`, `e2e`, `macos-platform`, `macos-coverage`, `macos-benchmarks`, `stress`, `artifact-contract`, `provenance`, and `Homebrew Formula Validation` | Infrastructure exists. The macOS platform, coverage, and benchmark jobs are independent from the Ubuntu `check` job so Linux runner queueing cannot hide missing macOS proof. The inspected Intel macOS platform proof on `macos-15-intel` includes 54 integration tests, E2E smoke, APFS JSON status, ad-hoc hardened-runtime codesign, temporary-tap Homebrew install/test, release-doctor JSON capture, and diagnostic binary artifact verification. Final goal cannot close until the final head completes all required jobs green. `macos-13` has been replaced with `macos-15-intel` because GitHub retired the old runner label; `macos-latest` remains the arm64 lane. |
 | Docs explain install, configure, verify, and diagnose | `README.md`, `docs/macos.md`, `docs/macos-full-disk-access.md`, `docs/cleanup-rules-macos.md`, `docs/testing-and-logging.md`, sample configs in `docs/configs/` | Covered in docs. Keep docs update lint green for future CLI/config changes. |
-| Release is signed, notarized, Gatekeeper-assessed, and distributed through Homebrew | `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, `.github/macos/sbh.entitlements.plist`, `packaging/homebrew/Formula/sbh.rb`, `docs/macos.md` release diagnostics, `src/cli/mod.rs::release_workflow_notarizes_macos_binaries_asynchronously` | Workflow and docs exist. `bd-ykwh.20` added release-side `spctl -a -t execute -vv` before packaging. `sbh doctor --release` now checks Homebrew tap access and warns when `Formula/sbh.rb` has not been published yet. Live credentials are now present, but a live tap formula and a successful signed/notarized tag release are still missing, so this is not complete. |
+| Release is signed, notarized, notary-ticket verified, and distributed through Homebrew | `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, `.github/macos/sbh.entitlements.plist`, `packaging/homebrew/Formula/sbh.rb`, `docs/macos.md` release diagnostics, `src/cli/mod.rs::release_workflow_notarizes_macos_binaries_asynchronously` | Workflow and docs exist. `bd-ykwh.20` now verifies Apple notary log ticketContents before packaging. `sbh doctor --release` now checks Homebrew tap access and warns when `Formula/sbh.rb` has not been published yet. Live credentials are now present, but a live tap formula and a successful signed/notarized tag release are still missing, so this is not complete. |
 
 ## Protected-Path Daemon Regression
 
@@ -446,8 +451,8 @@ not the current blocker. Live checks at 2026-05-11 02:00 UTC now show:
   present
 - `gh api repos/Dicklesworthstone/homebrew-sbh/contents/Formula`: only
   `Formula/.gitkeep`; no live `Formula/sbh.rb` yet
-- GitHub release/tag checks: latest published release is still `v0.4.6`, and no
-  `v0.4.7` tag exists yet
+- GitHub release/tag checks: latest published release is still `v0.4.6`; the
+  corrected release candidate is `v0.4.8`
 
 Remaining release blockers:
 

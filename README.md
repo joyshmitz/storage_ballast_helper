@@ -1504,7 +1504,7 @@ If the `cosign` binary is not installed on the system, the pipeline probes for i
 
 #### macOS Binary Trust Checks
 
-On macOS, the Unix installer and self-update path also run `codesign --verify --strict --verbose=2` and `spctl -a -t execute -vv` against the downloaded candidate before installing or replacing `sbh`. This rejects unsigned, malformed, or Gatekeeper-rejected binaries before they become active.
+On macOS, the Unix installer and self-update path also run `codesign --verify --strict --verbose=2` and inspect `codesign --display --verbose=4` output before installing or replacing `sbh`. This rejects unsigned, malformed, or incorrectly signed binaries unless they are signed by the expected `Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)` identity and `TeamIdentifier=AU8V2Z6NKY`.
 
 #### Bypass and Audit Trail
 
