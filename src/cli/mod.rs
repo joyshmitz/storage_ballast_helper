@@ -1928,6 +1928,61 @@ mod tests {
     }
 
     #[test]
+    fn ci_macos_platform_smoke_exercises_safe_operational_commands() {
+        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
+
+        for required in [
+            "macos-smoke-root",
+            "macos-smoke-state",
+            "smoke_config=\"${smoke_state}/config.toml\"",
+            "sample_target/debug/object.o",
+            "protected_paths = [\"${smoke_root}/config-protected\"]",
+            "case=smoke-config-validate",
+            "--config \"${smoke_config}\" config validate",
+            "case=json-status-sacred",
+            "--json status --sacred",
+            "case=json-check",
+            "--json check \"${smoke_root}\" --need 1M --target-free 0",
+            "case=json-scan",
+            "--json scan \"${smoke_root}\" --top 5 --min-score 0.1 --explain",
+            "case=json-clean-dry-run",
+            "--json clean \"${smoke_root}\" --dry-run --yes --max-items 2 --min-score 0.1",
+            "case=json-blame",
+            "--json blame --top 3 --since 1m",
+            "case=json-ballast-status",
+            "--json ballast status",
+            "case=json-tune",
+            "--json tune",
+            "case=json-setup-verify-dry-run",
+            "--json setup --verify --dry-run --bin-dir",
+            "case=json-protect-create",
+            "--json protect \"${smoke_root}/protected\"",
+            "case=json-protect-list",
+            "--json protect --list",
+            "macos-e2e-smoke-output.txt",
+        ] {
+            assert!(
+                ci_workflow.contains(required),
+                "macOS platform smoke must cover safe operational command fragment: {required}"
+            );
+        }
+
+        for forbidden in [
+            "case=emergency",
+            "--json emergency",
+            "case=unprotect",
+            "--json unprotect",
+            "case=uninstall",
+            "--json uninstall",
+        ] {
+            assert!(
+                !ci_workflow.contains(forbidden),
+                "macOS platform smoke must not exercise destructive or cleanup command fragment: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn ci_validates_homebrew_formula_generation() {
         let ci_workflow = include_str!("../../.github/workflows/ci.yml");
         let testing_guide = include_str!("../../docs/testing-and-logging.md");

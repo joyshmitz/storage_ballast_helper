@@ -707,6 +707,34 @@ jobs:
           set -euo pipefail
           bin="./target/release/sbh"
           test -x "${bin}"
+          smoke_root="${PWD}/macos-smoke-root"
+          smoke_state="${PWD}/macos-smoke-state"
+          smoke_config="${smoke_state}/config.toml"
+          mkdir -p \
+            "${smoke_root}/sample_target/debug" \
+            "${smoke_root}/config-protected" \
+            "${smoke_root}/protected" \
+            "${smoke_state}/ballast"
+          printf 'payload\n' > "${smoke_root}/sample_target/debug/object.o"
+          cat > "${smoke_config}" <<EOF
+          [paths]
+          config_file = "${smoke_config}"
+          state_file = "${smoke_state}/state.json"
+          sqlite_db = "${smoke_state}/activity.sqlite3"
+          jsonl_log = "${smoke_state}/activity.jsonl"
+          ballast_dir = "${smoke_state}/ballast"
+
+          [scanner]
+          root_paths = ["${smoke_root}"]
+          protected_paths = ["${smoke_root}/config-protected"]
+          min_file_age_minutes = 0
+          max_depth = 4
+          dry_run = true
+
+          [ballast]
+          file_count = 1
+          file_size_bytes = 1048576
+          EOF
           {
             echo "case=help"
             "${bin}" --help
@@ -716,8 +744,30 @@ jobs:
             "${bin}" --json version
             echo "case=config-validate"
             "${bin}" config validate
+            echo "case=smoke-config-validate"
+            "${bin}" --config "${smoke_config}" config validate
             echo "case=json-status"
             "${bin}" --json status
+            echo "case=json-status-sacred"
+            "${bin}" --config "${smoke_config}" --json status --sacred
+            echo "case=json-check"
+            "${bin}" --config "${smoke_config}" --json check "${smoke_root}" --need 1M --target-free 0
+            echo "case=json-scan"
+            "${bin}" --config "${smoke_config}" --json scan "${smoke_root}" --top 5 --min-score 0.1 --explain
+            echo "case=json-clean-dry-run"
+            "${bin}" --config "${smoke_config}" --json clean "${smoke_root}" --dry-run --yes --max-items 2 --min-score 0.1
+            echo "case=json-blame"
+            "${bin}" --config "${smoke_config}" --json blame --top 3 --since 1m
+            echo "case=json-ballast-status"
+            "${bin}" --config "${smoke_config}" --json ballast status
+            echo "case=json-tune"
+            "${bin}" --config "${smoke_config}" --json tune
+            echo "case=json-setup-verify-dry-run"
+            "${bin}" --config "${smoke_config}" --json setup --verify --dry-run --bin-dir "$(dirname "${bin}")"
+            echo "case=json-protect-create"
+            "${bin}" --config "${smoke_config}" --json protect "${smoke_root}/protected"
+            echo "case=json-protect-list"
+            "${bin}" --config "${smoke_config}" --json protect --list
             echo "case=completions-zsh"
             "${bin}" completions zsh > sbh-completions.zsh
             test -s sbh-completions.zsh
