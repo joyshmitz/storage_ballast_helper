@@ -576,8 +576,8 @@ create a new release; if it already exists, inspect the existing assets before
 uploading anything. Publication is the irreversible handoff point: create the
 GitHub Release, upload the verified artifact set, update
 `Dicklesworthstone/homebrew-sbh` `Formula/sbh.rb` to the same tag and macOS
-checksums, then verify the public tap with `brew fetch`, `brew audit`, `brew
-install`, and `brew test`.
+checksums, then verify the public tap with `brew fetch`, `brew audit`,
+`brew install`, and `brew test`.
 
 ## Self-Update Verification
 

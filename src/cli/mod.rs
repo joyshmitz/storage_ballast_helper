@@ -1894,6 +1894,40 @@ mod tests {
     }
 
     #[test]
+    fn macos_manual_release_fallback_docs_require_fresh_artifacts_and_approval() {
+        let macos_guide = include_str!("../../docs/macos.md");
+
+        for required in [
+            "Manual Release Fallback",
+            "operator has explicitly approved publishing outside the workflow",
+            "publish from chat notes",
+            "historical provenance",
+            "missing `/tmp` directory",
+            "release-work/storage_ballast_helper/releases",
+            "sbh-${TAG}-aarch64-apple-darwin.tar.xz",
+            "sbh-${TAG}-x86_64-apple-darwin.tar.xz",
+            "sbh-${TAG}-aarch64-unknown-linux-gnu.tar.xz",
+            "sbh-${TAG}-x86_64-unknown-linux-gnu.tar.xz",
+            "SHA256SUMS.txt",
+            "release-provenance.json",
+            "ticketContents",
+            "shasum -a 256 -c SHA256SUMS.txt",
+            "sbh doctor --release --json",
+            "gh release view \"$TAG\" -R Dicklesworthstone/storage_ballast_helper",
+            "Publication is the irreversible handoff point",
+            "brew fetch",
+            "brew audit",
+            "brew install",
+            "brew test",
+        ] {
+            assert!(
+                macos_guide.contains(required),
+                "macOS guide must document manual release fallback safety fragment: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn ci_validates_homebrew_formula_generation() {
         let ci_workflow = include_str!("../../.github/workflows/ci.yml");
         let testing_guide = include_str!("../../docs/testing-and-logging.md");
