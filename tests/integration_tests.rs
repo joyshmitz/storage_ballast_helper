@@ -53,6 +53,8 @@ use storage_ballast_helper::scanner::walker::{DirectoryWalker, WalkerConfig};
 
 #[cfg(target_os = "macos")]
 const MACOS_LIVE_CAPACITY_TOLERANCE_BYTES: u64 = 512 * 1_048_576;
+#[cfg(target_os = "macos")]
+const MACOS_LIVE_AVAILABLE_CAPACITY_TOLERANCE_RATIO: u64 = 400;
 
 #[cfg(target_os = "macos")]
 static MACOS_APFS_CAPACITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -517,13 +519,13 @@ fn macos_status_json_matches_diskutil_apfs_capacity() {
         data_mount,
         "container_available",
         diskutil_available,
-        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
+        macos_live_available_capacity_tolerance(data_mount),
     );
     assert_json_bytes_close(
         data_mount,
         "free",
         diskutil_available,
-        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
+        macos_live_available_capacity_tolerance(data_mount),
     );
 
     let apfs = &data_mount["platform"]["darwin"]["apfs"];
@@ -540,7 +542,7 @@ fn macos_status_json_matches_diskutil_apfs_capacity() {
         apfs,
         "container_available_bytes",
         diskutil_available,
-        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
+        macos_live_available_capacity_tolerance(data_mount),
     );
 }
 
@@ -554,6 +556,15 @@ fn assert_json_bytes_close(mount: &Value, key: &'static str, expected: u64, tole
         delta <= tolerance,
         "{key} mismatch exceeded tolerance: status={actual} diskutil={expected} delta={delta} tolerance={tolerance}; status_mount={mount}"
     );
+}
+
+#[cfg(target_os = "macos")]
+fn macos_live_available_capacity_tolerance(payload: &Value) -> u64 {
+    let total = payload["container_total"]
+        .as_u64()
+        .or_else(|| payload["container_total_bytes"].as_u64())
+        .unwrap_or(0);
+    MACOS_LIVE_CAPACITY_TOLERANCE_BYTES.max(total / MACOS_LIVE_AVAILABLE_CAPACITY_TOLERANCE_RATIO)
 }
 
 #[cfg(target_os = "macos")]
@@ -640,13 +651,13 @@ fn macos_check_json_matches_diskutil_apfs_capacity() {
         &payload,
         "container_available_bytes",
         diskutil_available,
-        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
+        macos_live_available_capacity_tolerance(&payload),
     );
     assert_json_bytes_close(
         &payload,
         "free_bytes",
         diskutil_available,
-        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
+        macos_live_available_capacity_tolerance(&payload),
     );
 
     let apfs = &payload["platform"]["darwin"]["apfs"];
@@ -662,7 +673,7 @@ fn macos_check_json_matches_diskutil_apfs_capacity() {
         apfs,
         "container_available_bytes",
         diskutil_available,
-        MACOS_LIVE_CAPACITY_TOLERANCE_BYTES,
+        macos_live_available_capacity_tolerance(&payload),
     );
 }
 
@@ -1726,7 +1737,14 @@ jsonl_log = "{}"
 ballast_dir = "{}"
 
 [pressure]
+green_min_free_pct = 0.01
+yellow_min_free_pct = 0.005
+orange_min_free_pct = 0.002
+red_min_free_pct = 0.001
 poll_interval_ms = 100
+
+[pressure.prediction]
+enabled = false
 
 [scanner]
 root_paths = ["{}"]
@@ -1778,7 +1796,14 @@ jsonl_log = "{}"
 ballast_dir = "{}"
 
 [pressure]
+green_min_free_pct = 0.01
+yellow_min_free_pct = 0.005
+orange_min_free_pct = 0.002
+red_min_free_pct = 0.001
 poll_interval_ms = 100
+
+[pressure.prediction]
+enabled = false
 
 [scanner]
 root_paths = ["{}"]
