@@ -3,7 +3,7 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`, `bd-r7m7.17`
 Parent: `bd-r7m7`
-Last audited: 2026-05-11 11:12 UTC
+Last audited: 2026-05-11 11:27 UTC
 Evidence snapshot: the audit records the live head and run state observed at
 refresh time, but every audit-only commit makes those literals stale. Before any
 close decision, refresh the live head and newest run with:
@@ -65,23 +65,27 @@ operator-visible outcomes:
 | "everything automatically detected during installation" | `src/cli/install.rs`, `src/daemon/service.rs`, launchd/systemd workflow tests, `docs/macos.md`, Homebrew formula and release workflow | Installer/service detection is implemented and documented. Developer ID, App Store Connect notary credentials, the repository-scoped Homebrew tap deploy key, the public tap formula, a manually published signed/notarized `v0.4.8` release, and live self-update E2E proof are now present. Final proof still requires hosted CI green for the fixed final head and automated hosted release-workflow proof. |
 | "while running" automatic platform behavior | PAL-backed status/check/scan/clean/blame/daemon paths, APFS/Mach/libproc macOS implementations, Linux PAL preservation, focused protection regression tests | Runtime behavior is routed through platform-specific implementations behind the shared CLI/PAL surface. Final proof still depends on queued hosted CI and live release diagnostics. |
 | "always does the right thing" / "just works" | Protected-path daemon tests, active-reference/open-file checks, sacred-path catalog, APFS accounting tests, launchd lifecycle test, docs and doctor diagnostics | Safety and diagnostics are covered in source and tests. Installed sbh 0.4.6 daemons must be upgraded/restarted because they predate the daemon protection fix. |
-| "additional testing infrastructure" | `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, macOS platform/coverage/benchmark jobs, Homebrew validation, release-doctor tests, protected-path tests | Infrastructure exists and focused local/rch proof passed. The CI and release Homebrew formula rewrite paths now both rewrite static release URLs, archive names, and checksum placeholders before validation or tap publication, and the CI temporary `sbh-ci` formula injects an explicit Cargo-derived version before testing local `file://` archives. Final proof still requires hosted CI green and hosted release-workflow success. |
+| "additional testing infrastructure" | `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, macOS platform/coverage/benchmark jobs, Homebrew validation, release-doctor tests, protected-path tests | Infrastructure exists and focused local/rch proof passed. The CI and release Homebrew formula rewrite paths now both rewrite static release URLs, archive names, and checksum placeholders before validation or tap publication, and the CI temporary `sbh-ci` formula injects an explicit Cargo-derived version before testing local `file://` archives. Final proof still requires the hosted release quality gate and hosted release workflow to succeed. |
 
 ## Current Tracker And CI State
 
-- Live refresh at 2026-05-11 11:12 UTC inspected tracker head
+- Live refresh at 2026-05-11 11:27 UTC inspected tracker head
   `8d552f48b249ebb5b5828ca6e61830c871bebae5` and source/release tag commit
   `b280b9aa0434683574f5b9126e02e5df546bf7ac`
-  (`Bump version for v0.4.10 release proof`). The active main CI run for the
-  source commit is `25666074690`; it is queued overall with all closeout jobs
-  queued before runner assignment and empty `runner_name`: `Format + Lint`,
-  `Homebrew Tap Deploy Key Preflight`, `Homebrew Formula Validation`,
-  `macOS Platform Tests (intel)`, `macOS Platform Tests (apple-silicon)`,
-  `macOS Coverage`, and `macOS Performance Budgets`.
+  (`Bump version for v0.4.10 release proof`). Main CI run `25666074690`
+  completed the Intel macOS platform lane successfully on `macos-15-intel`,
+  then was cancellation-requested to avoid competing with the release run's
+  source-equivalent reusable quality gate. Do not count the cancelled branch CI
+  run as final green proof.
 - The fresh automated release proof tag `v0.4.10` points at source commit
   `b280b9a`. Release workflow run `25666074747` is queued for that tag. Its
-  release-level `Homebrew Tap Deploy Key Preflight` and reusable quality-gate
-  macOS/Ubuntu jobs are also queued before runner assignment; no `v0.4.10`
+  reusable `Quality Gate / macOS Platform Tests (intel)` job completed
+  successfully on `macos-15-intel`, including unit tests, integration tests,
+  release build, ad-hoc signing, temporary Homebrew formula install/test from
+  the current signed binary, release doctor diagnostics, selected E2E smoke,
+  unsupported-PAL guard, and artifact uploads. The release-level
+  `Homebrew Tap Deploy Key Preflight` plus reusable quality-gate Ubuntu and
+  `macos-latest` jobs remain queued before runner assignment; no `v0.4.10`
   release assets have been published yet. Do not treat the manual `v0.4.8`
   release as automated hosted release proof.
 - The previous `v0.4.9` attempt exposed a second CI harness regression after
@@ -186,7 +190,7 @@ avoids pinning exact commit hashes or GitHub Actions run ids as durable proof.
 - `br ready --json` returned `[]`; remaining open actionable release work was
   blocked or already assigned at audit time.
 - Live `br ready --json` at 2026-05-11 03:25 UTC also returned `[]`.
-- Open release/parity blockers as of 2026-05-11 11:12 UTC are `bd-r7m7.17`
+- Open release/parity blockers as of 2026-05-11 11:27 UTC are `bd-r7m7.17`
   and `bd-ykwh.3`. `bd-ykwh.7` is closed based on real tap publication and
   install proof, and `bd-ykwh.10` is closed based on live self-update E2E proof.
   `bd-ykwh.2` and `bd-ykwh.13` are closed based on live Developer ID identity,
@@ -511,7 +515,7 @@ containing `bd-twgw` and `bd-j40b`, then restore the protected worktree files.
 ## Live Release Blocker Evidence
 
 The user confirmed Apple Developer Program enrollment, so enrollment itself is
-not the current blocker. Live checks at 2026-05-11 11:12 UTC now show:
+not the current blocker. Live checks at 2026-05-11 11:27 UTC now show:
 
 - `security find-identity -v -p codesigning`: one valid Developer ID
   Application identity for `Jeffrey Emanuel (AU8V2Z6NKY)`
@@ -527,15 +531,20 @@ not the current blocker. Live checks at 2026-05-11 11:12 UTC now show:
 - GitHub release/tag checks: `v0.4.10` is tagged at source commit `b280b9a`
   and release workflow run `25666074747` is queued, but no `v0.4.10` release
   assets are published yet
+- GitHub Actions checks: release run `25666074747` has completed
+  `Quality Gate / macOS Platform Tests (intel)` successfully; the remaining
+  release-level preflight and quality-gate Ubuntu/`macos-latest` jobs are still
+  queued before runner assignment
 - local Homebrew validation: `brew fetch`, `brew audit --strict --online`,
   `brew install`, `brew test`, `sbh version --verbose`, and
   `sbh --json doctor --release` passed for the public tap
 
 Remaining release blockers:
 
-- Complete hosted CI green on the fixed final head; the latest pushed-head run
-  is `25666074690` for source commit `b280b9a`, currently queued before runner
-  assignment.
+- Complete the hosted reusable release quality gate on the fixed final source
+  commit `b280b9a`; the Intel macOS lane has passed, while release-level
+  preflight plus Ubuntu and `macos-latest` quality-gate jobs remain queued
+  before runner assignment.
 - Run or re-run the automated signed/notarized tag release workflow and verify
   it completes through upload and tap publication rather than relying only on
   the manual `v0.4.8` release; the active attempt is `25666074747` for tag
@@ -555,7 +564,7 @@ release done until all of these are true:
    remains verified.
 5. The automated release workflow succeeds on a tag and produces
    signed/notarized macOS artifacts without manual publication.
-6. The final pushed head completes CI green, including Apple Silicon
-   `macos-platform`, Intel `macos-15-intel`, `macos-coverage`,
-   `macos-benchmarks`, Linux lanes, and
+6. The final source commit completes the hosted release quality gate green,
+   including Apple Silicon `macos-platform`, Intel `macos-15-intel`,
+   `macos-coverage`, `macos-benchmarks`, Linux lanes, and
    `Homebrew Formula Validation`.
