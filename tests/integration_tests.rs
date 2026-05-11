@@ -251,7 +251,7 @@ fn release_doctor_json_failure_exits_nonzero_after_parseable_report() {
     assert!(
         required_secrets
             .iter()
-            .any(|secret| secret.as_str() == Some("HOMEBREW_TAP_TOKEN")),
+            .any(|secret| secret.as_str() == Some("HOMEBREW_TAP_SSH_KEY")),
         "release doctor should include Homebrew tap secret requirement; payload={payload}; log={}",
         result.log_path.display()
     );
