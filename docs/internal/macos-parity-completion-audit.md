@@ -3,7 +3,7 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`, `bd-r7m7.17`
 Parent: `bd-r7m7`
-Last audited: 2026-05-10 23:10 UTC
+Last audited: 2026-05-11 02:00 UTC
 Evidence snapshot: the audit records the live head and run state observed at
 refresh time, but every audit-only commit makes those literals stale. Before any
 close decision, refresh the live head and newest run with:
@@ -69,22 +69,52 @@ operator-visible outcomes:
 
 ## Current Tracker And CI State
 
-- `bd-r7m7` remains open. Use live `br epic status --json` output before any
-  close decision because audit refresh beads change child counts.
+- `bd-r7m7` remains open. Live `br epic status --json` on 2026-05-11 02:00 UTC
+  reported 32 of 34 children closed, and the epic was not eligible for closure.
+  Use live `br epic status --json` output before any close decision because
+  audit refresh beads change child counts.
 - `bd-ykwh` remains open. Developer ID certificate/CI secret storage is now
   complete, and the Homebrew release credential has been replaced with a
   repository-scoped deploy key. Tap publication and signed/notarized tag-release
-  proof remain open.
+  proof remain open. Live `br epic status --json` reported 18 of 21 children
+  closed, and the epic was not eligible for closure.
 - `br ready --json` returned `[]`; remaining open actionable release work was
   blocked or already assigned at audit time.
-- In-progress release blockers are `bd-r7m7.17`, `bd-ykwh.3`, `bd-ykwh.10`, and
-  `bd-ykwh.13`. `bd-ykwh.2` is now closed based on live Developer ID identity,
-  P12/signing secrets, App Store Connect notary API-key secrets, rotation docs,
-  and certificate-expiration workflow evidence.
+- Open release/parity blockers are `bd-r7m7.17`, `bd-ykwh.3`, `bd-ykwh.7`, and
+  `bd-ykwh.10`. `bd-ykwh.2` and `bd-ykwh.13` are closed based on live Developer
+  ID identity, P12/signing secrets, App Store Connect notary API-key secrets,
+  rotation docs, Homebrew deploy-key secret evidence, and certificate-expiration
+  workflow evidence.
 - `bd-r7m7.17` tracks the current hosted CI queue as an explicit external
   blocker for final macOS parity proof.
 - `bd-ykwh.20` is closed; release CI now runs `spctl -a -t execute -vv` after
   notarization acceptance and before packaging macOS tarballs.
+- Live recheck at 2026-05-11 02:00 UTC inspected current tracker-only branch
+  head `aa6c03f69ac8ed6ff7e002fdc795e3e1dd5fa0af` and current source CI run
+  `25644934638` for source head `9e438e74c77f6385e0ad28bd2709947a83b6bad9`.
+  The run remains queued overall. `macOS Platform Tests (intel)` completed
+  success on `macos-15-intel`; `Homebrew Tap Deploy Key Preflight` and
+  `Format + Lint` on `ubuntu-latest`, plus `Homebrew Formula Validation`,
+  `macOS Platform Tests (apple-silicon)`, `macOS Coverage`, and
+  `macOS Performance Budgets` on `macos-latest`, remain queued before runner
+  assignment with empty `runner_name` and `runner_group_name`. This is not final
+  green CI proof.
+- Beads-only commits `de58956` and `aa6c03f` did not start a new source CI run,
+  confirming the current `.beads/**` path-ignore guard is still preventing
+  tracker evidence updates from canceling useful source validation.
+- Account-wide queue sampling on 2026-05-11 found many queued runs in
+  `frankenfs`, `asupersync`, `frankenredis`, and `pi_agent_rust` while the
+  current `storage_ballast_helper` jobs still had no runner assignment. This
+  supports treating the blocker as hosted/account queue backlog rather than an
+  `sbh` workflow failure.
+- GitHub's legacy Actions billing endpoint now returns HTTP 410. The current
+  enhanced billing endpoint
+  `/users/Dicklesworthstone/settings/billing/usage/summary` with
+  `X-GitHub-Api-Version: 2026-03-10` reported May 2026 Actions usage with
+  `netAmount=0` and `netQuantity=0` for Linux, Linux ARM, macOS, and Windows
+  minute SKUs. That does not look like obvious Actions minute exhaustion. The
+  budgets endpoint for `orgs/Dicklesworthstone` returned 404 because this is a
+  user account rather than an organization budget scope.
 - Live recheck at 2026-05-10 21:29 UTC inspected current branch head
   `9fa4dbae7aade6332217c546abfec0983bb2961d`. The newest CI run for that head
   is `25640194122`; it is still queued, and every job listed by GitHub remains
@@ -332,7 +362,7 @@ operator-visible outcomes:
 
 | Requirement | Evidence | Current Status |
 |---|---|---|
-| Fresh macOS install auto-detects launchd and status works | `src/platform/macos/pal.rs`, `src/daemon/service.rs`, `tests/integration_tests.rs::macos_launchd_user_service_lifecycle_bootstrap_kickstart_bootout`, `.github/workflows/ci.yml` `macos-platform`, `docs/macos.md` | Repo-side implementation and CI coverage exist. Signed release install remains blocked by `bd-ykwh.2`, `bd-ykwh.3`, and `bd-ykwh.13`. |
+| Fresh macOS install auto-detects launchd and status works | `src/platform/macos/pal.rs`, `src/daemon/service.rs`, `tests/integration_tests.rs::macos_launchd_user_service_lifecycle_bootstrap_kickstart_bootout`, `.github/workflows/ci.yml` `macos-platform`, `docs/macos.md` | Repo-side implementation and CI coverage exist. Signed release install remains blocked by `bd-ykwh.3` release proof plus the live tap/self-update proofs that depend on it. |
 | Status/check JSON shape and APFS accounting match macOS reality | `tests/integration_tests.rs::macos_status_json_matches_diskutil_apfs_capacity`, `tests/integration_tests.rs::macos_check_json_matches_diskutil_apfs_capacity`, `docs/macos.md` | Covered in macOS integration tests and docs. Requires final CI green on the shipped head. |
 | Scan finds and ranks macOS reclaim candidates | `src/platform/macos/cleanup_catalog.rs`, `tests/common/mod.rs::SyntheticMacTree`, `src/scanner/patterns.rs` macOS cleanup tests, `docs/macos-incident-case-study.md` | Covered for Xcode, CoreSimulator, Electron caches, `/private/tmp/*-target`, `*_target`, `target_*`, user trash, and sacred paths. |
 | Clean/daemon deletion respects protected paths and active builds | `src/daemon/loop_main.rs::should_skip_protected_daemon_candidate`, `src/scanner/walker.rs`, `src/scanner/deletion.rs`, `bd-twgw`, `bd-j40b`, `daemon::loop_main::tests::scanner_prescan_does_not_dispatch_protected_rust_fuzz_target`, `daemon::loop_main::tests::executor_preflight_skips_config_protected_daemon_candidate` | Fixed in current source. Installed sbh 0.4.6 daemons must be upgraded/restarted because they can still delete protected artifact-looking paths. |
@@ -357,7 +387,7 @@ Current source status:
   `asupersync_ansi_c/tools/rust_fuzz_target` path shape.
 - The focused proof lane is
   `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_sbh_daemon_protection_proof cargo test --lib protected -- --nocapture`.
-- On 2026-05-10 this lane passed 13 protection-related tests, including
+- On 2026-05-11 this lane passed 13 protection-related tests, including
   `scanner_prescan_does_not_dispatch_protected_rust_fuzz_target` and
   `executor_preflight_skips_config_protected_daemon_candidate`.
 
@@ -368,7 +398,7 @@ containing `bd-twgw` and `bd-j40b`, then restore the protected worktree files.
 ## Live Release Blocker Evidence
 
 The user confirmed Apple Developer Program enrollment, so enrollment itself is
-not the current blocker. Live checks at 2026-05-10 23:10 UTC now show:
+not the current blocker. Live checks at 2026-05-11 02:00 UTC now show:
 
 - `security find-identity -v -p codesigning`: one valid Developer ID
   Application identity for `Jeffrey Emanuel (AU8V2Z6NKY)`
@@ -379,14 +409,16 @@ not the current blocker. Live checks at 2026-05-10 23:10 UTC now show:
   present
 - `gh api repos/Dicklesworthstone/homebrew-sbh/contents/Formula`: only
   `Formula/.gitkeep`; no live `Formula/sbh.rb` yet
-- `gh release list --repo Dicklesworthstone/storage_ballast_helper --limit 5`:
-  latest published release is still `v0.4.6`, not the current macOS parity head
+- GitHub release/tag checks: latest published release is still `v0.4.6`, and no
+  `v0.4.7` tag exists yet
 
 Remaining release blockers:
 
 - Publish or verify the Homebrew tap formula after the first signed release.
-- Run `sbh doctor --release --json` from the current build and require all
-  release diagnostics to pass.
+- Complete current source CI green before tagging.
+- Run the signed/notarized tag release workflow and verify uploaded artifacts.
+- Run `sbh doctor --release --json` from the release/current build and require
+  all release diagnostics to pass, including the real tap formula check.
 
 ## Not Complete
 
