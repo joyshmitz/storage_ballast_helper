@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use super::sys;
-use proc_pidinfo::{Fd, Pid, VnodeInfoPath, proc_pidfdinfo, proc_pidinfo, proc_pidinfo_list};
+use proc_pidinfo::{Fd, Pid, proc_pidfdinfo, proc_pidinfo, proc_pidinfo_list};
 
 pub type ProcTaskInfo = proc_pidinfo::ProcTaskInfo;
 pub type ProcTaskAllInfo = proc_pidinfo::ProcTaskAllInfo;
@@ -16,46 +16,9 @@ pub type ProcFdInfo = proc_pidinfo::ProcFDInfo;
 pub type ProcFdType = proc_pidinfo::ProcFDType;
 pub type ProcFileInfo = proc_pidinfo::ProcFileInfo;
 pub type VnodeFdInfoWithPath = proc_pidinfo::VnodeFdInfoWithPath;
-pub type RUsageInfoV4 = libproc::libproc::pid_rusage::RUsageInfoV4;
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct ProcRegionInfo {
-    pub pri_protection: u32,
-    pub pri_max_protection: u32,
-    pub pri_inheritance: u32,
-    pub pri_flags: u32,
-    pub pri_offset: u64,
-    pub pri_behavior: u32,
-    pub pri_user_wired_count: u32,
-    pub pri_user_tag: u32,
-    pub pri_pages_resident: u32,
-    pub pri_pages_shared_now_private: u32,
-    pub pri_pages_swapped_out: u32,
-    pub pri_pages_dirtied: u32,
-    pub pri_ref_count: u32,
-    pub pri_shadow_depth: u32,
-    pub pri_share_mode: u32,
-    pub pri_private_pages_resident: u32,
-    pub pri_shared_pages_resident: u32,
-    pub pri_obj_id: u32,
-    pub pri_depth: u32,
-    pub pri_address: u64,
-    pub pri_size: u64,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone)]
-pub struct ProcRegionWithPathInfo {
-    pub prp_prinfo: ProcRegionInfo,
-    pub prp_vip: VnodeInfoPath,
-}
-
-impl libproc::libproc::proc_pid::PIDInfo for ProcRegionWithPathInfo {
-    fn flavor() -> libproc::libproc::proc_pid::PidInfoFlavor {
-        libproc::libproc::proc_pid::PidInfoFlavor::RegionPathInfo
-    }
-}
+pub type ProcRegionInfo = sbh_mach::ProcRegionInfo;
+pub type ProcRegionWithPathInfo = sbh_mach::ProcRegionWithPathInfo;
+pub type RUsageInfoV4 = sbh_mach::RUsageInfoV4;
 
 pub const PROC_ALL_PIDS: u32 = 1;
 pub const PROC_PIDLISTFDS: i32 = 1;
@@ -67,13 +30,7 @@ pub const RUSAGE_INFO_V4: i32 = 4;
 const PROCARGS2_HEADER_BYTES: usize = core::mem::size_of::<i32>();
 
 pub fn proc_listpids_safe() -> io::Result<Vec<i32>> {
-    libproc::processes::pids_by_type(libproc::processes::ProcFilter::All)?
-        .into_iter()
-        .map(|pid| {
-            i32::try_from(pid)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "pid exceeds i32 range"))
-        })
-        .collect()
+    sbh_mach::proc_listpids_all()
 }
 
 pub fn proc_pidinfo_task(pid: i32) -> io::Result<ProcTaskInfo> {
@@ -85,9 +42,8 @@ pub fn proc_pidinfo_task_all(pid: i32) -> io::Result<ProcTaskAllInfo> {
 }
 
 pub fn proc_pidpath_safe(pid: i32) -> io::Result<PathBuf> {
-    libproc::libproc::proc_pid::pidpath(pid)
-        .map(PathBuf::from)
-        .map_err(io::Error::other)
+    validate_pid(pid)?;
+    sbh_mach::proc_pidpath(pid)
 }
 
 pub fn proc_pid_command_line(pid: i32) -> io::Result<Vec<String>> {
@@ -111,7 +67,8 @@ pub fn proc_pid_procargs2(pid: i32) -> io::Result<Vec<u8>> {
 }
 
 pub fn proc_pid_rusage_v4_safe(pid: i32) -> io::Result<RUsageInfoV4> {
-    libproc::libproc::pid_rusage::pidrusage::<RUsageInfoV4>(pid).map_err(io::Error::other)
+    validate_pid(pid)?;
+    sbh_mach::proc_pid_rusage_v4(pid)
 }
 
 pub fn proc_pid_list_fds(pid: i32) -> io::Result<Vec<ProcFdInfo>> {
@@ -123,14 +80,8 @@ pub fn proc_pidfdinfo_vnode_path(pid: i32, fd: i32) -> io::Result<Option<VnodeFd
 }
 
 pub fn proc_pid_region_path(pid: i32, address: u64) -> io::Result<ProcRegionWithPathInfo> {
-    if pid < 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "pid must be non-negative",
-        ));
-    }
-    libproc::libproc::proc_pid::pidinfo::<ProcRegionWithPathInfo>(pid, address)
-        .map_err(io::Error::other)
+    validate_pid(pid)?;
+    sbh_mach::proc_pid_region_path(pid, address)
 }
 
 pub fn parse_procargs2_command_line(raw: &[u8]) -> io::Result<Vec<String>> {

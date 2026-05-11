@@ -5,10 +5,13 @@
 
 #![cfg(target_os = "macos")]
 
-use std::ffi::c_void;
+use std::ffi::{CStr, OsStr, c_void};
 use std::fmt;
+use std::io;
 use std::mem::{MaybeUninit, size_of};
+use std::os::unix::ffi::OsStrExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 use std::ptr;
 
 use dispatch2::{
@@ -33,6 +36,9 @@ use mach2::vm_types::{integer_t, natural_t};
 const THREAD_BASIC_INFO: natural_t = 3;
 const THREAD_BASIC_INFO_COUNT: mach_msg_type_number_t =
     (size_of::<MachThreadBasicInfoRaw>() / size_of::<natural_t>()) as mach_msg_type_number_t;
+const PROC_ALL_PIDS: u32 = 1;
+const PROC_PIDREGIONPATHINFO: i32 = 8;
+const RUSAGE_INFO_V4: i32 = 4;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -159,6 +165,67 @@ pub struct VmStats {
     /// Throttled pages.
     pub throttled_count: u64,
 }
+
+/// Darwin `proc_regioninfo` layout used by `PROC_PIDREGIONPATHINFO`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ProcRegionInfo {
+    /// Current VM protection bits.
+    pub pri_protection: u32,
+    /// Maximum VM protection bits.
+    pub pri_max_protection: u32,
+    /// VM inheritance value.
+    pub pri_inheritance: u32,
+    /// Region flags.
+    pub pri_flags: u32,
+    /// Region file offset.
+    pub pri_offset: u64,
+    /// VM behavior value.
+    pub pri_behavior: u32,
+    /// User wired page count.
+    pub pri_user_wired_count: u32,
+    /// User tag.
+    pub pri_user_tag: u32,
+    /// Resident page count.
+    pub pri_pages_resident: u32,
+    /// Shared pages that are now private.
+    pub pri_pages_shared_now_private: u32,
+    /// Swapped-out page count.
+    pub pri_pages_swapped_out: u32,
+    /// Dirtied page count.
+    pub pri_pages_dirtied: u32,
+    /// Object reference count.
+    pub pri_ref_count: u32,
+    /// Shadow chain depth.
+    pub pri_shadow_depth: u32,
+    /// Region sharing mode.
+    pub pri_share_mode: u32,
+    /// Private resident page count.
+    pub pri_private_pages_resident: u32,
+    /// Shared resident page count.
+    pub pri_shared_pages_resident: u32,
+    /// VM object identifier.
+    pub pri_obj_id: u32,
+    /// Region nesting depth.
+    pub pri_depth: u32,
+    /// Region start address.
+    pub pri_address: u64,
+    /// Region size in bytes.
+    pub pri_size: u64,
+}
+
+/// Darwin `proc_regionwithpathinfo` layout used by mapped-region scans.
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct ProcRegionWithPathInfo {
+    /// Region memory counters and address range.
+    pub prp_prinfo: ProcRegionInfo,
+    /// Backing vnode path information for the mapped region.
+    pub prp_vip: proc_pidinfo::VnodeInfoPath,
+}
+
+/// Process resource usage counters from Darwin `RUSAGE_INFO_V4`.
+pub type RUsageInfoV4 = libc::rusage_info_v4;
 
 /// Memory-pressure transition delivered by macOS Grand Central Dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +438,124 @@ pub fn host_vm_stats() -> Result<VmStats, MachError> {
             ptr::addr_of!(info.throttled_count).read_unaligned()
         }),
     })
+}
+
+/// Return all process identifiers visible to the current process.
+pub fn proc_listpids_all() -> io::Result<Vec<i32>> {
+    let initial_bytes = unsafe {
+        libc::proc_listpids(PROC_ALL_PIDS, 0, ptr::null_mut(), 0)
+    };
+    if initial_bytes < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let pid_size = size_of::<libc::pid_t>();
+    let initial_capacity = usize::try_from(initial_bytes)
+        .ok()
+        .filter(|bytes| *bytes > 0)
+        .map_or(1024, |bytes| bytes / pid_size);
+    let mut pids = Vec::<libc::pid_t>::with_capacity(initial_capacity.max(1));
+
+    loop {
+        let buffer_bytes = pids
+            .capacity()
+            .checked_mul(pid_size)
+            .and_then(|bytes| i32::try_from(bytes).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "pid buffer too large"))?;
+        let returned_bytes = unsafe {
+            libc::proc_listpids(
+                PROC_ALL_PIDS,
+                0,
+                pids.as_mut_ptr().cast::<c_void>(),
+                buffer_bytes,
+            )
+        };
+        if returned_bytes < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if returned_bytes == buffer_bytes {
+            pids.reserve(pids.capacity().max(1));
+            continue;
+        }
+        let returned_bytes = usize::try_from(returned_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative pid byte count"))?;
+        if returned_bytes % pid_size != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pid byte count is not aligned",
+            ));
+        }
+        let len = returned_bytes / pid_size;
+        unsafe {
+            pids.set_len(len);
+        }
+        return Ok(pids);
+    }
+}
+
+/// Return the executable path for a process.
+pub fn proc_pidpath(pid: i32) -> io::Result<PathBuf> {
+    let buffer_size = usize::try_from(libc::PROC_PIDPATHINFO_MAXSIZE)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid pid path buffer size"))?;
+    let mut buffer = vec![0_i8; buffer_size];
+    let returned_bytes = unsafe {
+        libc::proc_pidpath(
+            pid,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            u32::try_from(buffer.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "pid path buffer too large")
+            })?,
+        )
+    };
+    if returned_bytes <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let path = unsafe { CStr::from_ptr(buffer.as_ptr()) };
+    Ok(PathBuf::from(OsStr::from_bytes(path.to_bytes())))
+}
+
+/// Return Darwin `RUSAGE_INFO_V4` counters for a process.
+pub fn proc_pid_rusage_v4(pid: i32) -> io::Result<RUsageInfoV4> {
+    let mut usage = MaybeUninit::<RUsageInfoV4>::zeroed();
+    let buffer_ptr = usage.as_mut_ptr().cast::<c_void>();
+    let result = unsafe { libc::proc_pid_rusage(pid, RUSAGE_INFO_V4, buffer_ptr.cast()) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { usage.assume_init() })
+}
+
+/// Return mapped-region path information for a process address.
+pub fn proc_pid_region_path(pid: i32, address: u64) -> io::Result<ProcRegionWithPathInfo> {
+    let mut info = MaybeUninit::<ProcRegionWithPathInfo>::zeroed();
+    let buffer_size = i32::try_from(size_of::<ProcRegionWithPathInfo>())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "region buffer too large"))?;
+    let returned_bytes = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDREGIONPATHINFO,
+            address,
+            info.as_mut_ptr().cast::<c_void>(),
+            buffer_size,
+        )
+    };
+    if returned_bytes < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if returned_bytes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("proc_pidinfo returned no region data for pid {pid}"),
+        ));
+    }
+    if returned_bytes != buffer_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected region byte count {returned_bytes} != {buffer_size}"),
+        ));
+    }
+    Ok(unsafe { info.assume_init() })
 }
 
 /// Subscribe to native `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` events.
