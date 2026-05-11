@@ -69,25 +69,24 @@ operator-visible outcomes:
 
 ## Current Tracker And CI State
 
-- Live refresh at 2026-05-11 11:27 UTC inspected tracker head
-  `8d552f48b249ebb5b5828ca6e61830c871bebae5` and source/release tag commit
-  `b280b9aa0434683574f5b9126e02e5df546bf7ac`
-  (`Bump version for v0.4.10 release proof`). Main CI run `25666074690`
-  completed the Intel macOS platform lane successfully on `macos-15-intel`,
-  then was cancellation-requested to avoid competing with the release run's
-  source-equivalent reusable quality gate. Do not count the cancelled branch CI
-  run as final green proof.
-- The fresh automated release proof tag `v0.4.10` points at source commit
-  `b280b9a`. Release workflow run `25666074747` is queued for that tag. Its
+- Live refresh at 2026-05-11 14:00 UTC inspected fixed source commit
+  `a0de17009ca4cd7d723d714c4b2ba6f5c96dd63a` plus the package version metadata
+  prepared for a `v0.4.11` release attempt. Main CI run `25674846499` was
+  queued for the fixed source commit with all jobs still unassigned. Do not
+  count queued jobs as final green proof.
+- The previous automated release proof tag `v0.4.10` points at older source
+  commit `b280b9a`, before the macOS `/sbin/mount` timeout fallback fix.
+  Release workflow run `25666074747` is still queued for that stale tag. Its
   reusable `Quality Gate / macOS Platform Tests (intel)` job completed
   successfully on `macos-15-intel`, including unit tests, integration tests,
   release build, ad-hoc signing, temporary Homebrew formula install/test from
-  the current signed binary, release doctor diagnostics, selected E2E smoke,
+  the signed binary, release doctor diagnostics, selected E2E smoke,
   unsupported-PAL guard, and artifact uploads. The release-level
   `Homebrew Tap Deploy Key Preflight` plus reusable quality-gate Ubuntu and
   `macos-latest` jobs remain queued before runner assignment; no `v0.4.10`
-  release assets have been published yet. Do not treat the manual `v0.4.8`
-  release as automated hosted release proof.
+  release assets have been published yet. Because the tag is not fixed-head,
+  it cannot close this audit even if it later succeeds. Do not treat the manual
+  `v0.4.8` release as automated hosted release proof.
 - The previous `v0.4.9` attempt exposed a second CI harness regression after
   the static URL/checksum rewrite fix: the temporary `sbh-ci` Homebrew formula
   rewrote release URLs to a local `file://` archive whose name did not let
@@ -99,7 +98,7 @@ operator-visible outcomes:
   that workflow contract. Focused proof passed with local formula-generation
   simulation, `cargo fmt --check`, `git diff --check`, Ruby YAML parsing, `rch`
   focused Homebrew workflow tests, and full `rch cargo check --all-targets`
-  plus `rch cargo clippy --all-targets -- -D warnings` on the final `0.4.10`
+  plus `rch cargo clippy --all-targets -- -D warnings` on the pre-`v0.4.11`
   source state.
 - Release `v0.4.8` is now published, not draft or prerelease, at
   `https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.8`.
@@ -519,7 +518,7 @@ containing `bd-twgw` and `bd-j40b`, then restore the protected worktree files.
 ## Live Release Blocker Evidence
 
 The user confirmed Apple Developer Program enrollment, so enrollment itself is
-not the current blocker. Live checks at 2026-05-11 11:27 UTC now show:
+not the current blocker. Live checks at 2026-05-11 14:00 UTC now show:
 
 - `security find-identity -v -p codesigning`: one valid Developer ID
   Application identity for `Jeffrey Emanuel (AU8V2Z6NKY)`
@@ -532,9 +531,11 @@ not the current blocker. Live checks at 2026-05-11 11:27 UTC now show:
   public tap formula exists on `main`
 - GitHub release/tag checks: `v0.4.8` is published with macOS and Linux
   archives, checksum sidecars, `SHA256SUMS.txt`, and provenance
-- GitHub release/tag checks: `v0.4.10` is tagged at source commit `b280b9a`
-  and release workflow run `25666074747` is queued, but no `v0.4.10` release
-  assets are published yet
+- GitHub release/tag checks: `v0.4.10` is tagged at source commit `b280b9a`,
+  before the fixed-head mount-timeout fallback, and release workflow run
+  `25666074747` is queued, but no `v0.4.10` release assets are published yet
+- GitHub release/tag checks: package metadata has advanced to `0.4.11` for the
+  fixed-head release attempt, but no `v0.4.11` tag workflow has completed yet
 - GitHub Actions checks: release run `25666074747` has completed
   `Quality Gate / macOS Platform Tests (intel)` successfully; the remaining
   release-level preflight and quality-gate Ubuntu/`macos-latest` jobs are still
@@ -546,13 +547,12 @@ not the current blocker. Live checks at 2026-05-11 11:27 UTC now show:
 Remaining release blockers:
 
 - Complete the hosted reusable release quality gate on the fixed final source
-  commit `b280b9a`; the Intel macOS lane has passed, while release-level
-  preflight plus Ubuntu and `macos-latest` quality-gate jobs remain queued
-  before runner assignment.
-- Run or re-run the automated signed/notarized tag release workflow and verify
-  it completes through upload and tap publication rather than relying only on
-  the manual `v0.4.8` release; the active attempt is `25666074747` for tag
-  `v0.4.10`, currently queued before runner assignment.
+  commit and version metadata; the latest fixed-source branch run is
+  `25674846499`, currently queued before runner assignment.
+- Run the automated signed/notarized tag release workflow for `v0.4.11` or a
+  later fixed-head tag and verify it completes through upload and tap
+  publication rather than relying on the stale queued `v0.4.10` attempt or the
+  manual `v0.4.8` release.
 
 ## Not Complete
 
@@ -566,7 +566,7 @@ release done until all of these are true:
 3. The notary profile `sbh-notary` authenticates successfully.
 4. `HOMEBREW_TAP_SSH_KEY` is configured and the deploy-key tap update path
    remains verified.
-5. The automated release workflow succeeds on a tag and produces
+5. The automated release workflow succeeds on a fixed-head tag and produces
    signed/notarized macOS artifacts without manual publication.
 6. The final source commit completes the hosted release quality gate green,
    including Apple Silicon `macos-platform`, Intel `macos-15-intel`,
