@@ -3,7 +3,7 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`, `bd-r7m7.17`
 Parent: `bd-r7m7`
-Last audited: 2026-05-11 09:50 UTC
+Last audited: 2026-05-11 10:00 UTC
 Evidence snapshot: the audit records the live head and run state observed at
 refresh time, but every audit-only commit makes those literals stale. Before any
 close decision, refresh the live head and newest run with:
@@ -62,7 +62,7 @@ operator-visible outcomes:
 | Prompt requirement | Concrete artifacts inspected | Current audit result |
 |---|---|---|
 | "support mac os in addition to linux" | `src/platform/pal.rs`, `src/platform/linux`, `src/platform/macos`, Linux and macOS CI workflow lanes, macOS integration tests, existing Linux unit/integration lanes | Repo-side platform implementation exists for both OS families. Final proof still requires the final pushed head to complete all Linux and macOS CI jobs green. |
-| "everything automatically detected during installation" | `src/cli/install.rs`, `src/daemon/service.rs`, launchd/systemd workflow tests, `docs/macos.md`, Homebrew formula and release workflow | Installer/service detection is implemented and documented. Developer ID, App Store Connect notary credentials, the repository-scoped Homebrew tap deploy key, the public tap formula, and a manually published signed/notarized `v0.4.8` release are now present. Final proof still requires hosted CI green for the fixed final head and the live self-update E2E. |
+| "everything automatically detected during installation" | `src/cli/install.rs`, `src/daemon/service.rs`, launchd/systemd workflow tests, `docs/macos.md`, Homebrew formula and release workflow | Installer/service detection is implemented and documented. Developer ID, App Store Connect notary credentials, the repository-scoped Homebrew tap deploy key, the public tap formula, a manually published signed/notarized `v0.4.8` release, and live self-update E2E proof are now present. Final proof still requires hosted CI green for the fixed final head and automated hosted release-workflow proof. |
 | "while running" automatic platform behavior | PAL-backed status/check/scan/clean/blame/daemon paths, APFS/Mach/libproc macOS implementations, Linux PAL preservation, focused protection regression tests | Runtime behavior is routed through platform-specific implementations behind the shared CLI/PAL surface. Final proof still depends on queued hosted CI and live release diagnostics. |
 | "always does the right thing" / "just works" | Protected-path daemon tests, active-reference/open-file checks, sacred-path catalog, APFS accounting tests, launchd lifecycle test, docs and doctor diagnostics | Safety and diagnostics are covered in source and tests. Installed sbh 0.4.6 daemons must be upgraded/restarted because they predate the daemon protection fix. |
 | "additional testing infrastructure" | `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, macOS platform/coverage/benchmark jobs, Homebrew validation, release-doctor tests, protected-path tests | Infrastructure exists and focused local/rch proof passed. The current hosted run for the pushed head exposed a CI-only Homebrew formula rewrite bug in the Intel macOS lane; this audit refresh includes the local fix and focused proof, but the final pushed head still needs hosted CI green. |
@@ -109,14 +109,27 @@ operator-visible outcomes:
   `/opt/homebrew/bin/sbh version --verbose`, and
   `/opt/homebrew/bin/sbh --json doctor --release` with `ok=true`, `passed=4`,
   `warnings=0`, and `failed=0`.
-- Current open blockers are `bd-r7m7`, `bd-r7m7.17`, `bd-ykwh`,
-  `bd-ykwh.3`, and `bd-ykwh.10`. `bd-ykwh.7` was force-closed after real tap
-  publication and install proof. `bd-r7m7.17` remains the hosted CI Queue
-  Blocked tracker, `bd-ykwh.3` remains open because the automated release
-  workflow proof has not gone green on the final head, and `bd-ykwh.10` remains
-  open for live self-update E2E proof. `bd-r7m7.16` and `bd-ykwh.20` stay part
-  of the evidence chain; `bd-ykwh.20` specifically guards the release workflow's
-  notary log ticketContents validation.
+- Live self-update E2E proof for `bd-ykwh.10` passed at 2026-05-11 10:00 UTC.
+  The proof copied `/opt/homebrew/bin/sbh` into an isolated temp `bin`, used the
+  real published `sbh-v0.4.8-aarch64-apple-darwin.tar.xz` archive and checksum
+  through `sbh update --force --user --offline`, and set
+  `SBH_LAUNCHD_LABEL` to a throwaway loaded launchd job. Captured
+  `/tmp/sbh-update-e2e.20260511T095840Z.BE0zIa/update.json` reports
+  `success=true`, `applied=true`, target `v0.4.8`, isolated temp `install_path`,
+  backup creation, `Integrity verification passed`, `Installed to ...`, and
+  `service_restart.status=restarted`. Post-update checks passed
+  `sbh --json version`, `codesign --verify --strict --verbose=2`, Developer ID
+  authority/team inspection, and launchd evidence showing `runs = 2` plus
+  `last terminating signal = Terminated: 15` for the throwaway label.
+- Current open blockers are `bd-r7m7`, `bd-r7m7.17`, `bd-ykwh`, and
+  `bd-ykwh.3`. `bd-ykwh.7` was force-closed after real tap publication and
+  install proof. `bd-ykwh.10` was force-closed after live macOS self-update E2E
+  proof against the real signed `v0.4.8` release archive in an isolated temp
+  install path with launchd kickstart evidence. `bd-r7m7.17` remains the hosted
+  CI Queue Blocked tracker, and `bd-ykwh.3` remains open because the automated
+  release workflow proof has not gone green on the final head. `bd-r7m7.16` and
+  `bd-ykwh.20` stay part of the evidence chain; `bd-ykwh.20` specifically
+  guards the release workflow's notary log ticketContents validation.
 
 Older point-in-time evidence follows. It is useful context, but the closeout
 decision must start from the live commands above because this audit explicitly
@@ -157,20 +170,21 @@ avoids pinning exact commit hashes or GitHub Actions run ids as durable proof.
   audit refresh beads change child counts.
 - `bd-ykwh` remains open. Developer ID certificate/CI secret storage is now
   complete, the Homebrew release credential has been replaced with a
-  repository-scoped deploy key, and the public tap plus manual signed/notarized
-  `v0.4.8` release have been published. The automated hosted release workflow
-  and self-update E2E evidence remain open. Older live `br epic status --json`
-  reported 18 of 21 children closed, but use live tracker output before any
-  close decision.
+  repository-scoped deploy key, the public tap plus manual signed/notarized
+  `v0.4.8` release have been published, and self-update E2E evidence is now
+  recorded on `bd-ykwh.10`. The automated hosted release workflow evidence
+  remains open. Older live `br epic status --json` reported 18 of 21 children
+  closed, but use live tracker output before any close decision.
 - `br ready --json` returned `[]`; remaining open actionable release work was
   blocked or already assigned at audit time.
 - Live `br ready --json` at 2026-05-11 03:25 UTC also returned `[]`.
-- Open release/parity blockers as of 2026-05-11 09:50 UTC are `bd-r7m7.17`,
-  `bd-ykwh.3`, and `bd-ykwh.10`. `bd-ykwh.7` is closed based on real tap
-  publication and install proof. `bd-ykwh.2` and `bd-ykwh.13` are closed based
-  on live Developer ID identity, P12/signing secrets, App Store Connect notary
-  API-key secrets, rotation docs, Homebrew deploy-key secret evidence, and
-  certificate-expiration workflow evidence.
+- Open release/parity blockers as of 2026-05-11 10:00 UTC are `bd-r7m7.17`
+  and `bd-ykwh.3`. `bd-ykwh.7` is closed based on real tap publication and
+  install proof, and `bd-ykwh.10` is closed based on live self-update E2E proof.
+  `bd-ykwh.2` and `bd-ykwh.13` are closed based on live Developer ID identity,
+  P12/signing secrets, App Store Connect notary API-key secrets, rotation docs,
+  Homebrew deploy-key secret evidence, and certificate-expiration workflow
+  evidence.
 - `bd-r7m7.17` tracks the current hosted CI queue as an explicit external
   blocker for final macOS parity proof.
 - `bd-ykwh.20` is closed; release CI now verifies Apple notary log ticketContents
@@ -453,7 +467,7 @@ avoids pinning exact commit hashes or GitHub Actions run ids as durable proof.
 
 | Requirement | Evidence | Current Status |
 |---|---|---|
-| Fresh macOS install auto-detects launchd and status works | `src/platform/macos/pal.rs`, `src/daemon/service.rs`, `tests/integration_tests.rs::macos_launchd_user_service_lifecycle_bootstrap_kickstart_bootout`, `.github/workflows/ci.yml` `macos-platform`, `docs/macos.md` | Repo-side implementation and CI coverage exist. Signed release install now has manual `v0.4.8` and Homebrew tap proof; final closure still depends on hosted CI green for the fixed head and live self-update proof in `bd-ykwh.10`. |
+| Fresh macOS install auto-detects launchd and status works | `src/platform/macos/pal.rs`, `src/daemon/service.rs`, `tests/integration_tests.rs::macos_launchd_user_service_lifecycle_bootstrap_kickstart_bootout`, `.github/workflows/ci.yml` `macos-platform`, `docs/macos.md` | Repo-side implementation and CI coverage exist. Signed release install now has manual `v0.4.8`, Homebrew tap proof, and live self-update E2E proof in `bd-ykwh.10`; final closure still depends on hosted CI green for the fixed head and automated release-workflow proof. |
 | Status/check JSON shape and APFS accounting match macOS reality | `tests/integration_tests.rs::macos_status_json_matches_diskutil_apfs_capacity`, `tests/integration_tests.rs::macos_check_json_matches_diskutil_apfs_capacity`, `docs/macos.md` | Covered in macOS integration tests and docs. Requires final CI green on the shipped head. |
 | Scan finds and ranks macOS reclaim candidates | `src/platform/macos/cleanup_catalog.rs`, `tests/common/mod.rs::SyntheticMacTree`, `src/scanner/patterns.rs` macOS cleanup tests, `docs/macos-incident-case-study.md` | Covered for Xcode, CoreSimulator, Electron caches, `/private/tmp/*-target`, `*_target`, `target_*`, user trash, and sacred paths. |
 | Clean/daemon deletion respects protected paths and active builds | `src/daemon/loop_main.rs::should_skip_protected_daemon_candidate`, `src/scanner/walker.rs`, `src/scanner/deletion.rs`, `bd-twgw`, `bd-j40b`, `daemon::loop_main::tests::scanner_prescan_does_not_dispatch_protected_rust_fuzz_target`, `daemon::loop_main::tests::executor_preflight_skips_config_protected_daemon_candidate` | Fixed in current source. Installed sbh 0.4.6 daemons must be upgraded/restarted because they can still delete protected artifact-looking paths. |
@@ -514,7 +528,6 @@ Remaining release blockers:
 - Run or re-run the automated signed/notarized tag release workflow and verify
   it completes through upload and tap publication rather than relying only on
   the manual `v0.4.8` release.
-- Complete the live macOS self-update E2E tracked by `bd-ykwh.10`.
 
 ## Not Complete
 
@@ -534,4 +547,3 @@ release done until all of these are true:
    `macos-platform`, Intel `macos-15-intel`, `macos-coverage`,
    `macos-benchmarks`, Linux lanes, and
    `Homebrew Formula Validation`.
-7. The live macOS self-update E2E tracked by `bd-ykwh.10` passes.
