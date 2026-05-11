@@ -6656,6 +6656,33 @@ fn sacred_overlap_check_trace(
     )
 }
 
+fn score_candidate_with_deferred_sacred_check<F>(
+    engine: &ScoringEngine,
+    input: &CandidateInput,
+    urgency: f64,
+    sacred_paths: &[storage_ballast_helper::platform::types::SacredPath],
+    should_check: F,
+) -> (CandidacyScore, Vec<protection::SacredOverlap>)
+where
+    F: FnOnce(&CandidacyScore) -> bool,
+{
+    let base_score = engine.score_candidate(input, urgency);
+    if !should_check(&base_score) {
+        return (base_score, Vec::new());
+    }
+
+    match protection::find_sacred_overlaps(&input.path, sacred_paths) {
+        Ok(overlaps) => {
+            let score = engine.score_candidate_with_sacred_overlaps(input, urgency, &overlaps);
+            (score, overlaps)
+        }
+        Err(err) => (
+            engine.hard_veto(input, format!("sacred overlap check failed: {err}")),
+            Vec::new(),
+        ),
+    }
+}
+
 fn scan_trace_json(trace: &ScanTrace) -> Value {
     json!({
         "pattern_name": &trace.pattern_name,
@@ -6817,42 +6844,48 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
             let age = now
                 .duration_since(entry.metadata.effective_age_timestamp())
                 .unwrap_or_default();
-            let is_open = open_status_for_candidate(
-                &mut open_paths,
-                &scan_roots,
-                active_reference_scan,
-                &entry.path,
-                entry.metadata.content_size_bytes,
-            );
-            let (active_references, active_reference_checked) = active_references_for_candidate(
-                &mut active_reference_index,
-                &scan_roots,
-                active_reference_scan,
-                &entry.path,
-                entry.metadata.content_size_bytes,
-            );
-            let candidate = CandidateInput {
+            let mut candidate = CandidateInput {
                 path: entry.path.clone(),
                 size_bytes: entry.metadata.content_size_bytes,
                 age,
                 classification,
                 signals: entry.structural_signals,
-                active_references,
-                is_open,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
                 excluded: false,
             };
-            let (score, sacred_overlaps) =
-                match protection::find_sacred_overlaps(&entry.path, &sacred_paths) {
-                    Ok(overlaps) => {
-                        let score =
-                            engine.score_candidate_with_sacred_overlaps(&candidate, 0.0, &overlaps);
-                        (score, overlaps)
-                    }
-                    Err(err) => (
-                        engine.hard_veto(&candidate, format!("sacred overlap check failed: {err}")),
-                        Vec::new(),
-                    ),
-                };
+
+            let cheap_score = engine.score_candidate(&candidate, 0.0);
+            let should_collect_active_references =
+                args.explain && (!cheap_score.vetoed && cheap_score.total_score >= args.min_score);
+            let active_reference_checked = if should_collect_active_references {
+                candidate.is_open = open_status_for_candidate(
+                    &mut open_paths,
+                    &scan_roots,
+                    active_reference_scan,
+                    &entry.path,
+                    entry.metadata.content_size_bytes,
+                );
+                let (active_references, checked) = active_references_for_candidate(
+                    &mut active_reference_index,
+                    &scan_roots,
+                    active_reference_scan,
+                    &entry.path,
+                    entry.metadata.content_size_bytes,
+                );
+                candidate.active_references = active_references;
+                checked
+            } else {
+                false
+            };
+
+            let (score, sacred_overlaps) = score_candidate_with_deferred_sacred_check(
+                &engine,
+                &candidate,
+                0.0,
+                &sacred_paths,
+                |_| args.explain,
+            );
             let trace = build_scan_trace(
                 &candidate,
                 &score,
@@ -7167,38 +7200,42 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
             let age = now
                 .duration_since(entry.metadata.effective_age_timestamp())
                 .unwrap_or_default();
-            let is_open = open_status_for_candidate(
-                &mut open_paths,
-                &root_paths,
-                active_reference_scan,
-                &entry.path,
-                entry.metadata.content_size_bytes,
-            );
-            let (active_references, _) = active_references_for_candidate(
-                &mut active_reference_index,
-                &root_paths,
-                active_reference_scan,
-                &entry.path,
-                entry.metadata.content_size_bytes,
-            );
-            let candidate = CandidateInput {
+            let mut candidate = CandidateInput {
                 path: entry.path.clone(),
                 size_bytes: entry.metadata.content_size_bytes,
                 age,
                 classification,
                 signals: entry.structural_signals,
-                active_references,
-                is_open,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
                 excluded: false,
             };
-            match protection::find_sacred_overlaps(&entry.path, &sacred_paths) {
-                Ok(overlaps) => {
-                    engine.score_candidate_with_sacred_overlaps(&candidate, 0.0, &overlaps)
-                }
-                Err(err) => {
-                    engine.hard_veto(&candidate, format!("sacred overlap check failed: {err}"))
-                }
+            let cheap_score = engine.score_candidate(&candidate, 0.0);
+            if !cheap_score.vetoed && cheap_score.total_score >= args.min_score {
+                candidate.is_open = open_status_for_candidate(
+                    &mut open_paths,
+                    &root_paths,
+                    active_reference_scan,
+                    &entry.path,
+                    entry.metadata.content_size_bytes,
+                );
+                let (active_references, _) = active_references_for_candidate(
+                    &mut active_reference_index,
+                    &root_paths,
+                    active_reference_scan,
+                    &entry.path,
+                    entry.metadata.content_size_bytes,
+                );
+                candidate.active_references = active_references;
             }
+            score_candidate_with_deferred_sacred_check(
+                &engine,
+                &candidate,
+                0.0,
+                &sacred_paths,
+                |base_score| !base_score.vetoed && base_score.total_score >= args.min_score,
+            )
+            .0
         })
         .filter(|score| !score.vetoed && score.total_score >= args.min_score)
         .collect();
@@ -8233,39 +8270,44 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
             let age = now
                 .duration_since(entry.metadata.effective_age_timestamp())
                 .unwrap_or_default();
-            let is_open = open_status_for_candidate(
-                &mut open_paths,
-                &root_paths,
-                active_reference_scan,
-                &entry.path,
-                entry.metadata.content_size_bytes,
-            );
-            let (active_references, _) = active_references_for_candidate(
-                &mut active_reference_index,
-                &root_paths,
-                active_reference_scan,
-                &entry.path,
-                entry.metadata.content_size_bytes,
-            );
-            let candidate = CandidateInput {
+            let mut candidate = CandidateInput {
                 path: entry.path.clone(),
                 size_bytes: entry.metadata.content_size_bytes,
                 age,
                 classification,
                 signals: entry.structural_signals,
-                active_references,
-                is_open,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
                 excluded: false,
             };
-            match protection::find_sacred_overlaps(&entry.path, &sacred_paths) {
-                Ok(overlaps) => {
-                    // High urgency (0.8) for emergency mode — aggressive scoring.
-                    engine.score_candidate_with_sacred_overlaps(&candidate, 0.8, &overlaps)
-                }
-                Err(err) => {
-                    engine.hard_veto(&candidate, format!("sacred overlap check failed: {err}"))
-                }
+            let cheap_score = engine.score_candidate(&candidate, 0.8);
+            if !cheap_score.vetoed && cheap_score.total_score >= config.scoring.min_score {
+                candidate.is_open = open_status_for_candidate(
+                    &mut open_paths,
+                    &root_paths,
+                    active_reference_scan,
+                    &entry.path,
+                    entry.metadata.content_size_bytes,
+                );
+                let (active_references, _) = active_references_for_candidate(
+                    &mut active_reference_index,
+                    &root_paths,
+                    active_reference_scan,
+                    &entry.path,
+                    entry.metadata.content_size_bytes,
+                );
+                candidate.active_references = active_references;
             }
+            score_candidate_with_deferred_sacred_check(
+                &engine,
+                &candidate,
+                0.8,
+                &sacred_paths,
+                |base_score| {
+                    !base_score.vetoed && base_score.total_score >= config.scoring.min_score
+                },
+            )
+            .0
         })
         .filter(|score| !score.vetoed)
         .collect();

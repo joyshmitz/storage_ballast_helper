@@ -3619,36 +3619,7 @@ fn scanner_thread_main(
                             } else {
                                 raw_size
                             };
-                            let (active_references, is_open) =
-                                if active_reference_scan.should_probe(size) {
-                                    let open_files = open_files_joined.get_or_insert_with(|| {
-                                        collect_open_path_ancestors_cached(
-                                            &request.paths,
-                                            active_reference_scan.cache_ttl,
-                                        )
-                                        .0
-                                    });
-                                    let active_references = active_reference_joined
-                                        .get_or_insert_with(|| {
-                                            collect_active_references_for_scan(
-                                                platform.as_ref(),
-                                                &request.paths,
-                                                active_reference_scan,
-                                                logger,
-                                            )
-                                        });
-                                    (
-                                        active_references.summary_for(&candidate_path),
-                                        crate::scanner::walker::is_path_open_by_ancestor(
-                                            &candidate_path,
-                                            open_files,
-                                        ),
-                                    )
-                                } else {
-                                    (ActiveReferenceSummary::default(), false)
-                                };
-
-                            let input = crate::scanner::scoring::CandidateInput {
+                            let mut input = crate::scanner::scoring::CandidateInput {
                                 path: candidate_path.clone(),
                                 size_bytes: size,
                                 age: adjusted_candidate_age(
@@ -3660,31 +3631,66 @@ fn scanner_thread_main(
                                 ),
                                 classification: candidate_class,
                                 signals: StructuralSignals::default(),
-                                active_references,
-                                is_open,
+                                active_references: ActiveReferenceSummary::default(),
+                                is_open: false,
                                 excluded: false,
                             };
-                            let sacred_overlaps = match protection::find_sacred_overlaps(
-                                &candidate_path,
-                                &sacred_paths,
-                            ) {
-                                Ok(overlaps) => overlaps,
-                                Err(err) => {
-                                    logger.send(ActivityEvent::Error {
-                                        code: err.code().to_string(),
-                                        message: format!(
-                                            "sacred overlap check failed for {}: {err}",
-                                            candidate_path.display()
-                                        ),
+                            let mut score = prescan_engine.score_candidate(&input, request.urgency);
+                            if score.decision.action
+                                == crate::scanner::scoring::DecisionAction::Delete
+                                && !score.vetoed
+                                && active_reference_scan.should_probe(size)
+                            {
+                                let open_files = open_files_joined.get_or_insert_with(|| {
+                                    collect_open_path_ancestors_cached(
+                                        &request.paths,
+                                        active_reference_scan.cache_ttl,
+                                    )
+                                    .0
+                                });
+                                let active_references =
+                                    active_reference_joined.get_or_insert_with(|| {
+                                        collect_active_references_for_scan(
+                                            platform.as_ref(),
+                                            &request.paths,
+                                            active_reference_scan,
+                                            logger,
+                                        )
                                     });
-                                    continue;
-                                }
-                            };
-                            let score = prescan_engine.score_candidate_with_sacred_overlaps(
-                                &input,
-                                request.urgency,
-                                &sacred_overlaps,
-                            );
+                                input.active_references =
+                                    active_references.summary_for(&candidate_path);
+                                input.is_open = crate::scanner::walker::is_path_open_by_ancestor(
+                                    &candidate_path,
+                                    open_files,
+                                );
+                                score = prescan_engine.score_candidate(&input, request.urgency);
+                            }
+                            if score.decision.action
+                                == crate::scanner::scoring::DecisionAction::Delete
+                                && !score.vetoed
+                            {
+                                let sacred_overlaps = match protection::find_sacred_overlaps(
+                                    &candidate_path,
+                                    &sacred_paths,
+                                ) {
+                                    Ok(overlaps) => overlaps,
+                                    Err(err) => {
+                                        logger.send(ActivityEvent::Error {
+                                            code: err.code().to_string(),
+                                            message: format!(
+                                                "sacred overlap check failed for {}: {err}",
+                                                candidate_path.display()
+                                            ),
+                                        });
+                                        continue;
+                                    }
+                                };
+                                score = prescan_engine.score_candidate_with_sacred_overlaps(
+                                    &input,
+                                    request.urgency,
+                                    &sacred_overlaps,
+                                );
+                            }
                             if score.decision.action
                                 == crate::scanner::scoring::DecisionAction::Delete
                             {
@@ -3910,32 +3916,7 @@ fn scanner_thread_main(
                 dirs_with_candidates.insert(parent.to_path_buf());
             }
 
-            let (active_references, is_open) =
-                if active_reference_scan.should_probe(entry.metadata.content_size_bytes) {
-                    let open_files = open_files_joined.get_or_insert_with(|| {
-                        collect_open_path_ancestors_cached(
-                            &request.paths,
-                            active_reference_scan.cache_ttl,
-                        )
-                        .0
-                    });
-                    let active_references = active_reference_joined.get_or_insert_with(|| {
-                        collect_active_references_for_scan(
-                            platform.as_ref(),
-                            &request.paths,
-                            active_reference_scan,
-                            logger,
-                        )
-                    });
-                    (
-                        active_references.summary_for(&entry.path),
-                        crate::scanner::walker::is_path_open_by_ancestor(&entry.path, open_files),
-                    )
-                } else {
-                    (ActiveReferenceSummary::default(), false)
-                };
-
-            let input = crate::scanner::scoring::CandidateInput {
+            let mut input = crate::scanner::scoring::CandidateInput {
                 path: entry.path.clone(), // Clone needed for input
                 size_bytes: entry.metadata.content_size_bytes,
                 age: adjusted_candidate_age(
@@ -3947,30 +3928,59 @@ fn scanner_thread_main(
                 ),
                 classification,
                 signals: entry.structural_signals,
-                active_references,
-                is_open,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
                 excluded: false, // Walker already filters excluded paths.
             };
 
-            let sacred_overlaps = match protection::find_sacred_overlaps(&entry.path, &sacred_paths)
+            let mut score = engine.score_candidate(&input, request.urgency);
+            if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
+                && !score.vetoed
+                && active_reference_scan.should_probe(entry.metadata.content_size_bytes)
             {
-                Ok(overlaps) => overlaps,
-                Err(err) => {
-                    logger.send(ActivityEvent::Error {
-                        code: err.code().to_string(),
-                        message: format!(
-                            "sacred overlap check failed for {}: {err}",
-                            entry.path.display()
-                        ),
-                    });
-                    continue;
-                }
-            };
-            let score = engine.score_candidate_with_sacred_overlaps(
-                &input,
-                request.urgency,
-                &sacred_overlaps,
-            );
+                let open_files = open_files_joined.get_or_insert_with(|| {
+                    collect_open_path_ancestors_cached(
+                        &request.paths,
+                        active_reference_scan.cache_ttl,
+                    )
+                    .0
+                });
+                let active_references = active_reference_joined.get_or_insert_with(|| {
+                    collect_active_references_for_scan(
+                        platform.as_ref(),
+                        &request.paths,
+                        active_reference_scan,
+                        logger,
+                    )
+                });
+                input.active_references = active_references.summary_for(&entry.path);
+                input.is_open =
+                    crate::scanner::walker::is_path_open_by_ancestor(&entry.path, open_files);
+                score = engine.score_candidate(&input, request.urgency);
+            }
+            if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
+                && !score.vetoed
+            {
+                let sacred_overlaps =
+                    match protection::find_sacred_overlaps(&entry.path, &sacred_paths) {
+                        Ok(overlaps) => overlaps,
+                        Err(err) => {
+                            logger.send(ActivityEvent::Error {
+                                code: err.code().to_string(),
+                                message: format!(
+                                    "sacred overlap check failed for {}: {err}",
+                                    entry.path.display()
+                                ),
+                            });
+                            continue;
+                        }
+                    };
+                score = engine.score_candidate_with_sacred_overlaps(
+                    &input,
+                    request.urgency,
+                    &sacred_overlaps,
+                );
+            }
 
             // Attribute to root.
             let root_path = request.paths.iter().find(|r| entry.path.starts_with(r));

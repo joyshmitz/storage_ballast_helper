@@ -181,13 +181,17 @@ impl DirectoryWalker {
     pub fn stream(&self) -> Result<channel::Receiver<WalkEntry>> {
         let parallelism = self.config.parallelism.max(1);
 
-        // Channels: work items (bounded) and results (bounded for memory safety).
-        // Queue sized to hold children from multiple root paths without starvation.
+        // Channels: work items (unbounded) and results (bounded for memory safety).
+        // Worker threads both produce and consume directory work. A bounded work queue
+        // can deadlock when every worker is trying to enqueue child directories into a
+        // full queue and no worker is left to drain it. Keep only the result channel
+        // bounded; callers drain it while the walk runs.
+        //
         // Per-directory iteration cap (MAX_ENTRIES_PER_DIR) prevents any single huge
-        // directory (e.g. /data/tmp with 60K+ children) from monopolizing the queue.
+        // directory (e.g. /data/tmp with 60K+ children) from monopolizing traversal.
         // Result channel bounded to 10,000 entries to prevent unbounded memory growth
         // on large trees (previously unbounded, causing 14GB+ RSS on trj).
-        let (work_tx, work_rx) = channel::bounded::<WorkItem>(4096);
+        let (work_tx, work_rx) = channel::unbounded::<WorkItem>();
         let (result_tx, result_rx) = channel::bounded::<WalkEntry>(10_000);
 
         // Track in-flight work items so workers know when to stop.
@@ -1724,6 +1728,53 @@ mod tests {
         let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
         let entries = walker.walk().unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn walk_completes_when_workers_enqueue_many_child_directories() {
+        use std::sync::atomic::Ordering;
+        use std::thread;
+        use std::time::Duration;
+
+        let tmp = TempDir::new().unwrap();
+        let parent_count = 8;
+        let children_per_parent = 1024;
+
+        for parent_index in 0..parent_count {
+            let parent = tmp.path().join(format!("parent-{parent_index}"));
+            fs::create_dir(&parent).unwrap();
+            for child_index in 0..children_per_parent {
+                fs::create_dir(parent.join(format!("child-{child_index}"))).unwrap();
+            }
+        }
+
+        let mut config = test_config(tmp.path());
+        config.max_depth = 2;
+        config.parallelism = parent_count;
+        let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+        let cancel = walker.cancel_token();
+        let (done_tx, done_rx) = channel::bounded(1);
+
+        let join = thread::spawn(move || {
+            let result = walker.walk().map(|entries| entries.len());
+            let _ = done_tx.send(result);
+        });
+
+        let entries_len = match done_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(result) => result.unwrap(),
+            Err(err) => {
+                cancel.store(true, Ordering::Relaxed);
+                join.join().unwrap();
+                panic!("walker did not finish under heavy child-directory fanout: {err}");
+            }
+        };
+        join.join().unwrap();
+
+        let expected_dirs = parent_count + (parent_count * children_per_parent);
+        assert!(
+            entries_len >= expected_dirs,
+            "walker should visit all generated directories"
+        );
     }
 
     #[test]
