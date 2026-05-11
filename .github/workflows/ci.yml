@@ -469,12 +469,18 @@ jobs:
           tar -C macos-homebrew-archive -cJf "${archive}" sbh
           archive_sha="$(shasum -a 256 "${archive}" | awk '{print $1}')"
           archive_url="file://${archive}"
+          ci_formula_version="$(grep '^version = ' Cargo.toml | head -n 1 | sed 's/version = "\(.*\)"/\1/')"
           export ARCHIVE_SHA="${archive_sha}"
           export ARCHIVE_URL="${archive_url}"
+          export CI_FORMULA_VERSION="${ci_formula_version}"
 
           ruby - <<'RUBY'
           formula = File.read("packaging/homebrew/Formula/sbh.rb")
           formula = formula.sub("class Sbh < Formula", "class SbhCi < Formula")
+          formula = formula.sub(
+            "  license \"MIT\"\n",
+            "  license \"MIT\"\n  version \"#{ENV.fetch('CI_FORMULA_VERSION')}\"\n",
+          )
           formula = formula.gsub(
             %r{url "https://github\.com/Dicklesworthstone/storage_ballast_helper/releases/download/v[^/]+/" \\\n\s+"sbh-v[^"]+-(?:aarch64|x86_64)-apple-darwin\.tar\.xz"},
             %(url "#{ENV.fetch("ARCHIVE_URL")}"),
