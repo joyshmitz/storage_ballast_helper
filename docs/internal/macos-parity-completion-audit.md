@@ -3,7 +3,7 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`, `bd-r7m7.17`
 Parent: `bd-r7m7`
-Last audited: 2026-05-11 20:51 UTC
+Last audited: 2026-05-11 22:57 UTC
 Evidence snapshot: the audit records the live head and run state observed at
 refresh time, but every audit-only commit makes those literals stale. Before any
 close decision, refresh the live head and newest run with:
@@ -69,8 +69,8 @@ operator-visible outcomes:
 
 ## Current Tracker And CI State
 
-- Live refresh at 2026-05-11 20:51 UTC inspected current `main` at
-  `84221b53e451d283571f6f90d11e35f05f6a2e65`. This is an audit/tracker-only
+- Live refresh at 2026-05-11 22:57 UTC inspected current `main` at
+  `6c5eb36a2900155dd95859cf7ef2e79c815ac1f1`. This is an audit/tracker-only
   commit ahead of the `v0.4.14` tag; `origin/main` and the legacy compatibility
   branch are synchronized to the same commit. The only unstaged local change is
   `.beads/beads.db`, which is database state and not a release artifact.
@@ -95,11 +95,17 @@ operator-visible outcomes:
   and zero repository self-hosted runners. The queued release and CI jobs still
   have no runner assignment, so the current blocker remains hosted runner
   capacity or queue policy rather than an in-repo dependency graph failure.
-- Older release runs for `v0.4.10`, `v0.4.11`, `v0.4.12`, and `v0.4.13` remain
-  queued. They are stale relative to the current release proof and must not be
-  allowed to publish over newer evidence without an explicit operator decision.
-  Canceling/rerunning hosted workflows or manually publishing the prepared
-  artifacts is a remote-state change and still requires explicit approval.
+- The commit-scoped GitHub check-suite API for
+  `02e0c678a8e28831cf17efd1c30d7fa879de5c57` still reports both GitHub Actions
+  check suites queued, plus external app suites for Vercel, Cloudflare Workers
+  and Pages, Supabase, Cursor, and Claude queued with zero check runs. This is
+  non-green status, not completion evidence.
+- The user approved the stale release queue intervention with `proceed` after
+  the exact stale runs were listed. Release runs for `v0.4.10` (`25666074747`),
+  `v0.4.11` (`25675218864`), `v0.4.12` (`25677465183`), and `v0.4.13`
+  (`25678971515`) are now completed with conclusion `cancelled`. Current
+  `v0.4.14` Release run `25693688419` was intentionally left untouched and
+  remains queued.
 - The `v0.4.14` release credential gap found during this audit has been fixed:
   the first OpenSSL-modern P12 parsed with OpenSSL but failed macOS
   `security import`, so it was replaced with
@@ -122,10 +128,14 @@ operator-visible outcomes:
 - Manual fallback artifacts for `v0.4.14` are staged under
   `/tmp/sbh-v0414-manual-release-artifacts-20260511T195841Z`. The directory
   contains four platform archives, checksum sidecars, `SHA256SUMS.txt`, and
-  `release-provenance.json`; `shasum -a 256 -c SHA256SUMS.txt` passed. The
+  `release-provenance.json`; the checksum manifest was rechecked successfully
+  at 2026-05-11 21:22 UTC from inside the artifact directory. The provenance
+  records tag `v0.4.14`, source SHA
+  `02e0c678a8e28831cf17efd1c30d7fa879de5c57`, Release run `25693688419`, CI
+  run `25693489066`, and manual generation time `2026-05-11T20:09:41Z`. The
   macOS arm64 notarization id is `13d0624e-16b9-4b1a-a75d-e346907a8fce` with
-  cdhash `06845d8410e7a90a52901f967fb6f7fce`; the macOS x86_64 notarization id
-  is `f28c1cdb-9804-4305-a52b-bbf8228b4d62` with cdhash
+  cdhash `06845d8410e7a90a52901f967fb6f7fce31192d4`; the macOS x86_64
+  notarization id is `f28c1cdb-9804-4305-a52b-bbf8228b4d62` with cdhash
   `648b1b1c7e7f213e736369856cba5b07c8dbec54`. These artifacts are useful
   fallback evidence, but they are not published and do not replace hosted
   release workflow completion.
@@ -158,8 +168,10 @@ operator-visible outcomes:
   `v0.4.8` release; it has not been updated to `v0.4.14`.
 - The public tap now has `Formula/sbh.rb` on `main`
   (`Dicklesworthstone/homebrew-sbh`, content SHA
-  `6e4c74f521b3a2f58e2f8a216d04bc0da3164fef`). Local proof after publication
-  passed `brew fetch --formula dicklesworthstone/sbh/sbh`,
+  `6e4c74f521b3a2f58e2f8a216d04bc0da3164fef`). A live content read at
+  2026-05-11 21:22 UTC still shows both macOS URLs and checksums pointing at
+  `v0.4.8`, not `v0.4.14`. Local proof after publication passed
+  `brew fetch --formula dicklesworthstone/sbh/sbh`,
   `brew audit --strict --online dicklesworthstone/sbh/sbh`,
   `brew install --formula dicklesworthstone/sbh/sbh`,
   `brew test --force dicklesworthstone/sbh/sbh`,
@@ -564,7 +576,7 @@ containing `bd-twgw` and `bd-j40b`, then restore the protected worktree files.
 ## Live Release Blocker Evidence
 
 The user confirmed Apple Developer Program enrollment, so enrollment itself is
-not the current blocker. Live checks at 2026-05-11 20:36 UTC now show:
+not the current blocker. Live checks at 2026-05-11 22:57 UTC now show:
 
 - `security find-identity -v -p codesigning`: one valid Developer ID
   Application identity for `Jeffrey Emanuel (AU8V2Z6NKY)`.
@@ -577,11 +589,15 @@ not the current blocker. Live checks at 2026-05-11 20:36 UTC now show:
   extraction and macOS `security import`, and local workflow emulation used it
   to Developer-ID sign both staged `v0.4.14` macOS binaries.
 - `gh api repos/Dicklesworthstone/homebrew-sbh/contents/Formula/sbh.rb`: live
-  public tap formula exists on `main` but still points at `v0.4.8`.
+  public tap formula exists on `main` with content SHA
+  `6e4c74f521b3a2f58e2f8a216d04bc0da3164fef`, but still points at `v0.4.8`.
 - GitHub release/tag checks: `v0.4.8` is published with macOS and Linux
   archives, checksum sidecars, `SHA256SUMS.txt`, and provenance.
 - GitHub release/tag checks: `v0.4.14` is tagged and Release run
   `25693688419` exists, but no `v0.4.14` release assets are published yet.
+- GitHub check-suite checks for the `v0.4.14` source SHA still show queued
+  GitHub Actions suites and queued zero-run external app suites; this remains
+  non-green status, not completion evidence.
 - Local Homebrew validation: the public tap install/test path passed for
   `v0.4.8`, and local generated-formula validation passed for `v0.4.14`.
 
@@ -591,8 +607,9 @@ Remaining release blockers:
   commit and version metadata.
 - Let an automated signed/notarized tag release workflow for `v0.4.14` or a
   later fixed-head tag complete through upload and tap publication, or get
-  explicit operator approval to cancel stale queued release runs and manually
-  publish the prepared `v0.4.14` artifacts.
+  explicit operator approval to manually publish the prepared `v0.4.14`
+  artifacts. The stale `v0.4.10` through `v0.4.13` release runs have already
+  been cancelled with operator approval.
 - Verify the public Homebrew tap advances from `v0.4.8` to the final release
   version and that formula install/test still passes from the published release
   assets.
