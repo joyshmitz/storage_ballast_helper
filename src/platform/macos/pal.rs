@@ -1161,7 +1161,7 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, mpsc};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::platform::macos::sys::{
         ApfsContainer, ApfsInventory, ApfsVolume, ApfsVolumeRole,
@@ -2007,10 +2007,13 @@ mod tests {
         let expected =
             std::fs::canonicalize(&current_exe).expect("current executable should canonicalize");
 
-        let platform = MacOsPal::new();
-        let regions = platform
-            .mmap_regions_under(root)
-            .expect("macOS mapped region scan should be readable");
+        let root_variants = super::macos_process_path_variants(root);
+        let regions = super::mapped_regions_for_pid_under(
+            super::current_process_pid(),
+            &root_variants,
+            Instant::now() + super::MMAP_REGIONS_SCAN_TIMEOUT,
+        )
+        .expect("current process macOS mapped region scan should be readable");
 
         assert!(regions.iter().any(|region| {
             region.pid == super::current_process_pid()
