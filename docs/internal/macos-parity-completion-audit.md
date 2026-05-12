@@ -92,11 +92,12 @@ operator-visible outcomes:
   queued. The previous main CI run `25704673659` for `8409fe2` was cancelled by
   branch concurrency after the version/tag push. Do not count queued CI as final
   green proof.
-- A non-mutating queue sanity check found repository Actions enabled with
-  `allowed_actions=all`, no pending deployments for the prior `v0.4.14` Release run,
-  and zero repository self-hosted runners. The queued release and CI jobs still
-  have no runner assignment, so the current blocker remains hosted runner
-  capacity or queue policy rather than an in-repo dependency graph failure.
+- A non-mutating queue sanity check for active `v0.4.15` Release run
+  `25705033848` found repository Actions enabled with `allowed_actions=all`, no
+  pending deployments, and zero repository self-hosted runners. The queued
+  release and CI jobs still have no runner assignment, so the current blocker
+  remains hosted runner capacity or queue policy rather than an in-repo
+  dependency graph failure.
 - Current source proof for the latest source/workflow head is healthy outside
   hosted GitHub runners. Local macOS runtime checks against the installed public
   binary showed platform auto-detection working for `sbh status --json`,
