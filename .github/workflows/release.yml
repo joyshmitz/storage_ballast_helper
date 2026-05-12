@@ -376,6 +376,7 @@ jobs:
         uses: actions/download-artifact@v8.0.1
         with:
           path: release-artifacts
+          pattern: sbh-*
           merge-multiple: true
 
       - name: Generate release checksum manifest
@@ -482,6 +483,7 @@ jobs:
         uses: actions/download-artifact@v8.0.1
         with:
           path: release-artifacts
+          pattern: sbh-*
           merge-multiple: true
 
       - name: Generate tap formula

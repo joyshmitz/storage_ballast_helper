@@ -734,6 +734,14 @@ not the current blocker. Live checks at 2026-05-12 00:36 UTC now show:
   it remains correct when the reusable workflow sees the caller's original tag
   push context. The superseded `v0.4.20` run was cancelled before any gate
   completed.
+- The `v0.4.21` hosted release attempt at
+  `5ba24bbe7beedf8793e5b34bb10033c2d0c88b0d` proved every reusable quality gate,
+  skipped the redundant tag provenance job as intended, and completed all four
+  signed/notarized release build jobs. It did not publish because the release
+  publisher downloaded every workflow artifact, including macOS platform
+  diagnostic checksum files that were not part of the release archive contract.
+  Candidate `v0.4.22` filters release and tap downloads to build artifacts named
+  `sbh-*` before generating release manifests.
 - Account-wide queued Actions cleanup was used to unblock hosted runner
   assignment for the `v0.4.16` release attempt. The first pass cancelled 935
   queued runs older than one hour, excluding the active `storage_ballast_helper`
@@ -751,10 +759,10 @@ Remaining release blockers:
 
 - Complete the hosted reusable release quality gate on the fixed final source
   commit and version metadata.
-- Let a fresh automated signed/notarized tag release workflow for `v0.4.21`
+- Let a fresh automated signed/notarized tag release workflow for `v0.4.22`
   complete through upload and tap publication, or get explicit operator approval
-  to regenerate and manually publish freshly verified `v0.4.21` artifacts. The
-  stale `v0.4.10` through `v0.4.20` release runs have already been cancelled or
+  to regenerate and manually publish freshly verified `v0.4.22` artifacts. The
+  stale `v0.4.10` through `v0.4.21` release runs have already been cancelled or
   superseded.
 - Verify the public Homebrew tap advances from `v0.4.8` to the final release
   version and that formula install/test still passes from the published release
