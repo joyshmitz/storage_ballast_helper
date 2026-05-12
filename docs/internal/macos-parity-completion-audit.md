@@ -722,6 +722,14 @@ not the current blocker. Live checks at 2026-05-12 00:36 UTC now show:
   cancelled after that required gate failed. The next candidate is `v0.4.19`,
   which updates that contract assertion to the new explicit install/update
   wording.
+- The `v0.4.19` hosted release attempt at
+  `8ed99a9f9146dd92d0766cd4972d60236264d54f` proved the macOS gates, E2E
+  suite, stress tests, and the launchd fixture fix, but did not publish because
+  the reusable CI workflow's final provenance job remained queued on
+  `ubuntu-latest` for over twenty minutes after every required test gate had
+  passed. Candidate `v0.4.20` skips that redundant CI provenance job only for
+  tag-triggered release quality gates; the release workflow still generates and
+  uploads release provenance during publication.
 - Account-wide queued Actions cleanup was used to unblock hosted runner
   assignment for the `v0.4.16` release attempt. The first pass cancelled 935
   queued runs older than one hour, excluding the active `storage_ballast_helper`
@@ -739,10 +747,10 @@ Remaining release blockers:
 
 - Complete the hosted reusable release quality gate on the fixed final source
   commit and version metadata.
-- Let a fresh automated signed/notarized tag release workflow for `v0.4.19`
+- Let a fresh automated signed/notarized tag release workflow for `v0.4.20`
   complete through upload and tap publication, or get explicit operator approval
-  to regenerate and manually publish freshly verified `v0.4.19` artifacts. The
-  stale `v0.4.10` through `v0.4.18` release runs have already been cancelled or
+  to regenerate and manually publish freshly verified `v0.4.20` artifacts. The
+  stale `v0.4.10` through `v0.4.19` release runs have already been cancelled or
   superseded.
 - Verify the public Homebrew tap advances from `v0.4.8` to the final release
   version and that formula install/test still passes from the published release
