@@ -338,6 +338,21 @@ jobs:
             shasum -a 256 "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
           fi
 
+      - name: Mirror to legacy unversioned artifact names
+        # Pre-v0.4.8 sbh self-updaters request `sbh-{target}.{archive}` (no version
+        # in the filename). Ship both naming conventions so any installed sbh can
+        # find its expected artifact. Without this, every release breaks the
+        # self-updater for the previous minor cycle.
+        run: |
+          ARCHIVE_NAME="sbh-${GITHUB_REF_NAME}-${{ matrix.target }}.${{ matrix.archive }}"
+          LEGACY_NAME="sbh-${{ matrix.target }}.${{ matrix.archive }}"
+          cp "${ARCHIVE_NAME}" "${LEGACY_NAME}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${LEGACY_NAME}" > "${LEGACY_NAME}.sha256"
+          else
+            shasum -a 256 "${LEGACY_NAME}" > "${LEGACY_NAME}.sha256"
+          fi
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v7.0.1
         with:
