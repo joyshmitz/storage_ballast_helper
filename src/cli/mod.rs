@@ -2069,7 +2069,7 @@ mod tests {
         for required in [
             "concurrency:",
             "group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
-            "cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}",
+            "cancel-in-progress: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'pull_request' }}",
             "workflow_call:",
             "docs/internal/macos-parity-completion-audit.md",
         ] {
@@ -2081,9 +2081,10 @@ mod tests {
 
         for required in [
             "Superseded CI cancellation",
-            "`cancel-in-progress` enabled for `push` and `pull_request` events",
-            "newer commits from waiting behind obsolete hosted-runner jobs",
-            "`workflow_call` behavior for release quality gates",
+            "`cancel-in-progress` enabled for pushes to `refs/heads/main` and for",
+            "Tag-triggered release workflow calls are not cancelable",
+            "This keeps newer main commits from waiting behind",
+            "release quality gates",
         ] {
             assert!(
                 testing_guide.contains(required),
