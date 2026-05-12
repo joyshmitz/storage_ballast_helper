@@ -730,6 +730,10 @@ not the current blocker. Live checks at 2026-05-12 00:36 UTC now show:
   passed. Candidate `v0.4.20` skips that redundant CI provenance job only for
   tag-triggered release quality gates; the release workflow still generates and
   uploads release provenance during publication.
+- Candidate `v0.4.21` simplifies that skip predicate to the tag ref itself so
+  it remains correct when the reusable workflow sees the caller's original tag
+  push context. The superseded `v0.4.20` run was cancelled before any gate
+  completed.
 - Account-wide queued Actions cleanup was used to unblock hosted runner
   assignment for the `v0.4.16` release attempt. The first pass cancelled 935
   queued runs older than one hour, excluding the active `storage_ballast_helper`
@@ -747,10 +751,10 @@ Remaining release blockers:
 
 - Complete the hosted reusable release quality gate on the fixed final source
   commit and version metadata.
-- Let a fresh automated signed/notarized tag release workflow for `v0.4.20`
+- Let a fresh automated signed/notarized tag release workflow for `v0.4.21`
   complete through upload and tap publication, or get explicit operator approval
-  to regenerate and manually publish freshly verified `v0.4.20` artifacts. The
-  stale `v0.4.10` through `v0.4.19` release runs have already been cancelled or
+  to regenerate and manually publish freshly verified `v0.4.21` artifacts. The
+  stale `v0.4.10` through `v0.4.20` release runs have already been cancelled or
   superseded.
 - Verify the public Homebrew tap advances from `v0.4.8` to the final release
   version and that formula install/test still passes from the published release
