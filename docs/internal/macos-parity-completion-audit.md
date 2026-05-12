@@ -85,13 +85,13 @@ operator-visible outcomes:
   queued. The reusable `Quality Gate / Homebrew Tap Deploy Key Preflight` job is
   skipped by the CI workflow, as expected, because release.yml has its own
   release-level tap preflight. No `v0.4.15` GitHub Release exists yet.
-- The newest visible main CI run is `25705030478` for `067f55e`. It is queued
-  before runner assignment with Format + Lint, Homebrew Tap Deploy Key
-  Preflight, Homebrew Formula Validation, macOS Platform Tests
-  intel/apple-silicon, macOS Coverage, and macOS Performance Budgets all still
-  queued. The previous main CI run `25704673659` for `8409fe2` was cancelled by
-  branch concurrency after the version/tag push. Do not count queued CI as final
-  green proof.
+- The standalone main CI run `25705030478` for `067f55e` was cancelled at
+  2026-05-12 00:24 UTC to reduce duplicate queue pressure after confirming the
+  active `v0.4.15` Release run invokes the same reusable quality-gate workflow.
+  The previous main CI run `25704673659` for `8409fe2` had already been
+  cancelled by branch concurrency after the version/tag push. Do not count
+  cancelled CI as final green proof; the active hosted proof path is Release run
+  `25705033848`.
 - A non-mutating queue sanity check for active `v0.4.15` Release run
   `25705033848` found repository Actions enabled with `allowed_actions=all`, no
   pending deployments, and zero repository self-hosted runners. The queued
@@ -568,7 +568,7 @@ avoids pinning exact commit hashes or GitHub Actions run ids as durable proof.
 | Scan finds and ranks macOS reclaim candidates | `src/platform/macos/cleanup_catalog.rs`, `tests/common/mod.rs::SyntheticMacTree`, `src/scanner/patterns.rs` macOS cleanup tests, `docs/macos-incident-case-study.md` | Covered for Xcode, CoreSimulator, Electron caches, `/private/tmp/*-target`, `*_target`, `target_*`, user trash, and sacred paths. |
 | Clean/daemon deletion respects protected paths and active builds | `src/daemon/loop_main.rs::should_skip_protected_daemon_candidate`, `src/scanner/walker.rs`, `src/scanner/deletion.rs`, `bd-twgw`, `bd-j40b`, `daemon::loop_main::tests::scanner_prescan_does_not_dispatch_protected_rust_fuzz_target`, `daemon::loop_main::tests::executor_preflight_skips_config_protected_daemon_candidate` | Fixed in current source. Installed sbh 0.4.6 daemons must be upgraded/restarted because they can still delete protected artifact-looking paths. |
 | Blame attributes macOS disk growth to processes | `tests/integration_tests.rs::macos_synthetic_writer_surfaces_in_blame_top_rows`, `src/cli_app.rs::collect_blame_report_at`, macOS PAL libproc process I/O and open-file code | Covered by macOS integration test and PAL-backed implementation. |
-| CI validates Linux and macOS | `.github/workflows/ci.yml` jobs `check`, `unit`, `integration`, `linux-arm64`, `decision-plane`, `dashboard`, `e2e`, `macos-platform`, `macos-coverage`, `macos-benchmarks`, `stress`, `artifact-contract`, `provenance`, and `Homebrew Formula Validation` | Infrastructure exists. The macOS platform, coverage, and benchmark jobs are independent from the Ubuntu `check` job so Linux runner queueing cannot hide missing macOS proof. The current inspected `v0.4.15` CI and release quality-gate jobs are queued before runner assignment. Final goal cannot close until the final head completes all required hosted jobs green. `macos-15-intel` is the Intel lane; `macos-latest` remains the arm64 lane. |
+| CI validates Linux and macOS | `.github/workflows/ci.yml` jobs `check`, `unit`, `integration`, `linux-arm64`, `decision-plane`, `dashboard`, `e2e`, `macos-platform`, `macos-coverage`, `macos-benchmarks`, `stress`, `artifact-contract`, `provenance`, and `Homebrew Formula Validation` | Infrastructure exists. The macOS platform, coverage, and benchmark jobs are independent from the Ubuntu `check` job so Linux runner queueing cannot hide missing macOS proof. The standalone `v0.4.15` main CI run was cancelled to reduce duplicate queue pressure; the active `v0.4.15` release quality-gate jobs are queued before runner assignment. Final goal cannot close until the final head completes all required hosted jobs green. `macos-15-intel` is the Intel lane; `macos-latest` remains the arm64 lane. |
 | Docs explain install, configure, verify, and diagnose | `README.md`, `docs/macos.md`, `docs/macos-full-disk-access.md`, `docs/cleanup-rules-macos.md`, `docs/testing-and-logging.md`, sample configs in `docs/configs/` | Covered in docs. Keep docs update lint green for future CLI/config changes. |
 | Release is signed, notarized, notary-ticket verified, and distributed through Homebrew | `.github/workflows/release.yml`, `.github/workflows/cert-expiration.yml`, `.github/macos/sbh.entitlements.plist`, `packaging/homebrew/Formula/sbh.rb`, `docs/macos.md` release diagnostics, `src/cli/mod.rs::release_workflow_notarizes_macos_binaries_asynchronously` | Workflow and docs exist. `bd-ykwh.20` verifies Apple notary log ticketContents before packaging. Manual `v0.4.8` release artifacts are signed/notarized and the public Homebrew tap formula installs, audits, tests, and passes `sbh doctor --release`. Prior manual `v0.4.14` artifacts were signed/notarized and checksum-verified, and the repaired Developer ID P12 imports through the same macOS `security` path used by the workflow, but the `/tmp` artifact directory is gone and must be regenerated before any manual upload. Current automated hosted release workflow proof is `v0.4.15` run `25705033848`, still queued, and tap publication remains open under `bd-ykwh.3`, so the release system is not fully closeable yet. |
 
@@ -622,10 +622,10 @@ not the current blocker. Live checks at 2026-05-12 00:14 UTC now show:
   `067f55ea017321428b9a4722d70c0e518c6944b4`, but no `v0.4.15` release assets
   are published yet. Superseded `v0.4.14` Release run `25693688419` is
   cancelled.
-- GitHub Actions checks still show queued hosted CI/release work: Release run
-  `25705033848` is queued for `v0.4.15`, and main CI run `25705030478` is queued
-  for source/tag head `067f55e`. This remains non-green status, not completion
-  evidence.
+- GitHub Actions checks still show queued hosted release work: Release run
+  `25705033848` is queued for `v0.4.15`. Standalone main CI run `25705030478`
+  for the same source/tag head `067f55e` was cancelled to reduce duplicate queue
+  pressure. This remains non-green status, not completion evidence.
 - Local Homebrew validation: the public tap install/test path passed for
   `v0.4.8`, and historical generated-formula validation passed for `v0.4.14`.
 
