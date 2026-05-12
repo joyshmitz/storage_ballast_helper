@@ -514,6 +514,18 @@ export ARTIFACT_DIR="$HOME/release-work/storage_ballast_helper/releases/${TAG}"
 mkdir -p "$ARTIFACT_DIR"
 ```
 
+Build fallback artifacts with the same stable Rust toolchain and feature set as
+the hosted release workflow. This repository's local `rust-toolchain.toml` may
+select nightly for development, so force `+stable` in manual release commands:
+
+```bash
+export CI_FEATURES="--no-default-features --features cli,daemon,sqlite"
+cargo +stable build $CI_FEATURES --release --target aarch64-apple-darwin
+cargo +stable build $CI_FEATURES --release --target x86_64-apple-darwin
+cross +stable build $CI_FEATURES --release --target aarch64-unknown-linux-gnu
+cargo +stable build $CI_FEATURES --release --target x86_64-unknown-linux-gnu
+```
+
 The fallback artifact set is complete only when all of these files exist:
 
 - `sbh-${TAG}-aarch64-apple-darwin.tar.xz`
@@ -558,7 +570,7 @@ cat > release-provenance.json <<EOF
   "tag": "${TAG}",
   "sha": "${SOURCE_SHA}",
   "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "rustc_version": "$(rustc --version)",
+  "rustc_version": "$(rustc +stable --version)",
   "release_path": "manual-fallback"
 }
 EOF
