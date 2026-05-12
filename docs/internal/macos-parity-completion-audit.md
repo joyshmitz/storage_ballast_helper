@@ -69,11 +69,11 @@ operator-visible outcomes:
 
 ## Current Tracker And CI State
 
-- Live refresh at 2026-05-12 01:20 UTC inspected current `main`,
-  `origin/main`, and `origin/master` at
-  `d705122a27b4d675f3ad7d6aab6f4d9cd353fc39`. The annotated `v0.4.15`
-  tag resolves to commit `067f55ea017321428b9a4722d70c0e518c6944b4`, so
-  the active tag release proof is behind current `main`. The later commits are
+- Live refresh at 2026-05-12 01:20 UTC inspected the pushed `main`,
+  `origin/main`, and `origin/master` state before the follow-up audit commit.
+  The annotated `v0.4.15` tag resolves to commit
+  `067f55ea017321428b9a4722d70c0e518c6944b4`, so the active tag release proof is
+  behind the latest audit/tracker commits. Those later commits are
   docs/tracker-only closeout evidence and queue-state records, but a strict
   final-release closeout must either accept that distinction explicitly or
   create a fresh source-equivalent release candidate after hosted queues unblock.
