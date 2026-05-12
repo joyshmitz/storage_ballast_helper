@@ -1508,7 +1508,7 @@ On macOS, the Unix installer and self-update path also run `codesign --verify --
 
 #### Bypass and Audit Trail
 
-The `--no-verify` flag explicitly bypasses all artifact verification, including checksum, signature, and macOS trust checks. This is a loud operation: the outcome includes `bypass_used: true`, a warning message, and reason code `verify_bypass`. The structured `VerificationOutcome` captures the full decision trail (bypass, checksum status, signature status, reason codes, warnings) for audit logging.
+The `--no-verify` flag explicitly bypasses release-binary artifact verification, including checksum, signature, and macOS trust checks. This is a loud operation: the outcome includes `bypass_used: true`, a warning message, and reason code `verify_bypass`. The structured `VerificationOutcome` captures the full decision trail (bypass, checksum status, signature status, reason codes, warnings) for audit logging. On macOS, `sbh install --no-verify --offline <bundle-manifest.json>` forwards the same unsafe bypass into the release-binary install path; use it only for deliberate recovery from a trusted local bundle.
 
 For airgapped environments, the `--offline` flag accepts a local bundle manifest, allowing updates without network access while maintaining checksum verification.
 

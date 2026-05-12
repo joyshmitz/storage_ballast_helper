@@ -298,9 +298,9 @@ On macOS, that same `--verify` path also runs
 `codesign --display --verbose=4` against the downloaded `sbh` binary before
 writing it to the destination directory. The display output must identify the
 exact authority `Authority=Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)`
-and `TeamIdentifier=AU8V2Z6NKY`. The explicit `--no-verify` flag bypasses these
-installer trust checks and should only be used for deliberate recovery from a
-trusted local artifact.
+and `TeamIdentifier=AU8V2Z6NKY`. The explicit `sbh install --no-verify` or
+`sbh update --no-verify` flags bypass these installer trust checks and should
+only be used for deliberate recovery from a trusted local artifact.
 
 Tagged macOS releases also run an explicit notarization phase. Apple accepts
 notary uploads as ZIP archives, disk images, or signed flat packages, while the
@@ -507,7 +507,7 @@ Use a durable working directory outside `/tmp` so cleanup tools do not remove
 the prepared bundle before publication:
 
 ```bash
-export VERSION=0.4.17
+export VERSION=0.4.18
 export TAG="v${VERSION}"
 export SOURCE_SHA="$(git rev-parse "${TAG}^{commit}")"
 export ARTIFACT_DIR="$HOME/release-work/storage_ballast_helper/releases/${TAG}"
@@ -605,7 +605,7 @@ macOS, it also verifies the extracted candidate binary before the atomic replace
 4. Rename the verified candidate into place atomically and roll back to the
    previous binary if any pre-swap check or rename fails.
 
-The unsafe `sbh update --no-verify` escape hatch bypasses checksum, Sigstore, and Developer ID checks. Use it only for deliberate recovery from a trusted local bundle.
+The unsafe `sbh update --no-verify` escape hatch bypasses checksum, Sigstore, and Developer ID checks. The `sbh install --no-verify` escape hatch forwards that same bypass into the macOS release-binary install path before service setup. Use them only for deliberate recovery from a trusted local bundle.
 
 ## Watched Paths
 

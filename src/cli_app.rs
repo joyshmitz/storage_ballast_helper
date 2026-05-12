@@ -198,6 +198,9 @@ struct InstallArgs {
     /// Use offline bundle manifest for airgapped preflight checks.
     #[arg(long, value_name = "PATH")]
     offline: Option<PathBuf>,
+    /// Skip release binary artifact verification (unsafe; for debugging only).
+    #[arg(long)]
+    no_verify: bool,
     /// Show what would be done without executing.
     #[arg(long)]
     dry_run: bool,
@@ -1227,7 +1230,7 @@ fn build_macos_release_install_options(
         pinned_version: None,
         force: true,
         install_dir: macos_install_dir_for_service(service),
-        no_verify: false,
+        no_verify: args.no_verify,
         dry_run: args.dry_run,
         max_backups: 5,
         metadata_cache_file: config.update.metadata_cache_file.clone(),
@@ -10634,6 +10637,14 @@ mod tests {
             vec!["sbh", "install", "--scope", "system"],
             vec!["sbh", "install", "--from-source"],
             vec!["sbh", "install", "--from-source", "--scope", "user"],
+            vec!["sbh", "install", "--offline", "/tmp/bundle-manifest.json"],
+            vec![
+                "sbh",
+                "install",
+                "--no-verify",
+                "--offline",
+                "/tmp/bundle-manifest.json",
+            ],
         ] {
             let parsed = Cli::try_parse_from(case.iter().copied());
             assert!(parsed.is_ok(), "failed to parse install case: {case:?}");
@@ -10681,6 +10692,26 @@ mod tests {
             PathBuf::from("/tmp/sbh-install-cache.json")
         );
         assert!(opts.install_dir.ends_with(".local/bin"));
+    }
+
+    #[test]
+    fn macos_release_install_can_explicitly_bypass_verification() {
+        let args = InstallArgs {
+            no_verify: true,
+            ..InstallArgs::default()
+        };
+        let config = Config::default();
+        let service = Some(ResolvedInstallService {
+            kind: ServiceKind::Launchd,
+            user_scope: true,
+        });
+
+        let opts = build_macos_release_install_options(&args, &config, service);
+
+        assert!(
+            opts.no_verify,
+            "install --no-verify must forward the explicit unsafe bypass into the release binary install path"
+        );
     }
 
     #[test]

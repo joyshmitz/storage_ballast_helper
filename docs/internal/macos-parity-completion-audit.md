@@ -695,17 +695,33 @@ not the current blocker. Live checks at 2026-05-12 00:36 UTC now show:
   `macos_synthetic_writer_surfaces_in_blame_top_rows` because hosted APFS process
   write accounting reported 99,880,960 bytes for a 112 MiB synthetic writer while
   the test required at least 100 MiB. The run was then cancelled to avoid wasting
-  downstream release work. The next candidate is `v0.4.17`, which keeps the
+  downstream release work. Candidate `v0.4.17` kept the
   release concurrency fix and relaxes that macOS blame test to require a
   substantial 90 MiB visible write while still requiring the writer PID and open
   file path.
+- The `v0.4.17` hosted release attempt at
+  `14e2f03309c8622c6e02186ad4b04026f82bbea3` proved the blame threshold fix:
+  macOS coverage, Intel platform tests, Format + Lint, macOS performance
+  budgets, Homebrew formula validation, and tap deploy-key preflight passed.
+  Release run `25710141215` did not publish because the Apple Silicon launchd
+  lifecycle fixture packaged the just-built ad-hoc-signed CI binary into an
+  offline bundle and then used the default macOS install path, which correctly
+  rejected it for lacking the expected Developer ID Application identity. The
+  run was cancelled after that required gate failed to avoid wasting downstream
+  release work. The next candidate is `v0.4.18`, which keeps Developer ID trust
+  enforcement as the default, forwards the existing explicit `--no-verify`
+  bypass through `sbh install`, and uses that bypass only for the launchd
+  lifecycle test's trusted local offline fixture.
 - Account-wide queued Actions cleanup was used to unblock hosted runner
   assignment for the `v0.4.16` release attempt. The first pass cancelled 935
   queued runs older than one hour, excluding the active `storage_ballast_helper`
   release; 8 cancellation attempts failed because those runs had already
   completed. A second pass cancelled 351 queued runs older than 15 minutes with
   the same exclusion; 36 attempts were already completed or otherwise no longer
-  cancellable. In-progress runs were not cancelled.
+  cancellable. In-progress runs were not cancelled. A later `v0.4.17` queue
+  pass cancelled 147 queued runs older than 15 minutes outside
+  `storage_ballast_helper`; 8 cancellation attempts failed after the target run
+  changed state.
 - Local Homebrew validation: the public tap install/test path passed for
   `v0.4.8`, and historical generated-formula validation passed for `v0.4.14`.
 
@@ -713,10 +729,10 @@ Remaining release blockers:
 
 - Complete the hosted reusable release quality gate on the fixed final source
   commit and version metadata.
-- Let a fresh automated signed/notarized tag release workflow for `v0.4.17`
+- Let a fresh automated signed/notarized tag release workflow for `v0.4.18`
   complete through upload and tap publication, or get explicit operator approval
-  to regenerate and manually publish freshly verified `v0.4.17` artifacts. The
-  stale `v0.4.10` through `v0.4.16` release runs have already been cancelled or
+  to regenerate and manually publish freshly verified `v0.4.18` artifacts. The
+  stale `v0.4.10` through `v0.4.17` release runs have already been cancelled or
   superseded.
 - Verify the public Homebrew tap advances from `v0.4.8` to the final release
   version and that formula install/test still passes from the published release

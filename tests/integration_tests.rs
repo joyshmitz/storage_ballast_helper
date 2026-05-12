@@ -1680,6 +1680,7 @@ fn run_launchd_install(
             "user".to_string(),
             "--ballast-count".to_string(),
             "0".to_string(),
+            "--no-verify".to_string(),
             "--offline".to_string(),
             offline_bundle.to_string_lossy().into_owned(),
         ],
