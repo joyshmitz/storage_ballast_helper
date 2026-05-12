@@ -3,7 +3,7 @@
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`, `bd-r7m7.17`
 Parent: `bd-r7m7`
-Last audited: 2026-05-12 00:55 UTC
+Last audited: 2026-05-12 01:04 UTC
 Evidence snapshot: the audit records the live head and run state observed at
 refresh time, but every audit-only commit makes those literals stale. Before any
 close decision, refresh the live head and newest run with:
@@ -79,17 +79,16 @@ operator-visible outcomes:
   either accept that distinction explicitly or create a fresh source-equivalent
   release candidate after hosted queues unblock.
 - Main CI run `25706394564` for
-  `2ecbb053bc61e2f8bd35c4889e84b0d809e143f1` is queued before runner
-  assignment with all seven root jobs still queued: `Homebrew Tap Deploy Key
-  Preflight`, `Format + Lint`, Intel and Apple Silicon `macOS Platform Tests`,
-  `macOS Coverage`, `macOS Performance Budgets`, and `Homebrew Formula
-  Validation`. Release run `25705033848` for `v0.4.15` remains queued before
-  runner assignment with zero billable duration and the same unassigned
-  release-level / quality-gate jobs, except that the reusable CI tap-preflight
-  job is skipped as expected. `gh release view v0.4.15` still reports
-  `release not found`, and the public tap formula content SHA remains
-  `6e4c74f521b3a2f58e2f8a216d04bc0da3164fef` with URLs/checksums still
-  pointing at `v0.4.8`.
+  `2ecbb053bc61e2f8bd35c4889e84b0d809e143f1` was cancelled at
+  2026-05-12 01:03 UTC because it duplicated the active Release workflow's
+  quality-gate jobs without being the distribution or Homebrew tap publication
+  path. Release run `25705033848` for `v0.4.15` remains queued before runner
+  assignment with zero billable duration and the same unassigned release-level /
+  quality-gate jobs, except that the reusable CI tap-preflight job is skipped as
+  expected. `gh release view v0.4.15` still reports `release not found`, and the
+  public tap formula content SHA remains
+  `6e4c74f521b3a2f58e2f8a216d04bc0da3164fef` with URLs/checksums still pointing
+  at `v0.4.8`.
 - Current-head supplemental proof for commit `2ecbb05` passed
   `cargo fmt --check`, `git diff --check -- docs/macos.md src/cli/mod.rs`,
   and
