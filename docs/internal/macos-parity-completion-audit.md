@@ -337,6 +337,12 @@ avoids pinning exact commit hashes or GitHub Actions run ids as durable proof.
   json` returned parseable history JSON. GitHub Actions secrets now include the
   Developer ID P12, P12 password, signing identity, Team ID, and App Store
   Connect API-key notarization secrets.
+- Release-readiness recheck at 2026-05-12 00:36 UTC with installed `sbh 0.4.8`
+  passed `sbh --json doctor --release` with `ok=true`, `passed=4`,
+  `warnings=0`, and `failed=0`: Developer ID identity, `sbh-notary`, all
+  required GitHub release secrets, and the public Homebrew tap formula are all
+  visible. This removes credential setup as the live blocker, but it does not
+  publish `v0.4.15` artifacts or replace hosted release workflow proof.
 - `HOMEBREW_TAP_SSH_KEY` is now configured in GitHub Actions. The tap repository
   has a write-enabled deploy key named `sbh release workflow deploy key
   2026-05-10`, and local Git/SSH validation confirmed the key sees `main` and
@@ -599,12 +605,15 @@ containing `bd-twgw` and `bd-j40b`, then restore the protected worktree files.
 ## Live Release Blocker Evidence
 
 The user confirmed Apple Developer Program enrollment, so enrollment itself is
-not the current blocker. Live checks at 2026-05-12 00:14 UTC now show:
+not the current blocker. Live checks at 2026-05-12 00:36 UTC now show:
 
 - `security find-identity -v -p codesigning`: one valid Developer ID
   Application identity for `Jeffrey Emanuel (AU8V2Z6NKY)`.
 - `xcrun notarytool history --keychain-profile sbh-notary --output-format json`
   and the local `.p8` API-key invocation both return parseable history JSON.
+- `sbh --json doctor --release`: `ok=true`, with PASS for
+  `release.developer_id_identity`, `release.notary_profile`,
+  `release.github_secrets`, and `release.homebrew_tap`.
 - `gh secret list --repo Dicklesworthstone/storage_ballast_helper`: signing
   secrets were updated at 2026-05-11T20:31Z, notary secrets at
   2026-05-11T20:25Z, and Homebrew tap credentials are present.
@@ -626,6 +635,12 @@ not the current blocker. Live checks at 2026-05-12 00:14 UTC now show:
   `25705033848` is queued for `v0.4.15`. Standalone main CI run `25705030478`
   for the same source/tag head `067f55e` was cancelled to reduce duplicate queue
   pressure. This remains non-green status, not completion evidence.
+- A read-only account-wide Actions scan found 535 queued or in-progress runs
+  across the first 120 `Dicklesworthstone` repositories. The largest queued
+  groups were `pi_agent_rust`, `frankenfs`, and `asupersync` at 100 visible
+  queued runs each, while `storage_ballast_helper` had only the single active
+  `v0.4.15` Release run. No account-wide queue cancellation was performed; that
+  would affect unrelated projects and needs explicit operator approval.
 - Local Homebrew validation: the public tap install/test path passed for
   `v0.4.8`, and historical generated-formula validation passed for `v0.4.14`.
 
