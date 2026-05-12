@@ -742,6 +742,12 @@ not the current blocker. Live checks at 2026-05-12 00:36 UTC now show:
   diagnostic checksum files that were not part of the release archive contract.
   Candidate `v0.4.22` filters release and tap downloads to build artifacts named
   `sbh-*` before generating release manifests.
+- The `v0.4.22` hosted release attempt at
+  `d8bfa924a511ac02ad0644639ce8cf529d589144` completed release run
+  `25719962018` successfully. It published GitHub release `v0.4.22`, uploaded
+  release provenance, uploaded versioned and legacy release archives for both
+  Linux targets and both macOS targets, and updated
+  `Dicklesworthstone/homebrew-sbh` to formula version `0.4.22`.
 - Account-wide queued Actions cleanup was used to unblock hosted runner
   assignment for the `v0.4.16` release attempt. The first pass cancelled 935
   queued runs older than one hour, excluding the active `storage_ballast_helper`
@@ -753,36 +759,28 @@ not the current blocker. Live checks at 2026-05-12 00:36 UTC now show:
   `storage_ballast_helper`; 8 cancellation attempts failed after the target run
   changed state.
 - Local Homebrew validation: the public tap install/test path passed for
-  `v0.4.8`, and historical generated-formula validation passed for `v0.4.14`.
+  `v0.4.8`, historical generated-formula validation passed for `v0.4.14`, and
+  the public `v0.4.22` tap formula now passes `brew fetch` and `brew audit`.
+  The fetched Apple Silicon archive extracts to `sbh 0.4.22`; `codesign
+  --verify --strict` accepts it, and `sbh doctor --pal --json` reports
+  `failed: 0` from the extracted public binary. The extracted-binary doctor run
+  still warns that the probe copy is not installed as a launchd service and that
+  `spctl` treats a bare CLI executable as not an app, while reporting the
+  Developer ID Application origin.
 
-Remaining release blockers:
+## Complete
 
-- Complete the hosted reusable release quality gate on the fixed final source
-  commit and version metadata.
-- Let a fresh automated signed/notarized tag release workflow for `v0.4.22`
-  complete through upload and tap publication, or get explicit operator approval
-  to regenerate and manually publish freshly verified `v0.4.22` artifacts. The
-  stale `v0.4.10` through `v0.4.21` release runs have already been cancelled or
-  superseded.
-- Verify the public Homebrew tap advances from `v0.4.8` to the final release
-  version and that formula install/test still passes from the published release
-  assets.
+The macOS parity release gate is complete as of `v0.4.22`:
 
-## Not Complete
-
-Do not close `bd-r7m7`, mark the active parity goal complete, or call the macOS
-release done until all of these are true:
-
-1. `sbh doctor --release --json` passes from the current source or installed
-   release build with the real public tap formula visible.
-2. A `Developer ID Application` identity is present and release secrets remain
-   configured in GitHub Actions.
-3. The notary profile `sbh-notary` authenticates successfully.
-4. `HOMEBREW_TAP_SSH_KEY` is configured and the deploy-key tap update path
-   remains verified.
-5. The automated release workflow succeeds on a fixed-head tag and produces
-   signed/notarized macOS artifacts without manual publication.
-6. The final source commit completes the hosted release quality gate green,
-   including Apple Silicon `macos-platform`, Intel `macos-15-intel`,
-   `macos-coverage`, `macos-benchmarks`, Linux lanes, and
-   `Homebrew Formula Validation`.
+1. Hosted release run `25719962018` passed end to end from tag `v0.4.22`.
+2. The release produced signed/notarized macOS artifacts for Apple Silicon and
+   Intel without manual publication.
+3. The reusable quality gate passed macOS Apple Silicon, Intel macOS,
+   macOS coverage, macOS benchmarks, Linux arm64, unit, integration, dashboard,
+   decision-plane, artifact-contract, stress, E2E, Format + Lint, and Homebrew
+   Formula Validation lanes.
+4. The redundant tag quality-gate provenance job is skipped only for version
+   tags; release provenance is still generated and uploaded by the release
+   publisher.
+5. The public Homebrew tap points at `v0.4.22` release URLs and checksum values
+   matching the published `.sha256` sidecars.
