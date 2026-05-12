@@ -329,6 +329,212 @@ fn json_flag_accepted_by_status() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn isolated_config_exercises_safe_operational_commands() {
+    let temp = tempfile::tempdir().expect("create isolated smoke fixture");
+    let smoke_root = temp.path().join("smoke-root");
+    let smoke_state = temp.path().join("smoke-state");
+    let sample_target = smoke_root.join("sample_target").join("debug");
+    let config_protected = smoke_root.join("config-protected");
+    let marker_protected = smoke_root.join("protected");
+    let ballast_dir = smoke_state.join("ballast");
+
+    fs::create_dir_all(&sample_target).expect("create synthetic target directory");
+    fs::create_dir_all(&config_protected).expect("create config-protected directory");
+    fs::create_dir_all(&marker_protected).expect("create marker-protected directory");
+    fs::create_dir_all(&ballast_dir).expect("create isolated ballast directory");
+
+    let artifact = sample_target.join("object.o");
+    fs::write(&artifact, b"payload\n").expect("write synthetic build artifact");
+
+    let config_path = smoke_state.join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"[paths]
+config_file = "{}"
+state_file = "{}"
+sqlite_db = "{}"
+jsonl_log = "{}"
+ballast_dir = "{}"
+
+[scanner]
+root_paths = ["{}"]
+protected_paths = ["{}"]
+min_file_age_minutes = 0
+max_depth = 4
+parallelism = 1
+dry_run = true
+
+[ballast]
+file_count = 1
+file_size_bytes = 1048576
+"#,
+            toml_path(&config_path),
+            toml_path(&smoke_state.join("state.json")),
+            toml_path(&smoke_state.join("activity.sqlite3")),
+            toml_path(&smoke_state.join("activity.jsonl")),
+            toml_path(&ballast_dir),
+            toml_path(&smoke_root),
+            toml_path(&config_protected),
+        ),
+    )
+    .expect("write isolated smoke config");
+
+    let config = config_path.to_string_lossy().into_owned();
+    let root = smoke_root.to_string_lossy().into_owned();
+    let protected = marker_protected.to_string_lossy().into_owned();
+    let bin_dir = common::sbh_bin_path()
+        .parent()
+        .expect("integration binary should have parent dir")
+        .to_string_lossy()
+        .into_owned();
+
+    let config_validate = run_owned_cli_case(
+        "isolated_smoke_config_validate",
+        &["--config", &config, "config", "validate"],
+    );
+    assert_cli_success(&config_validate, "isolated config validate");
+
+    for (case_name, args, expected_command) in [
+        (
+            "isolated_smoke_status_sacred",
+            vec!["--config", &config, "--json", "status", "--sacred"],
+            "status",
+        ),
+        (
+            "isolated_smoke_check",
+            vec![
+                "--config",
+                &config,
+                "--json",
+                "check",
+                &root,
+                "--need",
+                "1M",
+                "--target-free",
+                "0",
+            ],
+            "check",
+        ),
+        (
+            "isolated_smoke_scan",
+            vec![
+                "--config",
+                &config,
+                "--json",
+                "scan",
+                &root,
+                "--top",
+                "5",
+                "--min-score",
+                "0.1",
+                "--explain",
+            ],
+            "scan",
+        ),
+        (
+            "isolated_smoke_clean_dry_run",
+            vec![
+                "--config",
+                &config,
+                "--json",
+                "clean",
+                &root,
+                "--dry-run",
+                "--yes",
+                "--max-items",
+                "2",
+                "--min-score",
+                "0.1",
+            ],
+            "clean",
+        ),
+        (
+            "isolated_smoke_blame",
+            vec![
+                "--config", &config, "--json", "blame", "--top", "3", "--since", "1m",
+            ],
+            "blame",
+        ),
+        (
+            "isolated_smoke_ballast_status",
+            vec!["--config", &config, "--json", "ballast", "status"],
+            "ballast status",
+        ),
+        (
+            "isolated_smoke_tune",
+            vec!["--config", &config, "--json", "tune"],
+            "tune",
+        ),
+        (
+            "isolated_smoke_setup_verify_dry_run",
+            vec![
+                "--config",
+                &config,
+                "--json",
+                "setup",
+                "--verify",
+                "--dry-run",
+                "--bin-dir",
+                &bin_dir,
+            ],
+            "setup",
+        ),
+        (
+            "isolated_smoke_protect_create",
+            vec!["--config", &config, "--json", "protect", &protected],
+            "protect",
+        ),
+        (
+            "isolated_smoke_protect_list",
+            vec!["--config", &config, "--json", "protect", "--list"],
+            "protect",
+        ),
+    ] {
+        let result = run_owned_cli_case(case_name, &args);
+        assert_cli_success(&result, case_name);
+        let payload = parse_json_stdout(&result);
+        assert_eq!(
+            payload["command"].as_str(),
+            Some(expected_command),
+            "{case_name} reported unexpected command payload: {payload}; log={}",
+            result.log_path.display()
+        );
+    }
+
+    assert!(
+        artifact.exists(),
+        "clean --dry-run must not remove the synthetic artifact"
+    );
+}
+
+fn run_owned_cli_case(case_name: &str, args: &[&str]) -> common::CmdResult {
+    common::run_cli_case(case_name, args)
+}
+
+fn assert_cli_success(result: &common::CmdResult, context: &str) {
+    assert!(
+        result.status.success(),
+        "{context} failed; stdout={:?}; stderr={:?}; log={}",
+        result.stdout,
+        result.stderr,
+        result.log_path.display()
+    );
+}
+
+fn parse_json_stdout(result: &common::CmdResult) -> Value {
+    serde_json::from_str(result.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "expected JSON stdout: {err}; stdout={:?}; stderr={:?}; log={}",
+            result.stdout,
+            result.stderr,
+            result.log_path.display()
+        )
+    })
+}
+
+#[test]
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_lines)]
 fn scan_reports_home_trash_without_candidate() {
