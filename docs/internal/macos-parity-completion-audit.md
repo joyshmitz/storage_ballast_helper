@@ -635,12 +635,17 @@ not the current blocker. Live checks at 2026-05-12 00:36 UTC now show:
   `25705033848` is queued for `v0.4.15`. Standalone main CI run `25705030478`
   for the same source/tag head `067f55e` was cancelled to reduce duplicate queue
   pressure. This remains non-green status, not completion evidence.
-- A read-only account-wide Actions scan found 535 queued or in-progress runs
-  across the first 120 `Dicklesworthstone` repositories. The largest queued
-  groups were `pi_agent_rust`, `frankenfs`, and `asupersync` at 100 visible
-  queued runs each, while `storage_ballast_helper` had only the single active
-  `v0.4.15` Release run. No account-wide queue cancellation was performed; that
-  would affect unrelated projects and needs explicit operator approval.
+- A read-only account-wide Actions scan found 1007 visible queued runs across
+  the first 120 `Dicklesworthstone` repositories. A dry-run cancellation policy
+  of queued runs older than one hour, excluding
+  `Dicklesworthstone/storage_ballast_helper`, produced 979 candidate runs. The
+  largest candidate groups were `frankenfs` (388), `pi_agent_rust` (241), and
+  `asupersync` (144). No account-wide queue cancellation was performed; that
+  would affect unrelated projects and needs explicit operator approval. The
+  candidate manifest was stored in the local temp file
+  `/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/tmp.OPt7aHJwdG` at the
+  time of the scan, but it is temp storage and should be regenerated before
+  execution.
 - Local Homebrew validation: the public tap install/test path passed for
   `v0.4.8`, and historical generated-formula validation passed for `v0.4.14`.
 
