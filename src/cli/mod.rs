@@ -2665,7 +2665,8 @@ mod tests {
             "codesign --verify --strict --verbose=2",
             "codesign --display --verbose=4",
             "Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)",
-            "The explicit `--no-verify` flag bypasses these",
+            "The explicit `sbh install --no-verify` or",
+            "`sbh update --no-verify` flags bypass these",
             "installer trust checks",
         ] {
             assert!(

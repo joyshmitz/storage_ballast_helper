@@ -708,10 +708,20 @@ not the current blocker. Live checks at 2026-05-12 00:36 UTC now show:
   offline bundle and then used the default macOS install path, which correctly
   rejected it for lacking the expected Developer ID Application identity. The
   run was cancelled after that required gate failed to avoid wasting downstream
-  release work. The next candidate is `v0.4.18`, which keeps Developer ID trust
+  release work. Candidate `v0.4.18` kept Developer ID trust
   enforcement as the default, forwards the existing explicit `--no-verify`
   bypass through `sbh install`, and uses that bypass only for the launchd
   lifecycle test's trusted local offline fixture.
+- The `v0.4.18` hosted release attempt at
+  `c6335ee5c0af81777014c704e2b05c9f13f7ed83` did not publish. Release run
+  `25713928783` failed early in the Intel macOS unit-test gate because the
+  documentation-contract test
+  `unix_installer_verifies_macos_binary_trust_before_install` still expected the
+  previous exact `--no-verify` wording after the docs were updated to mention
+  `sbh install --no-verify` and `sbh update --no-verify` separately. The run was
+  cancelled after that required gate failed. The next candidate is `v0.4.19`,
+  which updates that contract assertion to the new explicit install/update
+  wording.
 - Account-wide queued Actions cleanup was used to unblock hosted runner
   assignment for the `v0.4.16` release attempt. The first pass cancelled 935
   queued runs older than one hour, excluding the active `storage_ballast_helper`
@@ -729,10 +739,10 @@ Remaining release blockers:
 
 - Complete the hosted reusable release quality gate on the fixed final source
   commit and version metadata.
-- Let a fresh automated signed/notarized tag release workflow for `v0.4.18`
+- Let a fresh automated signed/notarized tag release workflow for `v0.4.19`
   complete through upload and tap publication, or get explicit operator approval
-  to regenerate and manually publish freshly verified `v0.4.18` artifacts. The
-  stale `v0.4.10` through `v0.4.17` release runs have already been cancelled or
+  to regenerate and manually publish freshly verified `v0.4.19` artifacts. The
+  stale `v0.4.10` through `v0.4.18` release runs have already been cancelled or
   superseded.
 - Verify the public Homebrew tap advances from `v0.4.8` to the final release
   version and that formula install/test still passes from the published release
