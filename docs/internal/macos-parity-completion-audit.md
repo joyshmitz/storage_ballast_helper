@@ -69,22 +69,24 @@ operator-visible outcomes:
 
 ## Current Tracker And CI State
 
-- Live refresh at 2026-05-12 00:55 UTC inspected current `main`,
+- Live refresh at 2026-05-12 01:20 UTC inspected current `main`,
   `origin/main`, and `origin/master` at
-  `2ecbb053bc61e2f8bd35c4889e84b0d809e143f1`. The annotated `v0.4.15`
+  `d705122a27b4d675f3ad7d6aab6f4d9cd353fc39`. The annotated `v0.4.15`
   tag resolves to commit `067f55ea017321428b9a4722d70c0e518c6944b4`, so
-  the active tag release proof is one docs/test contract commit behind
-  current `main`. That later commit only hardens manual fallback documentation
-  and the static docs contract test, but a strict final-release closeout must
-  either accept that distinction explicitly or create a fresh source-equivalent
-  release candidate after hosted queues unblock.
+  the active tag release proof is behind current `main`. The later commits are
+  docs/tracker-only closeout evidence and queue-state records, but a strict
+  final-release closeout must either accept that distinction explicitly or
+  create a fresh source-equivalent release candidate after hosted queues unblock.
 - Main CI run `25706394564` for
   `2ecbb053bc61e2f8bd35c4889e84b0d809e143f1` was cancelled at
   2026-05-12 01:03 UTC because it duplicated the active Release workflow's
   quality-gate jobs without being the distribution or Homebrew tap publication
-  path. Release run `25705033848` for `v0.4.15` remains queued before runner
-  assignment with zero billable duration and the same unassigned release-level /
-  quality-gate jobs, except that the reusable CI tap-preflight job is skipped as
+  path. Release run `25705033848` for `v0.4.15` remains queued overall, but its
+  `Quality Gate / macOS Platform Tests (intel)` job completed successfully on
+  2026-05-12 01:17 UTC after receiving a `macos-15-intel` runner. The release
+  level `Homebrew Tap Deploy Key Preflight`, reusable `Format + Lint`, Apple
+  Silicon macOS platform, macOS coverage, macOS performance, and Homebrew
+  formula jobs remain queued; the reusable CI tap-preflight job is skipped as
   expected. `gh release view v0.4.15` still reports `release not found`, and the
   public tap formula content SHA remains
   `6e4c74f521b3a2f58e2f8a216d04bc0da3164fef` with URLs/checksums still pointing
@@ -107,13 +109,24 @@ operator-visible outcomes:
   and not a release artifact.
 - The current hosted release proof is tag `v0.4.15`, pointing at
   `067f55ea017321428b9a4722d70c0e518c6944b4`. Release workflow run
-  `25705033848` is queued overall before runner assignment. The release-level
-  `Homebrew Tap Deploy Key Preflight`, reusable `Quality Gate / Format + Lint`,
-  Intel and Apple Silicon `macOS Platform Tests`, `macOS Coverage`,
-  `macOS Performance Budgets`, and `Homebrew Formula Validation` jobs are still
-  queued. The reusable `Quality Gate / Homebrew Tap Deploy Key Preflight` job is
-  skipped by the CI workflow, as expected, because release.yml has its own
-  release-level tap preflight. No `v0.4.15` GitHub Release exists yet.
+  `25705033848` is queued overall. `Quality Gate / macOS Platform Tests (intel)`
+  completed success on `macos-15-intel`; the release-level `Homebrew Tap Deploy
+  Key Preflight`, reusable `Quality Gate / Format + Lint`, Apple Silicon
+  `macOS Platform Tests`, `macOS Coverage`, `macOS Performance Budgets`, and
+  `Homebrew Formula Validation` jobs are still queued. The reusable
+  `Quality Gate / Homebrew Tap Deploy Key Preflight` job is skipped by the CI
+  workflow, as expected, because release.yml has its own release-level tap
+  preflight. No `v0.4.15` GitHub Release exists yet.
+- The current `v0.4.15` Intel hosted artifacts were downloaded under
+  `~/release-work/storage_ballast_helper/hosted-proof/v0.4.15-run-25705033848-intel`.
+  `sbh-intel.sha256` records
+  `9cfd0c9283d05cdcfa6c88bc541cdca1f979ed7bbaf9e3fd59c40e93b2777ac4`, matching
+  `shasum -a 256 sbh-intel`; `arch -x86_64 ./sbh-intel --version` reports
+  `sbh 0.4.15`; and `codesign --verify --strict --verbose=2 ./sbh-intel`
+  passes. Hosted logs show 1213 library tests passed, 116 binary tests passed,
+  55 integration tests passed, ad-hoc codesign verification passed, and the
+  isolated macOS E2E smoke exercised safe operational commands including
+  `status`, `clean --dry-run`, and `setup --verify`.
 - The standalone main CI run `25705030478` for `067f55e` was cancelled at
   2026-05-12 00:24 UTC to reduce duplicate queue pressure after confirming the
   active `v0.4.15` Release run invokes the same reusable quality-gate workflow.
@@ -123,10 +136,10 @@ operator-visible outcomes:
   `25705033848`.
 - A non-mutating queue sanity check for active `v0.4.15` Release run
   `25705033848` found repository Actions enabled with `allowed_actions=all`, no
-  pending deployments, and zero repository self-hosted runners. The queued
-  release and CI jobs still have no runner assignment, so the current blocker
-  remains hosted runner capacity or queue policy rather than an in-repo
-  dependency graph failure.
+  pending deployments, and zero repository self-hosted runners. The remaining
+  queued release and quality-gate jobs still have no runner assignment, so the
+  current blocker remains hosted runner capacity or queue policy rather than an
+  in-repo dependency graph failure.
 - Current source proof for the latest source/workflow head is healthy outside
   hosted GitHub runners. Local macOS runtime checks against the installed public
   binary showed platform auto-detection working for `sbh status --json`,
@@ -656,25 +669,28 @@ not the current blocker. Live checks at 2026-05-12 00:36 UTC now show:
   `6e4c74f521b3a2f58e2f8a216d04bc0da3164fef`, but still points at `v0.4.8`.
 - GitHub release/tag checks: `v0.4.8` is published with macOS and Linux
   archives, checksum sidecars, `SHA256SUMS.txt`, and provenance.
-- GitHub release/tag checks: `v0.4.15` is tagged at current head
+- GitHub release/tag checks: `v0.4.15` is tagged at release-candidate head
   `067f55ea017321428b9a4722d70c0e518c6944b4`, but no `v0.4.15` release assets
   are published yet. Superseded `v0.4.14` Release run `25693688419` is
   cancelled.
 - GitHub Actions checks still show queued hosted release work: Release run
-  `25705033848` is queued for `v0.4.15`. Standalone main CI run `25705030478`
-  for the same source/tag head `067f55e` was cancelled to reduce duplicate queue
-  pressure. This remains non-green status, not completion evidence.
-- A read-only account-wide Actions scan found 1007 visible queued runs across
-  the first 120 `Dicklesworthstone` repositories. A dry-run cancellation policy
-  of queued runs older than one hour, excluding
-  `Dicklesworthstone/storage_ballast_helper`, produced 979 candidate runs. The
-  largest candidate groups were `frankenfs` (388), `pi_agent_rust` (241), and
-  `asupersync` (144). No account-wide queue cancellation was performed; that
-  would affect unrelated projects and needs explicit operator approval. The
-  candidate manifest was stored in the local temp file
-  `/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/tmp.OPt7aHJwdG` at the
-  time of the scan, but it is temp storage and should be regenerated before
-  execution.
+  `25705033848` is queued overall for `v0.4.15`; its Intel macOS platform job
+  completed success, while release-level tap preflight, Format + Lint, Apple
+  Silicon macOS platform, coverage, performance, and Homebrew formula jobs
+  remain queued. Standalone main CI run `25705030478` for the same source/tag
+  head `067f55e` and later standalone main CI run `25706394564` for docs/test
+  head `2ecbb05` were cancelled to reduce duplicate queue pressure. This
+  remains non-green status, not completion evidence.
+- A read-only account-wide Actions scan found 532 visible queued runs across
+  the first 200 non-archived `Dicklesworthstone` repositories. A dry-run
+  cancellation policy of queued runs older than one hour, excluding
+  `Dicklesworthstone/storage_ballast_helper`, produced 484 candidate runs with
+  zero candidates from this repository. The largest candidate groups were
+  `pi_agent_rust` (97), `asupersync` (95), `frankenfs` (92),
+  `agentic_coding_flywheel_setup` (23), and `mcp_agent_mail_rust` (21). No
+  account-wide queue cancellation was performed; that would affect unrelated
+  projects and needs explicit operator approval. The durable local manifest is
+  `~/release-work/storage_ballast_helper/queue-cleanup/stale-queued-runs-20260512T010930Z.json`.
 - Local Homebrew validation: the public tap install/test path passed for
   `v0.4.8`, and historical generated-formula validation passed for `v0.4.14`.
 
