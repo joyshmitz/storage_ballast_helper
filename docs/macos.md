@@ -507,7 +507,7 @@ Use a durable working directory outside `/tmp` so cleanup tools do not remove
 the prepared bundle before publication:
 
 ```bash
-export VERSION=0.4.16
+export VERSION=0.4.17
 export TAG="v${VERSION}"
 export SOURCE_SHA="$(git rev-parse "${TAG}^{commit}")"
 export ARTIFACT_DIR="$HOME/release-work/storage_ballast_helper/releases/${TAG}"

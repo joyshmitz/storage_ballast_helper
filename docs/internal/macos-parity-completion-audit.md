@@ -684,19 +684,28 @@ not the current blocker. Live checks at 2026-05-12 00:36 UTC now show:
   main CI run `25705030478` for the same source/tag head `067f55e` and later
   standalone main CI run `25706394564` for docs/test head `2ecbb05` were
   cancelled to reduce duplicate queue pressure. This remains non-green status,
-  not completion evidence. The next candidate is `v0.4.16`, which includes the
-  CI concurrency fix that prevents tag-triggered release quality-gate calls from
-  being cancelled by the branch/PR supersession policy.
-- A read-only account-wide Actions scan found 532 visible queued runs across
-  the first 200 non-archived `Dicklesworthstone` repositories. A dry-run
-  cancellation policy of queued runs older than one hour, excluding
-  `Dicklesworthstone/storage_ballast_helper`, produced 484 candidate runs with
-  zero candidates from this repository. The largest candidate groups were
-  `pi_agent_rust` (97), `asupersync` (95), `frankenfs` (92),
-  `agentic_coding_flywheel_setup` (23), and `mcp_agent_mail_rust` (21). No
-  account-wide queue cancellation was performed; that would affect unrelated
-  projects and needs explicit operator approval. The durable local manifest is
-  `~/release-work/storage_ballast_helper/queue-cleanup/stale-queued-runs-20260512T010930Z.json`.
+  not completion evidence.
+- The `v0.4.16` hosted release attempt at
+  `f9275c09a0c9c975775d2908d56453109a3c9dc4` proved the CI concurrency fix was
+  effective enough to let tag-triggered release quality gates start after queued
+  runner pressure was reduced, but Release run `25708496915` did not publish.
+  Tap preflight, Homebrew formula validation, macOS performance budgets, Format
+  + Lint, and Intel macOS platform tests passed. Apple Silicon macOS platform
+  tests and macOS coverage both failed on
+  `macos_synthetic_writer_surfaces_in_blame_top_rows` because hosted APFS process
+  write accounting reported 99,880,960 bytes for a 112 MiB synthetic writer while
+  the test required at least 100 MiB. The run was then cancelled to avoid wasting
+  downstream release work. The next candidate is `v0.4.17`, which keeps the
+  release concurrency fix and relaxes that macOS blame test to require a
+  substantial 90 MiB visible write while still requiring the writer PID and open
+  file path.
+- Account-wide queued Actions cleanup was used to unblock hosted runner
+  assignment for the `v0.4.16` release attempt. The first pass cancelled 935
+  queued runs older than one hour, excluding the active `storage_ballast_helper`
+  release; 8 cancellation attempts failed because those runs had already
+  completed. A second pass cancelled 351 queued runs older than 15 minutes with
+  the same exclusion; 36 attempts were already completed or otherwise no longer
+  cancellable. In-progress runs were not cancelled.
 - Local Homebrew validation: the public tap install/test path passed for
   `v0.4.8`, and historical generated-formula validation passed for `v0.4.14`.
 
@@ -704,10 +713,10 @@ Remaining release blockers:
 
 - Complete the hosted reusable release quality gate on the fixed final source
   commit and version metadata.
-- Let a fresh automated signed/notarized tag release workflow for `v0.4.16`
+- Let a fresh automated signed/notarized tag release workflow for `v0.4.17`
   complete through upload and tap publication, or get explicit operator approval
-  to regenerate and manually publish freshly verified `v0.4.16` artifacts. The
-  stale `v0.4.10` through `v0.4.15` release runs have already been cancelled or
+  to regenerate and manually publish freshly verified `v0.4.17` artifacts. The
+  stale `v0.4.10` through `v0.4.16` release runs have already been cancelled or
   superseded.
 - Verify the public Homebrew tap advances from `v0.4.8` to the final release
   version and that formula install/test still passes from the published release

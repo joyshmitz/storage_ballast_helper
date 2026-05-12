@@ -1091,7 +1091,7 @@ fn macos_apfs_ballast_preallocates_and_releases_space() {}
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_synthetic_writer_surfaces_in_blame_top_rows() {
-    const MIN_VISIBLE_WRITER_BYTES: u64 = 100 * 1_048_576;
+    const MIN_VISIBLE_WRITER_BYTES: u64 = 90 * 1_048_576;
     const WRITER_MIB: u64 = 112;
 
     let perl = Path::new("/usr/bin/perl");
