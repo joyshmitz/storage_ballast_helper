@@ -518,7 +518,7 @@ Source of truth: `docs/frankentui-compliance-plan.md`
 For any PR importing FrankentUI-derived code:
 
 - Follow the import review checklist in the compliance plan.
-- Verify stable toolchain compilation before merging.
+- Verify nightly toolchain compilation before merging.
 - Add attribution comments to files with substantial copied code.
 - Audit new transitive dependencies for permissive licensing.
 

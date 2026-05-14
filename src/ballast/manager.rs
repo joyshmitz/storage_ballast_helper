@@ -13,7 +13,7 @@
 #![allow(clippy::cast_precision_loss)]
 #![allow(clippy::cast_possible_truncation)]
 
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};

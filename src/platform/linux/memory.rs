@@ -1,6 +1,5 @@
 //! Linux memory readers for the PAL.
 
-#![cfg(target_os = "linux")]
 #![allow(missing_docs)]
 
 use std::collections::HashMap;

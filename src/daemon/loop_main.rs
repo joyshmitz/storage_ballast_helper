@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 
 use crate::ballast::coordinator::BallastPoolCoordinator;
 use crate::ballast::release::BallastReleaseController;
-use crate::core::config::Config;
+use crate::core::config::{Config, ScannerConfig};
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::notifications::{NotificationEvent, NotificationLevel, NotificationManager};
 use crate::daemon::policy::{
@@ -115,6 +115,11 @@ const TICK_THROTTLE_ESCALATE_TICKS: u8 = TICK_THROTTLE_SUSTAINED_TICKS * 2;
 const TICK_THROTTLE_FIRST_BACKOFF: Duration = Duration::from_secs(30);
 /// Maximum self-throttle interval under sustained daemon resource pressure.
 const TICK_THROTTLE_MAX_BACKOFF: Duration = Duration::from_mins(1);
+/// Worker shutdown poll interval. Workers use timeouts instead of indefinite
+/// channel receives so SIGTERM can stop the daemon even while senders are alive.
+const WORKER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Maximum time to wait for an individual worker thread during shutdown.
+const WORKER_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ──────────────────── shared executor config ────────────────────
 
@@ -983,6 +988,66 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
     }
 }
 
+fn path_is_same_or_descendant(candidate: &Path, ancestor: &Path) -> bool {
+    if candidate == ancestor || candidate.starts_with(ancestor) {
+        return true;
+    }
+
+    let (Ok(candidate), Ok(ancestor)) = (candidate.canonicalize(), ancestor.canonicalize()) else {
+        return false;
+    };
+    candidate == ancestor || candidate.starts_with(ancestor)
+}
+
+fn special_location_scan_roots(location: &Path, configured_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for root in configured_roots {
+        if path_is_same_or_descendant(root, location) {
+            push_unique_path(&mut roots, root.clone());
+        }
+    }
+
+    if roots.is_empty()
+        && configured_roots
+            .iter()
+            .any(|root| path_is_same_or_descendant(location, root))
+    {
+        push_unique_path(&mut roots, location.to_path_buf());
+    }
+
+    if roots.is_empty() {
+        push_unique_path(&mut roots, location.to_path_buf());
+    }
+
+    roots
+}
+
+fn effective_scan_budget(config: &ScannerConfig, pressure_level: PressureLevel) -> Duration {
+    let base_budget_secs = if config.scan_time_budget_secs > 0 {
+        config.scan_time_budget_secs
+    } else {
+        SCAN_TIME_BUDGET_SECS
+    };
+    let budget_secs = match pressure_level {
+        PressureLevel::Red | PressureLevel::Critical | PressureLevel::Orange => {
+            base_budget_secs.saturating_mul(2).min(600)
+        }
+        _ => base_budget_secs,
+    };
+    Duration::from_secs(budget_secs)
+}
+
+fn scan_deadline_reached(scan_start: Instant, scan_deadline: Instant, phase: &str) -> bool {
+    if Instant::now() < scan_deadline {
+        return false;
+    }
+    eprintln!(
+        "[SBH-SCANNER] {phase} budget reached ({:.1}s) — cancelling scan pass",
+        scan_start.elapsed().as_secs_f64()
+    );
+    true
+}
+
 fn ballast_discovery_paths(
     config: &Config,
     special_locations: &SpecialLocationRegistry,
@@ -1617,6 +1682,9 @@ impl MonitoringDaemon {
         let deadline = Instant::now() + interval;
         loop {
             let now = Instant::now();
+            if self.signal_handler.should_shutdown() {
+                break;
+            }
             let Some(remaining) = deadline.checked_duration_since(now) else {
                 break;
             };
@@ -1973,7 +2041,9 @@ impl MonitoringDaemon {
             }
 
             // 10. Thread health check.
-            if last_health_check.elapsed() >= THREAD_HEALTH_CHECK_INTERVAL {
+            if last_health_check.elapsed() >= THREAD_HEALTH_CHECK_INTERVAL
+                && !self.signal_handler.should_shutdown()
+            {
                 last_health_check = Instant::now();
 
                 let scanner_dead = scanner_join
@@ -2897,12 +2967,10 @@ impl MonitoringDaemon {
                     let _ = self.release_ballast(&mount, &release_response);
                 }
 
-                let mut scan_paths = Vec::with_capacity(self.config.scanner.root_paths.len() + 1);
-                scan_paths.push(location.path.clone());
+                let mut scan_paths =
+                    special_location_scan_roots(&location.path, &self.config.scanner.root_paths);
                 for root in &self.config.scanner.root_paths {
-                    if root != &location.path {
-                        scan_paths.push(root.clone());
-                    }
+                    push_unique_path(&mut scan_paths, root.clone());
                 }
 
                 let request = ScanRequest {
@@ -3091,6 +3159,7 @@ impl MonitoringDaemon {
         let scoring_config = Arc::clone(&self.shared_scoring_config);
         let scanner_config = Arc::clone(&self.shared_scanner_config);
         let platform = Arc::clone(&self.platform);
+        let shutdown = self.signal_handler.shutdown_token();
         thread::Builder::new()
             .name("sbh-scanner".to_string())
             .spawn(move || {
@@ -3103,6 +3172,7 @@ impl MonitoringDaemon {
                     &platform,
                     &heartbeat,
                     &report_tx,
+                    &shutdown,
                 );
             })
             .map_err(|source| SbhError::Runtime {
@@ -3121,6 +3191,7 @@ impl MonitoringDaemon {
         let scanner_config = Arc::clone(&self.shared_scanner_config);
         let policy_engine = Arc::clone(&self.policy_engine);
         let shared_guard_diagnostics = Arc::clone(&self.shared_guard_diagnostics);
+        let shutdown = self.signal_handler.shutdown_token();
 
         thread::Builder::new()
             .name("sbh-executor".to_string())
@@ -3134,6 +3205,7 @@ impl MonitoringDaemon {
                     &report_tx,
                     &policy_engine,
                     &shared_guard_diagnostics,
+                    &shutdown,
                 );
             })
             .map_err(|source| SbhError::Runtime {
@@ -3152,16 +3224,19 @@ impl MonitoringDaemon {
     ) {
         let uptime_secs = self.start_time.elapsed().as_secs();
 
-        // 1. Drop channel senders to signal worker threads to exit.
+        // 1. Broadcast cancellation, then drop channel senders to signal worker threads to exit.
+        self.signal_handler.request_shutdown();
         drop(scan_tx);
         drop(del_tx);
 
-        // 2. Wait for worker threads.
+        // 2. Wait briefly for worker threads. Long critical-pressure scans must not
+        // trap SIGTERM behind an unbounded join; unfinished workers are abandoned
+        // and the process exits after logger shutdown.
         if let Some(h) = scanner_join {
-            let _ = h.join();
+            join_worker_with_timeout("scanner", h, WORKER_SHUTDOWN_JOIN_TIMEOUT);
         }
         if let Some(h) = executor_join {
-            let _ = h.join();
+            join_worker_with_timeout("executor", h, WORKER_SHUTDOWN_JOIN_TIMEOUT);
         }
 
         // 3. Log shutdown.
@@ -3183,6 +3258,26 @@ impl MonitoringDaemon {
 
         eprintln!("[SBH-DAEMON] shutdown complete (uptime={uptime_secs}s)");
     }
+}
+
+fn join_worker_with_timeout(name: &str, handle: thread::JoinHandle<()>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            eprintln!(
+                "[SBH-DAEMON] {name} worker did not stop within {:.1}s; continuing shutdown",
+                timeout.as_secs_f64(),
+            );
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let stopped = matches!(handle.join(), Ok(()));
+    if !stopped {
+        eprintln!("[SBH-DAEMON] {name} worker panicked during shutdown");
+    }
+    stopped
 }
 
 // ──────────────────── scanner thread ────────────────────
@@ -3299,6 +3394,31 @@ fn collect_active_references_for_scan(
     index
 }
 
+const ACTIVE_REFERENCE_SCAN_BUDGET_MACOS: Duration = Duration::from_secs(13);
+const ACTIVE_REFERENCE_SCAN_BUDGET_DEFAULT: Duration = Duration::from_secs(5);
+const ACTIVE_REFERENCE_BUDGET_SKIP_REASON: &str =
+    "active-reference scan skipped because scan budget remaining was insufficient";
+
+fn active_reference_scan_budget(platform_name: &str) -> Duration {
+    if platform_name == "macos" {
+        ACTIVE_REFERENCE_SCAN_BUDGET_MACOS
+    } else {
+        ACTIVE_REFERENCE_SCAN_BUDGET_DEFAULT
+    }
+}
+
+fn has_active_reference_scan_budget(scan_deadline: Instant, reserve: Duration) -> bool {
+    Instant::now()
+        .checked_add(reserve)
+        .is_some_and(|reserved_deadline| reserved_deadline <= scan_deadline)
+}
+
+fn mark_active_reference_budget_incomplete(input: &mut crate::scanner::scoring::CandidateInput) {
+    input
+        .active_references
+        .mark_incomplete(ACTIVE_REFERENCE_BUDGET_SKIP_REASON);
+}
+
 /// Incremental scan cursor — persists across scan iterations within the scanner
 /// thread to avoid re-walking large directory subtrees that contained zero
 /// cleanup candidates on the previous pass.
@@ -3402,6 +3522,7 @@ fn scanner_thread_main(
     platform: &Arc<dyn Platform>,
     heartbeat: &Arc<ThreadHeartbeat>,
     report_tx: &Sender<WorkerReport>,
+    shutdown: &Arc<AtomicBool>,
 ) {
     const DIR_SIZE_FLOOR: u64 = 100 * 1_048_576; // 100 MiB
 
@@ -3418,7 +3539,20 @@ fn scanner_thread_main(
     // (previously caused thousands of ContainsGit log entries per hour).
     let mut known_git_dirs: HashSet<PathBuf> = HashSet::new();
 
-    while let Ok(request) = scan_rx.recv() {
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let request = match scan_rx.recv_timeout(WORKER_SHUTDOWN_POLL_INTERVAL) {
+            Ok(request) => request,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
         // Read latest config at the start of each scan.
         let current_scoring_config = shared_scoring_config.read().clone();
         let current_scanner_config = shared_scanner_config.read().clone();
@@ -3434,15 +3568,68 @@ fn scanner_thread_main(
         }
 
         heartbeat.beat();
+
+        // Truncate-in-place sweep for active append-only logs (e.g. codex-tui.log).
+        // Runs before the regular scan because the FileOpen veto in the deletion
+        // executor would otherwise prevent recovery of these files — the failure
+        // mode that drove css/ts2/trj to 99% disk on 2026-05-13. Cheap when the
+        // policy is disabled (just an enabled-check) so it's safe to call every
+        // scan cycle. Maps the coarse pressure level into a synthetic free-pct
+        // for the policy's pressure_free_pct_ceiling gate.
+        if current_scanner_config.log_truncation.enabled {
+            let synthetic_free_pct = match request.pressure_level {
+                crate::monitor::pid::PressureLevel::Green => 100.0,
+                crate::monitor::pid::PressureLevel::Yellow => 15.0,
+                crate::monitor::pid::PressureLevel::Orange => 5.0,
+                crate::monitor::pid::PressureLevel::Red
+                | crate::monitor::pid::PressureLevel::Critical => 0.0,
+            };
+            let trunc_report = crate::scanner::log_truncator::truncate_oversized_logs(
+                &current_scanner_config.log_truncation,
+                synthetic_free_pct,
+                current_scanner_config.dry_run,
+            );
+            if trunc_report.files_truncated > 0 || !trunc_report.errors.is_empty() {
+                eprintln!(
+                    "[sbh-truncate] pressure={:?} freed={}B files={} skipped={} errors={} dur={}ms",
+                    request.pressure_level,
+                    trunc_report.bytes_reclaimed,
+                    trunc_report.files_truncated,
+                    trunc_report.files_skipped,
+                    trunc_report.errors.len(),
+                    trunc_report.duration.as_millis(),
+                );
+                logger.send(crate::logger::dual::ActivityEvent::Info {
+                    message: format!(
+                        "log_truncation: freed {} bytes across {} file(s) at pressure={:?}",
+                        trunc_report.bytes_reclaimed,
+                        trunc_report.files_truncated,
+                        request.pressure_level,
+                    ),
+                });
+                for (path, err) in &trunc_report.errors {
+                    logger.send(crate::logger::dual::ActivityEvent::Error {
+                        code: "SBH-LOGTRUNC".to_string(),
+                        message: format!("log_truncation error on {}: {err}", path.display()),
+                    });
+                }
+            }
+        }
+
         let scan_start = Instant::now();
+        let scan_deadline =
+            scan_start + effective_scan_budget(&current_scanner_config, request.pressure_level);
 
         // Track total candidates found (priority pre-scan + general walker).
         let mut candidates_found = 0;
+        let mut scanner_should_exit = false;
+        let mut scan_timed_out = false;
 
         let active_reference_scan = ActiveReferenceScanConfig::new(
             Duration::from_secs(current_scanner_config.active_reference_cache_ttl_secs),
             current_scanner_config.active_reference_min_size_bytes,
         );
+        let active_reference_probe_budget = active_reference_scan_budget(platform.name());
         let mut open_files_joined: Option<std::collections::HashSet<std::path::PathBuf>> = None;
         let mut active_reference_joined: Option<ActiveReferenceIndex> = None;
         let mut sacred_paths = platform.sacred_paths();
@@ -3476,9 +3663,25 @@ fn scanner_thread_main(
                 &current_scoring_config,
                 current_scanner_config.min_file_age_minutes,
             );
-            for root in &request.paths {
+            'priority_roots: for root in &request.paths {
+                if shutdown.load(Ordering::Relaxed) {
+                    scanner_should_exit = true;
+                    break;
+                }
+                if scan_deadline_reached(scan_start, scan_deadline, "priority pre-scan") {
+                    scan_timed_out = true;
+                    break;
+                }
                 if let Ok(entries) = std::fs::read_dir(root) {
                     for entry in entries.flatten() {
+                        if shutdown.load(Ordering::Relaxed) {
+                            scanner_should_exit = true;
+                            break 'priority_roots;
+                        }
+                        if scan_deadline_reached(scan_start, scan_deadline, "priority pre-scan") {
+                            scan_timed_out = true;
+                            break 'priority_roots;
+                        }
                         let path = entry.path();
                         if !path.is_dir() {
                             continue;
@@ -3517,6 +3720,18 @@ fn scanner_thread_main(
                         // (e.g., /data/projects/myproject/target).
                         if let Ok(sub_entries) = std::fs::read_dir(&path) {
                             for sub_entry in sub_entries.flatten() {
+                                if shutdown.load(Ordering::Relaxed) {
+                                    scanner_should_exit = true;
+                                    break 'priority_roots;
+                                }
+                                if scan_deadline_reached(
+                                    scan_start,
+                                    scan_deadline,
+                                    "priority pre-scan",
+                                ) {
+                                    scan_timed_out = true;
+                                    break 'priority_roots;
+                                }
                                 let sub_path = sub_entry.path();
                                 if sub_path.is_dir() {
                                     if should_skip_protected_daemon_candidate(
@@ -3543,6 +3758,18 @@ fn scanner_thread_main(
                                         // (catches workspace patterns like crates/foo/target).
                                         if let Ok(d3_entries) = std::fs::read_dir(&sub_path) {
                                             for d3_entry in d3_entries.flatten() {
+                                                if shutdown.load(Ordering::Relaxed) {
+                                                    scanner_should_exit = true;
+                                                    break 'priority_roots;
+                                                }
+                                                if scan_deadline_reached(
+                                                    scan_start,
+                                                    scan_deadline,
+                                                    "priority pre-scan",
+                                                ) {
+                                                    scan_timed_out = true;
+                                                    break 'priority_roots;
+                                                }
                                                 let d3_path = d3_entry.path();
                                                 if d3_path.is_dir() {
                                                     if should_skip_protected_daemon_candidate(
@@ -3641,28 +3868,36 @@ fn scanner_thread_main(
                                 && !score.vetoed
                                 && active_reference_scan.should_probe(size)
                             {
-                                let open_files = open_files_joined.get_or_insert_with(|| {
-                                    collect_open_path_ancestors_cached(
-                                        &request.paths,
-                                        active_reference_scan.cache_ttl,
-                                    )
-                                    .0
-                                });
-                                let active_references =
-                                    active_reference_joined.get_or_insert_with(|| {
-                                        collect_active_references_for_scan(
-                                            platform.as_ref(),
+                                if has_active_reference_scan_budget(
+                                    scan_deadline,
+                                    active_reference_probe_budget,
+                                ) {
+                                    let open_files = open_files_joined.get_or_insert_with(|| {
+                                        collect_open_path_ancestors_cached(
                                             &request.paths,
-                                            active_reference_scan,
-                                            logger,
+                                            active_reference_scan.cache_ttl,
                                         )
+                                        .0
                                     });
-                                input.active_references =
-                                    active_references.summary_for(&candidate_path);
-                                input.is_open = crate::scanner::walker::is_path_open_by_ancestor(
-                                    &candidate_path,
-                                    open_files,
-                                );
+                                    let active_references = active_reference_joined
+                                        .get_or_insert_with(|| {
+                                            collect_active_references_for_scan(
+                                                platform.as_ref(),
+                                                &request.paths,
+                                                active_reference_scan,
+                                                logger,
+                                            )
+                                        });
+                                    input.active_references =
+                                        active_references.summary_for(&candidate_path);
+                                    input.is_open =
+                                        crate::scanner::walker::is_path_open_by_ancestor(
+                                            &candidate_path,
+                                            open_files,
+                                        );
+                                } else {
+                                    mark_active_reference_budget_incomplete(&mut input);
+                                }
                                 score = prescan_engine.score_candidate(&input, request.urgency);
                             }
                             if score.decision.action
@@ -3700,6 +3935,9 @@ fn scanner_thread_main(
                     }
                 }
             }
+        }
+        if scanner_should_exit {
+            break;
         }
 
         // Dispatch priority candidates immediately if any found.
@@ -3744,6 +3982,32 @@ fn scanner_thread_main(
                     );
                 }
             }
+        }
+        if scan_timed_out {
+            let duration = scan_start.elapsed();
+            let root_stats: Vec<RootScanResult> = request
+                .paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| RootScanResult {
+                    path: path.clone(),
+                    candidates_found: if index == 0 { candidates_found } else { 0 },
+                    potential_bytes: 0,
+                    false_positives: 0,
+                    duration,
+                })
+                .collect();
+            let _ = report_tx.send(WorkerReport::ScanCompleted {
+                candidates: candidates_found,
+                duration,
+                root_stats,
+                timed_out: true,
+            });
+            eprintln!(
+                "[SBH-SCANNER] scan complete: 0 entries, {candidates_found} candidates, {:.1}s (timed out)",
+                duration.as_secs_f64()
+            );
+            continue;
         }
 
         // Configure walker.
@@ -3795,8 +4059,6 @@ fn scanner_thread_main(
 
         let mut paths_scanned = 0;
         let mut scored: Vec<CandidacyScore> = Vec::with_capacity(1024);
-        let mut scanner_should_exit = false;
-        let mut scan_timed_out = false;
 
         // Track directories for the incremental scan cursor.
         let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
@@ -3822,33 +4084,24 @@ fn scanner_thread_main(
             );
         }
 
-        // Scan budget: absolute deadline for this scan pass.
-        // Use configured budget, falling back to the built-in constant.
-        // Under high pressure, extend the budget so the scanner can find more
-        // candidates to free — timing out with too few candidates is exactly
-        // how the fallback_safe deadlock forms.
-        let base_budget_secs = if current_scanner_config.scan_time_budget_secs > 0 {
-            current_scanner_config.scan_time_budget_secs
-        } else {
-            SCAN_TIME_BUDGET_SECS
-        };
-        let budget_secs = match request.pressure_level {
-            PressureLevel::Red | PressureLevel::Critical => {
-                base_budget_secs.saturating_mul(2).min(600)
-            }
-            PressureLevel::Orange => base_budget_secs.saturating_mul(2).min(600),
-            _ => base_budget_secs,
-        };
-        let scan_deadline = scan_start + Duration::from_secs(budget_secs);
-
         // Process entries with timeout to handle walker deadlocks.
         // The walker can deadlock when both worker threads block on a full work queue
         // (bounded channel). Using recv_timeout ensures the budget check fires even
         // when no entries are flowing.
         loop {
+            if shutdown.load(Ordering::Relaxed) {
+                cancel_token.store(true, Ordering::Relaxed);
+                scanner_should_exit = true;
+                break;
+            }
             let entry = match rx.recv_timeout(Duration::from_secs(2)) {
                 Ok(entry) => entry,
                 Err(RecvTimeoutError::Timeout) => {
+                    if shutdown.load(Ordering::Relaxed) {
+                        cancel_token.store(true, Ordering::Relaxed);
+                        scanner_should_exit = true;
+                        break;
+                    }
                     // No entries for 2 seconds — check if budget is exhausted.
                     if Instant::now() >= scan_deadline {
                         cancel_token.store(true, Ordering::Relaxed);
@@ -3864,6 +4117,11 @@ fn scanner_thread_main(
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             };
+            if shutdown.load(Ordering::Relaxed) {
+                cancel_token.store(true, Ordering::Relaxed);
+                scanner_should_exit = true;
+                break;
+            }
             paths_scanned += 1;
 
             // Budget check: stop processing if we've exceeded entry count or time limits.
@@ -3938,24 +4196,28 @@ fn scanner_thread_main(
                 && !score.vetoed
                 && active_reference_scan.should_probe(entry.metadata.content_size_bytes)
             {
-                let open_files = open_files_joined.get_or_insert_with(|| {
-                    collect_open_path_ancestors_cached(
-                        &request.paths,
-                        active_reference_scan.cache_ttl,
-                    )
-                    .0
-                });
-                let active_references = active_reference_joined.get_or_insert_with(|| {
-                    collect_active_references_for_scan(
-                        platform.as_ref(),
-                        &request.paths,
-                        active_reference_scan,
-                        logger,
-                    )
-                });
-                input.active_references = active_references.summary_for(&entry.path);
-                input.is_open =
-                    crate::scanner::walker::is_path_open_by_ancestor(&entry.path, open_files);
+                if has_active_reference_scan_budget(scan_deadline, active_reference_probe_budget) {
+                    let open_files = open_files_joined.get_or_insert_with(|| {
+                        collect_open_path_ancestors_cached(
+                            &request.paths,
+                            active_reference_scan.cache_ttl,
+                        )
+                        .0
+                    });
+                    let active_references = active_reference_joined.get_or_insert_with(|| {
+                        collect_active_references_for_scan(
+                            platform.as_ref(),
+                            &request.paths,
+                            active_reference_scan,
+                            logger,
+                        )
+                    });
+                    input.active_references = active_references.summary_for(&entry.path);
+                    input.is_open =
+                        crate::scanner::walker::is_path_open_by_ancestor(&entry.path, open_files);
+                } else {
+                    mark_active_reference_budget_incomplete(&mut input);
+                }
                 score = engine.score_candidate(&input, request.urgency);
             }
             if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
@@ -4063,6 +4325,9 @@ fn scanner_thread_main(
         // Hard cap: never spend more than 30s flushing after the scan loop ends.
         let flush_deadline = Instant::now() + Duration::from_secs(30);
         while !scored.is_empty() {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
             if Instant::now() >= flush_deadline {
                 eprintln!(
                     "[SBH-SCANNER] flush deadline reached; {} candidates will be rediscovered on next pass",
@@ -4224,6 +4489,7 @@ fn executor_thread_main(
     report_tx: &Sender<WorkerReport>,
     policy_engine: &Arc<Mutex<PolicyEngine>>,
     shared_guard_diagnostics: &Arc<RwLock<Option<GuardDiagnostics>>>,
+    shutdown: &Arc<AtomicBool>,
 ) {
     let mut tracker = RepeatDeletionTracker::new(
         Duration::from_secs(shared_config.repeat_base_cooldown_secs()),
@@ -4241,7 +4507,20 @@ fn executor_thread_main(
     // fixes the unit file, so logging on every batch would flood journals.
     let mut last_not_writable_warning: Option<Instant> = None;
 
-    while let Ok(batch) = del_rx.recv() {
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let batch = match del_rx.recv_timeout(WORKER_SHUTDOWN_POLL_INTERVAL) {
+            Ok(batch) => batch,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
         heartbeat.beat();
         batch_count += 1;
 
@@ -4337,6 +4616,10 @@ fn executor_thread_main(
             continue;
         }
 
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
         // Read latest config from shared atomics (updated by config reload).
         let dry_run = shared_config.dry_run.load(Ordering::Relaxed);
         let max_batch_size = shared_config.max_batch_size.load(Ordering::Relaxed);
@@ -4383,6 +4666,9 @@ fn executor_thread_main(
         let sacred_paths =
             protection::sacred_paths_from_protected_patterns(&scanner_config.protected_paths);
         let skip_protected = |path: &Path| {
+            if shutdown.load(Ordering::Relaxed) {
+                return true;
+            }
             let mut protection = protection.lock();
             should_skip_protected_daemon_candidate(
                 &mut protection,
@@ -4437,7 +4723,18 @@ fn executor_thread_main(
         // Record deletions for repeat-deletion dampening.
         tracker.record_deletions(&report.deleted_paths);
 
-        if report.items_deleted > 0 || report.items_failed > 0 {
+        if report.dry_run {
+            if report.items_would_delete > 0 || report.items_failed > 0 {
+                eprintln!(
+                    "[SBH-EXECUTOR] dry-run would_delete={} failed={} skipped={} would_free={}B ({:?})",
+                    report.items_would_delete,
+                    report.items_failed,
+                    report.items_skipped,
+                    report.bytes_would_free,
+                    report.duration,
+                );
+            }
+        } else if report.items_deleted > 0 || report.items_failed > 0 {
             eprintln!(
                 "[SBH-EXECUTOR] deleted={} failed={} skipped={} freed={}B ({:?})",
                 report.items_deleted,
@@ -4721,6 +5018,7 @@ mod tests {
         let shared_scoring_config = Arc::new(RwLock::new(config.scoring));
         let shared_scanner_config = Arc::new(RwLock::new(config.scanner));
         let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         scan_tx
             .send(ScanRequest {
@@ -4742,6 +5040,7 @@ mod tests {
             &platform,
             &heartbeat,
             &report_tx,
+            &shutdown,
         );
 
         assert!(
@@ -5411,6 +5710,69 @@ mod tests {
             PressureLevel::Yellow
         };
         assert!(matches!(level, PressureLevel::Yellow));
+    }
+
+    #[test]
+    fn special_location_scan_roots_prefer_configured_subtree() {
+        let configured = vec![PathBuf::from("/tmp/sbh-run/scan-root")];
+        let roots = special_location_scan_roots(Path::new("/tmp"), &configured);
+
+        assert_eq!(roots, configured);
+        assert!(!roots.iter().any(|root| root == Path::new("/tmp")));
+    }
+
+    #[test]
+    fn special_location_scan_roots_keep_default_tmp_root() {
+        let configured = vec![PathBuf::from("/tmp"), PathBuf::from("/data/projects")];
+        let roots = special_location_scan_roots(Path::new("/tmp"), &configured);
+
+        assert_eq!(roots, vec![PathBuf::from("/tmp")]);
+    }
+
+    #[test]
+    fn special_location_scan_roots_keep_independent_special_location() {
+        let configured = vec![PathBuf::from("/data/projects")];
+        let roots = special_location_scan_roots(Path::new("/dev/shm"), &configured);
+
+        assert_eq!(roots, vec![PathBuf::from("/dev/shm")]);
+    }
+
+    #[test]
+    fn effective_scan_budget_applies_pressure_extension_once() {
+        let config = ScannerConfig {
+            scan_time_budget_secs: 5,
+            ..ScannerConfig::default()
+        };
+
+        assert_eq!(
+            effective_scan_budget(&config, PressureLevel::Green),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            effective_scan_budget(&config, PressureLevel::Critical),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn active_reference_probe_respects_scan_deadline() {
+        assert_eq!(
+            active_reference_scan_budget("macos"),
+            Duration::from_secs(13)
+        );
+        assert_eq!(
+            active_reference_scan_budget("linux"),
+            Duration::from_secs(5)
+        );
+
+        assert!(!has_active_reference_scan_budget(
+            Instant::now() + Duration::from_secs(1),
+            active_reference_scan_budget("macos")
+        ));
+        assert!(has_active_reference_scan_budget(
+            Instant::now() + Duration::from_secs(20),
+            active_reference_scan_budget("macos")
+        ));
     }
 
     #[test]

@@ -788,6 +788,25 @@ fn normalized_open_roots(root_paths: &[PathBuf]) -> Vec<(PathBuf, usize)> {
         .collect()
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
+fn common_open_file_probe_root(normalized_roots: &[(PathBuf, usize)]) -> Option<PathBuf> {
+    let (first, _) = normalized_roots.first()?;
+    let mut candidate = first.as_path();
+
+    while !normalized_roots
+        .iter()
+        .all(|(root, _)| root.starts_with(candidate))
+    {
+        candidate = candidate.parent()?;
+    }
+
+    // Do not collapse unrelated roots to the filesystem root. A root-wide
+    // process-fd query is broader than the per-candidate fallback and can be
+    // prohibitively expensive on busy developer machines.
+    candidate.parent()?;
+    Some(candidate.to_path_buf())
+}
+
 fn add_open_path_ancestor_chain(
     ancestors: &mut HashSet<PathBuf>,
     target: &Path,
@@ -891,7 +910,16 @@ fn collect_open_path_ancestors_platform(root_paths: &[PathBuf]) -> (HashSet<Path
 
     let platform = crate::platform::current();
     let mut ancestors = HashSet::with_capacity(4096);
-    for (root, _) in &normalized_roots {
+    let probe_roots = common_open_file_probe_root(&normalized_roots).map_or_else(
+        || {
+            normalized_roots
+                .iter()
+                .map(|(root, _)| root.clone())
+                .collect::<Vec<_>>()
+        },
+        |root| vec![root],
+    );
+    for root in &probe_roots {
         let Ok(open_files) = platform.open_files_under(root) else {
             return (ancestors, false);
         };
@@ -1301,6 +1329,31 @@ mod tests {
             !ancestors.contains(&normalized_tmp),
             "ancestor chain should stop at the outermost matching scan root"
         );
+    }
+
+    #[test]
+    fn common_open_file_probe_root_groups_related_candidates() {
+        let roots = normalized_open_roots(&[
+            PathBuf::from("/tmp/sbh-run/scan-root/project-a/target"),
+            PathBuf::from("/tmp/sbh-run/scan-root/project-b/target"),
+        ]);
+        let expected =
+            crate::core::paths::resolve_absolute_path(Path::new("/tmp/sbh-run/scan-root"));
+
+        assert_eq!(
+            common_open_file_probe_root(&roots).as_deref(),
+            Some(expected.as_path())
+        );
+    }
+
+    #[test]
+    fn common_open_file_probe_root_does_not_collapse_to_filesystem_root() {
+        let roots = normalized_open_roots(&[
+            PathBuf::from("/tmp/sbh-run/target"),
+            PathBuf::from("/Users/example/project/target"),
+        ]);
+
+        assert_eq!(common_open_file_probe_root(&roots), None);
     }
 
     #[cfg(target_os = "macos")]

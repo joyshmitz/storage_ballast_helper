@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use super::model::{DashboardCmd, DashboardError, DashboardModel, DashboardMsg, Overlay, Screen};
 use super::render;
 use super::update;
+use crate::core::hex_lower;
 use crate::daemon::self_monitor::{
     BallastState, Counters, DaemonState, LastScanState, MountPressure, PressureState,
 };
@@ -336,7 +337,7 @@ impl DashboardHarness {
                 frame.screen, frame.overlay, frame.degraded, frame.tick, frame.last_cmd_debug
             ));
         }
-        format!("{:x}", hasher.finalize())
+        hex_lower(hasher.finalize())
     }
 
     // ── Internal ──

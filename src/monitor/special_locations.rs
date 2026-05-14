@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::core::errors::Result;
-use crate::platform::pal::{FsStats, Platform};
+use crate::platform::pal::{FsStats, MountPoint, Platform};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpecialKind {
@@ -68,17 +68,7 @@ impl SpecialLocationRegistry {
         let mut locations = Vec::<SpecialLocation>::new();
 
         for mount in mounts {
-            if !mount.is_ram_backed {
-                continue;
-            }
-            // Skip systemd runtime dirs — these are small credential/session tmpfs
-            // mounts that are always "full" by design and not actionable.
-            let path_str = mount.path.to_string_lossy();
-            if path_str.starts_with("/run/credentials/")
-                || path_str.starts_with("/run/user/")
-                || path_str == "/run/lock"
-                || path_str == "/run"
-            {
+            if !is_actionable_special_mount(&mount) {
                 continue;
             }
             let kind = match mount.path.as_path() {
@@ -145,6 +135,35 @@ impl SpecialLocationRegistry {
     pub fn all(&self) -> &[SpecialLocation] {
         &self.locations
     }
+}
+
+fn is_actionable_special_mount(mount: &MountPoint) -> bool {
+    if !mount.is_ram_backed {
+        return false;
+    }
+
+    if mount.path == Path::new("/dev/shm") {
+        return true;
+    }
+
+    let fs_type = mount.fs_type.to_ascii_lowercase();
+    if matches!(fs_type.as_str(), "devfs" | "devtmpfs") {
+        return false;
+    }
+
+    // `/dev` and its device pseudo-filesystems are not reclaimable scratch
+    // space. Linux `/dev/shm` is handled explicitly above.
+    if mount.path == Path::new("/dev") || mount.path.starts_with("/dev") {
+        return false;
+    }
+
+    // Systemd runtime dirs are small credential/session tmpfs mounts that are
+    // often "full" by design and not actionable.
+    let path_str = mount.path.to_string_lossy();
+    !(path_str.starts_with("/run/credentials/")
+        || path_str.starts_with("/run/user/")
+        || path_str == "/run/lock"
+        || path_str == "/run")
 }
 
 #[cfg(test)]
@@ -386,6 +405,49 @@ mod tests {
                 .any(|loc| loc.path == Path::new("/data/tmp")),
             "/data/tmp should be added as fallback"
         );
+    }
+
+    #[test]
+    fn discover_skips_non_reclaimable_devfs_mount() {
+        let platform = TestPlatform {
+            mounts: vec![MountPoint {
+                path: PathBuf::from("/dev"),
+                device: "devfs".to_string(),
+                fs_type: "devfs".to_string(),
+                is_ram_backed: true,
+            }],
+        };
+        let registry =
+            SpecialLocationRegistry::discover(&platform, &[]).expect("discovery should succeed");
+
+        assert!(
+            registry
+                .all()
+                .iter()
+                .all(|location| location.path != Path::new("/dev")),
+            "/dev device filesystem must not be treated as reclaimable scratch space"
+        );
+    }
+
+    #[test]
+    fn discover_keeps_dev_shm_special_mount() {
+        let platform = TestPlatform {
+            mounts: vec![MountPoint {
+                path: PathBuf::from("/dev/shm"),
+                device: "tmpfs".to_string(),
+                fs_type: "tmpfs".to_string(),
+                is_ram_backed: true,
+            }],
+        };
+        let registry =
+            SpecialLocationRegistry::discover(&platform, &[]).expect("discovery should succeed");
+
+        let dev_shm = registry
+            .all()
+            .iter()
+            .find(|location| location.path == Path::new("/dev/shm"))
+            .expect("/dev/shm should stay registered");
+        assert!(matches!(dev_shm.kind, SpecialKind::DevShm));
     }
 
     #[test]

@@ -13,6 +13,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rand::random;
 use serde::Serialize;
 
+#[cfg(test)]
+use crate::core::hex_lower;
 use crate::core::update_cache::{CachedUpdateMetadata, UpdateMetadataCache};
 
 use super::{
@@ -1543,7 +1545,7 @@ mod tests {
         let sigstore_name = contract.sigstore_bundle_name_for_tag(&release_tag);
         let archive_path = root.join(&archive_name);
         std::fs::write(&archive_path, archive_bytes).unwrap();
-        let checksum_hex = format!("{:x}", Sha256::digest(archive_bytes));
+        let checksum_hex = hex_lower(Sha256::digest(archive_bytes));
         std::fs::write(
             root.join(&checksum_name),
             format!("{checksum_hex}  {archive_name}\n"),

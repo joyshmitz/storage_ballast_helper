@@ -33,6 +33,7 @@ use storage_ballast_helper::cli::{
     ReleaseChannel, resolve_installer_artifact_contract, resolve_updater_artifact_contract,
 };
 use storage_ballast_helper::core::config::Config;
+use storage_ballast_helper::core::hex_lower;
 
 use sha2::{Digest, Sha256};
 
@@ -76,7 +77,7 @@ fn create_valid_bundle(tmp: &Path) -> PathBuf {
     std::fs::write(tmp.join(&archive_name), archive_bytes).unwrap();
 
     let checksum = Sha256::digest(archive_bytes);
-    let checksum_hex = format!("{checksum:x}");
+    let checksum_hex = hex_lower(checksum);
     std::fs::write(
         tmp.join(&checksum_name),
         format!("{checksum_hex}  {archive_name}\n"),
@@ -152,7 +153,7 @@ fn create_update_bundle(tmp: &Path, valid_checksum: bool) -> PathBuf {
     std::fs::write(tmp.join(&archive_name), archive_bytes).unwrap();
 
     let checksum_hex = if valid_checksum {
-        format!("{:x}", Sha256::digest(archive_bytes))
+        hex_lower(Sha256::digest(archive_bytes))
     } else {
         "0000000000000000000000000000000000000000000000000000000000000000".to_string()
     };

@@ -16,6 +16,8 @@ use super::{
 };
 use crate::ballast::manager::BallastManager;
 use crate::core::config::{BallastConfig, Config, PathsConfig};
+#[cfg(test)]
+use crate::core::hex_lower;
 // errors module available but not directly used in this module.
 
 // ---------------------------------------------------------------------------
@@ -924,7 +926,7 @@ mod tests {
         std::fs::write(&archive_path, archive_bytes).unwrap();
 
         let checksum = Sha256::digest(archive_bytes);
-        let checksum_hex = format!("{checksum:x}");
+        let checksum_hex = hex_lower(checksum);
         std::fs::write(
             tmp.path().join(&checksum_name),
             format!("{checksum_hex}  {archive_name}\n"),
@@ -1000,7 +1002,7 @@ mod tests {
         std::fs::write(tmp.path().join(&sigstore_name), "{\"invalid\":true}\n").unwrap();
 
         let checksum = Sha256::digest(archive_bytes);
-        let checksum_hex = format!("{checksum:x}");
+        let checksum_hex = hex_lower(checksum);
         std::fs::write(
             tmp.path().join(&checksum_name),
             format!("{checksum_hex}  {archive_name}\n"),

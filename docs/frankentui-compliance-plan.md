@@ -72,33 +72,34 @@ found in the core crates targeted for reuse.
 | Property | FrankentUI | SBH |
 | --- | --- | --- |
 | Edition | 2024 | 2024 |
-| Toolchain | nightly | **stable** |
+| Toolchain | nightly | **nightly** |
 | `#![feature(...)]` | None found in core crates | None (forbidden by policy) |
 
 ### Key Finding
 
-FrankentUI's `rust-toolchain.toml` pins `channel = "nightly"`, but the core
-crates (ftui-core, ftui-render, ftui-style, ftui-text, ftui-layout) do **not**
-use any `#![feature(...)]` directives. Edition 2024 was stabilized in Rust
-1.85.0 (February 2025). This means the core crates likely compile on stable
-Rust without modification.
+FrankentUI's `rust-toolchain.toml` pins `channel = "nightly"`, matching SBH's
+default toolchain. The core crates (ftui-core, ftui-render, ftui-style,
+ftui-text, ftui-layout) do **not** use any `#![feature(...)]` directives, so
+nightly is a project policy choice rather than a license to import unstable
+APIs casually.
 
 ### Policy
 
-**SBH MUST remain on stable Rust.** This is non-negotiable.
+**SBH uses nightly Rust.** This is non-negotiable unless the operator changes
+the toolchain policy again.
 
-1. **No nightly-only features may be introduced into SBH**, even behind feature
-   gates, unless explicitly approved with a documented exception and a
-   stable-fallback path.
+1. **Nightly-only language/library features require explicit documentation.**
+   The default nightly toolchain is allowed, but unstable features still need a
+   clear reason and regression coverage.
 
-2. **Copied FrankentUI code must compile on stable.** Before merging any
+2. **Copied FrankentUI code must compile on nightly.** Before merging any
    FrankentUI-derived code:
    - [ ] Verify compilation with `rch exec "cargo check --all-targets"` on
-         the stable toolchain.
-   - [ ] Remove or gate any nightly-only constructs.
+         the repository nightly toolchain.
+   - [ ] Document any unstable feature dependency.
 
-3. **Feature gates for conditional nightly support are NOT permitted** at this
-   time. The added complexity of maintaining dual-toolchain code paths is not
+3. **Dual stable/nightly compatibility shims are NOT permitted** at this time.
+   The added complexity of maintaining dual-toolchain code paths is not
    justified. If a future need arises, it must be approved through a new ADR.
 
 4. **Edition 2024 compatibility:** Both projects use Edition 2024, which is
@@ -252,7 +253,7 @@ SBH. This prevents silent policy drift.
 
 | Decision | Rationale |
 | --- | --- |
-| SBH remains on stable Rust | Production reliability; no nightly breakage risk |
+| SBH remains on nightly Rust | Matches the operator-approved project toolchain |
 | MIT attribution via file comments | Sufficient under MIT; lightweight compliance |
 | No feature-gated nightly paths | Complexity not justified at this stage |
 | Core crates (ftui-core/render/style/text/layout) are safe candidates | `forbid(unsafe_code)`, minimal deps, no `#![feature]` |

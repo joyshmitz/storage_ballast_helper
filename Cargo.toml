@@ -1,6 +1,6 @@
 [package]
 name = "storage_ballast_helper"
-version = "0.4.22"
+version = "0.4.23"
 edition = "2024"
 license = "MIT"
 description = "System service that prevents disk-full scenarios from coding agent swarms via ballast files, artifact scanning, and special location monitoring."
@@ -30,15 +30,15 @@ tui = ["dep:ftui", "dep:ftui-backend", "dep:ftui-tty"]
 clap = { version = "4.5", features = ["derive"], optional = true }
 clap_complete = { version = "4.5", optional = true }
 colored = { version = "3.0", optional = true }
-crossterm = { version = "0.28", optional = true }
+crossterm = { version = "0.29", optional = true }
 # Serialization (core)
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+toml = "1.1"
 plist = "1.9.0"
 bincode = { version = "2.0.1", features = ["serde"] }
 # Database (optional — gated behind "sqlite" feature)
-rusqlite = { version = "0.33", features = ["bundled", "functions"], optional = true }
+rusqlite = { version = "0.39", features = ["bundled", "functions"], optional = true }
 # Error handling (core)
 thiserror = "2.0"
 # TUI (optional — gated behind "tui" feature)
@@ -55,22 +55,22 @@ memchr = "2.7"
 # Pattern matching for artifact classification (core)
 regex = "1.11"
 # Supply-chain checksum verification (core)
-sha2 = "0.10"
+sha2 = "0.11"
 # Signal handling (optional — gated behind "daemon" feature)
-signal-hook = { version = "0.3", optional = true }
+signal-hook = { version = "0.4", optional = true }
 # Ballast generation and randomized test fixtures (core)
-rand = "0.9"
+rand = "0.10.1"
 # Platform-specific
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["event", "fs", "mount", "signal", "user"] }
+nix = { version = "0.31.3", features = ["event", "fs", "mount", "signal", "user"] }
 libc = "0.2"
-rustix = { version = "=1.1.3", features = ["fs"] }
+rustix = { version = "=1.1.4", features = ["fs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue"] }
 proc_pidinfo = "0.1.4"
 sbh_mach = { path = "crates/sbh_mach" }
-sysctl = "0.6.0"
+sysctl = "0.7.1"
 whichdisk = "0.4.0"
 [dev-dependencies]
 tempfile = "3.17"

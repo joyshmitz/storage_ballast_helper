@@ -71,7 +71,7 @@ rch exec "cargo clippy --all-targets --features tui -- -D warnings"
 **Artifacts**: stderr capture with lint locations
 **Failure triage**:
 - `clippy::pedantic` / `clippy::nursery` → see `Cargo.toml` for allowed exceptions
-- New lint in stable toolchain update → add targeted `#[allow]` with justification
+- New lint in nightly toolchain update → add targeted `#[allow]` with justification
 - Cross-file lint (unused import/dead code) → check if another agent removed the callsite
 
 ---

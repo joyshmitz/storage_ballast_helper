@@ -138,6 +138,24 @@ enum Command {
     Setup(SetupArgs),
     /// View activity log entries.
     Log(LogArgs),
+    /// Truncate active append-only logs in place (e.g. agent codex-tui.log).
+    TruncateLogs(TruncateLogsArgs),
+}
+
+#[derive(Debug, Clone, Args, Serialize, Default)]
+struct TruncateLogsArgs {
+    /// Print what would be truncated without writing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Override the configured `min_size_bytes` threshold for this run.
+    #[arg(long, value_name = "BYTES")]
+    min_size: Option<u64>,
+    /// Bypass the configured age gate (treat as under-pressure).
+    #[arg(long)]
+    force: bool,
+    /// Run even if `[scanner.log_truncation].enabled = false` in config.
+    #[arg(long)]
+    enable_anyway: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -780,7 +798,55 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Update(args) => run_update(cli, args),
         Command::Setup(args) => run_setup(cli, args),
         Command::Log(args) => run_log(cli, args),
+        Command::TruncateLogs(args) => run_truncate_logs(cli, args),
     }
+}
+
+fn run_truncate_logs(cli: &Cli, args: &TruncateLogsArgs) -> Result<(), CliError> {
+    use storage_ballast_helper::scanner::log_truncator::{
+        LogTruncationReport, truncate_oversized_logs,
+    };
+
+    let config =
+        Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let mut policy = config.scanner.log_truncation;
+    if args.enable_anyway {
+        policy.enabled = true;
+    }
+    if let Some(size) = args.min_size {
+        policy.min_size_bytes = size;
+    }
+    if !policy.enabled {
+        eprintln!(
+            "[sbh] scanner.log_truncation.enabled = false. Pass --enable-anyway to override, \
+             or edit /etc/sbh/config.toml to enable persistently."
+        );
+        return Ok(());
+    }
+
+    // Force-mode collapses the age gate by reporting "100% pressure".
+    let synthetic_free_pct = if args.force { 0.0 } else { 100.0 };
+
+    let report: LogTruncationReport =
+        truncate_oversized_logs(&policy, synthetic_free_pct, args.dry_run);
+
+    let verb = if args.dry_run { "would free" } else { "freed" };
+    let bytes = if args.dry_run {
+        report.bytes_would_reclaim
+    } else {
+        report.bytes_reclaimed
+    };
+    println!(
+        "[sbh] log truncation pass {verb} {bytes} bytes across {n} file(s); skipped {sk}; {e} error(s); took {ms} ms",
+        n = report.files_truncated,
+        sk = report.files_skipped,
+        e = report.errors.len(),
+        ms = report.duration.as_millis(),
+    );
+    for (path, err) in &report.errors {
+        eprintln!("  error: {} — {err}", path.display());
+    }
+    Ok(())
 }
 
 fn to_runtime_daemon_args(args: &DaemonArgs) -> RuntimeDaemonArgs {
@@ -7277,7 +7343,9 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                     "elapsed_seconds": scan_elapsed.as_secs_f64(),
                     "candidates_count": 0,
                     "items_deleted": 0,
+                    "items_would_delete": 0,
                     "bytes_freed": 0,
+                    "bytes_would_free": 0,
                     "dry_run": args.dry_run,
                     "protected_count": protected_count,
                 });
@@ -7312,8 +7380,8 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
             OutputMode::Human => {
                 println!(
                     "Dry run complete: {} items ({}) would be freed.",
-                    report.items_deleted,
-                    format_bytes(report.bytes_freed),
+                    report.items_would_delete,
+                    format_bytes(report.bytes_would_free),
                 );
             }
             OutputMode::Json => {
@@ -7824,8 +7892,8 @@ fn print_clean_summary(report: &storage_ballast_helper::scanner::deletion::Delet
     if report.dry_run {
         println!(
             "Dry run: {} items ({}) would be freed.",
-            report.items_deleted,
-            format_bytes(report.bytes_freed),
+            report.items_would_delete,
+            format_bytes(report.bytes_would_free),
         );
     } else {
         println!("Cleanup complete:");
@@ -7877,9 +7945,11 @@ fn emit_clean_report_json(
         "elapsed_seconds": scan_elapsed.as_secs_f64(),
         "candidates_count": plan.estimated_items,
         "items_deleted": report.items_deleted,
+        "items_would_delete": report.items_would_delete,
         "items_skipped": report.items_skipped,
         "items_failed": report.items_failed,
         "bytes_freed": report.bytes_freed,
+        "bytes_would_free": report.bytes_would_free,
         "duration_seconds": report.duration.as_secs_f64(),
         "dry_run": report.dry_run,
         "circuit_breaker_tripped": report.circuit_breaker_tripped,

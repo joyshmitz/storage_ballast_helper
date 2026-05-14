@@ -2,6 +2,7 @@
 
 pub mod decision_record;
 pub mod deletion;
+pub mod log_truncator;
 pub mod merkle;
 pub mod patterns;
 pub mod protection;

@@ -32,6 +32,7 @@ const APFS_CACHE_TTL_SECS: u64 = 5 * 60;
 const APFS_CACHE_TTL: Duration = Duration::from_secs(APFS_CACHE_TTL_SECS);
 const MOUNTED_FILESYSTEMS_CACHE_TTL: Duration = Duration::from_secs(5);
 const MOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
+const MOUNT_COMMAND_FAILURE_BACKOFF: Duration = Duration::from_mins(5);
 const DISKUTIL_APFS_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const TMUTIL_LIST_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const TMUTIL_THIN_COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
@@ -41,9 +42,11 @@ const MACOS_COMMAND_KILL_REAP_ATTEMPTS: usize = 10;
 pub const LOCAL_SNAPSHOT_THIN_AMOUNT_BYTES: u64 = 9_999_999_999_999_999;
 pub const LOCAL_SNAPSHOT_THIN_URGENCY: u8 = 4;
 type MountedFilesystemsCache = RwLock<Option<(Instant, Vec<StatfsSnapshot>)>>;
+type MountCommandBackoff = RwLock<Option<Instant>>;
 
 static APFS_INVENTORY_CACHE: OnceLock<RwLock<Option<(Instant, ApfsInventory)>>> = OnceLock::new();
 static MOUNTED_FILESYSTEMS_CACHE: OnceLock<MountedFilesystemsCache> = OnceLock::new();
+static MOUNT_COMMAND_BACKOFF_UNTIL: OnceLock<MountCommandBackoff> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatfsSnapshot {
@@ -351,9 +354,15 @@ pub fn mounted_filesystems() -> io::Result<Vec<StatfsSnapshot>> {
 }
 
 fn mount_command_entries() -> io::Result<Vec<MountCommandEntry>> {
+    let now = Instant::now();
+    if mount_command_in_backoff(now) {
+        return whichdisk_mount_entries();
+    }
+
     let mut command = Command::new("/sbin/mount");
     match command_output_with_timeout(&mut command, MOUNT_COMMAND_TIMEOUT) {
         Ok(Some(output)) if output.status.success() => {
+            clear_mount_command_failure_backoff();
             let entries = parse_mount_command_output(&String::from_utf8_lossy(&output.stdout));
             if entries.is_empty() {
                 whichdisk_mount_entries()
@@ -362,6 +371,7 @@ fn mount_command_entries() -> io::Result<Vec<MountCommandEntry>> {
             }
         }
         Ok(Some(output)) => {
+            remember_mount_command_failure(now);
             let detail = String::from_utf8_lossy(&output.stderr);
             eprintln!(
                 "[sbh] warning: /sbin/mount failed with status {}: {}; falling back to whichdisk",
@@ -371,15 +381,36 @@ fn mount_command_entries() -> io::Result<Vec<MountCommandEntry>> {
             whichdisk_mount_entries()
         }
         Ok(None) => {
+            remember_mount_command_failure(now);
             eprintln!(
                 "[sbh] warning: /sbin/mount timed out after {MOUNT_COMMAND_TIMEOUT:?}; falling back to whichdisk"
             );
             whichdisk_mount_entries()
         }
         Err(error) => {
+            remember_mount_command_failure(now);
             eprintln!("[sbh] warning: /sbin/mount unavailable: {error}; falling back to whichdisk");
             whichdisk_mount_entries()
         }
+    }
+}
+
+fn mount_command_in_backoff(now: Instant) -> bool {
+    let backoff = MOUNT_COMMAND_BACKOFF_UNTIL.get_or_init(|| RwLock::new(None));
+    backoff
+        .read()
+        .as_ref()
+        .is_some_and(|retry_at| now < *retry_at)
+}
+
+fn remember_mount_command_failure(now: Instant) {
+    let backoff = MOUNT_COMMAND_BACKOFF_UNTIL.get_or_init(|| RwLock::new(None));
+    *backoff.write() = now.checked_add(MOUNT_COMMAND_FAILURE_BACKOFF);
+}
+
+fn clear_mount_command_failure_backoff() {
+    if let Some(backoff) = MOUNT_COMMAND_BACKOFF_UNTIL.get() {
+        *backoff.write() = None;
     }
 }
 

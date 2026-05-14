@@ -21,6 +21,7 @@ use storage_ballast_helper::cli::{
     ReleaseChannel, resolve_updater_artifact_contract,
 };
 use storage_ballast_helper::core::config::{BallastConfig, Config, ScoringConfig};
+use storage_ballast_helper::core::hex_lower;
 use storage_ballast_helper::daemon::notifications::{NotificationEvent, NotificationManager};
 use storage_ballast_helper::daemon::policy::{
     ActiveMode, FallbackReason, PolicyConfig, PolicyEngine,
@@ -1924,7 +1925,7 @@ fn sha256_file_hex(path: &Path) -> String {
     let bytes = fs::read(path).unwrap_or_else(|err| {
         panic!("read {} for sha256 failed: {err}", path.display());
     });
-    format!("{:x}", Sha256::digest(&bytes))
+    hex_lower(Sha256::digest(&bytes))
 }
 
 fn write_rss_hard_cap_test_config(
@@ -2536,7 +2537,7 @@ fn create_offline_update_bundle(bundle_root: &Path, release_tag: &str) -> (PathB
 
     let archive_bytes = b"integration-offline-update-bundle";
     fs::write(bundle_root.join(&archive_name), archive_bytes).expect("write bundle archive");
-    let checksum_hex = format!("{:x}", Sha256::digest(archive_bytes));
+    let checksum_hex = hex_lower(Sha256::digest(archive_bytes));
     fs::write(
         bundle_root.join(&checksum_name),
         format!("{checksum_hex}  {archive_name}\n"),
@@ -3425,6 +3426,14 @@ fn dry_run_deletes_nothing() {
     let report = executor.execute(&plan, None);
 
     assert!(report.dry_run, "should be dry run");
+    assert_eq!(
+        report.items_deleted, 0,
+        "dry-run must not report real deletions"
+    );
+    assert_eq!(
+        report.bytes_freed, 0,
+        "dry-run must not report real bytes freed"
+    );
     // File should still exist.
     assert!(artifact.exists(), "dry-run should not delete the file");
 }

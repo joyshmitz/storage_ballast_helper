@@ -86,7 +86,7 @@ jobs:
           # Use perl for cross-platform compat (macOS sed -i requires different syntax)
           perl -i -ne 'print unless /^ftui.*=.*\{.*path.*=.*"\/dp\//' Cargo.toml
           perl -i -pe 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: ${{ matrix.target }}
 
@@ -370,7 +370,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8.0.1

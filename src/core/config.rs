@@ -95,6 +95,42 @@ pub struct ScannerConfig {
     /// Minimum candidate size before running expensive active-reference probes.
     /// 0 checks every candidate.
     pub active_reference_min_size_bytes: u64,
+    /// Active append-only log truncation policy.
+    ///
+    /// Standard delete is blocked by the FileOpen veto when a process holds a
+    /// write fd on a growing log. This policy lets the daemon reclaim space by
+    /// `ftruncate`-ing matching files in place, which preserves the open fd so
+    /// the writer keeps logging into the same (now sparse) file.
+    pub log_truncation: LogTruncationConfig,
+}
+
+/// Active-log truncate-in-place policy.
+///
+/// Matches by a small custom path-pattern language to avoid pulling in a glob
+/// dependency. Each `paths` entry is an absolute path that may contain a
+/// single `*` per segment — matched against direct children of that segment
+/// (e.g. `/home/*/.codex/log/codex-tui.log` expands to one file per home).
+/// `~` and `$HOME` are NOT expanded; configure absolute paths explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LogTruncationConfig {
+    /// Master switch. Disabled by default for backward compatibility with
+    /// existing deployments; enable explicitly per-host once paths are vetted.
+    pub enabled: bool,
+    /// Path patterns to consider. See struct-level docs for the pattern grammar.
+    pub paths: Vec<String>,
+    /// Minimum file size before truncation is attempted. Set high enough that
+    /// a routine ad-hoc log isn't truncated mid-write under low pressure.
+    pub min_size_bytes: u64,
+    /// Free-percent ceiling below which truncation is allowed even on files
+    /// younger than `min_age_minutes`. Above this threshold, only files that
+    /// have not been modified for `min_age_minutes` are eligible. 100 disables
+    /// the pressure gate (always-eligible if size threshold met).
+    pub pressure_free_pct_ceiling: u8,
+    /// Minimum file mtime age (minutes) before truncation in non-pressure mode.
+    /// Prevents truncating a log that's actively being written under healthy
+    /// disk conditions just because it crossed the size threshold.
+    pub min_age_minutes: u64,
 }
 
 /// Multi-factor score weights and decision-theoretic losses.
@@ -488,6 +524,28 @@ impl Default for ScannerConfig {
             scan_time_budget_secs: 900,
             active_reference_cache_ttl_secs: 30,
             active_reference_min_size_bytes: 100 * 1024 * 1024,
+            log_truncation: LogTruncationConfig::default(),
+        }
+    }
+}
+
+impl Default for LogTruncationConfig {
+    fn default() -> Self {
+        // Defaults target the AI-coding-agent log patterns that drove the
+        // 2026-05-13 css/ts2/trj fill incident: codex held write fds on
+        // 81G–318G `codex-tui.log` files that sbh could not delete. Patterns
+        // are listed but the feature is off by default so existing deployments
+        // pick it up only after operator review.
+        Self {
+            enabled: false,
+            paths: vec![
+                "/home/*/.codex/log/codex-tui.log".to_string(),
+                "/root/.codex/log/codex-tui.log".to_string(),
+                "/home/*/.codex/log/*.log".to_string(),
+            ],
+            min_size_bytes: 1_073_741_824, // 1 GiB
+            pressure_free_pct_ceiling: 15,
+            min_age_minutes: 60,
         }
     }
 }

@@ -1,6 +1,5 @@
 //! Linux mount and filesystem helpers for the PAL.
 
-#![cfg(target_os = "linux")]
 #![allow(missing_docs)]
 
 use std::fs;

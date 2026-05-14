@@ -28,6 +28,7 @@ use super::telemetry::{
 use super::theme::AccessibilityProfile;
 use super::{input, render, update};
 use crate::cli::dashboard::{self, DashboardConfig as LegacyDashboardConfig};
+use crate::core::hex_lower;
 use crate::daemon::self_monitor::DaemonState;
 
 /// Which runtime path to execute.
@@ -319,7 +320,7 @@ fn preference_action_target(action: PreferenceAction) -> String {
 fn preference_profile_hash(prefs: &UserPreferences) -> Result<String, serde_json::Error> {
     let encoded = serde_json::to_vec(prefs)?;
     let digest = Sha256::digest(encoded);
-    Ok(format!("{digest:x}"))
+    Ok(hex_lower(digest))
 }
 
 /// Run dashboard runtime via one canonical entrypoint.

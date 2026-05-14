@@ -65,7 +65,7 @@ Multiple agents work on this codebase simultaneously. This is normal and expecte
 We only use **Cargo** in this project, NEVER any other package manager.
 
 - **Edition:** Rust 2024 (see `Cargo.toml`)
-- **Toolchain:** Stable (see `rust-toolchain.toml`)
+- **Toolchain:** Nightly (see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml only
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` in both `lib.rs` and `main.rs`)

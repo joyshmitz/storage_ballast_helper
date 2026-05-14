@@ -72,10 +72,16 @@ pub struct DeletionPlan {
 /// Summary after a deletion batch completes.
 #[derive(Debug, Clone)]
 pub struct DeletionReport {
+    /// Paths actually removed from the filesystem.
     pub items_deleted: usize,
     pub items_failed: usize,
     pub items_skipped: usize,
+    /// Paths that passed all safety checks and would have been removed in dry-run mode.
+    pub items_would_delete: usize,
+    /// Bytes actually reclaimed from the filesystem.
     pub bytes_freed: u64,
+    /// Bytes that would have been reclaimed in dry-run mode.
+    pub bytes_would_free: u64,
     pub duration: Duration,
     pub errors: Vec<DeletionError>,
     pub dry_run: bool,
@@ -169,7 +175,9 @@ impl DeletionExecutor {
             items_deleted: 0,
             items_failed: 0,
             items_skipped: 0,
+            items_would_delete: 0,
             bytes_freed: 0,
+            bytes_would_free: 0,
             duration: Duration::ZERO,
             errors: Vec::new(),
             dry_run: self.config.dry_run,
@@ -180,9 +188,11 @@ impl DeletionExecutor {
 
         let mut consecutive_failures: u32 = 0;
         let limit = plan.candidates.len().min(self.config.max_batch_size);
-        // Build an open-path ancestor index once per batch to avoid deep per-candidate
-        // inode-tree scans on large artifact directories.
-        let open_paths = if self.config.check_open_files {
+        // Build an open-path ancestor index once per mutating batch to avoid
+        // deep per-candidate inode-tree scans on large artifact directories.
+        // Dry-run never mutates, so it must not pay a global process-fd scan
+        // or fail a planning report because live process visibility was partial.
+        let open_paths = if self.config.check_open_files && !self.config.dry_run {
             let roots = plan
                 .candidates
                 .iter()
@@ -283,8 +293,8 @@ impl DeletionExecutor {
             }
 
             if self.config.dry_run {
-                report.items_deleted += 1;
-                report.bytes_freed += candidate.size_bytes;
+                report.items_would_delete += 1;
+                report.bytes_would_free += candidate.size_bytes;
                 Self::log_dry_run(candidate);
                 continue;
             }
@@ -664,7 +674,10 @@ mod tests {
         let plan = executor.plan(vec![c]);
         let report = executor.execute(&plan, None);
 
-        assert_eq!(report.items_deleted, 1);
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.bytes_freed, 0);
+        assert_eq!(report.items_would_delete, 1);
+        assert_eq!(report.bytes_would_free, 9);
         assert!(report.dry_run);
         assert!(file_path.exists(), "file should still exist in dry-run");
     }

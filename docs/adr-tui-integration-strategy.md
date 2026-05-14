@@ -28,8 +28,8 @@ added to Cargo.toml.
 
 The following constraints are mandatory for all downstream work:
 
-1. **Stable-only toolchain:** no nightly Rust paths and no ftui-* crate
-   dependencies in SBH's release dependency graph.
+1. **Nightly toolchain:** SBH release builds use the repository nightly
+   toolchain, and ftui-* crate dependencies remain intentional and audited.
 2. **Zero contract regression:** baseline contract IDs C-01 through C-18 from
    `docs/dashboard-status-contract-baseline.md` remain satisfied.
 3. **Safety before polish:** emergency paths, veto visibility, stale-state
@@ -239,8 +239,8 @@ Per the compliance plan (`docs/frankentui-compliance-plan.md`):
 - **Nightly features:** FrankentUI core crates have **NO** `#![feature()]`
   directives. The nightly pinning is vestigial from pre-Edition-2024
   stabilization. Core crates likely compile on stable without modification.
-- **Toolchain policy:** SBH MUST remain on stable Rust. No nightly features,
-  no feature-gated nightly paths. Per-PR import review checklist is mandatory.
+- **Toolchain policy:** SBH uses nightly Rust. Unstable feature use must remain
+  documented and covered. Per-PR import review checklist is mandatory.
 - **Safe candidates:** ftui-core, ftui-render, ftui-style, ftui-text,
   ftui-layout all use `forbid(unsafe_code)` and have minimal deps.
 - **Excluded:** ftui-extras, WASM crates, ftui-pty, ftui-i18n, frankenterm-*.

@@ -213,8 +213,8 @@ impl<'a> StatsEngine<'a> {
             .query_map(params![since, limit], |row| {
                 Ok(PatternStat {
                     pattern: row.get(0)?,
-                    count: row.get(1)?,
-                    total_bytes: row.get::<_, i64>(2).unwrap_or(0) as u64,
+                    count: sqlite_nonnegative_i64_to_u64(row.get(1)?),
+                    total_bytes: sqlite_nonnegative_i64_to_u64(row.get::<_, i64>(2).unwrap_or(0)),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -531,6 +531,10 @@ impl<'a> StatsEngine<'a> {
             current_free_pct,
         })
     }
+}
+
+fn sqlite_nonnegative_i64_to_u64(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
 }
 
 // ──────────────────── utility functions ────────────────────

@@ -32,6 +32,7 @@ use sha2::{Digest, Sha256};
 use super::model::{DashboardModel, DashboardMsg, Screen};
 use super::render;
 use super::update;
+use crate::core::hex_lower;
 use crate::daemon::self_monitor::{
     BallastState, Counters, DaemonState, LastScanState, MountPressure, PressureState,
 };
@@ -47,7 +48,7 @@ fn render_frame(model: &DashboardModel) -> String {
 fn frame_digest(frame: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(frame.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex_lower(hasher.finalize())
 }
 
 /// Assert that a frame matches its golden digest. On mismatch, print the full

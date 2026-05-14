@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::core::errors::{Result, SbhError};
+use crate::core::hex_lower;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -670,7 +671,7 @@ fn compute_sha256_hex(path: &Path) -> Result<String> {
     }
 
     let digest = hasher.finalize();
-    Ok(format!("{digest:x}"))
+    Ok(hex_lower(digest))
 }
 
 fn resolve_release_artifact_contract(
@@ -940,6 +941,10 @@ mod tests {
         assert!(
             timeout_branch.contains("whichdisk_mount_entries()"),
             "macOS mount timeout must use whichdisk instead of returning an empty inventory"
+        );
+        assert!(
+            timeout_branch.contains("remember_mount_command_failure"),
+            "macOS mount timeout must enter backoff before falling back"
         );
         assert!(
             !timeout_branch.contains("Ok(Vec::new())"),
@@ -1277,7 +1282,7 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(contents);
         let digest = hasher.finalize();
-        format!("{digest:x}")
+        hex_lower(digest)
     }
 
     #[test]
@@ -1599,7 +1604,7 @@ mod tests {
             "shasum -a 256 -c \"${checksum_file}\"",
             "SHA256SUMS.txt",
             "Collect provenance",
-            "dtolnay/rust-toolchain@stable",
+            "dtolnay/rust-toolchain@nightly",
             "rustc --version",
             "release-provenance.json",
         ] {
@@ -1611,7 +1616,7 @@ mod tests {
 
         let publish_release = workflow_block(release_workflow, "  release:\n", "\n  homebrew-tap:");
         let toolchain_setup = publish_release
-            .find("dtolnay/rust-toolchain@stable")
+            .find("dtolnay/rust-toolchain@nightly")
             .expect("publish release job must install the Rust toolchain");
         let provenance = publish_release
             .find("Collect provenance")
@@ -1904,18 +1909,18 @@ mod tests {
             "historical provenance",
             "missing `/tmp` directory",
             "release-work/storage_ballast_helper/releases",
-            "same stable Rust toolchain and feature set as",
-            "cargo +stable build $CI_FEATURES --release --target aarch64-apple-darwin",
-            "cargo +stable build $CI_FEATURES --release --target x86_64-apple-darwin",
-            "cross +stable build $CI_FEATURES --release --target aarch64-unknown-linux-gnu",
-            "cargo +stable build $CI_FEATURES --release --target x86_64-unknown-linux-gnu",
+            "same nightly Rust toolchain and feature set as",
+            "cargo +nightly build $CI_FEATURES --release --target aarch64-apple-darwin",
+            "cargo +nightly build $CI_FEATURES --release --target x86_64-apple-darwin",
+            "cross +nightly build $CI_FEATURES --release --target aarch64-unknown-linux-gnu",
+            "cargo +nightly build $CI_FEATURES --release --target x86_64-unknown-linux-gnu",
             "sbh-${TAG}-aarch64-apple-darwin.tar.xz",
             "sbh-${TAG}-x86_64-apple-darwin.tar.xz",
             "sbh-${TAG}-aarch64-unknown-linux-gnu.tar.xz",
             "sbh-${TAG}-x86_64-unknown-linux-gnu.tar.xz",
             "SHA256SUMS.txt",
             "release-provenance.json",
-            "rustc +stable --version",
+            "rustc +nightly --version",
             "ticketContents",
             "shasum -a 256 -c SHA256SUMS.txt",
             "sbh doctor --release --json",
@@ -1931,6 +1936,20 @@ mod tests {
                 "macOS guide must document manual release fallback safety fragment: {required}"
             );
         }
+    }
+
+    #[test]
+    fn repository_toolchain_pins_nightly_for_release_contracts() {
+        let toolchain = include_str!("../../rust-toolchain.toml");
+
+        assert!(
+            toolchain.contains("channel = \"nightly\""),
+            "release and CI provenance contracts require the repository toolchain to pin nightly"
+        );
+        assert!(
+            !toolchain.contains("channel = \"stable\""),
+            "stable must not be the repository default toolchain"
+        );
     }
 
     #[test]

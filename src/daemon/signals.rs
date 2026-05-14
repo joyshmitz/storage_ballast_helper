@@ -54,6 +54,12 @@ impl SignalHandler {
         self.shutdown_flag.load(Ordering::Relaxed)
     }
 
+    /// Shared shutdown flag for long-running worker threads.
+    #[must_use]
+    pub(crate) fn shutdown_token(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown_flag)
+    }
+
     /// Check (and clear) whether a config reload has been requested.
     #[must_use]
     pub fn should_reload(&self) -> bool {
