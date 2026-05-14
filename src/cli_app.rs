@@ -824,7 +824,7 @@ fn run_truncate_logs(cli: &Cli, args: &TruncateLogsArgs) -> Result<(), CliError>
         return Ok(());
     }
 
-    // Force-mode collapses the age gate by reporting "100% pressure".
+    // Force-mode collapses the age gate by reporting critical pressure.
     let synthetic_free_pct = if args.force { 0.0 } else { 100.0 };
 
     let report: LogTruncationReport =
@@ -836,9 +836,14 @@ fn run_truncate_logs(cli: &Cli, args: &TruncateLogsArgs) -> Result<(), CliError>
     } else {
         report.bytes_reclaimed
     };
+    let files = if args.dry_run {
+        report.files_would_truncate
+    } else {
+        report.files_truncated
+    };
     println!(
         "[sbh] log truncation pass {verb} {bytes} bytes across {n} file(s); skipped {sk}; {e} error(s); took {ms} ms",
-        n = report.files_truncated,
+        n = files,
         sk = report.files_skipped,
         e = report.errors.len(),
         ms = report.duration.as_millis(),

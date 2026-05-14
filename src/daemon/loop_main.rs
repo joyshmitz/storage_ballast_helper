@@ -286,6 +286,9 @@ pub struct ScanRequest {
     pub paths: Vec<PathBuf>,
     pub urgency: f64,
     pub pressure_level: PressureLevel,
+    /// Actual free percentage for the mount/root that triggered this scan.
+    /// `None` is allowed for synthetic unit-test requests and degraded callers.
+    pub free_pct: Option<f64>,
     pub max_delete_batch: usize,
     /// When config is reloaded, this carries the updated scoring and scanner config.
     pub config_update: Option<(
@@ -1035,6 +1038,21 @@ fn effective_scan_budget(config: &ScannerConfig, pressure_level: PressureLevel) 
         _ => base_budget_secs,
     };
     Duration::from_secs(budget_secs)
+}
+
+fn fallback_log_truncation_free_pct(pressure_level: PressureLevel) -> f64 {
+    match pressure_level {
+        PressureLevel::Green | PressureLevel::Yellow => 100.0,
+        PressureLevel::Orange => 10.0,
+        PressureLevel::Red | PressureLevel::Critical => 0.0,
+    }
+}
+
+fn log_truncation_free_pct_for_request(request: &ScanRequest) -> f64 {
+    request
+        .free_pct
+        .filter(|pct| pct.is_finite())
+        .unwrap_or_else(|| fallback_log_truncation_free_pct(request.pressure_level))
 }
 
 fn scan_deadline_reached(scan_start: Instant, scan_deadline: Instant, phase: &str) -> bool {
@@ -2667,6 +2685,7 @@ impl MonitoringDaemon {
             paths,
             urgency: response.urgency,
             pressure_level: response.level,
+            free_pct: Some(response.free_pct),
             max_delete_batch: behavior_delete_batch_limit(
                 self.behavior_state.mode,
                 response.max_delete_batch,
@@ -2719,6 +2738,7 @@ impl MonitoringDaemon {
             paths: self.config.scanner.root_paths.clone(),
             urgency: response.urgency.max(0.5), // at least moderate urgency for forced scans
             pressure_level: response.level,
+            free_pct: Some(response.free_pct),
             max_delete_batch: response.max_delete_batch,
             config_update: None,
         };
@@ -2962,6 +2982,7 @@ impl MonitoringDaemon {
                         max_delete_batch,
                         fallback_active: false,
                         causing_mount: mount.clone(),
+                        free_pct: stats.free_pct(),
                         predicted_seconds: None,
                     };
                     let _ = self.release_ballast(&mount, &release_response);
@@ -2977,6 +2998,7 @@ impl MonitoringDaemon {
                     paths: scan_paths,
                     urgency,
                     pressure_level,
+                    free_pct: Some(stats.free_pct()),
                     max_delete_batch,
                     config_update: None,
                 };
@@ -3574,36 +3596,43 @@ fn scanner_thread_main(
         // executor would otherwise prevent recovery of these files — the failure
         // mode that drove css/ts2/trj to 99% disk on 2026-05-13. Cheap when the
         // policy is disabled (just an enabled-check) so it's safe to call every
-        // scan cycle. Maps the coarse pressure level into a synthetic free-pct
-        // for the policy's pressure_free_pct_ceiling gate.
+        // scan cycle. Uses the actual triggering free-pct when available so
+        // the policy's pressure_free_pct_ceiling gate keeps its configured
+        // meaning across Yellow/Orange boundary conditions.
         if current_scanner_config.log_truncation.enabled {
-            let synthetic_free_pct = match request.pressure_level {
-                crate::monitor::pid::PressureLevel::Green => 100.0,
-                crate::monitor::pid::PressureLevel::Yellow => 15.0,
-                crate::monitor::pid::PressureLevel::Orange => 5.0,
-                crate::monitor::pid::PressureLevel::Red
-                | crate::monitor::pid::PressureLevel::Critical => 0.0,
-            };
+            let truncation_free_pct = log_truncation_free_pct_for_request(&request);
             let trunc_report = crate::scanner::log_truncator::truncate_oversized_logs(
                 &current_scanner_config.log_truncation,
-                synthetic_free_pct,
+                truncation_free_pct,
                 current_scanner_config.dry_run,
             );
-            if trunc_report.files_truncated > 0 || !trunc_report.errors.is_empty() {
-                eprintln!(
-                    "[sbh-truncate] pressure={:?} freed={}B files={} skipped={} errors={} dur={}ms",
-                    request.pressure_level,
+            let (truncate_verb, truncate_bytes, truncate_files) = if current_scanner_config.dry_run
+            {
+                (
+                    "would_free",
+                    trunc_report.bytes_would_reclaim,
+                    trunc_report.files_would_truncate,
+                )
+            } else {
+                (
+                    "freed",
                     trunc_report.bytes_reclaimed,
                     trunc_report.files_truncated,
+                )
+            };
+            if truncate_files > 0 || !trunc_report.errors.is_empty() {
+                eprintln!(
+                    "[sbh-truncate] pressure={:?} {truncate_verb}={}B files={} skipped={} errors={} dur={}ms",
+                    request.pressure_level,
+                    truncate_bytes,
+                    truncate_files,
                     trunc_report.files_skipped,
                     trunc_report.errors.len(),
                     trunc_report.duration.as_millis(),
                 );
                 logger.send(crate::logger::dual::ActivityEvent::Info {
                     message: format!(
-                        "log_truncation: freed {} bytes across {} file(s) at pressure={:?}",
-                        trunc_report.bytes_reclaimed,
-                        trunc_report.files_truncated,
+                        "log_truncation: {truncate_verb} {truncate_bytes} bytes across {truncate_files} file(s) at pressure={:?}",
                         request.pressure_level,
                     ),
                 });
@@ -5025,6 +5054,7 @@ mod tests {
                 paths: vec![root],
                 urgency: 0.9,
                 pressure_level: PressureLevel::Orange,
+                free_pct: Some(9.0),
                 max_delete_batch: 10,
                 config_update: None,
             })
@@ -5448,6 +5478,7 @@ mod tests {
             paths: vec![PathBuf::from("/tmp")],
             urgency: 0.5,
             pressure_level: PressureLevel::Yellow,
+            free_pct: None,
             max_delete_batch: 0,
             config_update: None,
         };
@@ -5543,11 +5574,58 @@ mod tests {
             paths: vec![PathBuf::from("/tmp"), PathBuf::from("/data/projects")],
             urgency: 0.7,
             pressure_level: PressureLevel::Orange,
+            free_pct: Some(8.5),
             max_delete_batch: 10,
             config_update: None,
         };
         assert_eq!(request.paths.len(), 2);
         assert_eq!(request.urgency.to_bits(), 0.7_f64.to_bits());
+        assert_eq!(request.free_pct, Some(8.5));
+    }
+
+    #[test]
+    fn fallback_log_truncation_free_pct_is_conservative_before_orange() {
+        assert_eq!(
+            fallback_log_truncation_free_pct(PressureLevel::Green).to_bits(),
+            100.0_f64.to_bits()
+        );
+        assert_eq!(
+            fallback_log_truncation_free_pct(PressureLevel::Yellow).to_bits(),
+            100.0_f64.to_bits()
+        );
+        assert_eq!(
+            fallback_log_truncation_free_pct(PressureLevel::Orange).to_bits(),
+            10.0_f64.to_bits()
+        );
+        assert_eq!(
+            fallback_log_truncation_free_pct(PressureLevel::Critical).to_bits(),
+            0.0_f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn log_truncation_free_pct_prefers_actual_scan_pressure() {
+        let request = ScanRequest {
+            paths: vec![PathBuf::from("/tmp")],
+            urgency: 0.4,
+            pressure_level: PressureLevel::Yellow,
+            free_pct: Some(18.0),
+            max_delete_batch: 0,
+            config_update: None,
+        };
+        assert_eq!(
+            log_truncation_free_pct_for_request(&request).to_bits(),
+            18.0_f64.to_bits()
+        );
+
+        let missing_free_pct = ScanRequest {
+            free_pct: None,
+            ..request
+        };
+        assert_eq!(
+            log_truncation_free_pct_for_request(&missing_free_pct).to_bits(),
+            100.0_f64.to_bits()
+        );
     }
 
     #[test]
@@ -5568,6 +5646,7 @@ mod tests {
             max_delete_batch: 7,
             fallback_active: false,
             causing_mount: PathBuf::from("/"),
+            free_pct: 12.5,
             predicted_seconds: Some(120.0),
         };
         let memory = MemoryInfo {
@@ -5641,6 +5720,7 @@ mod tests {
             paths: vec![],
             urgency: 0.5,
             pressure_level: PressureLevel::Orange,
+            free_pct: None,
             max_delete_batch: 10,
             config_update: None,
         };
@@ -5783,6 +5863,7 @@ mod tests {
             paths: vec![],
             urgency,
             pressure_level: PressureLevel::Critical,
+            free_pct: None,
             max_delete_batch: 40,
             config_update: None,
         };
@@ -5807,6 +5888,7 @@ mod tests {
             paths: vec![],
             urgency,
             pressure_level: PressureLevel::Critical,
+            free_pct: None,
             max_delete_batch: 40,
             config_update: None,
         };
@@ -5873,6 +5955,7 @@ mod tests {
             paths: vec![],
             urgency: 0.9,
             pressure_level: PressureLevel::Critical,
+            free_pct: None,
             max_delete_batch: 40,
             config_update: None,
         };
@@ -5891,6 +5974,7 @@ mod tests {
             paths: vec![PathBuf::from("/tmp")],
             urgency: 1.0,
             pressure_level: PressureLevel::Critical,
+            free_pct: None,
             max_delete_batch: 1,
             config_update: None,
         };
@@ -5916,6 +6000,7 @@ mod tests {
             paths: vec![PathBuf::from("/tmp")],
             urgency: 1.0,
             pressure_level: PressureLevel::Critical,
+            free_pct: None,
             max_delete_batch: 1,
             config_update: None,
         };

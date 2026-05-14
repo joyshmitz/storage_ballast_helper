@@ -30,6 +30,7 @@ mod tests {
             max_delete_batch: 10,
             fallback_active: false,
             causing_mount: PathBuf::from("/test"),
+            free_pct: 5.0,
             predicted_seconds: None,
         }
     }

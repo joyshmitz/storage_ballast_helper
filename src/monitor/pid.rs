@@ -44,6 +44,7 @@ pub struct PressureResponse {
     pub max_delete_batch: usize,
     pub fallback_active: bool,
     pub causing_mount: PathBuf,
+    pub free_pct: f64,
     pub predicted_seconds: Option<f64>,
 }
 
@@ -243,6 +244,7 @@ impl PidPressureController {
             max_delete_batch,
             fallback_active: false,
             causing_mount: reading.mount,
+            free_pct,
             predicted_seconds: predicted_seconds_to_red,
         }
     }

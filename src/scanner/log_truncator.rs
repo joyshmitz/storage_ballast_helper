@@ -19,8 +19,8 @@
 //! way to free space from an active log without killing the writer.
 //!
 //! Patterns are matched with a tiny built-in matcher rather than pulling in
-//! `glob`/`globset`. Each `paths` entry is an absolute path; a single literal
-//! `*` per segment matches any direct entry of that segment's parent.
+//! `glob`/`globset`. Each `paths` entry is an absolute path; literal `*`
+//! wildcards inside a path segment match direct entries of that segment's parent.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,6 +33,8 @@ use crate::core::config::LogTruncationConfig;
 pub struct LogTruncationReport {
     /// Number of files truncated in-place.
     pub files_truncated: usize,
+    /// Number of files that would have been truncated in dry-run mode.
+    pub files_would_truncate: usize,
     /// Number of matching paths rejected or failed before truncation.
     pub files_skipped: usize,
     /// Bytes reclaimed by successful in-place truncation.
@@ -102,7 +104,7 @@ pub fn truncate_oversized_logs(
                     report.bytes_reclaimed += bytes;
                 }
                 Ok(Outcome::WouldTruncate(bytes)) => {
-                    report.files_truncated += 1;
+                    report.files_would_truncate += 1;
                     report.bytes_would_reclaim += bytes;
                 }
                 Ok(Outcome::Skipped(reason)) => {
@@ -155,16 +157,36 @@ fn process_candidate(
     if dry_run {
         return Ok(Outcome::WouldTruncate(size));
     }
-    let f = fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(|e| e.to_string())?;
+    let f = open_candidate_for_truncate(path)?;
+    if !f.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("opened path is not a regular file".to_string());
+    }
     f.set_len(0).map_err(|e| e.to_string())?;
     Ok(Outcome::Truncated(size))
 }
 
-/// Expand a pattern with at most a single literal `*` per segment by walking
-/// the filesystem from the longest non-wildcard prefix.
+fn open_candidate_for_truncate(path: &Path) -> Result<fs::File, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Expand a pattern with literal `*` wildcards by walking the filesystem from
+/// the longest non-wildcard prefix.
 fn expand_pattern(pattern: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     if !pattern.is_absolute() {
         return Err("only absolute patterns are supported".to_string());
@@ -192,7 +214,7 @@ fn expand_recursive(prefix: &Path, segments: &[String], idx: usize, out: &mut Ve
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if segment_matches(seg, &name_str) {
-                let next = prefix.join(&*name_str);
+                let next = prefix.join(&name);
                 expand_recursive(&next, segments, idx + 1, out);
             }
         }
@@ -208,7 +230,8 @@ fn expand_recursive(prefix: &Path, segments: &[String], idx: usize, out: &mut Ve
 /// Match a single path segment against a pattern that may contain `*`.
 ///
 /// `*` matches any run of characters within the segment (greedy, non-empty
-/// or empty). Forward slashes never appear inside a segment.
+/// or empty). Other characters, including `?`, are treated literally.
+/// Forward slashes never appear inside a segment.
 fn segment_matches(pattern: &str, name: &str) -> bool {
     // Shell glob convention: hidden entries are only matched when the
     // pattern explicitly opens with a literal dot. A pattern starting with
@@ -232,7 +255,7 @@ fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
             star = Some(p);
             t_after_star = t;
             p += 1;
-        } else if p < pattern.len() && (pattern[p] == text[t] || pattern[p] == b'?') {
+        } else if p < pattern.len() && pattern[p] == text[t] {
             p += 1;
             t += 1;
         } else if let Some(star_idx) = star {
@@ -264,6 +287,8 @@ mod tests {
         assert!(!segment_matches("*", ".hidden"));
         assert!(segment_matches(".hidden", ".hidden"));
         assert!(segment_matches("foo-*-bar", "foo-XYZ-bar"));
+        assert!(segment_matches("run?.log", "run?.log"));
+        assert!(!segment_matches("run?.log", "run1.log"));
     }
 
     #[test]
@@ -335,7 +360,8 @@ mod tests {
         };
 
         let report = truncate_oversized_logs(&config, 50.0, true);
-        assert_eq!(report.files_truncated, 1);
+        assert_eq!(report.files_truncated, 0);
+        assert_eq!(report.files_would_truncate, 1);
         assert_eq!(report.bytes_would_reclaim, 2048);
         assert_eq!(report.bytes_reclaimed, 0);
         assert_eq!(fs::metadata(&path).unwrap().len(), 2048);
@@ -449,5 +475,34 @@ mod tests {
         assert_eq!(report.bytes_reclaimed, 4096);
         assert_eq!(fs::metadata(&file_a).unwrap().len(), 0);
         assert_eq!(fs::metadata(&file_b).unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wildcard_expansion_preserves_non_utf8_file_names() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_name = OsString::from_vec(b"codex-\xFF.log".to_vec());
+        let path = dir.path().join(&file_name);
+        File::create(&path)
+            .unwrap()
+            .write_all(&vec![b'x'; 2048])
+            .unwrap();
+
+        let pattern = format!("{}/*.log", dir.path().display());
+        let config = LogTruncationConfig {
+            enabled: true,
+            paths: vec![pattern],
+            min_size_bytes: 1024,
+            pressure_free_pct_ceiling: 100,
+            min_age_minutes: 0,
+        };
+
+        let report = truncate_oversized_logs(&config, 50.0, false);
+        assert_eq!(report.files_truncated, 1, "{report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
     }
 }

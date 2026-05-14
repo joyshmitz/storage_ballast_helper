@@ -108,8 +108,9 @@ pub struct ScannerConfig {
 ///
 /// Matches by a small custom path-pattern language to avoid pulling in a glob
 /// dependency. Each `paths` entry is an absolute path that may contain a
-/// single `*` per segment — matched against direct children of that segment
-/// (e.g. `/home/*/.codex/log/codex-tui.log` expands to one file per home).
+/// literal `*` wildcard inside a segment — matched against direct children of
+/// that segment (e.g. `/home/*/.codex/log/codex-tui.log` expands to one file
+/// per home). Other wildcard characters such as `?` are treated literally.
 /// `~` and `$HOME` are NOT expanded; configure absolute paths explicitly.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
