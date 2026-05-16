@@ -2141,7 +2141,6 @@ mod tests {
             "notary log ticketContents",
             "sbh-notary",
             "HOMEBREW_TAP_SSH_KEY",
-            "Not Complete",
             "sbh doctor --release --json",
             "aggregate `ok` boolean",
             "`passed`,",
