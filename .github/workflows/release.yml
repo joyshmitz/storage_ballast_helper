@@ -338,6 +338,50 @@ jobs:
             shasum -a 256 "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
           fi
 
+      - name: Verify tarball binary matches matrix target
+        # Guard against label/content mismatch (e.g., the v0.4.23 incident where the
+        # macOS aarch64 binary was uploaded under linux-x86_64 filenames). Extract
+        # the binary from the freshly built archive and assert `file` output matches
+        # the matrix target — fails the build before broken artifacts can ship.
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE_NAME="sbh-${GITHUB_REF_NAME}-${{ matrix.target }}.${{ matrix.archive }}"
+          probe_dir="$(mktemp -d)"
+          tar -xJf "${ARCHIVE_NAME}" -C "${probe_dir}"
+          probe_bin="${probe_dir}/sbh"
+          if [ ! -f "${probe_bin}" ]; then
+            echo "::error::archive ${ARCHIVE_NAME} did not contain an sbh binary"
+            exit 1
+          fi
+          file_out="$(file -b "${probe_bin}")"
+          echo "Probe (target=${{ matrix.target }}): ${file_out}"
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)
+              expected_regex='ELF 64-bit LSB.*x86-64'
+              ;;
+            aarch64-unknown-linux-gnu)
+              expected_regex='ELF 64-bit LSB.*(aarch64|ARM aarch64)'
+              ;;
+            x86_64-apple-darwin)
+              expected_regex='Mach-O 64-bit executable x86_64'
+              ;;
+            aarch64-apple-darwin)
+              expected_regex='Mach-O 64-bit executable arm64'
+              ;;
+            *)
+              echo "::error::unknown matrix target ${{ matrix.target }} has no arch validator"
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "${file_out}" | grep -Eq "${expected_regex}"; then
+            echo "::error::archive ${ARCHIVE_NAME} contains a binary that does not match target ${{ matrix.target }}"
+            echo "::error::expected regex: ${expected_regex}"
+            echo "::error::file output:    ${file_out}"
+            exit 1
+          fi
+          rm -rf "${probe_dir}"
+
       - name: Mirror to legacy unversioned artifact names
         # Pre-v0.4.8 sbh self-updaters request `sbh-{target}.{archive}` (no version
         # in the filename). Ship both naming conventions so any installed sbh can
