@@ -477,7 +477,11 @@ mod tests {
         assert_eq!(fs::metadata(&file_b).unwrap().len(), 0);
     }
 
-    #[cfg(unix)]
+    // Linux-only: APFS/HFS+ reject non-UTF-8 byte sequences in filenames, so the
+    // `\xFF` test fixture can't be created on macOS. The behavior under test
+    // (wildcard expansion preserving exotic OsString bytes) is reachable only
+    // on filesystems that admit such names — which on this codebase means Linux.
+    #[cfg(target_os = "linux")]
     #[test]
     fn wildcard_expansion_preserves_non_utf8_file_names() {
         use std::ffi::OsString;
