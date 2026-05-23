@@ -6,6 +6,92 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ---
 
+## v0.4.25
+
+Compare: [`v0.4.24...v0.4.25`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.24...v0.4.25)
+
+### Safety floor — source-code deletion is now impossible regardless of config
+
+**Background.** The 2026-05-16 fleet carnage wiped ~87 working trees under `/data/projects` on trj when the scanner's name-heuristic gave source-crate directories high artifact-like scores. The carnage repeated on a smaller scale on 2026-05-22 when sbh was re-enabled on the vmi worker fleet: synced source-crate stubs (1–10 KB, no `Cargo.toml` yet) were classified as deletable artifacts and `frankenterm/crates/frankenterm-core`, `frankenterm/crates/frankenterm-alloc`, `frankenterm/crates/frankenterm-topo`, and ~25 other crate dirs were deleted across vmi1149989/vmi1153651/vmi1156319/vmi1167313 before the operator caught it. No primary source was lost (vmis hold synced ephemeral copies and re-sync from trj on next rch job), but the bug means an operator who points sbh at `/data/projects` on a primary dev machine can lose actual source.
+
+**Fix.** Two hardcoded safety layers were added to `scanner::deletion::preflight_check` that cannot be disabled via operator configuration:
+
+- **`SkipReason::HardcodedSourceTree`** (preflight step 0, runs BEFORE the existence check) refuses paths inside well-known source-tree locations — `/data/projects/`, `/home/<user>/projects/`, `/Users/<user>/projects/` — UNLESS the candidate's basename clearly identifies it as a disposable build/cache artifact (see the carve-out list below). It also refuses, unconditionally with no carve-out, any path with an ancestor directory literally named `.git` (including the candidate itself being named `.git`). The match list is hardcoded and cannot be disabled by config.
+- **`SkipReason::LooksLikeSourceCode`** (preflight step 5b, runs after the existing cargo-manifest veto) refuses any directory that directly contains a source manifest (`Cargo.toml`, `package.json`, `pyproject.toml`, `setup.py`, `go.mod`, `pom.xml`, `build.gradle`, `tsconfig.json`, `Gemfile`, `Pipfile`, `mix.exs`, `Project.toml`, etc.) OR direct-child source files (`*.rs`, `*.py`, `*.ts`, `*.go`, `*.cpp`, `*.swift`, `*.rb`, `*.java`, `*.kt`, `*.ex`, `*.exs`, `*.ml`, `*.hs`, `*.c`, `*.h`, `*.hpp`, `*.scala`, `*.clj`, `*.cljs`, `*.lua`, `*.jl`, etc.). Catches synced stubs that lack `Cargo.toml` and so slip past the existing `ContainsCargoManifest` veto. Direct-child only (no recursion). The check applies everywhere — even outside the hardcoded source-tree paths — so a stray `package.json` in an unexpected location still triggers a veto.
+
+Both new skip reasons are routed through the existing "normal safety veto" log-noise filter so they don't flood the activity log with expected refusals.
+
+### Artifact-basename carve-out — keeps sbh useful inside source trees
+
+The broad source-tree refusal would otherwise block sbh from doing its main job inside operator-configured source roots (the setup wizard adds `/data/projects` to `root_paths` precisely so target/ etc. can be cleaned). The carve-out is a narrow allow-list of basenames that are unambiguously disposable:
+
+**Exact match** (alphabetized): `.cargo-target`, `.next`, `.nuxt`, `.parcel-cache`, `.pytest_cache`, `.rch-target`, `.rch_target`, `.target`, `.tox`, `.turbo`, `.venv`, `__pycache__`, `build`, `dist`, `node_modules`, `rch-target`, `rch_target`, `target`, `venv`.
+
+**Prefix match (each requires the trailing separator):** `target-*`, `target_*`, `.rch-target-*`, `.rch_target_*`, `rch-target-*`, `rch_target_*`, `.cargo-target-*`.
+
+The separator requirement matters — an earlier draft used `.rch-target` as a prefix (no trailing `-`), which would have falsely matched names like `.rch-targetfoo` and exempted them from the protection. Each prefix matcher in the implementation requires its separator; bare basenames without suffixes are in the exact-match list instead.
+
+A path under a protected root whose basename matches one of these IS deletable; any other basename is vetoed. This means `/data/projects/franken_node/target` gets cleaned, but `/data/projects/franken_node/src` (or `/data/projects/frankenterm/crates/frankenterm-core`, the actual 2026-05-22 incident) stays protected.
+
+The `.git`-ancestor refusal is NOT subject to the carve-out — `/srv/code/.git/target` is still vetoed because the `.git` ancestor wins. The whole purpose of refusing under-.git paths is to protect git metadata; allowing artifact-named children would defeat that.
+
+### Default scan roots are now safe out of the box
+
+`ScannerConfig::default()` shipped with `["/data/projects", "/tmp", "/data/tmp", "/var/tmp", "/home", "/root"]` — three of those six entries hold source code or personal files. A fresh install that inherited defaults was unsafe. New default:
+
+- `root_paths = ["/tmp", "/data/tmp", "/var/tmp"]` — only ephemeral temp paths.
+
+`excluded_paths` is unchanged. `/data/projects` is intentionally NOT added to default `excluded_paths`: the setup wizard (`cli/wizard.rs`) actively adds `/data/projects` to `root_paths` when run, so excluding it would silently break wizard-generated configs (the walker would refuse to descend into the configured root). The hardcoded preflight refusal at deletion time — combined with the artifact-basename carve-out — is the real defense.
+
+### Operator implications
+
+Once v0.4.25 is deployed and sbh is re-enabled:
+
+- The setup wizard's auto-added `/data/projects` root continues to be useful: `target/`, `node_modules/`, `.rch-target-*/`, etc. under it ARE cleaned up.
+- Arbitrary basenames under `/data/projects/`, `/home/*/projects/`, or `/Users/*/projects/` (e.g., `src/`, `docs/`, `crates/`, `frankenterm-core/`) are refused at preflight even if the scorer marks them as candidates. This is the carnage-prevention guarantee.
+- `LooksLikeSourceCode` (step 5b) provides a second-layer defense even outside the protected paths: any dir containing source manifests or top-level source files is refused regardless of where it sits.
+
+If the carve-out list misses a basename you'd like sbh to clean (or includes one you'd like protected), it's an additive edit to the constant list inside `is_obvious_build_artifact_basename` in `src/scanner/deletion.rs` — no API change.
+
+### Tests
+
+Hardcoded source-tree refusal:
+
+- `hardcoded_source_tree_matches_data_projects` / `_home_projects` / `_users_projects` — non-artifact basenames under each protected root are refused.
+- `hardcoded_source_tree_skips_unrelated_paths` — `/tmp/junk`, `/home/ubuntu/.cache`, `/home/ubuntu/project` (singular), etc. pass through unchanged.
+- `hardcoded_source_tree_matches_git_ancestor` — paths with `.git` ancestor (including the leaf case `/srv/code/.git` and `/.git`) are unconditionally refused.
+
+Artifact-basename carve-out:
+
+- `obvious_build_artifact_basename_exact_matches` — every entry in the exact-match list is recognized (covers all 19 bare names including the bare `.rch-target`, `.rch_target`, `rch-target`, `rch_target` variants).
+- `obvious_build_artifact_basename_prefix_matches` — `target-*`, `target_*`, `.rch-target-*`, `.rch_target_*`, `rch-target-*`, `rch_target_*`, `.cargo-target-*` patterns recognized.
+- `obvious_build_artifact_basename_negatives` — confusables (`targets` plural, `my-target`, `untargeted`, `nodemodules` without underscore, etc.) and real source basenames (`src`, `lib`, `tests`, `docs`, `frankenterm-core`, etc.) do NOT match. Includes regression cases for the prefix-without-separator class (`.rch-targetfoo`, `rch-targetfoo`, `rch_targetfoo`, `.cargo-targetfoo`, `targetfoo`) that an earlier permissive prefix matcher would have wrongly exempted.
+- `obvious_build_artifact_basename_handles_no_basename` — `/` and empty paths return false.
+
+Hybrid behavior:
+
+- `hardcoded_source_tree_allows_target_under_data_projects` — `target/`, `node_modules/`, `.next/`, `__pycache__/` under `/data/projects/foo/` are NOT vetoed.
+- `hardcoded_source_tree_allows_rch_targets_under_data_projects` — full rch per-job target paths are recognized via the prefix-match list.
+- `hardcoded_source_tree_allows_target_under_users_projects` / `_under_home_projects` — carve-out applies equally to all three protected roots.
+- `hardcoded_source_tree_still_vetoes_source_basenames_under_protected_root` — `src`, `docs`, `legacy_code`, working-tree root names, and the actual 2026-05-22 incident target (`frankenterm-core`) all STAY vetoed.
+- `hardcoded_source_tree_git_check_overrides_artifact_carveout` — `/srv/code/.git/target` and `/srv/code/.git/objects/pack/target` are refused despite the artifact basename, because the `.git` ancestor check runs after the carve-out.
+
+Source-code marker veto:
+
+- `looks_like_source_code_detects_cargo_toml` / `_rust_files` / `_package_json` / `_python_files` / `_go_files` — positive triggers across languages.
+- `looks_like_source_code_ignores_build_artifacts` — pure cargo `target/` dir is NOT classified as source.
+- `looks_like_source_code_skips_unreadable_dir` — `read_dir` failure returns false (matches existing helper behavior).
+
+Preflight wiring:
+
+- `preflight_vetoes_hardcoded_source_tree` — step 0 fires for `/data/projects/frankenterm/crates/frankenterm-core`.
+- `preflight_vetoes_source_code_dir` — step 5b fires for a dir with `package.json` + `index.ts`.
+- `preflight_cargo_manifest_still_takes_precedence_over_source_marker` — locks in step 5 (ContainsCargoManifest) firing before step 5b (LooksLikeSourceCode) when a dir matches both, so a future refactor that swaps the order is visible in test diffs.
+
+### Fleet status as of this release
+
+This crate version is not yet built or deployed. The je fleet currently runs v0.4.24 with operator-patched `/etc/sbh/config.toml` (`root_paths = ["/tmp", "/data/tmp"]`). The config patch alone is sufficient to prevent the recurring scenario (walker never descends into `/data/projects`); v0.4.25 lets operators safely add `/data/projects` back to `root_paths` because the in-code defenses fire at deletion time — refusing source-shaped paths while permitting `target/` and friends.
+
 ## Unreleased
 
 Compare: [`v0.4.6...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.6...HEAD)

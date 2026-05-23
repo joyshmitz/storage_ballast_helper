@@ -115,6 +115,22 @@ pub enum SkipReason {
     BelowThreshold,
     Symlink,
     ContainsCargoManifest,
+    /// Path sits under a hardcoded source-tree location
+    /// (`/data/projects/*`, `/home/*/projects/*`, `/Users/*/projects/*`) AND
+    /// the candidate's basename does not match the obvious-build-artifact
+    /// carve-out (`target`, `node_modules`, `__pycache__`, `.rch-target-*`, etc.).
+    /// Also fires unconditionally for any path with a `.git` ancestor or that
+    /// IS a `.git` directory.
+    ///
+    /// This is the carnage-prevention floor that overrides operator config.
+    /// See `is_hardcoded_source_tree` and `is_obvious_build_artifact_basename`
+    /// in this module for the exact predicates.
+    HardcodedSourceTree,
+    /// Directory contains source-code marker files (Cargo.toml, package.json,
+    /// pyproject.toml, etc.) and so is treated as source code even if it lacks
+    /// build-output markers. Catches synced source stubs that the cargo-only
+    /// veto misses (root cause of the 2026-05-22 frankenterm crate deletions).
+    LooksLikeSourceCode,
 }
 
 // ──────────────────── executor ────────────────────
@@ -269,13 +285,16 @@ impl DeletionExecutor {
                         report.not_writable_paths.push(candidate.path.clone());
                     }
                     // Only log unexpected skip reasons. PathGone (parent deleted),
-                    // ContainsGit, and Cargo manifests are normal safety vetoes that
+                    // ContainsGit, Cargo manifests, hardcoded source-tree refusal,
+                    // and source-code-marker refusal are normal safety vetoes that
                     // produce excessive log noise when logged as errors.
                     if !matches!(
                         skip,
                         SkipReason::PathGone
                             | SkipReason::ContainsGit
                             | SkipReason::ContainsCargoManifest
+                            | SkipReason::HardcodedSourceTree
+                            | SkipReason::LooksLikeSourceCode
                     ) {
                         eprintln!(
                             "[SBH-EXECUTOR] skip: {} ({:?})",
@@ -346,6 +365,19 @@ impl DeletionExecutor {
         path: &Path,
         open_paths: Option<&HashSet<PathBuf>>,
     ) -> std::result::Result<(), SkipReason> {
+        // 0. Hardcoded source-tree refusal — runs BEFORE the existence check
+        //    so the result holds even for stat-failing paths. This is the
+        //    carnage-prevention floor: operators cannot disable it via config.
+        //    Background: on 2026-05-16 sbh wiped ~87 working trees under
+        //    /data/projects on trj when its scorer misclassified source crate
+        //    directories as build artifacts. On 2026-05-22 the same scoring
+        //    bug deleted synced frankenterm crate stubs across the vmi worker
+        //    fleet. Hardcoded path refusal makes both impossible regardless
+        //    of `root_paths` / `excluded_paths` config.
+        if is_hardcoded_source_tree(path) {
+            return Err(SkipReason::HardcodedSourceTree);
+        }
+
         // 1. Path still exists (use symlink_metadata to not follow symlinks).
         let Ok(meta) = fs::symlink_metadata(path) else {
             return Err(SkipReason::PathGone);
@@ -375,6 +407,14 @@ impl DeletionExecutor {
         //    remove_dir_all.
         if meta.is_dir() && contains_cargo_manifest_without_artifact_markers(path) {
             return Err(SkipReason::ContainsCargoManifest);
+        }
+
+        // 5b. Source-code marker check — catches stubs that the cargo-only
+        //     veto misses. Any directory containing Cargo.toml, package.json,
+        //     pyproject.toml, go.mod, *.rs/*.py/*.ts/*.go source files is
+        //     treated as source regardless of build-output markers.
+        if meta.is_dir() && looks_like_source_code(path) {
+            return Err(SkipReason::LooksLikeSourceCode);
         }
 
         // 6. Not currently open by any process (Linux /proc check).
@@ -483,6 +523,217 @@ fn contains_nested_git(path: &Path, max_depth: usize) -> bool {
             return true;
         }
     }
+    false
+}
+
+/// Returns true if the candidate's basename clearly identifies it as a
+/// disposable build/cache artifact that's safe to delete even when located
+/// inside a protected source-tree root.
+///
+/// This is the "carve-out" that keeps sbh useful inside `/data/projects/`,
+/// `/home/<user>/projects/`, and `/Users/<user>/projects/`: the broad
+/// hardcoded-source-tree refusal would otherwise block all cleanup there,
+/// including the wizard's main intended use case (clearing `target/`,
+/// `node_modules/`, etc. under operator-configured source roots).
+///
+/// The list is intentionally narrow — only basenames we are confident
+/// represent disposable build/cache directories. Anything not on this list
+/// stays vetoed under protected roots, preserving the carnage-prevention
+/// guarantee for arbitrary unknown names.
+///
+/// If you ever expand this list, the new entries are additive — they only
+/// ever LOOSEN the refusal for the matched basename. Existing protections
+/// for unmatched basenames are unchanged.
+fn is_obvious_build_artifact_basename(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+
+    // Exact-match basenames (alphabetized for ease of audit). Bare rch
+    // target dir names without a job-suffix are included here so the prefix
+    // matchers below can safely require a separator (`-` or `_`) — this
+    // prevents `.rch-targetfoo` style false positives.
+    let exact_artifacts: &[&str] = &[
+        ".cargo-target",
+        ".next",
+        ".nuxt",
+        ".parcel-cache",
+        ".pytest_cache",
+        ".rch-target",
+        ".rch_target",
+        ".target",
+        ".tox",
+        ".turbo",
+        ".venv",
+        "__pycache__",
+        "build",
+        "dist",
+        "node_modules",
+        "rch-target",
+        "rch_target",
+        "target",
+        "venv",
+    ];
+    if exact_artifacts.contains(&name) {
+        return true;
+    }
+
+    // Prefix-match basenames — match per-job/per-config suffixes produced
+    // by cargo (`target-foo`, `target_bar`) and rch (`.rch-target-job-42`,
+    // `rch-target-…`, `rch_target_…`, `.cargo-target-rusticmill`). Each
+    // prefix REQUIRES the separator (`-` or `_`) so we never match unrelated
+    // names that happen to start with `target` or `.rch-target`.
+    name.starts_with("target-")
+        || name.starts_with("target_")
+        || name.starts_with(".rch-target-")
+        || name.starts_with(".rch_target_")
+        || name.starts_with("rch-target-")
+        || name.starts_with("rch_target_")
+        || name.starts_with(".cargo-target-")
+}
+
+/// Hardcoded refusal: paths inside well-known source-tree locations must
+/// never be deleted, regardless of operator config — UNLESS the candidate's
+/// basename clearly identifies it as a build/cache artifact (see
+/// [`is_obvious_build_artifact_basename`]).
+///
+/// Covered locations (refused unless basename is artifact-like):
+/// - `/data/projects/...`
+/// - `/home/*/projects/...`
+/// - `/Users/*/projects/...`
+///
+/// Plus an UNCONDITIONAL refusal (no artifact carve-out) for:
+/// - any path with an ancestor directory literally named `.git`
+/// - the path itself being named `.git`
+///
+/// This is the carnage-prevention floor that overrides any operator config.
+/// The 2026-05-16 trj incident and the 2026-05-22 vmi rerun both deleted
+/// source crate directories under `/data/projects/`; this function makes
+/// arbitrary-name deletion there impossible while still letting the
+/// scanner reclaim `target/`, `node_modules/`, etc.
+///
+/// Note: matching is case-sensitive and operates on the path's string form.
+/// On case-insensitive filesystems (default APFS) a path entered as
+/// `/Home/...` would not match `/home/...`; in practice operators use the
+/// canonical case so this is acceptable. Windows-native paths
+/// (`C:\Users\...`) are not currently covered — sbh's target deployments
+/// are Linux and macOS only.
+fn is_hardcoded_source_tree(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+
+    // Determine whether the candidate sits under a protected source-tree root.
+    // `starts_with("/data/projects/")` also handles a trailing-slash variant
+    // (`Path::new("/data/projects/").to_string_lossy()` preserves the slash).
+    let in_protected_root = s == "/data/projects"
+        || s.starts_with("/data/projects/")
+        || is_under_user_projects(&s, "/home/")
+        || is_under_user_projects(&s, "/Users/");
+
+    if in_protected_root {
+        // Carve-out: allow deletion if the candidate's basename clearly
+        // identifies it as a disposable build/cache artifact. This is the
+        // ONLY way to permit `target/`, `node_modules/`, etc. cleanup
+        // inside operator-configured source roots. Arbitrary unknown
+        // basenames (e.g., `src`, `docs`, or a misclassified crate name)
+        // stay vetoed — that's the carnage-prevention guarantee.
+        if !is_obvious_build_artifact_basename(path) {
+            return true;
+        }
+    }
+
+    // Walk the path AND every ancestor looking for a component literally
+    // named `.git`. This catches both the deep case (`/repo/.git/objects/pack`)
+    // and the leaf case (`/repo/.git` as the deletion target itself). It
+    // runs UNCONDITIONALLY — there is no artifact carve-out for `.git`
+    // metadata, even if the basename happens to look like an artifact.
+    // (`contains_nested_git` only inspects CHILDREN of the candidate, so a
+    // `.git` directory passed in directly would not be caught without this
+    // loop checking the path itself.)
+    for ancestor in path.ancestors() {
+        if ancestor.file_name().and_then(|n| n.to_str()) == Some(".git") {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Helper for `is_hardcoded_source_tree`: matches `<root><user>/projects[/...]`
+/// where `<root>` is `/home/` or `/Users/`. Splits on the first `/` after the
+/// root prefix so a bare `/home/<user>` (no further components) does NOT match.
+fn is_under_user_projects(path_str: &str, root: &str) -> bool {
+    let Some(rest) = path_str.strip_prefix(root) else {
+        return false;
+    };
+    // rest must have at least one `/` and the component after that `/` must
+    // be `projects` exactly or `projects/...`.
+    let Some((_, after_user)) = rest.split_once('/') else {
+        return false;
+    };
+    after_user == "projects" || after_user.starts_with("projects/")
+}
+
+/// Returns true if `path` directly contains files that indicate it's a source
+/// directory rather than a build artifact. Catches synced source stubs that
+/// don't have build-output markers and so slip past
+/// `contains_cargo_manifest_without_artifact_markers`.
+///
+/// We check direct children only (no recursion) to keep this O(dirsize). The
+/// presence of even one source marker is enough to veto deletion — false
+/// positives only mean keeping a few bytes of disk; false negatives mean
+/// destroying source.
+fn looks_like_source_code(path: &Path) -> bool {
+    // Manifest filenames — any one is a hard veto.
+    const MANIFEST_FILES: &[&str] = &[
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "Gemfile",
+        "Pipfile",
+        "requirements.txt",
+        "tsconfig.json",
+        "deno.json",
+        "mix.exs",
+        "Project.toml",
+    ];
+
+    // Source-file extensions — any one direct-child source file vetos.
+    const SOURCE_EXTS: &[&str] = &[
+        "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "kt", "rb", "ex", "exs", "ml", "hs",
+        "cpp", "cc", "c", "h", "hpp", "swift", "scala", "clj", "cljs", "lua", "jl",
+    ];
+
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+
+    for entry in entries.flatten() {
+        let name_os = entry.file_name();
+        let name = name_os.to_string_lossy();
+
+        // Manifest match (case-insensitive for cross-platform safety).
+        if MANIFEST_FILES.iter().any(|m| name.eq_ignore_ascii_case(m)) {
+            return true;
+        }
+
+        // Source extension match — only count regular files, never symlinks.
+        if let Ok(ft) = entry.file_type()
+            && ft.is_file()
+            && let Some(ext) = std::path::Path::new(name.as_ref())
+                .extension()
+                .and_then(|e| e.to_str())
+            && SOURCE_EXTS.iter().any(|s| ext.eq_ignore_ascii_case(s))
+        {
+            return true;
+        }
+    }
+
     false
 }
 
@@ -1024,5 +1275,384 @@ mod tests {
         assert_eq!(report.items_skipped, 1);
         assert_eq!(report.not_writable_paths.len(), 1);
         assert_eq!(report.not_writable_paths[0], target);
+    }
+
+    // ──────────────────── hardcoded safety floor ────────────────────
+
+    #[test]
+    fn hardcoded_source_tree_matches_data_projects() {
+        assert!(is_hardcoded_source_tree(Path::new("/data/projects")));
+        assert!(is_hardcoded_source_tree(Path::new("/data/projects/")));
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/data/projects/frankenterm"
+        )));
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/data/projects/frankenterm/crates/frankenterm-core"
+        )));
+    }
+
+    #[test]
+    fn hardcoded_source_tree_matches_home_projects() {
+        assert!(is_hardcoded_source_tree(Path::new("/home/ubuntu/projects")));
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/home/ubuntu/projects/sbh"
+        )));
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/home/jeff/projects/something/deep"
+        )));
+    }
+
+    #[test]
+    fn hardcoded_source_tree_matches_users_projects() {
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/Users/jemanuel/projects"
+        )));
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/Users/jemanuel/projects/storage_ballast_helper"
+        )));
+    }
+
+    #[test]
+    fn hardcoded_source_tree_skips_unrelated_paths() {
+        assert!(!is_hardcoded_source_tree(Path::new("/tmp/junk")));
+        assert!(!is_hardcoded_source_tree(Path::new("/data/tmp/build")));
+        assert!(!is_hardcoded_source_tree(Path::new("/var/tmp/cache")));
+        assert!(!is_hardcoded_source_tree(Path::new("/home/ubuntu/.cache")));
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/data/dataset/something"
+        )));
+        // `/home/ubuntu/project` (singular) should NOT match
+        assert!(!is_hardcoded_source_tree(Path::new("/home/ubuntu/project")));
+    }
+
+    #[test]
+    fn hardcoded_source_tree_matches_git_ancestor() {
+        // Any path with a `.git` ancestor (including the path itself) is refused.
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/some/repo/.git/objects/pack"
+        )));
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/srv/code/.git/refs/heads"
+        )));
+        // Leaf case: the candidate itself IS a .git directory.
+        assert!(is_hardcoded_source_tree(Path::new("/srv/code/.git")));
+        assert!(is_hardcoded_source_tree(Path::new("/.git")));
+    }
+
+    #[test]
+    fn looks_like_source_code_detects_cargo_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+        assert!(looks_like_source_code(dir.path()));
+    }
+
+    #[test]
+    fn looks_like_source_code_detects_rust_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lib.rs"), "pub fn x() {}").unwrap();
+        assert!(looks_like_source_code(dir.path()));
+    }
+
+    #[test]
+    fn looks_like_source_code_detects_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        assert!(looks_like_source_code(dir.path()));
+    }
+
+    #[test]
+    fn looks_like_source_code_detects_python_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.py"), "x = 1").unwrap();
+        assert!(looks_like_source_code(dir.path()));
+    }
+
+    #[test]
+    fn looks_like_source_code_ignores_build_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        // A pure cargo target/ would contain these but no source manifests.
+        fs::create_dir_all(dir.path().join("debug/deps")).unwrap();
+        fs::create_dir_all(dir.path().join(".fingerprint")).unwrap();
+        fs::write(dir.path().join(".rustc_info.json"), "{}").unwrap();
+        assert!(!looks_like_source_code(dir.path()));
+    }
+
+    #[test]
+    fn preflight_vetoes_hardcoded_source_tree() {
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        // A real path is not required — the hardcoded check runs before stat.
+        let result = executor.preflight_check(
+            Path::new("/data/projects/frankenterm/crates/frankenterm-core"),
+            None,
+        );
+        assert_eq!(result, Err(SkipReason::HardcodedSourceTree));
+    }
+
+    #[test]
+    fn preflight_vetoes_source_code_dir() {
+        // Even outside known source roots, a dir containing source markers
+        // vetoes. We use package.json + a .ts file rather than Cargo.toml so
+        // the existing ContainsCargoManifest check (step 5) doesn't fire
+        // first — this test specifically validates step 5b (LooksLikeSourceCode)
+        // catches non-cargo source projects that the older veto missed.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{\"name\":\"x\"}").unwrap();
+        fs::write(dir.path().join("index.ts"), "export const x = 1;").unwrap();
+
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let result = executor.preflight_check(dir.path(), None);
+        assert_eq!(result, Err(SkipReason::LooksLikeSourceCode));
+    }
+
+    #[test]
+    fn preflight_cargo_manifest_still_takes_precedence_over_source_marker() {
+        // Defensive: if a dir has BOTH Cargo.toml and a .rs file, the older
+        // ContainsCargoManifest veto fires first (step 5 before 5b). Either
+        // skip is a successful veto — we just lock down which one fires so a
+        // future refactor that swaps the order is visible in test diffs.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let result = executor.preflight_check(dir.path(), None);
+        assert_eq!(result, Err(SkipReason::ContainsCargoManifest));
+    }
+
+    #[test]
+    fn looks_like_source_code_detects_go_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.go"), "package main").unwrap();
+        assert!(looks_like_source_code(dir.path()));
+    }
+
+    #[test]
+    fn looks_like_source_code_skips_unreadable_dir() {
+        // Documented behavior: if read_dir fails, this returns false. This is
+        // intentionally consistent with contains_cargo_manifest_without_artifact_markers
+        // and is safe because remove_dir_all on the same unreadable dir will
+        // also fail. A nonexistent path triggers the read_dir failure path.
+        assert!(!looks_like_source_code(Path::new(
+            "/__sbh_definitely_not_a_real_path_for_test"
+        )));
+    }
+
+    // ──────────────────── artifact-basename carve-out ────────────────────
+
+    #[test]
+    fn obvious_build_artifact_basename_exact_matches() {
+        // Each of these basenames represents a known disposable build/cache
+        // directory and must be exempted from the broad source-tree refusal.
+        // The bare `rch-target` / `rch_target` (with and without leading dot)
+        // entries cover rch deployments that don't use per-job suffixes.
+        for name in [
+            "target",
+            ".target",
+            ".cargo-target",
+            "node_modules",
+            "__pycache__",
+            ".pytest_cache",
+            ".next",
+            ".nuxt",
+            ".turbo",
+            ".parcel-cache",
+            "dist",
+            "build",
+            ".venv",
+            "venv",
+            ".tox",
+            ".rch-target",
+            ".rch_target",
+            "rch-target",
+            "rch_target",
+        ] {
+            // Test that an arbitrary parent prefix doesn't affect basename matching.
+            let p = PathBuf::from(format!("/data/projects/foo/{name}"));
+            assert!(
+                is_obvious_build_artifact_basename(&p),
+                "expected `{name}` to be recognized as a build artifact"
+            );
+        }
+    }
+
+    #[test]
+    fn obvious_build_artifact_basename_prefix_matches() {
+        // Prefix matches cover per-job and per-config suffix patterns produced
+        // by cargo and rch. Each prefix REQUIRES the separator (`-` or `_`)
+        // before the suffix — see the negative tests below for the false
+        // positives this guards against.
+        for name in [
+            "target-foo",
+            "target-debug-build",
+            "target_release",
+            "target_my_special_build",
+            ".rch-target-job-42",
+            ".rch-target-vmi1149989-job-12345-67890-0",
+            ".rch_target_job_999",
+            "rch-target-something",
+            "rch_target_my_project",
+            ".cargo-target-rusticmill",
+        ] {
+            let p = PathBuf::from(format!("/Users/foo/projects/repo/{name}"));
+            assert!(
+                is_obvious_build_artifact_basename(&p),
+                "expected `{name}` to be recognized as a build artifact"
+            );
+        }
+    }
+
+    #[test]
+    fn obvious_build_artifact_basename_negatives() {
+        // These should NOT match — operators must never see source-like names
+        // exempted from the broad refusal.
+        for name in [
+            // Real source-tree subdirs
+            "src",
+            "lib",
+            "tests",
+            "bin",
+            "docs",
+            "examples",
+            "benches",
+            "scripts",
+            "crates",
+            // Real crate names (would have been deleted in the 2026-05-22 incident)
+            "frankenterm-core",
+            "frankenterm-alloc",
+            "frankenterm-topo",
+            "franken_node",
+            // Confusables: similar names that don't match our list
+            "targets",      // plural of `target` is not on the list
+            "my-target",    // ends with `-target`, but prefix match is start-anchored
+            "untargeted",   // contains `target` mid-string
+            "nodemodules",  // missing underscore; only `node_modules` exact match
+            "deno-modules", // similar shape to `node_modules`, but not in the list
+            "project",      // singular form; not a build-artifact name
+            "projects",     // singular dir name; not a build-artifact name
+            // Top-level dirs that look ambiguous
+            "tmp",
+            "data",
+            "var",
+            // Regression: prefix-without-separator false positives. Each of
+            // these starts with an artifact-name prefix but has no `-` or `_`
+            // separator before the trailing characters, so it must NOT be
+            // classified as a build artifact. Earlier versions of the prefix
+            // check used `starts_with(".rch-target")` (no trailing `-`), which
+            // matched `.rch-targetfoo` and exempted unrelated dirs from the
+            // protection.
+            "targetfoo",
+            ".rch-targetfoo",
+            "rch-targetfoo",
+            "rch_targetfoo",
+            ".cargo-targetfoo",
+        ] {
+            let p = PathBuf::from(format!("/data/projects/foo/{name}"));
+            assert!(
+                !is_obvious_build_artifact_basename(&p),
+                "expected `{name}` to NOT be classified as a build artifact"
+            );
+        }
+    }
+
+    #[test]
+    fn obvious_build_artifact_basename_handles_no_basename() {
+        // Edge cases: root path, empty path. Neither has a meaningful basename
+        // and should not be classified as an artifact.
+        assert!(!is_obvious_build_artifact_basename(Path::new("/")));
+        assert!(!is_obvious_build_artifact_basename(Path::new("")));
+    }
+
+    // ──────────────────── hybrid behavior (broad + carve-out) ────────────────────
+
+    #[test]
+    fn hardcoded_source_tree_allows_target_under_data_projects() {
+        // The carve-out: `target/` and friends under /data/projects/ are now
+        // allowed to be deleted. This is the wizard's primary use case.
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/target"
+        )));
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/node_modules"
+        )));
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/.next"
+        )));
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/__pycache__"
+        )));
+    }
+
+    #[test]
+    fn hardcoded_source_tree_allows_rch_targets_under_data_projects() {
+        // The rch worker per-job target dirs under /data/projects/ are the
+        // single largest disk hog in practice. v0.4.25 must let sbh clean
+        // them up.
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/.rch-target-vmi1149989-job-29843600204366645-1779389660177931125-0"
+        )));
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/data/projects/foo/rch-target-anything"
+        )));
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/data/projects/foo/rch_target_something"
+        )));
+    }
+
+    #[test]
+    fn hardcoded_source_tree_allows_target_under_users_projects() {
+        // Carve-out applies equally to /Users/<user>/projects/ on macOS.
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/Users/jemanuel/projects/sbh/target"
+        )));
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/Users/jemanuel/projects/sbh/node_modules"
+        )));
+    }
+
+    #[test]
+    fn hardcoded_source_tree_allows_target_under_home_projects() {
+        // Carve-out applies equally to /home/<user>/projects/ on Linux.
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/home/ubuntu/projects/franken_node/target"
+        )));
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/home/ubuntu/projects/franken_node/.pytest_cache"
+        )));
+    }
+
+    #[test]
+    fn hardcoded_source_tree_still_vetoes_source_basenames_under_protected_root() {
+        // The carve-out is narrow — anything NOT on the artifact list is
+        // still vetoed. This protects against scorer misclassification.
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/src"
+        )));
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/docs"
+        )));
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/legacy_code"
+        )));
+        // The actual carnage targets — synced source crate stubs.
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/data/projects/frankenterm/crates/frankenterm-core"
+        )));
+        // The working tree root itself.
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node"
+        )));
+    }
+
+    #[test]
+    fn hardcoded_source_tree_git_check_overrides_artifact_carveout() {
+        // If a `.git` directory or anything inside it somehow ends up as a
+        // candidate, the `.git` ancestor check must veto it regardless of
+        // whether the basename happens to match an artifact pattern. (E.g.
+        // a user-created `.git/target/` directory inside a real git repo.)
+        assert!(is_hardcoded_source_tree(Path::new("/srv/code/.git/target")));
+        // Even though `target` is an artifact name, the `.git` ancestor
+        // wins.
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/srv/code/.git/objects/pack/target"
+        )));
     }
 }

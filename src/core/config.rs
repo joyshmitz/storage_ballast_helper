@@ -487,15 +487,33 @@ impl Default for PredictionConfig {
 
 impl Default for ScannerConfig {
     fn default() -> Self {
+        // Safe-by-default scan roots: only ephemeral temp directories.
+        // `/data/projects`, `/home`, and `/root` are NOT included by default —
+        // these hold source code and personal files, and historical scanner
+        // heuristics have proven unsafe there (2026-05-16 fleet carnage wiped
+        // ~87 working trees under `/data/projects` on trj; 2026-05-22 vmi
+        // rerun deleted synced source crate stubs across the worker fleet).
+        // Operators who want broader sweeps must opt in via config (or the
+        // setup wizard), and the hardcoded refusal in
+        // `deletion::preflight_check` will still veto anything that looks
+        // like source code regardless of which roots are configured.
         Self {
             root_paths: vec![
-                PathBuf::from("/data/projects"),
                 PathBuf::from("/tmp"),
                 PathBuf::from("/data/tmp"),
                 PathBuf::from("/var/tmp"),
-                PathBuf::from("/home"),
-                PathBuf::from("/root"),
             ],
+            // Note: `/data/projects` is intentionally NOT in this list.
+            // The setup wizard (cli/wizard.rs) actively adds `/data/projects`
+            // to `root_paths` when run, and adding it ALSO to `excluded_paths`
+            // would silently break wizard-generated configs (the walker would
+            // refuse to descend into the configured root). The hardcoded
+            // `is_hardcoded_source_tree` check in
+            // `scanner::deletion::preflight_check` is the real defense and
+            // applies regardless of config — operators can scan
+            // `/data/projects` for legitimate target-dir cleanup, and
+            // deletions of anything that looks like source code are vetoed
+            // at preflight time.
             excluded_paths: vec![
                 PathBuf::from("/"),
                 PathBuf::from("/boot"),
