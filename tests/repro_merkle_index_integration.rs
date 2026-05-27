@@ -7,7 +7,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
     use storage_ballast_helper::scanner::merkle::MerkleScanIndex;
     use storage_ballast_helper::scanner::patterns::StructuralSignals;
-    use storage_ballast_helper::scanner::walker::{EntryMetadata, WalkEntry};
+    use storage_ballast_helper::scanner::walker::{EntryMetadata, FsEntryKind, WalkEntry};
 
     fn make_entry(path: &str, mtime_secs: u64) -> WalkEntry {
         WalkEntry {
@@ -20,11 +20,13 @@ mod tests {
                 is_dir: false,
                 inode: 0,
                 device_id: 0,
+                kind: FsEntryKind::File,
                 permissions: 0,
             },
             depth: 1,
             structural_signals: StructuralSignals::default(),
             is_open: false,
+            opaque_tree: None,
         }
     }
 

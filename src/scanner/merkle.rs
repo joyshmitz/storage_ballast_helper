@@ -779,7 +779,7 @@ pub fn hash_hex(hash: &MerkleHash) -> String {
 mod tests {
     use super::*;
     use crate::scanner::patterns::StructuralSignals;
-    use crate::scanner::walker::EntryMetadata;
+    use crate::scanner::walker::{EntryMetadata, FsEntryKind};
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -794,11 +794,13 @@ mod tests {
                 is_dir: true,
                 inode: 0,
                 device_id: 0,
+                kind: FsEntryKind::Directory,
                 permissions: 0o755,
             },
             depth,
             structural_signals: StructuralSignals::default(),
             is_open: false,
+            opaque_tree: None,
         }
     }
 

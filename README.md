@@ -619,11 +619,12 @@ sbh update --prune 3
 
 ```toml
 [scanner]
-watched_paths = ["/data/projects", "/tmp", "/dev/shm"]
-cross_device = false
-
-[scanner.protected_paths]
-paths = ["/data/projects/production-*", "/home/*/critical-builds"]
+engine = "v1"  # set to "v2" only for the event/index-assisted scanner rollout
+event_source = "auto"
+event_watch_budget = 8192
+root_paths = ["/data/projects", "/tmp", "/dev/shm"]
+cross_devices = false
+protected_paths = ["/data/projects/production-*", "/home/*/critical-builds"]
 
 [monitor]
 sample_interval_seconds = 2
@@ -762,7 +763,7 @@ What follows covers the algorithms, control theory, safety mechanisms, and desig
 The daemon runs four threads connected by bounded channels:
 
 1. **Monitor thread** polls filesystem stats at a configurable interval, feeds them to the EWMA forecaster and PID controller, and emits a `ScanRequest` when pressure warrants action.
-2. **Scanner thread** receives scan requests, walks directories in parallel, scores every discovered artifact, and produces a ranked `DeletionBatch`.
+2. **Scanner thread** receives scan requests, selects `scanner.engine = "v1"` or `"v2"`, scores discovered artifacts, and produces a ranked `DeletionBatch`. v1 is the production directory-walker path. v2 adds opaque-tree pruning, a persistent candidate index, filesystem event invalidation where available, and pressure-gated reconciliation.
 3. **Executor thread** receives deletion batches and executes them through the circuit breaker and pre-flight safety checks.
 4. **Logger thread** receives activity events and writes them to both SQLite and JSONL backends.
 
@@ -1109,7 +1110,7 @@ All ballast operations (provision, release, replenish, verify) are serialized pe
 
 ### VOI Scan Scheduling
 
-Fixed-interval full scans waste IO bandwidth when most directories haven't changed. The Value-of-Information (VOI) scheduler allocates a limited scan budget (default: 5 paths per cycle) to the paths most likely to yield reclaimable space.
+Fixed-interval full scans waste IO bandwidth when most directories haven't changed. For v1, the Value-of-Information (VOI) scheduler allocates a limited scan budget (default: 5 paths per cycle) to the paths most likely to yield reclaimable space. For v2, the same pressure signal decides when to use the persistent candidate index, event-dirty roots, or bounded reconciliation instead of recursively walking every configured root.
 
 #### Per-Path Statistics
 
@@ -1295,40 +1296,31 @@ The emergency command scans the specified paths, scores candidates using the sta
 
 A completely full disk is precisely the situation where most cleanup tools fail, since they need to write temp files or state. By reducing to pure in-memory scoring and direct unlink calls, `sbh emergency` can recover a system that nothing else can touch.
 
-### Incremental Merkle Scan Index
+### Scanner Indexes
 
-Full directory walks are expensive. A machine with hundreds of thousands of directories pays a significant IO cost every scan cycle, even when most of the filesystem hasn't changed. The Merkle scan index eliminates redundant work by tracking a hash tree over directory metadata, so the daemon can detect unchanged subtrees without walking them.
+The live daemon has two index-related code paths:
 
-#### How It Works
+- `src/scanner/index.rs` is the v2 daemon candidate index. It stores one record per candidate root keyed by filesystem identity, persists to `scanner-index-v2.json`, records event generations, and keeps per-candidate deletion-failure backoff. It is active only when `scanner.engine = "v2"`.
+- `src/scanner/merkle.rs` is an older Merkle-tree index implementation. It remains tested library code, but it is not the live daemon scanner index and should not be read as the current daemon behavior.
 
-Each directory entry produces a metadata hash from its path, size, modification time, inode, device ID, and entry type (file vs. directory). These hashes are combined bottom-up into subtree hashes: a directory's subtree hash is the SHA-256 of its own metadata hash concatenated with the sorted subtree hashes of its children. The result is a Merkle tree where any change to any file in a subtree propagates up to the root.
+v2 uses the candidate index to avoid cold full walks under pressure. At Green or Yellow pressure with no dirty event roots, it can report a no-op scan without recursively walking configured roots. Under Orange or higher pressure, it ranks persisted candidates first and only runs bounded reconciliation when the index or event state requires it. All deletion still goes through the same policy engine and final pre-flight safety checks.
 
-On subsequent scan cycles, the daemon compares fresh walk entries against the stored index. If a directory's subtree hash matches, the entire subtree is skipped — no scoring, no candidate evaluation, no IO. Only changed, new, or removed paths are passed to the scoring engine.
+For validation and A/B artifacts, `sbh scan --json` reports `scanner_engine`, `scanner_dispatch`, `opaque_pruning`, `opaque_pruned_dirs`, `scanned_entries`, and nullable `process_cpu_micros` alongside the existing candidate totals. Daemon `scan_complete` activity events also include the selected dispatch, pruning state, dirty event-root count, index generation, indexed-record count, candidate bytes seen, and timeout state in their `details` payload. These fields are intended to make v1/v2 scan captures auditable without scraping human output.
 
-#### Budget-Aware Degradation
+The in-repo scanner-v2 validation tests emit focused JSON artifacts for synthetic v1/v2 walk effort and safety parity, event-overflow reconciliation fallback, and memory-pressure transition latency. Those artifacts support rollout review, but the default remains v1 until live A/B runs prove the CPU and deletion-safety targets outside the synthetic harness.
 
-Each incremental diff operates under a `ScanBudget` that limits the number of subtree hash recomputations per cycle. Under heavy filesystem churn (large builds, parallel agent swarms), the budget may be exhausted before all changed paths are processed. When this happens:
+For a live A/B capture, run the same scan root twice with only the engine override changed:
 
-- Processed paths are returned as the incremental diff for immediate scoring.
-- Remaining paths are deferred to the next cycle or a full-scan fallback.
-- The index health transitions to `Degraded` rather than `Healthy`.
+```bash
+SBH_SCANNER_ENGINE=v1 sbh --json scan /data/projects --top 200 > scan-v1.json
+SBH_SCANNER_ENGINE=v2 sbh --json scan /data/projects --top 200 > scan-v2.json
+```
 
-This prevents a single busy cycle from consuming unbounded CPU time on Merkle recomputation while ensuring forward progress across cycles.
+Compare `scanned_entries`, `process_cpu_micros`, candidates, vetoes/explanations, and matching daemon `scan_complete` activity events before considering v2 promotion.
 
-#### Integrity and Recovery
+The v2 checkpoint contains a version, root/config fingerprint, event generation, serialized candidate records, and a SHA-256 integrity hash. If it is missing, stale, or corrupt, v2 rebuilds conservatively through bounded reconciliation rather than trusting stale state.
 
-The index checkpoint (persisted to disk between daemon restarts) includes a SHA-256 integrity hash over the serialized node map. On load, this hash is verified. If it fails — due to disk corruption, partial writes, or version skew — the index transitions to `Corrupt` health and the daemon falls back to full-scan mode until a clean rebuild completes.
-
-| Health State | Meaning | Daemon Behavior |
-| --- | --- | --- |
-| Healthy | Index is valid and usable | Incremental scans skip unchanged subtrees |
-| Degraded | Partial corruption or budget exhaustion | Usable for some subtrees; degraded paths get full scans |
-| Corrupt | Integrity check failed | Full scan on every cycle until rebuild |
-| Uninitialized | Index has not been built yet | Initial full scan builds the index from scratch |
-
-The checkpoint format includes a version field for forward compatibility. Schema evolution (new fields in a newer daemon version) does not hard-fail deserialization.
-
-Source: `src/scanner/merkle.rs`
+Source: `src/scanner/index.rs`; legacy Merkle implementation: `src/scanner/merkle.rs`
 
 ### Parallel Directory Walker
 
@@ -1444,7 +1436,7 @@ The generated systemd unit file includes several layers of hardening:
 - `IOSchedulingClass=idle` — only uses disk IO when no other process needs it
 - `IOSchedulingPriority=7` — lowest IO priority within the idle class
 
-This ensures `sbh` never competes with build workloads, compiler processes, or test suites for CPU or IO bandwidth.
+This keeps `sbh` at background priority. System-scope systemd units also add a cgroup CPU quota; v2 adds in-process scan budgeting so a relaxed or stale service override does not make the scanner unbounded.
 
 **Security sandboxing (system scope only):**
 - `ProtectSystem=strict` — mounts the entire filesystem read-only except explicitly allowed paths
@@ -1473,13 +1465,13 @@ The generated launchd plist provides equivalent lifecycle management:
 
 - `RunAtLoad=true` — starts the daemon on login (user agent) or boot (system daemon)
 - `KeepAlive` with `SuccessfulExit=false` — auto-restarts on non-zero exit, stays stopped on clean shutdown
-- `ThrottleInterval=10` — minimum 10 seconds between restart attempts
+- `ThrottleInterval=60` — minimum 60 seconds between restart attempts
 - `Nice=19` — lowest scheduling priority
 - `LowPriorityIO=true` — marks all IO as low-priority
 
 User agents install to `~/Library/LaunchAgents/`, system daemons to `/Library/LaunchDaemons/`. Log output goes to `~/Library/Logs/sbh/` (user) or `/var/log/sbh/` (system).
 
-Source: `src/daemon/service.rs`
+Source: `src/daemon/service/systemd.rs`, `src/daemon/service/launchd.rs`
 
 ### Supply Chain Verification
 

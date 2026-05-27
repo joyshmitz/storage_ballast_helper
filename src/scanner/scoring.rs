@@ -15,6 +15,7 @@ use crate::platform::cleanup_catalog::{CleanupRule, ReclaimCommand};
 use crate::platform::{linux, macos};
 use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
 use crate::scanner::protection::SacredOverlap;
+use crate::scanner::walker::FsIdentity;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScoringWeights {
@@ -199,6 +200,7 @@ pub struct DecisionOutcome {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CandidacyScore {
     pub path: PathBuf,
+    pub identity: Option<FsIdentity>,
     pub total_score: f64,
     pub factors: ScoreFactors,
     pub vetoed: bool,
@@ -369,6 +371,7 @@ impl ScoringEngine {
 
         CandidacyScore {
             path: input.path.clone(),
+            identity: None,
             total_score: total,
             factors,
             vetoed: false,
@@ -467,6 +470,7 @@ impl ScoringEngine {
     fn vetoed(&self, input: &CandidateInput, reason: Cow<'static, str>) -> CandidacyScore {
         CandidacyScore {
             path: input.path.clone(),
+            identity: None,
             total_score: 0.0,
             factors: ScoreFactors {
                 location: 0.0,

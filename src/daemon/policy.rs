@@ -1195,6 +1195,7 @@ mod tests {
     fn sample_candidate(action: DecisionAction, score: f64) -> CandidacyScore {
         CandidacyScore {
             path: PathBuf::from("/data/projects/test/.target_opus"),
+            identity: None,
             total_score: score,
             factors: ScoreFactors {
                 location: 0.85,

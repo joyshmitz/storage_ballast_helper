@@ -146,6 +146,7 @@ fn random_candidates(rng: &mut SeededRng, count: usize) -> Vec<CandidateInput> {
 fn make_scored(action: DecisionAction, score: f64) -> CandidacyScore {
     CandidacyScore {
         path: PathBuf::from("/data/test/.target_opus"),
+        identity: None,
         total_score: score,
         factors: ScoreFactors {
             location: 0.85,

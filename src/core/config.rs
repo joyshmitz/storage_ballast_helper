@@ -71,10 +71,86 @@ pub struct PredictionConfig {
     pub burst_min_confidence: f64,
 }
 
+/// Scanner runtime implementation selector.
+///
+/// `V1` is the current directory-walker implementation. `V2` enables the
+/// event/index-assisted scanner path behind the rollout flag while keeping all
+/// destructive actions behind the existing policy and deletion gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ScannerEngineMode {
+    /// Current production scanner implementation.
+    #[default]
+    V1,
+    /// Event/index-assisted scanner rollout path.
+    V2,
+}
+
+impl std::fmt::Display for ScannerEngineMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::V1 => f.write_str("v1"),
+            Self::V2 => f.write_str("v2"),
+        }
+    }
+}
+
+impl std::str::FromStr for ScannerEngineMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "v1" => Ok(Self::V1),
+            "v2" => Ok(Self::V2),
+            other => Err(format!(
+                "invalid scanner engine {other:?}: expected \"v1\" or \"v2\""
+            )),
+        }
+    }
+}
+
+/// Filesystem event backend selection for scanner v2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScannerEventSourceMode {
+    /// Prefer a safe kernel backend when one is available; otherwise fall back
+    /// to reconciliation.
+    #[default]
+    Auto,
+    /// Force stat/mtime reconciliation without a kernel event source.
+    ReconciliationOnly,
+}
+
+impl std::fmt::Display for ScannerEventSourceMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::ReconciliationOnly => f.write_str("reconciliation-only"),
+        }
+    }
+}
+
+impl std::str::FromStr for ScannerEventSourceMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "reconciliation-only" | "reconciliation_only" => Ok(Self::ReconciliationOnly),
+            other => Err(format!(
+                "invalid scanner event source {other:?}: expected \"auto\" or \"reconciliation-only\""
+            )),
+        }
+    }
+}
+
 /// Scanner behavior and safety constraints.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ScannerConfig {
+    pub engine: ScannerEngineMode,
+    pub event_source: ScannerEventSourceMode,
+    pub event_watch_budget: usize,
     pub root_paths: Vec<PathBuf>,
     pub excluded_paths: Vec<PathBuf>,
     pub protected_paths: Vec<String>,
@@ -410,6 +486,12 @@ impl PathsConfig {
             Self::system_default()
         }
     }
+
+    /// Durable scanner v2 candidate-index checkpoint.
+    #[must_use]
+    pub fn scanner_index_file(&self) -> PathBuf {
+        data_dir_for_paths(self).join("scanner-index-v2.json")
+    }
 }
 
 /// User-managed protection paths kept separate from the generated main config.
@@ -498,6 +580,9 @@ impl Default for ScannerConfig {
         // `deletion::preflight_check` will still veto anything that looks
         // like source code regardless of which roots are configured.
         Self {
+            engine: ScannerEngineMode::V1,
+            event_source: ScannerEventSourceMode::Auto,
+            event_watch_budget: 8192,
             root_paths: vec![
                 PathBuf::from("/tmp"),
                 PathBuf::from("/data/tmp"),
@@ -998,6 +1083,7 @@ impl Config {
             "SBH_SCANNER_MIN_FILE_AGE_MINUTES",
             &mut self.scanner.min_file_age_minutes,
         )?;
+        self.apply_scanner_env_overrides_from(env_var)?;
         set_env_usize("SBH_SCANNER_MAX_DEPTH", &mut self.scanner.max_depth)?;
         set_env_usize("SBH_SCANNER_PARALLELISM", &mut self.scanner.parallelism)?;
         set_env_bool(
@@ -1099,6 +1185,34 @@ impl Config {
 
         // policy
         set_env_bool("SBH_POLICY_KILL_SWITCH", &mut self.policy.kill_switch)?;
+
+        Ok(())
+    }
+
+    fn apply_scanner_env_overrides_from<F>(&mut self, mut lookup: F) -> Result<()>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        if let Some(raw) = lookup("SBH_SCANNER_ENGINE") {
+            self.scanner.engine =
+                raw.parse::<ScannerEngineMode>()
+                    .map_err(|details| SbhError::ConfigParse {
+                        context: "env",
+                        details: format!("SBH_SCANNER_ENGINE={raw:?}: {details}"),
+                    })?;
+        }
+        if let Some(raw) = lookup("SBH_SCANNER_EVENT_SOURCE") {
+            self.scanner.event_source =
+                raw.parse::<ScannerEventSourceMode>()
+                    .map_err(|details| SbhError::ConfigParse {
+                        context: "env",
+                        details: format!("SBH_SCANNER_EVENT_SOURCE={raw:?}: {details}"),
+                    })?;
+        }
+        if let Some(raw) = lookup("SBH_SCANNER_EVENT_WATCH_BUDGET") {
+            self.scanner.event_watch_budget =
+                parse_env_usize("SBH_SCANNER_EVENT_WATCH_BUDGET", &raw)?;
+        }
 
         Ok(())
     }
@@ -1588,6 +1702,13 @@ fn parse_env_u64(name: &str, raw: &str) -> Result<u64> {
     })
 }
 
+fn parse_env_usize(name: &str, raw: &str) -> Result<usize> {
+    raw.parse::<usize>().map_err(|error| SbhError::ConfigParse {
+        context: "env",
+        details: format!("{name}={raw:?}: {error}"),
+    })
+}
+
 fn parse_env_bool(name: &str, raw: &str) -> Result<bool> {
     raw.parse::<bool>().map_err(|error| SbhError::ConfigParse {
         context: "env",
@@ -1604,8 +1725,8 @@ fn strip_trailing_separator(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, PathsConfig, SacredConfig, SbhError, load_sacred_config, sacred_config_path_for,
-        write_sacred_config,
+        Config, PathsConfig, SacredConfig, SbhError, ScannerEngineMode, load_sacred_config,
+        sacred_config_path_for, write_sacred_config,
     };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -1749,6 +1870,56 @@ mod tests {
             cfg.scanner.active_reference_min_size_bytes,
             100 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn scanner_engine_defaults_to_v1_and_parses_toml() {
+        let cfg = Config::default();
+        assert_eq!(cfg.scanner.engine, ScannerEngineMode::V1);
+
+        let parsed: Config =
+            toml::from_str("[scanner]\nengine = \"v2\"\n").expect("scanner engine should parse");
+        assert_eq!(parsed.scanner.engine, ScannerEngineMode::V2);
+
+        let shown = toml::to_string_pretty(&parsed).expect("config should serialize");
+        assert!(shown.contains("engine = \"v2\""));
+    }
+
+    #[test]
+    fn scanner_engine_rejects_invalid_toml() {
+        let err = toml::from_str::<Config>("[scanner]\nengine = \"v3\"\n")
+            .expect_err("invalid scanner engine should fail parsing");
+
+        assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn scanner_engine_env_override_parses() {
+        let mut cfg = Config::default();
+        let overrides = vars(&[("SBH_SCANNER_ENGINE", "v2")]);
+
+        cfg.apply_scanner_env_overrides_from(|name| overrides.get(name).cloned())
+            .expect("scanner env override should parse");
+
+        assert_eq!(cfg.scanner.engine, ScannerEngineMode::V2);
+    }
+
+    #[test]
+    fn scanner_engine_invalid_env_override_is_rejected() {
+        let mut cfg = Config::default();
+        let overrides = vars(&[("SBH_SCANNER_ENGINE", "evented")]);
+
+        let err = cfg
+            .apply_scanner_env_overrides_from(|name| overrides.get(name).cloned())
+            .expect_err("invalid scanner engine should fail");
+        match err {
+            SbhError::ConfigParse { context, details } => {
+                assert_eq!(context, "env");
+                assert!(details.contains("SBH_SCANNER_ENGINE"));
+                assert!(details.contains("expected \"v1\" or \"v2\""));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

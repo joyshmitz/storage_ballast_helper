@@ -1,0 +1,306 @@
+# Design: Event-Driven, Pressure-Gated Scanner (v2)
+
+**Status:** Partially implemented behind `scanner.engine = "v2"`; validation
+harness in progress and default remains `v1` pending promotion evidence · **Author:**
+fleet-maintenance investigation, 2026-05-25
+**Supersedes the steady-state behavior of:** `src/scanner/walker.rs`, the open-file
+path in `OpenPathCache`, and the periodic full-walk model.
+
+---
+
+## 1. Problem: the current scanner pins cores at steady state
+
+Observed on the live fleet (2026-05-25): the `sbh` daemon averaged **78–185% CPU over
+multi-day lifetimes** (css: 3d 17h CPU in 2 days; 411% instantaneous across 4
+`sbh-scanner` threads). The `tick` self-throttle in `daemon/loop_main.rs`
+(`TICK_THROTTLE_*`) governs the **monitor** cadence but **not** scanner work already
+dispatched to the walker. Generated systemd/launchd units intend background behavior
+(`Nice=19`, idle I/O, lower CPU quota), but the live fleet had an interim
+`CPUQuota=100%` override. The design needs an in-process budget even when service-level
+limits are relaxed or wrong.
+
+Live `thread apply all bt` on a runaway daemon showed all hot threads in
+`__readlink → realpath_stk → __GI___realpath`, `getdents64`, and `statx`, walking
+`…/cargo_home_*/registry/src/index.crates.io-…/<crate>/src/…`. The I/O sample showed
+**0 read bytes / 0 read syscalls** in the window — i.e. CPU-bound on **cached** dentry
+metadata + path canonicalization, not real disk I/O. Wasted work.
+
+### Root defects (file:line)
+
+1. **Descends into opaque package caches.** `process_directory` (`walker.rs:311`)
+   recurses every subdir to `max_depth` (default 10) with no pre-descent artifact
+   pruning. `.git` / `Cargo.toml` are only recorded as `StructuralSignals`
+   (`walker.rs:411-423`); the walker still descends into
+   `registry/src/<crate>/…`. With many `cargo_home_*` mirrors present, every pass
+   re-enumerates **millions of tiny files**.
+2. **`realpath()` on the hot path.** `core::paths::resolve_absolute_path`
+   (`core/paths.rs:13`) calls `std::fs::canonicalize` and is invoked across the
+   open-file / normalization helpers (`walker.rs:784,818,949,1005,1019,1057,1192`).
+   canonicalize is O(path-depth) `readlink` syscalls per call → the realpath storm.
+3. **Active-reference checks are still path-heavy and partly duplicated.**
+   `walker.rs:656-701` can collect open `(dev, ino)` values from `/proc/*/fd`, but
+   the daemon/executor still rebuild path-ancestor state (`walker.rs:858-873`,
+   `deletion.rs:211-218`), and the legacy `OpenPathCache::is_path_open_unix`
+   helper (`walker.rs:1226`) can recursively descend **up to `MAX_SCAN = 20_000`
+   entries per candidate**. The scanner should not carry both models.
+4. **Per-file `lstat` for size** (`walker.rs:466`) over those same giant caches.
+5. **Hot retry on undeletable items.** css logged **400 failed deletions/hour, 11
+   successes**. Current code has a batch circuit breaker and dampens successful
+   delete/recreate loops, but it does not durably back off specific paths that fail
+   source/protection/open/permission/identity checks.
+6. **The Merkle index is not the daemon scanner.** `scanner/merkle.rs` implements a
+   persistent index, but current daemon/CLI scan dispatch does not wire it into
+   candidate ranking or deletion decisions. The README currently reads more
+   strongly than the live code here; v2 must explicitly integrate an index instead
+   of assuming this module is active.
+
+Net: a daemon meant to be near-idle runs the equivalent of `find / -exec realpath`
+across the worst-possible directory shapes, every few seconds.
+
+---
+
+## 2. Principle inversion
+
+> **Stop polling the world. React to change and to pressure.**
+> At green pressure with no filesystem activity, the scanner must be ~0% CPU.
+
+Cost model shift: from **O(files on disk) per pass** → **O(filesystem changes since
+last pass)**, with effort gated by disk-pressure level.
+
+---
+
+## 3. Architecture
+
+### 3.1 Event-driven discovery
+- Mark configured roots with **`fanotify`** (`FAN_MARK_FILESYSTEM` + FID/`FAN_REPORT_FID`)
+  where permitted. If falling back to `inotify`, use watch-budgeted recursive watches
+  only for selected roots/subtrees; plain root watches do not observe deep changes. When
+  recursive watches exceed budget, mark the root dirty and rely on bounded
+  reconciliation. macOS should use FSEvents through the platform layer when a safe
+  backend exists; until then it must use reconciliation.
+- Maintain a **persistent candidate index** (§3.5). Events mark subtrees dirty; only
+  dirty subtrees are re-evaluated.
+- Treat event overflow, watch-budget exhaustion, permission loss, and backend restart as
+  dirty-root signals that force bounded reconciliation. Events only invalidate cache
+  state; they never authorize deletion.
+- This crate forbids unsafe code. If fanotify/FSEvents requires lower-level platform
+  APIs, use a safe dependency with an audited public API; if none is available, defer
+  that backend and keep bounded reconciliation. Do not introduce local unsafe code.
+
+Implementation status for `bd-xtpv.6`: Linux now has a safe recursive `inotify`
+event-source abstraction with watch-budget planning, overflow/backend-loss dirty-root
+invalidation, and reconciliation fallback. `fanotify` remains an explicit capability
+probe marked unavailable until a safe backend is wired. macOS and other platforms remain
+reconciliation-only.
+
+### 3.2 Pressure-gated effort
+- Drive everything off the existing cheap `statfs` pressure poll. Effort ladder:
+  - **green:** event subscription only + one shallow top-level reconciliation every
+    few minutes. No deep work.
+  - **yellow:** evaluate dirty candidates from the index; refresh estimates.
+  - **orange/red:** rank from the index and feed the deletion executor. Avoid cold full
+    walks under pressure; if the index is missing or invalid, run only bounded bootstrap
+    work and prefer ballast release / known opaque roots first.
+
+### 3.3 Opaque-tree pruning (name match during `readdir`, no stat)
+- A prune-set classifies a directory before descent:
+  - `CandidateOpaque`: score as one cleanup unit and never descend.
+  - `ProtectedOpaque`: never descend and never delete.
+  - `SignalOnly`: record source/cache evidence but keep normal traversal behavior.
+- `node_modules`, Cargo registry/cache roots, `target/`, and known build caches can be
+  `CandidateOpaque` when path context proves they are regenerable artifact storage.
+- `.git` is always `ProtectedOpaque`, never a deletion candidate.
+- `vendor`, `site-packages`, `.venv`, and language package stores require context gates:
+  they are candidates only under known temp/cache/virtualenv locations; otherwise they
+  are source/dependency evidence, not wholesale cleanup targets.
+- Reuse / extend the existing classifier in `scanner/patterns.rs` (it already knows
+  `node_modules`, build-artifact basenames). Add a prune disposition distinct from
+  `Signal`.
+- Rationale: a `target/` or cargo registry is a thing to **evaluate as one cleanup
+  unit**, not a tree to enumerate for ranking. This removes >99% of the syscalls on
+  agent machines while preserving final policy/preflight checks.
+
+### 3.4 Inode identity instead of `realpath`
+- Remove `resolve_absolute_path`/`canonicalize` from all scanner hot paths. The helper
+  can still exist for config validation and user-facing path normalization.
+- Canonicalize the **roots** and the **open-file mount points once** at startup when
+  necessary.
+  Thereafter compare candidates by `(dev, ino)` from a single `lstat` — symlink-proof,
+  one stat. `EntryMetadata` already carries `inode`/`device_id` (`walker.rs:86-87`).
+
+### 3.5 Persistent incremental index with dir-mtime invalidation
+- Persist `{path, dev, ino, kind, parent_dev, parent_ino, parent_mtime, candidate_mtime,
+  candidate_ctime, size_estimate, prune_decision, score, safety_state, fail_count,
+  cooldown_until, event_generation}`.
+- Parent-dir mtime validates candidate discovery only: if the parent identity+mtime is
+  unchanged, v2 can skip re-listing siblings to rediscover the same artifact root.
+  Candidate freshness uses the candidate identity, candidate mtime/ctime, event
+  generation, and bounded scheduled size refresh. Do not assume parent mtime captures
+  file content changes inside an existing opaque tree.
+- This subsumes `scanner/merkle.rs`’s intent (change detection) but at directory
+  granularity instead of content hashing the world. Reuse `scanner/merkle.rs` only after
+  proving it satisfies daemon scanner persistence, dirty-root, overflow, and migration
+  requirements.
+
+### 3.6 Open-file safety: O(1) candidate-root membership, deferred deep check
+- Build active-reference evidence **once per pass** from `/proc/*/{fd,maps}` and
+  platform mmap/reference APIs where available. The fd half exists today; mmap support
+  is platform/PAL work, not a free property of `walker.rs:858`.
+- Convert active references into an `active_candidate_ids` set by matching each open
+  reference against the current-cycle candidate root table once; the persistent index
+  later makes that table durable. This can use bounded path-prefix evidence as an input,
+  but it must not recurse through every candidate tree.
+- A candidate is "busy" iff its root identity, an indexed descendant identity, or its
+  candidate-root identity in `active_candidate_ids` is active.
+- Move the strong guarantee to **delete time**: re-stat the root, require identity
+  equality, use safe no-follow / descriptor-relative traversal where available, and
+  skip if identity or active-reference state cannot be verified. **Drop the 20k-entry
+  per-candidate pre-walk.**
+- Do not rely on Unix delete calls returning `EBUSY` for open files; unlinking open
+  files can succeed. The active-reference index and final identity checks are the
+  safety mechanism.
+
+### 3.7 Size estimation; measure only the shortlist
+- Bounded/sampled size estimate for scoring (keep `content_size_bytes` lower-bound
+  idea from `EntryMetadata`, but do not `lstat` every file in pruned trees).
+- Compute exact bytes only for the **top-N** candidates about to be deleted, or record
+  exact freed bytes from filesystem deltas/post-delete audit. Estimates are ranking
+  evidence, not final accounting.
+
+### 3.8 Real CPU/IO budget + failure backoff
+- Single worker at green; small bounded pool only under pressure. Threads at
+  `nice 19` + `ionice idle`. (Interim systemd `CPUQuota=100%` is in place fleet-wide
+  as of 2026-05-25 — add in-process budget and then reconcile the service docs/unit
+  story.)
+- Token-bucket CPU budget with cooperative yield and a **resumable cursor**
+  (pause/resume; never restart the pass).
+- Failed deletions enter exponential-backoff cooldown (`cooldown_until`) — directly
+  kills the 400/hr loop.
+
+Implementation status for `bd-xtpv.7`: v2 now skips Green/Yellow recursive work when
+there are no dirty event roots, limits dirty-root refreshes to one walker worker, caps
+Orange/Red/Critical v2 walker pools to small fixed sizes, ranks persisted index
+candidates before any walk under Orange+ pressure, and stops scanning after enough
+safe candidate bytes are found for the current deletion batch. It uses the existing
+wall-clock/entry scan budget and incremental scan cursor as the in-process budget
+mechanism. Executor safety/preflight failures now feed durable candidate-index
+backoff, preserving cooldowns for unchanged evidence and retrying only after the
+cooldown expires.
+
+---
+
+## 4. Invariants preserved (must not regress)
+- `.sbh-protect` subtree markers (`scanner/protection.rs`).
+- Hardcoded source-tree refusal + artifact carve-out (`scanner/deletion.rs:368-377`,
+  `is_hardcoded_source_tree`).
+- Open-file protection, `.git` veto, non-writable-parent veto, `min_file_age`.
+- Cross-device guard; never follow symlinks for deletion.
+- `.git`, recognized source roots, and context-ambiguous dependency directories are not
+  opaque cleanup candidates.
+- All destructive actions still go through `DeletionExecutor`, policy mode checks, and
+  dual logging/explain evidence.
+
+## 5. Rollout
+- Behind typed `scanner.engine = "v1" | "v2"` config (default v1 until validated), with
+  env override and config validation.
+- Add v2 shadow mode before enforce-mode deletion.
+- Validate on one box (e.g. css — heaviest cargo-cache load) against v1 for a week:
+  compare CPU-seconds/day, entries visited, dirs pruned, canonicalize/readlink count,
+  active-reference scan time, bytes reclaimed, deletion failure rate, and
+  pressure-response latency.
+- Reconcile README/service documentation so it does not overstate unused Merkle behavior
+  or stale CPU quota behavior.
+- Promote to default only after A/B safety parity, then remove the v1 implementation in
+  the same cleanup track once rollback artifacts are no longer needed.
+
+Implementation status for `bd-xtpv.8`: the in-repo validation harness now exercises
+the core scanner-v2 risk: a synthetic Cargo target tree is walked by both v1 and
+v2, and v2 must emit the target as one opaque candidate without descending into its
+children while reducing deterministic walker effort by at least 50x. A Linux-only
+fixture keeps a file open deep inside that opaque target tree and asserts the
+open-descendant evidence hard-vetoes the opaque root. `sbh scan --json` also now
+emits `scanner_engine`, `scanner_dispatch`, `opaque_pruning`, `opaque_pruned_dirs`,
+`scanned_entries`, and nullable `process_cpu_micros`, so manual v1/v2 scan
+artifacts can record the selected engine, pruning behavior, and process CPU
+delta without parsing human output. Daemon `scan_complete` activity events now
+carry the selected dispatch, pruning state, dirty event-root count, index
+generation, index-record count, candidate bytes seen, and timeout state in
+`details`, including priority-prescan timeout completions that previously only
+reached stderr/report counters. The synthetic validation tests also emit
+machine-readable JSON artifacts for the v1/v2 walk-effort and safety-parity case,
+event-overflow reconciliation fallback, and memory-pressure transition latency
+budget. This is necessary but not yet the full promotion bar above: live fleet
+A/B CPU-seconds/day, deletion parity, and pressure-response measurements still
+need to be recorded before changing the default engine.
+
+## 6. Bead plan
+
+Epic: `bd-xtpv` — Redesign scanner as event-driven, pressure-gated cleanup engine.
+
+Dependency intent:
+
+```text
+bd-xtpv.1  scaffold + config flag
+├── bd-xtpv.2  opaque pruning and safe prune taxonomy
+├── bd-xtpv.3  remove canonicalize/realpath from scanner hot paths
+└── bd-xtpv.4  O(1) active-candidate checks by identity/reference evidence
+
+bd-xtpv.5 depends on .2, .3, and .4
+├── bd-xtpv.6  event source and dirty-root invalidation
+└── bd-xtpv.7  pressure ladder, budgets, and failed-delete backoff
+
+bd-xtpv.8 depends on .6 and .7
+```
+
+Only `bd-xtpv.1` should be ready initially, excluding the parent epic itself. The
+persistent index must depend on pruning because the index schema stores prune decisions
+and should persist one artifact-root candidate rather than millions of child entries.
+
+## 7. Acceptance criteria
+- Steady-state (green, no FS activity): daemon < **1% of one core** averaged over 10 min.
+- Under a synthetic cargo-cache tree (1M files): no full descent; CPU-seconds per pass
+  drops ≥ 50× vs v1.
+- Zero `realpath`/`canonicalize` calls per entry on the hot path (assert via counter).
+- Active-reference checking marks busy candidate roots in O(open references + indexed
+  candidates), not O(candidate subtree size), and fails closed if reference-to-candidate
+  mapping is incomplete.
+- Deletion-failure retry rate bounded by backoff (no item retried more than
+  `O(log)` times/hour).
+- All existing protection/safety tests pass unchanged.
+- Event overflow/permission-loss tests force bounded reconciliation instead of trusting
+  stale index state.
+- Pruning tests prove `.git`, source roots, `vendor`, and `site-packages` are not blanket
+  deletion candidates.
+- Symlink race tests cannot redirect deletion outside the approved identity.
+- README/design docs accurately distinguish current v1 behavior, unused Merkle code, and
+  v2 rollout behavior.
+
+Current validation note (2026-05-26): repository tests cover the synthetic
+large-tree no-descent case, Linux deep-open-file veto for opaque roots, and
+`sbh scan --json` plus daemon `scan_complete` v2 engine/pruning/index/event
+metrics. Focused JSON validation artifacts are produced by
+`scanner_v2_validation_artifact_is_machine_readable`,
+`event_overflow_validation_artifact_records_reconciliation_fallback`, and
+`pressure_latency_validation_artifact_is_machine_readable`. The default remains
+`scanner.engine = "v1"` until live A/B artifacts demonstrate the CPU-seconds/pass
+target and safety parity outside the synthetic harness.
+
+Live A/B capture procedure:
+
+1. Pick the same representative scan root for both runs, preferably a large
+   Cargo/cache-heavy tree on the pressure-sensitive mount.
+2. Run the manual scanner twice with only the engine override changed:
+   ```bash
+   SBH_SCANNER_ENGINE=v1 sbh --json scan /data/projects --top 200 > scan-v1.json
+   SBH_SCANNER_ENGINE=v2 sbh --json scan /data/projects --top 200 > scan-v2.json
+   ```
+3. Archive both JSON payloads with daemon `scan_complete` activity events from
+   the same time window. The required fields are `scanner_engine`,
+   `scanner_dispatch`, `opaque_pruning`, `opaque_pruned_dirs`,
+   `scanned_entries`, `elapsed_seconds`, `process_cpu_micros`,
+   `candidates_count`, `total_reclaimable_bytes`, and each candidate path plus
+   veto/explanation data when `--explain` is used.
+4. Promotion remains blocked unless v2 has no candidate that v1 hard-vetoes,
+   event-overflow or backend-loss windows force reconciliation instead of stale
+   index reuse, and the live CPU-seconds/pass reduction supports the ≥50x target
+   when normalized from `process_cpu_micros`.

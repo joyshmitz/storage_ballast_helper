@@ -2,6 +2,9 @@
 
 pub mod decision_record;
 pub mod deletion;
+pub mod engine;
+pub mod events;
+pub mod index;
 pub mod log_truncator;
 pub mod merkle;
 pub mod patterns;

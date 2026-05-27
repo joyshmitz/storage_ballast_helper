@@ -14,12 +14,12 @@
 #![allow(clippy::cast_precision_loss)]
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
 use parking_lot::{Mutex, RwLock};
@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 
 use crate::ballast::coordinator::BallastPoolCoordinator;
 use crate::ballast::release::BallastReleaseController;
-use crate::core::config::{Config, ScannerConfig};
+use crate::core::config::{Config, ScannerConfig, ScannerEngineMode};
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::notifications::{NotificationEvent, NotificationLevel, NotificationManager};
 use crate::daemon::policy::{
@@ -37,7 +37,9 @@ use crate::daemon::policy::{
 use crate::daemon::process_io_history::ProcessIoHistory;
 use crate::daemon::self_monitor::{SelfMonitor, SelfMonitorTick, ThreadHeartbeat, ThreadStatus};
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat};
-use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, spawn_logger};
+use crate::logger::dual::{
+    ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, ScanCompletionTelemetry, spawn_logger,
+};
 use crate::logger::jsonl::JsonlConfig;
 use crate::monitor::ewma::{DiskRateEstimator, RateEstimate};
 use crate::monitor::fs_stats::FsStatsCollector;
@@ -55,8 +57,15 @@ use crate::platform::types::{
     FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureLevel,
 };
 use crate::scanner::deletion::{DeletionConfig, DeletionExecutor};
+use crate::scanner::engine::{ScannerEngine, SelectedScannerEngine};
+use crate::scanner::events::{EventSourceConfig, ScannerEventSource};
+use crate::scanner::index::{
+    CandidateIndexRecord, IndexedIdentity, ScannerCandidateIndex, ScannerIndexContext,
+    ScannerIndexLoadStatus,
+};
 use crate::scanner::patterns::{
-    ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, StructuralSignals,
+    ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, OpaqueTreeDisposition,
+    StructuralSignals,
 };
 use crate::scanner::protection::{self, ProtectionRegistry};
 use crate::scanner::scoring::{ActiveReferenceSummary, CandidacyScore, ScoringEngine};
@@ -83,6 +92,7 @@ const EARLY_DISPATCH_MAX_WAIT: Duration = Duration::from_secs(10);
 /// of nested cargo targets). When the budget is reached, whatever candidates have
 /// been found so far are sent to the executor. The next scan request will continue.
 const SCAN_ENTRY_BUDGET: usize = 500_000;
+const V2_PRESSURE_RECLAIM_BYTES_PER_CANDIDATE: u64 = 256 * 1_048_576;
 
 /// Maximum wall-clock time for a single scan pass (seconds).
 /// After this deadline, the scanner processes accumulated candidates and returns.
@@ -290,11 +300,41 @@ pub struct ScanRequest {
     /// `None` is allowed for synthetic unit-test requests and degraded callers.
     pub free_pct: Option<f64>,
     pub max_delete_batch: usize,
+    /// Explicit operator/service request that must reconcile the configured roots
+    /// even when v2 has no dirty event roots under green/yellow pressure.
+    pub force_full_scan: bool,
     /// When config is reloaded, this carries the updated scoring and scanner config.
     pub config_update: Option<(
         crate::core::config::ScoringConfig,
         crate::core::config::ScannerConfig,
     )>,
+}
+
+#[must_use]
+fn scan_reason_for_request(request: &ScanRequest) -> &'static str {
+    if request.force_full_scan {
+        return "forced";
+    }
+    if request.config_update.is_some() {
+        return "config_reload";
+    }
+    if request.free_pct.is_none() {
+        return "synthetic";
+    }
+
+    match request.pressure_level {
+        PressureLevel::Green => {
+            if request.urgency > 0.0 {
+                "green_scheduled"
+            } else {
+                "green_idle"
+            }
+        }
+        PressureLevel::Yellow => "yellow_pressure",
+        PressureLevel::Orange => "orange_pressure",
+        PressureLevel::Red => "red_pressure",
+        PressureLevel::Critical => "critical_pressure",
+    }
 }
 
 /// Scored candidates ready for deletion.
@@ -330,6 +370,12 @@ enum WorkerReport {
         bytes_freed: u64,
         failed: u64,
     },
+}
+
+#[derive(Debug, Clone)]
+struct ScannerIndexFeedback {
+    identity: IndexedIdentity,
+    path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -1038,6 +1084,44 @@ fn effective_scan_budget(config: &ScannerConfig, pressure_level: PressureLevel) 
         _ => base_budget_secs,
     };
     Duration::from_secs(budget_secs)
+}
+
+fn v2_pressure_candidate_byte_target(request: &ScanRequest) -> Option<u64> {
+    if request.pressure_level < PressureLevel::Orange || request.max_delete_batch == 0 {
+        return None;
+    }
+    Some(
+        V2_PRESSURE_RECLAIM_BYTES_PER_CANDIDATE
+            .saturating_mul(request.max_delete_batch.max(1) as u64),
+    )
+}
+
+fn v2_active_scan_paths(
+    request: &ScanRequest,
+    dirty_roots: &BTreeSet<PathBuf>,
+) -> Option<Vec<PathBuf>> {
+    if request.force_full_scan {
+        return None;
+    }
+    match request.pressure_level {
+        PressureLevel::Green | PressureLevel::Yellow => {
+            if dirty_roots.is_empty() {
+                Some(Vec::new())
+            } else {
+                Some(dirty_roots.iter().cloned().collect())
+            }
+        }
+        PressureLevel::Orange | PressureLevel::Red | PressureLevel::Critical => None,
+    }
+}
+
+fn v2_effective_parallelism(config: &ScannerConfig, pressure_level: PressureLevel) -> usize {
+    let configured = config.parallelism.max(1);
+    match pressure_level {
+        PressureLevel::Green | PressureLevel::Yellow => 1,
+        PressureLevel::Orange => configured.min(2),
+        PressureLevel::Red | PressureLevel::Critical => configured.min(4),
+    }
 }
 
 fn fallback_log_truncation_free_pct(pressure_level: PressureLevel) -> f64 {
@@ -1871,6 +1955,8 @@ impl MonitoringDaemon {
         let (scan_tx, scan_rx) = bounded::<ScanRequest>(SCANNER_CHANNEL_CAP);
         let (del_tx, del_rx) = bounded::<DeletionBatch>(EXECUTOR_CHANNEL_CAP);
         let (report_tx, report_rx) = bounded::<WorkerReport>(REPORT_CHANNEL_CAP);
+        let (index_feedback_tx, index_feedback_rx) =
+            bounded::<ScannerIndexFeedback>(EXECUTOR_CHANNEL_CAP);
 
         // Spawn worker threads with heartbeats.
         let mut scanner_health = ThreadHealth::new();
@@ -1882,12 +1968,14 @@ impl MonitoringDaemon {
             self.logger_handle.clone(),
             Arc::clone(&self.scanner_heartbeat),
             report_tx.clone(),
+            index_feedback_rx.clone(),
         )?);
         let mut executor_join: Option<thread::JoinHandle<()>> = Some(self.spawn_executor_thread(
             del_rx.clone(),
             self.logger_handle.clone(),
             Arc::clone(&self.executor_heartbeat),
             report_tx.clone(),
+            index_feedback_tx.clone(),
         )?);
 
         let mut last_health_check = Instant::now();
@@ -2081,6 +2169,7 @@ impl MonitoringDaemon {
                             self.logger_handle.clone(),
                             Arc::clone(&self.scanner_heartbeat),
                             report_tx.clone(),
+                            index_feedback_rx.clone(),
                         ) {
                             Ok(handle) => scanner_join = Some(handle),
                             Err(err) => {
@@ -2118,6 +2207,7 @@ impl MonitoringDaemon {
                             self.logger_handle.clone(),
                             Arc::clone(&self.executor_heartbeat),
                             report_tx.clone(),
+                            index_feedback_tx.clone(),
                         ) {
                             Ok(handle) => executor_join = Some(handle),
                             Err(err) => {
@@ -2690,6 +2780,7 @@ impl MonitoringDaemon {
                 self.behavior_state.mode,
                 response.max_delete_batch,
             ),
+            force_full_scan: false,
             config_update: None,
         };
 
@@ -2740,6 +2831,7 @@ impl MonitoringDaemon {
             pressure_level: response.level,
             free_pct: Some(response.free_pct),
             max_delete_batch: response.max_delete_batch,
+            force_full_scan: true,
             config_update: None,
         };
         // For forced scans, block briefly to ensure delivery.
@@ -3000,6 +3092,7 @@ impl MonitoringDaemon {
                     pressure_level,
                     free_pct: Some(stats.free_pct()),
                     max_delete_batch,
+                    force_full_scan: false,
                     config_update: None,
                 };
 
@@ -3177,11 +3270,13 @@ impl MonitoringDaemon {
         logger: ActivityLoggerHandle,
         heartbeat: Arc<ThreadHeartbeat>,
         report_tx: Sender<WorkerReport>,
+        index_feedback_rx: Receiver<ScannerIndexFeedback>,
     ) -> Result<thread::JoinHandle<()>> {
         let scoring_config = Arc::clone(&self.shared_scoring_config);
         let scanner_config = Arc::clone(&self.shared_scanner_config);
         let platform = Arc::clone(&self.platform);
         let shutdown = self.signal_handler.shutdown_token();
+        let scanner_index_path = self.config.paths.scanner_index_file();
         thread::Builder::new()
             .name("sbh-scanner".to_string())
             .spawn(move || {
@@ -3195,6 +3290,8 @@ impl MonitoringDaemon {
                     &heartbeat,
                     &report_tx,
                     &shutdown,
+                    &scanner_index_path,
+                    &index_feedback_rx,
                 );
             })
             .map_err(|source| SbhError::Runtime {
@@ -3208,6 +3305,7 @@ impl MonitoringDaemon {
         logger: ActivityLoggerHandle,
         heartbeat: Arc<ThreadHeartbeat>,
         report_tx: Sender<WorkerReport>,
+        index_feedback_tx: Sender<ScannerIndexFeedback>,
     ) -> Result<thread::JoinHandle<()>> {
         let shared_config = Arc::clone(&self.shared_executor_config);
         let scanner_config = Arc::clone(&self.shared_scanner_config);
@@ -3228,6 +3326,7 @@ impl MonitoringDaemon {
                     &policy_engine,
                     &shared_guard_diagnostics,
                     &shutdown,
+                    &index_feedback_tx,
                 );
             })
             .map_err(|source| SbhError::Runtime {
@@ -3349,6 +3448,51 @@ fn dispatch_top_candidates(
             true
         }
         Err(TrySendError::Disconnected(_)) => false, // Channel closed, exit
+    }
+}
+
+fn drain_scanner_index_feedback(
+    index: &mut ScannerCandidateIndex,
+    feedback_rx: &Receiver<ScannerIndexFeedback>,
+    scanner_config: &ScannerConfig,
+    logger: &ActivityLoggerHandle,
+) -> usize {
+    let mut applied = 0usize;
+    let base = Duration::from_secs(scanner_config.repeat_deletion_base_cooldown_secs);
+    let max = Duration::from_secs(scanner_config.repeat_deletion_max_cooldown_secs);
+    while let Ok(feedback) = feedback_rx.try_recv() {
+        index.record_failure(feedback.identity, SystemTime::now(), base, max);
+        applied += 1;
+        logger.send(ActivityEvent::Info {
+            message: format!(
+                "scanner_index: failure backoff recorded for {}",
+                feedback.path.display()
+            ),
+        });
+    }
+    applied
+}
+
+fn persist_scanner_index_records(
+    index: &mut ScannerCandidateIndex,
+    records: &mut Vec<CandidateIndexRecord>,
+    scanner_index_path: &Path,
+    logger: &ActivityLoggerHandle,
+) {
+    if records.is_empty() {
+        return;
+    }
+    for record in records.drain(..) {
+        index.upsert(record);
+    }
+    if let Err(err) = index.save_checkpoint(scanner_index_path) {
+        logger.send(ActivityEvent::Error {
+            code: err.code().to_string(),
+            message: format!(
+                "scanner_index: failed to save {}: {err}",
+                scanner_index_path.display()
+            ),
+        });
     }
 }
 
@@ -3545,6 +3689,8 @@ fn scanner_thread_main(
     heartbeat: &Arc<ThreadHeartbeat>,
     report_tx: &Sender<WorkerReport>,
     shutdown: &Arc<AtomicBool>,
+    scanner_index_path: &Path,
+    index_feedback_rx: &Receiver<ScannerIndexFeedback>,
 ) {
     const DIR_SIZE_FLOOR: u64 = 100 * 1_048_576; // 100 MiB
 
@@ -3554,12 +3700,15 @@ fn scanner_thread_main(
     // Incremental scan cursor — persists across scan iterations to skip
     // barren directory subtrees that yielded no candidates on a prior pass.
     let mut scan_cursor = ScanCursor::new();
+    let mut scanner_index: Option<ScannerCandidateIndex> = None;
+    let mut scanner_event_source: Option<ScannerEventSource> = None;
 
     // Cache of directories known to contain .git — these are valid project
     // roots that should never be deleted. Persists across scan passes to
     // avoid re-discovering and re-rejecting the same paths every 10 minutes
     // (previously caused thousands of ContainsGit log entries per hour).
     let mut known_git_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut last_scanner_engine_mode: Option<ScannerEngineMode> = None;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -3578,6 +3727,132 @@ fn scanner_thread_main(
         // Read latest config at the start of each scan.
         let current_scoring_config = shared_scoring_config.read().clone();
         let current_scanner_config = shared_scanner_config.read().clone();
+        let selected_scanner_engine =
+            SelectedScannerEngine::for_mode(current_scanner_config.engine);
+        let scanner_engine_mode = selected_scanner_engine.mode();
+        let scanner_dispatch = selected_scanner_engine.dispatch();
+        let scanner_shadow_mode = selected_scanner_engine.shadow_mode();
+        let scanner_opaque_pruning = selected_scanner_engine.opaque_pruning();
+        let scanner_index_enabled = scanner_engine_mode == ScannerEngineMode::V2;
+        let mut scanner_event_dirty_roots = BTreeSet::new();
+        let scanner_index_event_generation = if scanner_index_enabled {
+            let context =
+                ScannerIndexContext::from_roots_and_config(&request.paths, &current_scanner_config);
+            let needs_load = scanner_index
+                .as_ref()
+                .is_none_or(|index| index.context() != &context);
+            if needs_load {
+                let (loaded, status) =
+                    ScannerCandidateIndex::load_checkpoint(scanner_index_path, context);
+                match status {
+                    ScannerIndexLoadStatus::Loaded => logger.send(ActivityEvent::Info {
+                        message: format!(
+                            "scanner_index: loaded {} candidates from {}",
+                            loaded.len(),
+                            scanner_index_path.display()
+                        ),
+                    }),
+                    ScannerIndexLoadStatus::Missing => {}
+                    ScannerIndexLoadStatus::Stale(reason)
+                    | ScannerIndexLoadStatus::Corrupt(reason) => {
+                        logger.send(ActivityEvent::Info {
+                            message: format!("scanner_index: rebuilt checkpoint state: {reason}"),
+                        });
+                    }
+                }
+                scanner_index = Some(loaded);
+            }
+            let event_config =
+                EventSourceConfig::from_scanner_config(&request.paths, &current_scanner_config);
+            let needs_event_source = scanner_event_source
+                .as_ref()
+                .is_none_or(|source| !source.matches_config(&event_config));
+            if needs_event_source {
+                scanner_event_source = Some(ScannerEventSource::start(event_config));
+                if let Some(source) = scanner_event_source.as_ref() {
+                    let capability = source.capability();
+                    logger.send(ActivityEvent::Info {
+                        message: format!(
+                            "scanner_events: backend={} complete={} watched_dirs={} dirty_roots={} reason={}",
+                            capability.selected_backend,
+                            capability.complete,
+                            capability.watched_dirs,
+                            capability.dirty_roots.len(),
+                            capability.reason
+                        ),
+                    });
+                }
+            }
+            if let Some(source) = scanner_event_source.as_mut() {
+                let invalidation = source.drain();
+                scanner_event_dirty_roots.clone_from(invalidation.dirty_roots());
+                if invalidation.requires_reconciliation() {
+                    logger.send(ActivityEvent::Info {
+                        message: format!(
+                            "scanner_events: dirty_roots={} dirty_paths={} generation_bump={} reason={}",
+                            invalidation.dirty_roots().len(),
+                            invalidation.dirty_paths().len(),
+                            invalidation.requires_index_generation_bump(),
+                            invalidation.reason_summary()
+                        ),
+                    });
+                }
+                if let Some(index) = scanner_index.as_mut() {
+                    invalidation.apply_to_index(index);
+                }
+            }
+            if let Some(index) = scanner_index.as_mut() {
+                let applied = drain_scanner_index_feedback(
+                    index,
+                    index_feedback_rx,
+                    &current_scanner_config,
+                    logger,
+                );
+                if applied > 0
+                    && let Err(err) = index.save_checkpoint(scanner_index_path)
+                {
+                    logger.send(ActivityEvent::Error {
+                        code: err.code().to_string(),
+                        message: format!(
+                            "scanner_index: failed to save feedback backoff {}: {err}",
+                            scanner_index_path.display()
+                        ),
+                    });
+                }
+            }
+            scanner_index
+                .as_ref()
+                .map_or(0, ScannerCandidateIndex::event_generation)
+        } else {
+            scanner_event_source = None;
+            0
+        };
+        let mut scanner_index_records = Vec::new();
+        let scan_reason = scan_reason_for_request(&request);
+        let scan_completion_telemetry =
+            |opaque_pruned_dirs: usize,
+             candidate_bytes_seen: u64,
+             timed_out: bool,
+             index_records: usize| ScanCompletionTelemetry {
+                engine: scanner_engine_mode.to_string(),
+                dispatch: scanner_dispatch.to_string(),
+                scan_reason: scan_reason.to_string(),
+                opaque_pruning: scanner_opaque_pruning,
+                opaque_pruned_dirs,
+                event_dirty_roots: scanner_event_dirty_roots.len(),
+                index_event_generation: scanner_index_event_generation,
+                index_records,
+                candidate_bytes_seen,
+                timed_out,
+            };
+        if last_scanner_engine_mode != Some(scanner_engine_mode) {
+            logger.send(ActivityEvent::Info {
+                message: format!(
+                    "scanner_engine: mode={scanner_engine_mode} dispatch={scanner_dispatch} shadow_mode={scanner_shadow_mode} opaque_pruning={scanner_opaque_pruning}"
+                ),
+            });
+            last_scanner_engine_mode = Some(scanner_engine_mode);
+        }
 
         let engine = ScoringEngine::from_config(
             &current_scoring_config,
@@ -3590,6 +3865,45 @@ fn scanner_thread_main(
         }
 
         heartbeat.beat();
+
+        let active_scan_paths = if scanner_index_enabled {
+            v2_active_scan_paths(&request, &scanner_event_dirty_roots)
+                .unwrap_or_else(|| request.paths.clone())
+        } else {
+            request.paths.clone()
+        };
+
+        if scanner_index_enabled && active_scan_paths.is_empty() {
+            logger.send(ActivityEvent::ScanCompleted {
+                paths_scanned: 0,
+                candidates_found: 0,
+                duration_ms: 0,
+                telemetry: scan_completion_telemetry(
+                    0,
+                    0,
+                    false,
+                    scanner_index.as_ref().map_or(0, ScannerCandidateIndex::len),
+                ),
+            });
+            let root_stats = request
+                .paths
+                .iter()
+                .map(|path| RootScanResult {
+                    path: path.clone(),
+                    candidates_found: 0,
+                    potential_bytes: 0,
+                    false_positives: 0,
+                    duration: Duration::ZERO,
+                })
+                .collect();
+            let _ = report_tx.try_send(WorkerReport::ScanCompleted {
+                candidates: 0,
+                duration: Duration::ZERO,
+                root_stats,
+                timed_out: false,
+            });
+            continue;
+        }
 
         // Truncate-in-place sweep for active append-only logs (e.g. codex-tui.log).
         // Runs before the regular scan because the FileOpen veto in the deletion
@@ -3653,6 +3967,70 @@ fn scanner_thread_main(
         let mut candidates_found = 0;
         let mut scanner_should_exit = false;
         let mut scan_timed_out = false;
+        let v2_candidate_byte_target = if scanner_index_enabled {
+            v2_pressure_candidate_byte_target(&request)
+        } else {
+            None
+        };
+        let mut v2_candidate_bytes_seen = 0u64;
+
+        if scanner_index_enabled
+            && request.pressure_level >= PressureLevel::Orange
+            && request.max_delete_batch > 0
+            && let Some(index) = scanner_index.as_ref()
+        {
+            let mut indexed_candidates =
+                index.ranked_candidate_scores(SystemTime::now(), request.max_delete_batch);
+            let indexed_bytes = indexed_candidates
+                .iter()
+                .map(|candidate| candidate.size_bytes)
+                .sum::<u64>();
+            let indexed_count = indexed_candidates.len();
+            if indexed_count > 0 {
+                let indexed_before_dispatch = indexed_candidates.len();
+                if !dispatch_top_candidates(&mut indexed_candidates, &request, del_tx) {
+                    break;
+                }
+                let indexed_dispatched =
+                    indexed_before_dispatch.saturating_sub(indexed_candidates.len());
+                candidates_found += indexed_count;
+                if indexed_dispatched > 0 {
+                    v2_candidate_bytes_seen = v2_candidate_bytes_seen.saturating_add(indexed_bytes);
+                }
+                if v2_candidate_byte_target.is_some_and(|target| v2_candidate_bytes_seen >= target)
+                {
+                    logger.send(ActivityEvent::ScanCompleted {
+                        paths_scanned: 0,
+                        candidates_found,
+                        duration_ms: 0,
+                        telemetry: scan_completion_telemetry(
+                            0,
+                            v2_candidate_bytes_seen,
+                            false,
+                            scanner_index.as_ref().map_or(0, ScannerCandidateIndex::len),
+                        ),
+                    });
+                    let root_stats = active_scan_paths
+                        .iter()
+                        .enumerate()
+                        .map(|(index, path)| RootScanResult {
+                            path: path.clone(),
+                            candidates_found: if index == 0 { candidates_found } else { 0 },
+                            potential_bytes: if index == 0 { indexed_bytes } else { 0 },
+                            false_positives: 0,
+                            duration: Duration::ZERO,
+                        })
+                        .collect();
+                    let _ = report_tx.try_send(WorkerReport::ScanCompleted {
+                        candidates: candidates_found,
+                        duration: Duration::ZERO,
+                        root_stats,
+                        timed_out: false,
+                    });
+                    continue;
+                }
+            }
+        }
 
         let active_reference_scan = ActiveReferenceScanConfig::new(
             Duration::from_secs(current_scanner_config.active_reference_cache_ttl_secs),
@@ -3692,7 +4070,7 @@ fn scanner_thread_main(
                 &current_scoring_config,
                 current_scanner_config.min_file_age_minutes,
             );
-            'priority_roots: for root in &request.paths {
+            'priority_roots: for root in &active_scan_paths {
                 if shutdown.load(Ordering::Relaxed) {
                     scanner_should_exit = true;
                     break;
@@ -3903,7 +4281,7 @@ fn scanner_thread_main(
                                 ) {
                                     let open_files = open_files_joined.get_or_insert_with(|| {
                                         collect_open_path_ancestors_cached(
-                                            &request.paths,
+                                            &active_scan_paths,
                                             active_reference_scan.cache_ttl,
                                         )
                                         .0
@@ -3912,15 +4290,20 @@ fn scanner_thread_main(
                                         .get_or_insert_with(|| {
                                             collect_active_references_for_scan(
                                                 platform.as_ref(),
-                                                &request.paths,
+                                                &active_scan_paths,
                                                 active_reference_scan,
                                                 logger,
                                             )
                                         });
-                                    input.active_references =
-                                        active_references.summary_for(&candidate_path);
-                                    input.is_open =
-                                        crate::scanner::walker::is_path_open_by_ancestor(
+                                    if let Ok(identity) = crate::scanner::walker::identity_for_path(
+                                        &candidate_path,
+                                        current_scanner_config.follow_symlinks,
+                                    ) {
+                                        input.active_references =
+                                            active_references.summary_for_identity(identity);
+                                    }
+                                    input.is_open = !input.active_references.is_empty()
+                                        || crate::scanner::walker::is_path_open_by_ancestor(
                                             &candidate_path,
                                             open_files,
                                         );
@@ -3958,7 +4341,41 @@ fn scanner_thread_main(
                             if score.decision.action
                                 == crate::scanner::scoring::DecisionAction::Delete
                             {
-                                priority_candidates.push(score);
+                                score.identity = crate::scanner::walker::identity_for_path(
+                                    &candidate_path,
+                                    current_scanner_config.follow_symlinks,
+                                )
+                                .ok();
+                                let mut scanner_index_backoff_active = false;
+                                if scanner_index_enabled {
+                                    match CandidateIndexRecord::from_candidate_score(
+                                        &score,
+                                        None,
+                                        scanner_index_event_generation,
+                                    ) {
+                                        Ok(Some(record)) => {
+                                            scanner_index_backoff_active =
+                                                scanner_index.as_ref().is_some_and(|index| {
+                                                    index.candidate_in_cooldown(
+                                                        &record,
+                                                        SystemTime::now(),
+                                                    )
+                                                });
+                                            scanner_index_records.push(record);
+                                        }
+                                        Ok(None) => {}
+                                        Err(err) => logger.send(ActivityEvent::Error {
+                                            code: err.code().to_string(),
+                                            message: format!(
+                                                "scanner_index: failed to record {}: {err}",
+                                                candidate_path.display()
+                                            ),
+                                        }),
+                                    }
+                                }
+                                if !scanner_index_backoff_active {
+                                    priority_candidates.push(score);
+                                }
                             }
                         }
                     }
@@ -3972,6 +4389,20 @@ fn scanner_thread_main(
         // Dispatch priority candidates immediately if any found.
         if !priority_candidates.is_empty() {
             let count = priority_candidates.len();
+            priority_candidates.sort_by(|a, b| {
+                b.total_score
+                    .partial_cmp(&a.total_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let priority_dispatch_bytes = if request.max_delete_batch == 0 {
+                0
+            } else {
+                priority_candidates
+                    .iter()
+                    .take(request.max_delete_batch)
+                    .map(|candidate| candidate.size_bytes)
+                    .sum()
+            };
             // Build pattern frequency breakdown for the log line.
             let mut pattern_counts: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
@@ -3988,34 +4419,39 @@ fn scanner_thread_main(
                 .collect::<Vec<_>>()
                 .join(", ");
 
-            priority_candidates.sort_by(|a, b| {
-                b.total_score
-                    .partial_cmp(&a.total_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
             if request.max_delete_batch == 0 {
                 candidates_found += count;
                 eprintln!(
                     "[SBH-SCANNER] priority pre-scan identified {count} candidates without cleanup ({breakdown_str})"
                 );
             } else {
-                let batch = DeletionBatch {
-                    candidates: priority_candidates,
-                    pressure_level: request.pressure_level,
-                    urgency: request.urgency,
-                };
-                if del_tx.try_send(batch).is_ok() {
+                let remaining_before_dispatch = priority_candidates.len();
+                if dispatch_top_candidates(&mut priority_candidates, &request, del_tx) {
+                    let dispatched_count =
+                        remaining_before_dispatch.saturating_sub(priority_candidates.len());
                     candidates_found += count;
-                    eprintln!(
-                        "[SBH-SCANNER] priority pre-scan dispatched {count} candidates ({breakdown_str})"
-                    );
+                    if dispatched_count > 0 {
+                        v2_candidate_bytes_seen =
+                            v2_candidate_bytes_seen.saturating_add(priority_dispatch_bytes);
+                        eprintln!(
+                            "[SBH-SCANNER] priority pre-scan dispatched {dispatched_count}/{count} candidates ({breakdown_str})"
+                        );
+                    } else {
+                        eprintln!(
+                            "[SBH-SCANNER] priority pre-scan deferred {count} candidates ({breakdown_str})"
+                        );
+                    }
+                } else {
+                    scanner_should_exit = true;
                 }
             }
         }
+        if scanner_should_exit {
+            break;
+        }
         if scan_timed_out {
             let duration = scan_start.elapsed();
-            let root_stats: Vec<RootScanResult> = request
-                .paths
+            let root_stats: Vec<RootScanResult> = active_scan_paths
                 .iter()
                 .enumerate()
                 .map(|(index, path)| RootScanResult {
@@ -4036,16 +4472,86 @@ fn scanner_thread_main(
                 "[SBH-SCANNER] scan complete: 0 entries, {candidates_found} candidates, {:.1}s (timed out)",
                 duration.as_secs_f64()
             );
+            if scanner_index_enabled && let Some(index) = scanner_index.as_mut() {
+                persist_scanner_index_records(
+                    index,
+                    &mut scanner_index_records,
+                    scanner_index_path,
+                    logger,
+                );
+            }
+            logger.send(ActivityEvent::ScanCompleted {
+                paths_scanned: 0,
+                candidates_found,
+                duration_ms: duration.as_millis().try_into().unwrap_or(u64::MAX),
+                telemetry: scan_completion_telemetry(
+                    0,
+                    v2_candidate_bytes_seen,
+                    true,
+                    scanner_index.as_ref().map_or(0, ScannerCandidateIndex::len),
+                ),
+            });
+            continue;
+        }
+        if let Some(target_bytes) = v2_candidate_byte_target
+            && v2_candidate_bytes_seen >= target_bytes
+        {
+            let duration = scan_start.elapsed();
+            if scanner_index_enabled && let Some(index) = scanner_index.as_mut() {
+                persist_scanner_index_records(
+                    index,
+                    &mut scanner_index_records,
+                    scanner_index_path,
+                    logger,
+                );
+            }
+            logger.send(ActivityEvent::ScanCompleted {
+                paths_scanned: 0,
+                candidates_found,
+                duration_ms: duration.as_millis().try_into().unwrap_or(u64::MAX),
+                telemetry: scan_completion_telemetry(
+                    0,
+                    v2_candidate_bytes_seen,
+                    false,
+                    scanner_index.as_ref().map_or(0, ScannerCandidateIndex::len),
+                ),
+            });
+            let root_stats = active_scan_paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| RootScanResult {
+                    path: path.clone(),
+                    candidates_found: if index == 0 { candidates_found } else { 0 },
+                    potential_bytes: if index == 0 {
+                        v2_candidate_bytes_seen
+                    } else {
+                        0
+                    },
+                    false_positives: 0,
+                    duration,
+                })
+                .collect();
+            let _ = report_tx.try_send(WorkerReport::ScanCompleted {
+                candidates: candidates_found,
+                duration,
+                root_stats,
+                timed_out: false,
+            });
             continue;
         }
 
         // Configure walker.
         let walker_config = WalkerConfig {
-            root_paths: request.paths.clone(),
+            root_paths: active_scan_paths.clone(),
             max_depth: current_scanner_config.max_depth,
             follow_symlinks: current_scanner_config.follow_symlinks,
             cross_devices: current_scanner_config.cross_devices,
-            parallelism: current_scanner_config.parallelism,
+            parallelism: if scanner_index_enabled {
+                v2_effective_parallelism(&current_scanner_config, request.pressure_level)
+            } else {
+                current_scanner_config.parallelism
+            },
+            opaque_pruning: scanner_opaque_pruning,
             excluded_paths: {
                 let mut excluded: HashSet<PathBuf> = current_scanner_config
                     .excluded_paths
@@ -4087,6 +4593,7 @@ fn scanner_thread_main(
         };
 
         let mut paths_scanned = 0;
+        let mut opaque_pruned_dirs = 0usize;
         let mut scored: Vec<CandidacyScore> = Vec::with_capacity(1024);
 
         // Track directories for the incremental scan cursor.
@@ -4100,7 +4607,7 @@ fn scanner_thread_main(
 
         // Initialize per-root stats.
         let mut root_stats_map: HashMap<PathBuf, RootScanResult> = HashMap::new();
-        for root in &request.paths {
+        for root in &active_scan_paths {
             root_stats_map.insert(
                 root.clone(),
                 RootScanResult {
@@ -4182,7 +4689,26 @@ fn scanner_thread_main(
             }
 
             // Classify.
-            let classification = pattern_registry.classify(&entry.path, entry.structural_signals);
+            let classification = if let Some(opaque_tree) = &entry.opaque_tree {
+                match opaque_tree.disposition {
+                    OpaqueTreeDisposition::CandidateOpaque => {
+                        opaque_pruned_dirs += 1;
+                        logger.send(ActivityEvent::Info {
+                            message: format!(
+                                "opaque_prune: disposition=CandidateOpaque reason={} path={}",
+                                opaque_tree.reason,
+                                entry.path.display()
+                            ),
+                        });
+                        opaque_tree.classification.clone()
+                    }
+                    OpaqueTreeDisposition::SignalOnly | OpaqueTreeDisposition::ProtectedOpaque => {
+                        continue;
+                    }
+                }
+            } else {
+                pattern_registry.classify(&entry.path, entry.structural_signals)
+            };
 
             // Skip unknown artifacts to save scoring cycles.
             if classification.category == crate::scanner::patterns::ArtifactCategory::Unknown {
@@ -4228,7 +4754,7 @@ fn scanner_thread_main(
                 if has_active_reference_scan_budget(scan_deadline, active_reference_probe_budget) {
                     let open_files = open_files_joined.get_or_insert_with(|| {
                         collect_open_path_ancestors_cached(
-                            &request.paths,
+                            &active_scan_paths,
                             active_reference_scan.cache_ttl,
                         )
                         .0
@@ -4236,14 +4762,18 @@ fn scanner_thread_main(
                     let active_references = active_reference_joined.get_or_insert_with(|| {
                         collect_active_references_for_scan(
                             platform.as_ref(),
-                            &request.paths,
+                            &active_scan_paths,
                             active_reference_scan,
                             logger,
                         )
                     });
-                    input.active_references = active_references.summary_for(&entry.path);
-                    input.is_open =
-                        crate::scanner::walker::is_path_open_by_ancestor(&entry.path, open_files);
+                    input.active_references =
+                        active_references.summary_for_identity(entry.metadata.identity());
+                    input.is_open = !input.active_references.is_empty()
+                        || crate::scanner::walker::is_path_open_by_ancestor(
+                            &entry.path,
+                            open_files,
+                        );
                 } else {
                     mark_active_reference_budget_incomplete(&mut input);
                 }
@@ -4273,13 +4803,44 @@ fn scanner_thread_main(
                 );
             }
 
+            score.identity = Some(entry.metadata.identity());
+            let mut scanner_index_backoff_active = false;
+            if scanner_index_enabled {
+                match CandidateIndexRecord::from_candidate_score(
+                    &score,
+                    entry.opaque_tree.as_ref(),
+                    scanner_index_event_generation,
+                ) {
+                    Ok(Some(record)) => {
+                        scanner_index_backoff_active =
+                            scanner_index.as_ref().is_some_and(|index| {
+                                index.candidate_in_cooldown(&record, SystemTime::now())
+                            });
+                        scanner_index_records.push(record);
+                    }
+                    Ok(None) => {}
+                    Err(err) => logger.send(ActivityEvent::Error {
+                        code: err.code().to_string(),
+                        message: format!(
+                            "scanner_index: failed to record {}: {err}",
+                            entry.path.display()
+                        ),
+                    }),
+                }
+            }
+
             // Attribute to root.
-            let root_path = request.paths.iter().find(|r| entry.path.starts_with(r));
+            let root_path = active_scan_paths.iter().find(|r| entry.path.starts_with(r));
+
+            if scanner_index_backoff_active {
+                continue;
+            }
 
             if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
                 && !score.vetoed
             {
                 candidates_found += 1;
+                v2_candidate_bytes_seen = v2_candidate_bytes_seen.saturating_add(score.size_bytes);
                 scored.push(score);
                 if let Some(root) = root_path
                     && let Some(stat) = root_stats_map.get_mut(root)
@@ -4305,6 +4866,15 @@ fn scanner_thread_main(
                     break;
                 }
                 next_dispatch_deadline = Instant::now() + EARLY_DISPATCH_MAX_WAIT;
+            }
+            if let Some(target_bytes) = v2_candidate_byte_target
+                && v2_candidate_bytes_seen >= target_bytes
+            {
+                if !dispatch_top_candidates(&mut scored, &request, del_tx) {
+                    scanner_should_exit = true;
+                }
+                cancel_token.store(true, Ordering::Relaxed);
+                break;
             }
         }
 
@@ -4335,11 +4905,27 @@ fn scanner_thread_main(
         // cleared for a fresh scan.
         scan_cursor.update(&visited_dirs, &dirs_with_candidates, scan_timed_out);
 
+        // Persist v2 candidate-index state before reporting completion.
+        if scanner_index_enabled && let Some(index) = scanner_index.as_mut() {
+            persist_scanner_index_records(
+                index,
+                &mut scanner_index_records,
+                scanner_index_path,
+                logger,
+            );
+        }
+
         // Log scan completion.
         logger.send(ActivityEvent::ScanCompleted {
             paths_scanned,
             candidates_found,
             duration_ms: scan_duration_ms,
+            telemetry: scan_completion_telemetry(
+                opaque_pruned_dirs,
+                v2_candidate_bytes_seen,
+                scan_timed_out,
+                scanner_index.as_ref().map_or(0, ScannerCandidateIndex::len),
+            ),
         });
 
         // Report scan stats back to main loop for SelfMonitor counters.
@@ -4519,6 +5105,7 @@ fn executor_thread_main(
     policy_engine: &Arc<Mutex<PolicyEngine>>,
     shared_guard_diagnostics: &Arc<RwLock<Option<GuardDiagnostics>>>,
     shutdown: &Arc<AtomicBool>,
+    index_feedback_tx: &Sender<ScannerIndexFeedback>,
 ) {
     let mut tracker = RepeatDeletionTracker::new(
         Duration::from_secs(shared_config.repeat_base_cooldown_secs()),
@@ -4661,6 +5248,10 @@ fn executor_thread_main(
                 dry_run,
                 min_score,
                 check_open_files: true,
+                require_identity: matches!(
+                    shared_scanner_config.read().engine,
+                    ScannerEngineMode::V2
+                ),
                 ..Default::default()
             },
             Some(logger.clone()),
@@ -4709,6 +5300,18 @@ fn executor_thread_main(
         };
 
         let report = executor.execute(&plan, Some(&skip_protected));
+
+        if scanner_config.engine == ScannerEngineMode::V2 {
+            for candidate in &report.backoff_candidates {
+                let Some(identity) = candidate.identity else {
+                    continue;
+                };
+                let _ = index_feedback_tx.try_send(ScannerIndexFeedback {
+                    identity: IndexedIdentity::from(identity),
+                    path: candidate.path.clone(),
+                });
+            }
+        }
 
         // If preflight failed any candidates with NotWritable, the daemon's
         // sandbox doesn't include those paths. This is almost always a
@@ -4828,6 +5431,7 @@ mod tests {
     fn test_candidate(path: &str, total_score: f64) -> CandidacyScore {
         CandidacyScore {
             path: PathBuf::from(path),
+            identity: None,
             total_score,
             factors: ScoreFactors {
                 location: 0.0,
@@ -5043,11 +5647,13 @@ mod tests {
         let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
         let (del_tx, del_rx) = bounded::<DeletionBatch>(1);
         let (report_tx, report_rx) = bounded::<WorkerReport>(1);
+        let (_index_feedback_tx, index_feedback_rx) = bounded::<ScannerIndexFeedback>(1);
         let heartbeat = Arc::new(ThreadHeartbeat::new("test-scanner"));
         let shared_scoring_config = Arc::new(RwLock::new(config.scoring));
         let shared_scanner_config = Arc::new(RwLock::new(config.scanner));
         let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
         let shutdown = Arc::new(AtomicBool::new(false));
+        let scanner_index_path = temp.path().join("scanner-index-v2.json");
 
         scan_tx
             .send(ScanRequest {
@@ -5056,6 +5662,7 @@ mod tests {
                 pressure_level: PressureLevel::Orange,
                 free_pct: Some(9.0),
                 max_delete_batch: 10,
+                force_full_scan: false,
                 config_update: None,
             })
             .unwrap();
@@ -5071,6 +5678,8 @@ mod tests {
             &heartbeat,
             &report_tx,
             &shutdown,
+            &scanner_index_path,
+            &index_feedback_rx,
         );
 
         assert!(
@@ -5094,6 +5703,102 @@ mod tests {
 
         logger.shutdown();
         logger_join.join().unwrap();
+    }
+
+    #[test]
+    fn forced_v2_green_scan_walks_roots_and_logs_telemetry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("scan-root").join("demo");
+        let target = root.join("target");
+        std::fs::create_dir_all(target.join("debug").join("deps").join("crate_000")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        std::fs::write(
+            target
+                .join("debug")
+                .join("deps")
+                .join("crate_000")
+                .join("libdemo.rlib"),
+            b"fake artifact\n",
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.scanner.engine = ScannerEngineMode::V2;
+        config.scanner.root_paths = vec![root.clone()];
+        config.scanner.min_file_age_minutes = 0;
+        config.scanner.parallelism = 1;
+        config.scanner.active_reference_min_size_bytes = u64::MAX;
+
+        let log_path = temp.path().join("activity.jsonl");
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: JsonlConfig {
+                path: log_path.clone(),
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 64,
+        })
+        .unwrap();
+        let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+        let (del_tx, _del_rx) = bounded::<DeletionBatch>(1);
+        let (report_tx, report_rx) = bounded::<WorkerReport>(1);
+        let (_index_feedback_tx, index_feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+        let heartbeat = Arc::new(ThreadHeartbeat::new("test-scanner"));
+        let shared_scoring_config = Arc::new(RwLock::new(config.scoring));
+        let shared_scanner_config = Arc::new(RwLock::new(config.scanner));
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let scanner_index_path = temp.path().join("scanner-index-v2.json");
+
+        scan_tx
+            .send(ScanRequest {
+                paths: vec![root],
+                urgency: 0.5,
+                pressure_level: PressureLevel::Green,
+                free_pct: Some(50.0),
+                max_delete_batch: 10,
+                force_full_scan: true,
+                config_update: None,
+            })
+            .unwrap();
+        drop(scan_tx);
+
+        scanner_thread_main(
+            &scan_rx,
+            &del_tx,
+            &logger,
+            &shared_scoring_config,
+            &shared_scanner_config,
+            &platform,
+            &heartbeat,
+            &report_tx,
+            &shutdown,
+            &scanner_index_path,
+            &index_feedback_rx,
+        );
+
+        let report = report_rx
+            .try_recv()
+            .expect("forced v2 scan should report completion");
+        match report {
+            WorkerReport::ScanCompleted { root_stats, .. } => {
+                assert_eq!(root_stats.len(), 1);
+            }
+            WorkerReport::DeletionCompleted { .. } => panic!("expected scanner completion report"),
+        }
+
+        logger.shutdown();
+        logger_join.join().unwrap();
+
+        let contents = std::fs::read_to_string(log_path).unwrap();
+        assert!(contents.contains("\"event\":\"scan_complete\""));
+        assert!(contents.contains("engine=v2"));
+        assert!(contents.contains("reason=forced"));
+        assert!(contents.contains("opaque_pruning=true"));
+        assert!(contents.contains("opaque_pruned_dirs=1"));
     }
 
     #[test]
@@ -5480,6 +6185,7 @@ mod tests {
             pressure_level: PressureLevel::Yellow,
             free_pct: None,
             max_delete_batch: 0,
+            force_full_scan: false,
             config_update: None,
         };
         let mut scored = vec![test_candidate("/tmp/a", 0.4), test_candidate("/tmp/b", 0.6)];
@@ -5489,9 +6195,42 @@ mod tests {
         assert!(del_rx.try_recv().is_err());
     }
 
+    #[derive(Debug, serde::Serialize)]
+    struct PressureLatencyValidationArtifact {
+        schema_version: u32,
+        scenario: &'static str,
+        memory_pressure_wake_interval_ms: u128,
+        transition_latency_budget_ms: u128,
+        meets_budget: bool,
+    }
+
     #[test]
     fn memory_pressure_wake_interval_meets_transition_latency_budget() {
         assert!(MEMORY_PRESSURE_WAKE_INTERVAL <= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn pressure_latency_validation_artifact_is_machine_readable() {
+        let budget = Duration::from_millis(500);
+        let artifact = PressureLatencyValidationArtifact {
+            schema_version: 1,
+            scenario: "memory-pressure-transition",
+            memory_pressure_wake_interval_ms: MEMORY_PRESSURE_WAKE_INTERVAL.as_millis(),
+            transition_latency_budget_ms: budget.as_millis(),
+            meets_budget: MEMORY_PRESSURE_WAKE_INTERVAL <= budget,
+        };
+        let payload = serde_json::to_value(&artifact).unwrap();
+
+        assert_eq!(payload["schema_version"].as_u64(), Some(1));
+        assert_eq!(
+            payload["scenario"].as_str(),
+            Some("memory-pressure-transition")
+        );
+        assert!(artifact.meets_budget);
+        eprintln!(
+            "scanner_v2_pressure_latency_validation_artifact={}",
+            serde_json::to_string(&artifact).unwrap()
+        );
     }
 
     #[test]
@@ -5576,6 +6315,7 @@ mod tests {
             pressure_level: PressureLevel::Orange,
             free_pct: Some(8.5),
             max_delete_batch: 10,
+            force_full_scan: false,
             config_update: None,
         };
         assert_eq!(request.paths.len(), 2);
@@ -5611,6 +6351,7 @@ mod tests {
             pressure_level: PressureLevel::Yellow,
             free_pct: Some(18.0),
             max_delete_batch: 0,
+            force_full_scan: false,
             config_update: None,
         };
         assert_eq!(
@@ -5722,6 +6463,7 @@ mod tests {
             pressure_level: PressureLevel::Orange,
             free_pct: None,
             max_delete_batch: 10,
+            force_full_scan: false,
             config_update: None,
         };
         // With capacity 0, send blocks until recv is called.
@@ -5835,6 +6577,92 @@ mod tests {
     }
 
     #[test]
+    fn v2_pressure_candidate_byte_target_only_applies_under_cleanup_pressure() {
+        let mut request = ScanRequest {
+            paths: vec![PathBuf::from("/tmp")],
+            urgency: 0.5,
+            pressure_level: PressureLevel::Yellow,
+            free_pct: Some(15.0),
+            max_delete_batch: 4,
+            force_full_scan: false,
+            config_update: None,
+        };
+
+        assert_eq!(v2_pressure_candidate_byte_target(&request), None);
+
+        request.pressure_level = PressureLevel::Orange;
+        assert_eq!(
+            v2_pressure_candidate_byte_target(&request),
+            Some(4 * 256 * 1_048_576)
+        );
+
+        request.max_delete_batch = 0;
+        assert_eq!(v2_pressure_candidate_byte_target(&request), None);
+    }
+
+    #[test]
+    fn v2_active_scan_paths_skip_green_yellow_without_dirty_roots() {
+        let mut request = ScanRequest {
+            paths: vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")],
+            urgency: 0.0,
+            pressure_level: PressureLevel::Green,
+            free_pct: Some(50.0),
+            max_delete_batch: 10,
+            force_full_scan: false,
+            config_update: None,
+        };
+        let mut dirty = BTreeSet::new();
+
+        assert_eq!(v2_active_scan_paths(&request, &dirty), Some(Vec::new()));
+
+        dirty.insert(PathBuf::from("/tmp"));
+        request.pressure_level = PressureLevel::Yellow;
+        assert_eq!(
+            v2_active_scan_paths(&request, &dirty),
+            Some(vec![PathBuf::from("/tmp")])
+        );
+
+        request.pressure_level = PressureLevel::Orange;
+        assert_eq!(v2_active_scan_paths(&request, &dirty), None);
+    }
+
+    #[test]
+    fn v2_active_scan_paths_do_not_skip_forced_green_scan() {
+        let request = ScanRequest {
+            paths: vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")],
+            urgency: 0.5,
+            pressure_level: PressureLevel::Green,
+            free_pct: Some(50.0),
+            max_delete_batch: 10,
+            force_full_scan: true,
+            config_update: None,
+        };
+        let dirty = BTreeSet::new();
+
+        assert_eq!(scan_reason_for_request(&request), "forced");
+        assert_eq!(v2_active_scan_paths(&request, &dirty), None);
+    }
+
+    #[test]
+    fn v2_effective_parallelism_caps_low_pressure_refreshes() {
+        let mut config = ScannerConfig {
+            parallelism: 16,
+            ..ScannerConfig::default()
+        };
+
+        assert_eq!(v2_effective_parallelism(&config, PressureLevel::Green), 1);
+        assert_eq!(v2_effective_parallelism(&config, PressureLevel::Yellow), 1);
+        assert_eq!(v2_effective_parallelism(&config, PressureLevel::Orange), 2);
+        assert_eq!(v2_effective_parallelism(&config, PressureLevel::Red), 4);
+
+        config.parallelism = 1;
+        assert_eq!(
+            v2_effective_parallelism(&config, PressureLevel::Critical),
+            1
+        );
+    }
+
+    #[test]
     fn active_reference_probe_respects_scan_deadline() {
         assert_eq!(
             active_reference_scan_budget("macos"),
@@ -5865,6 +6693,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             free_pct: None,
             max_delete_batch: 40,
+            force_full_scan: false,
             config_update: None,
         };
 
@@ -5890,6 +6719,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             free_pct: None,
             max_delete_batch: 40,
+            force_full_scan: false,
             config_update: None,
         };
 
@@ -5957,6 +6787,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             free_pct: None,
             max_delete_batch: 40,
+            force_full_scan: false,
             config_update: None,
         };
         for _ in 0..SCANNER_CHANNEL_CAP {
@@ -5976,6 +6807,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             free_pct: None,
             max_delete_batch: 1,
+            force_full_scan: false,
             config_update: None,
         };
         let (del_tx, del_rx) = bounded::<DeletionBatch>(4);
@@ -6002,6 +6834,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             free_pct: None,
             max_delete_batch: 1,
+            force_full_scan: false,
             config_update: None,
         };
         let (del_tx, del_rx) = bounded::<DeletionBatch>(1);

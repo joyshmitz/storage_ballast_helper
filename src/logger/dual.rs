@@ -27,6 +27,21 @@ const CHANNEL_CAPACITY: usize = 1024;
 
 // ──────────────────── public event type ────────────────────
 
+/// Structured scan-completion fields used for scanner rollout validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanCompletionTelemetry {
+    pub engine: String,
+    pub dispatch: String,
+    pub scan_reason: String,
+    pub opaque_pruning: bool,
+    pub opaque_pruned_dirs: usize,
+    pub event_dirty_roots: usize,
+    pub index_event_generation: u64,
+    pub index_records: usize,
+    pub candidate_bytes_seen: u64,
+    pub timed_out: bool,
+}
+
 /// Events that can be logged through the dual-write coordinator.
 #[derive(Debug, Clone)]
 pub enum ActivityEvent {
@@ -81,6 +96,7 @@ pub enum ActivityEvent {
         paths_scanned: usize,
         candidates_found: usize,
         duration_ms: u64,
+        telemetry: ScanCompletionTelemetry,
     },
     ConfigReloaded {
         details: String,
@@ -328,6 +344,30 @@ fn logger_thread_main(
 
 // ──────────────────── event conversion ────────────────────
 
+fn scan_completion_details(
+    paths_scanned: usize,
+    candidates_found: usize,
+    telemetry: &ScanCompletionTelemetry,
+) -> String {
+    format!(
+        "paths_scanned={} candidates={} engine={} dispatch={} reason={} \
+         opaque_pruning={} opaque_pruned_dirs={} event_dirty_roots={} \
+         index_event_generation={} index_records={} candidate_bytes_seen={} timed_out={}",
+        paths_scanned,
+        candidates_found,
+        telemetry.engine,
+        telemetry.dispatch,
+        telemetry.scan_reason,
+        telemetry.opaque_pruning,
+        telemetry.opaque_pruned_dirs,
+        telemetry.event_dirty_roots,
+        telemetry.index_event_generation,
+        telemetry.index_records,
+        telemetry.candidate_bytes_seen,
+        telemetry.timed_out
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
     match event {
@@ -428,11 +468,14 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
             paths_scanned,
             candidates_found,
             duration_ms,
+            telemetry,
         } => {
             let mut e = LogEntry::new(EventType::ScanComplete, Severity::Info);
             e.duration_ms = Some(*duration_ms);
-            e.details = Some(format!(
-                "paths_scanned={paths_scanned} candidates={candidates_found}"
+            e.details = Some(scan_completion_details(
+                *paths_scanned,
+                *candidates_found,
+                telemetry,
             ));
             e.ok = Some(true);
             e
@@ -563,6 +606,7 @@ fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
             paths_scanned,
             candidates_found,
             duration_ms,
+            telemetry,
         } => Some(ActivityRow {
             timestamp: ts,
             event_type: "scan_complete".to_string(),
@@ -577,8 +621,10 @@ fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
             success: 1,
             error_code: None,
             error_message: None,
-            details: Some(format!(
-                "paths_scanned={paths_scanned} candidates={candidates_found}"
+            details: Some(scan_completion_details(
+                *paths_scanned,
+                *candidates_found,
+                telemetry,
             )),
         }),
         ActivityEvent::Error { code, message } => Some(ActivityRow {
@@ -717,6 +763,21 @@ mod tests {
         }
     }
 
+    fn test_scan_telemetry(engine: &str) -> ScanCompletionTelemetry {
+        ScanCompletionTelemetry {
+            engine: engine.to_string(),
+            dispatch: "test-dispatch".to_string(),
+            scan_reason: "test".to_string(),
+            opaque_pruning: false,
+            opaque_pruned_dirs: 0,
+            event_dirty_roots: 0,
+            index_event_generation: 0,
+            index_records: 0,
+            candidate_bytes_seen: 0,
+            timed_out: false,
+        }
+    }
+
     #[test]
     fn spawn_and_shutdown() {
         let dir = tempfile::tempdir().unwrap();
@@ -747,6 +808,7 @@ mod tests {
             paths_scanned: 100,
             candidates_found: 5,
             duration_ms: 250,
+            telemetry: test_scan_telemetry("v1"),
         });
         handle.send(ActivityEvent::ArtifactDeleted {
             path: "/data/projects/foo/.target_opus".to_string(),
@@ -768,6 +830,9 @@ mod tests {
 
         let contents = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
         assert_eq!(contents.lines().count(), 3);
+        assert!(contents.contains("dispatch=test-dispatch"));
+        assert!(contents.contains("event_dirty_roots=0"));
+        assert!(contents.contains("timed_out=false"));
 
         // Check SQLite too.
         #[cfg(feature = "sqlite")]
@@ -795,6 +860,7 @@ mod tests {
             paths_scanned: 10,
             candidates_found: 1,
             duration_ms: 50,
+            telemetry: test_scan_telemetry("v1"),
         });
         handle.shutdown();
         join.join().unwrap();
@@ -902,6 +968,7 @@ mod tests {
             paths_scanned: 42,
             candidates_found: 7,
             duration_ms: 100,
+            telemetry: test_scan_telemetry("v1"),
         });
         handle.shutdown();
         join.join().unwrap();
@@ -1006,6 +1073,7 @@ mod tests {
                 paths_scanned: i,
                 candidates_found: i / 2,
                 duration_ms: 50,
+                telemetry: test_scan_telemetry("v1"),
             });
         }
         handle.shutdown();

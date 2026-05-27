@@ -653,6 +653,77 @@ fn scan_reports_home_trash_without_candidate() {
 #[test]
 fn scan_reports_home_trash_without_candidate() {}
 
+#[test]
+fn scan_json_reports_v2_engine_and_opaque_pruning_metrics() {
+    let tmp = tempfile::tempdir().expect("create scan metrics fixture");
+    let root = tmp.path().join("project");
+    let target = root.join("target");
+    fs::create_dir_all(
+        target
+            .join("debug")
+            .join("deps")
+            .join("crate_000")
+            .join("src"),
+    )
+    .expect("create synthetic target tree");
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("write Cargo.toml");
+    fs::write(
+        target
+            .join("debug")
+            .join("deps")
+            .join("crate_000")
+            .join("src")
+            .join("lib.rs"),
+        b"pub fn demo() {}\n",
+    )
+    .expect("write synthetic source");
+
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&state_dir).expect("create state directory");
+    let config_path = tmp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[paths]\nstate_file = \"{}\"\nsqlite_db = \"{}\"\njsonl_log = \"{}\"\nballast_dir = \"{}\"\n\n[scanner]\nengine = \"v2\"\nroot_paths = [\"{}\"]\nmin_file_age_minutes = 0\n",
+            state_dir.join("state.json").display(),
+            state_dir.join("activity.sqlite3").display(),
+            state_dir.join("activity.jsonl").display(),
+            state_dir.join("ballast").display(),
+            root.display(),
+        ),
+    )
+    .expect("write scan metrics config");
+
+    let config_str = config_path.to_string_lossy().to_string();
+    let root_str = root.to_string_lossy().to_string();
+    let result = common::run_cli_case(
+        "scan_json_reports_v2_engine_and_opaque_pruning_metrics",
+        &["--config", &config_str, "--json", "scan", &root_str],
+    );
+    assert_cli_success(&result, "v2 scan metrics");
+
+    let payload = parse_json_stdout(&result);
+    assert_eq!(payload["scanner_engine"].as_str(), Some("v2"));
+    assert_eq!(
+        payload["scanner_dispatch"].as_str(),
+        Some("v2_opaque_pruning_walker")
+    );
+    assert_eq!(payload["opaque_pruning"].as_bool(), Some(true));
+    assert_eq!(payload["opaque_pruned_dirs"].as_u64(), Some(1));
+    assert!(
+        payload
+            .get("process_cpu_micros")
+            .is_some_and(|value| value.is_null() || value.as_u64().is_some()),
+        "scan JSON should include a nullable process_cpu_micros field for A/B artifacts; payload={payload}"
+    );
+    assert!(
+        payload["scanned_entries"]
+            .as_u64()
+            .is_some_and(|entries| entries < 10),
+        "v2 scan should report an opaque root without descending; payload={payload}"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_status_json_matches_diskutil_apfs_capacity() {
@@ -3288,6 +3359,7 @@ fn walker_discovers_entries_in_tree() {
         cross_devices: false,
         parallelism: 1,
         excluded_paths: HashSet::new(),
+        opaque_pruning: false,
     };
 
     let protection = ProtectionRegistry::new(None).expect("create protection");
@@ -3418,6 +3490,7 @@ fn dry_run_deletes_nothing() {
             circuit_breaker_threshold: 3,
             circuit_breaker_cooldown: Duration::from_secs(1),
             check_open_files: false,
+            require_identity: false,
         },
         None,
     );
@@ -3586,6 +3659,7 @@ fn walker_skips_protected_directories() {
         cross_devices: false,
         parallelism: 1,
         excluded_paths: HashSet::new(),
+        opaque_pruning: false,
     };
 
     let protection = ProtectionRegistry::new(None).expect("create protection");
@@ -3742,6 +3816,7 @@ fn e2e_bad_observations(count: usize, error_factor: f64) -> Vec<CalibrationObser
 fn e2e_scored_candidate(action: DecisionAction, score: f64) -> CandidacyScore {
     CandidacyScore {
         path: PathBuf::from("/data/projects/test/.target_opus"),
+        identity: None,
         total_score: score,
         factors: ScoreFactors {
             location: 0.85,

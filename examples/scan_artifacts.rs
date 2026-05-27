@@ -35,6 +35,7 @@ fn main() {
         cross_devices: false,
         parallelism: 4,
         excluded_paths: HashSet::new(),
+        opaque_pruning: false,
     };
 
     let walker = DirectoryWalker::new(walker_config, protection);

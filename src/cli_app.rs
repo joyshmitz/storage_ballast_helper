@@ -16,7 +16,8 @@ use storage_ballast_helper::ballast::manager::BallastManager;
 use storage_ballast_helper::cli::RELEASE_REPOSITORY;
 use storage_ballast_helper::cli::update::{UpdateReport, UpdateServiceRestart};
 use storage_ballast_helper::core::config::{
-    Config, PathsConfig, load_sacred_config, sacred_config_path_for, write_sacred_config,
+    Config, PathsConfig, ScannerEngineMode, load_sacred_config, sacred_config_path_for,
+    write_sacred_config,
 };
 use storage_ballast_helper::daemon::loop_main::{
     DaemonArgs as RuntimeDaemonArgs, MonitoringDaemon,
@@ -39,13 +40,16 @@ use storage_ballast_helper::platform::types::{
     ProcessInfo, ProcessIo, ServiceKind,
 };
 use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionPlan};
-use storage_ballast_helper::scanner::patterns::{ArtifactCategory, ArtifactPatternRegistry};
+use storage_ballast_helper::scanner::engine::{ScannerEngine, SelectedScannerEngine};
+use storage_ballast_helper::scanner::patterns::{
+    ArtifactCategory, ArtifactPatternRegistry, OpaqueTreeDisposition,
+};
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
 use storage_ballast_helper::scanner::scoring::{
     ActiveReferenceSummary, CandidacyScore, CandidateInput, ScoringEngine,
 };
 use storage_ballast_helper::scanner::walker::{
-    ActiveReferenceIndex, ActiveReferenceScanConfig, DirectoryWalker, WalkerConfig,
+    ActiveReferenceIndex, ActiveReferenceScanConfig, DirectoryWalker, FsIdentity, WalkerConfig,
     collect_active_reference_index_cached, collect_open_path_ancestors,
     collect_open_path_ancestors_cached, is_path_open_by_ancestor,
 };
@@ -5678,6 +5682,7 @@ fn count_sacred_scan_overlaps(
             .iter()
             .cloned()
             .collect::<HashSet<_>>(),
+        opaque_pruning: matches!(config.scanner.engine, ScannerEngineMode::V2),
     };
     let walker = DirectoryWalker::new(walker_config, registry);
     let entries = walker
@@ -6838,10 +6843,20 @@ fn scan_entry_json(entry: &ScoredScanEntry, explain: bool) -> Value {
     item
 }
 
+fn current_process_cpu_micros() -> Option<u64> {
+    let stats = detect_platform().ok()?.self_stats().ok()?;
+    Some(
+        stats
+            .cpu_user_micros
+            .saturating_add(stats.cpu_system_micros),
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let cpu_start_micros = current_process_cpu_micros();
     let start = std::time::Instant::now();
 
     // Determine scan roots: CLI paths or configured watched paths.
@@ -6869,6 +6884,10 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
         return Err(CliError::User("no valid scan paths found".to_string()));
     }
     let scan_roots = root_paths.clone();
+    let selected_scanner_engine = SelectedScannerEngine::for_mode(config.scanner.engine);
+    let scanner_engine_mode = selected_scanner_engine.mode();
+    let scanner_dispatch = selected_scanner_engine.dispatch();
+    let scanner_opaque_pruning = selected_scanner_engine.opaque_pruning();
 
     // Build protection registry from config patterns.
     let protection_patterns = if config.scanner.protected_paths.is_empty() {
@@ -6892,6 +6911,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
             .iter()
             .cloned()
             .collect::<HashSet<_>>(),
+        opaque_pruning: scanner_opaque_pruning,
     };
     let walker = DirectoryWalker::new(walker_config, protection);
 
@@ -6910,11 +6930,28 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     let mut open_paths = None;
     let mut active_reference_index = None;
     let min_file_age_seconds = config.scanner.min_file_age_minutes.saturating_mul(60);
+    let opaque_pruned_dirs = entries
+        .iter()
+        .filter(|entry| {
+            entry.opaque_tree.as_ref().is_some_and(|opaque_tree| {
+                opaque_tree.disposition == OpaqueTreeDisposition::CandidateOpaque
+            })
+        })
+        .count();
 
     let scored_entries = entries
         .iter()
-        .map(|entry| {
-            let classification = registry.classify(&entry.path, entry.structural_signals);
+        .filter_map(|entry| {
+            let classification = if let Some(opaque_tree) = &entry.opaque_tree {
+                match opaque_tree.disposition {
+                    OpaqueTreeDisposition::CandidateOpaque => opaque_tree.classification.clone(),
+                    OpaqueTreeDisposition::SignalOnly | OpaqueTreeDisposition::ProtectedOpaque => {
+                        return None;
+                    }
+                }
+            } else {
+                registry.classify(&entry.path, entry.structural_signals)
+            };
             let age = now
                 .duration_since(entry.metadata.effective_age_timestamp())
                 .unwrap_or_default();
@@ -6945,6 +6982,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                     &scan_roots,
                     active_reference_scan,
                     &entry.path,
+                    Some(entry.metadata.identity()),
                     entry.metadata.content_size_bytes,
                 );
                 candidate.active_references = active_references;
@@ -6953,13 +6991,14 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 false
             };
 
-            let (score, sacred_overlaps) = score_candidate_with_deferred_sacred_check(
+            let (mut score, sacred_overlaps) = score_candidate_with_deferred_sacred_check(
                 &engine,
                 &candidate,
                 0.0,
                 &sacred_paths,
                 |_| args.explain,
             );
+            score.identity = Some(entry.metadata.identity());
             let trace = build_scan_trace(
                 &candidate,
                 &score,
@@ -6967,7 +7006,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 active_reference_checked,
                 &sacred_overlaps,
             );
-            ScoredScanEntry { score, trace }
+            Some(ScoredScanEntry { score, trace })
         })
         .collect::<Vec<_>>();
 
@@ -7008,13 +7047,20 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     }
 
     let elapsed = start.elapsed();
+    let process_cpu_micros = cpu_start_micros
+        .zip(current_process_cpu_micros())
+        .map(|(start, end)| end.saturating_sub(start));
     let total_reclaimable: u64 = candidates.iter().map(|entry| entry.score.size_bytes).sum();
     let total_reported: u64 = report_only.iter().map(|entry| entry.score.size_bytes).sum();
 
     match output_mode(cli) {
         OutputMode::Human => {
             println!(
-                "Build Artifact Scan Results\n  Scanned: {} directories in {:.1}s\n  Candidates found: {} (above threshold {:.2})\n",
+                "Build Artifact Scan Results\n  Engine: {} ({}, opaque_pruning={}, opaque_pruned_dirs={})\n  Scanned: {} entries in {:.1}s\n  Candidates found: {} (above threshold {:.2})\n",
+                scanner_engine_mode,
+                scanner_dispatch,
+                scanner_opaque_pruning,
+                opaque_pruned_dirs,
                 dir_count,
                 elapsed.as_secs_f64(),
                 candidates.len(),
@@ -7123,8 +7169,14 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
 
             let mut payload = json!({
                 "command": "scan",
+                "scanner_engine": scanner_engine_mode.to_string(),
+                "scanner_dispatch": scanner_dispatch.to_string(),
+                "opaque_pruning": scanner_opaque_pruning,
+                "opaque_pruned_dirs": opaque_pruned_dirs,
                 "scanned_directories": dir_count,
+                "scanned_entries": dir_count,
                 "elapsed_seconds": elapsed.as_secs_f64(),
+                "process_cpu_micros": process_cpu_micros,
                 "min_score": args.min_score,
                 "candidates_count": entries_json.len(),
                 "total_reclaimable_bytes": total_reclaimable,
@@ -7244,6 +7296,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
             .iter()
             .cloned()
             .collect::<HashSet<_>>(),
+        opaque_pruning: matches!(config.scanner.engine, ScannerEngineMode::V2),
     };
     let walker = DirectoryWalker::new(walker_config, protection);
     let entries = walker
@@ -7298,18 +7351,20 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                     &root_paths,
                     active_reference_scan,
                     &entry.path,
+                    Some(entry.metadata.identity()),
                     entry.metadata.content_size_bytes,
                 );
                 candidate.active_references = active_references;
             }
-            score_candidate_with_deferred_sacred_check(
+            let (mut score, _) = score_candidate_with_deferred_sacred_check(
                 &engine,
                 &candidate,
                 0.0,
                 &sacred_paths,
                 |base_score| !base_score.vetoed && base_score.total_score >= args.min_score,
-            )
-            .0
+            );
+            score.identity = Some(entry.metadata.identity());
+            score
         })
         .filter(|score| !score.vetoed && score.total_score >= args.min_score)
         .collect();
@@ -7322,6 +7377,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
         dry_run: args.dry_run,
         min_score: args.min_score,
         check_open_files: true,
+        require_identity: matches!(config.scanner.engine, ScannerEngineMode::V2),
         ..Default::default()
     };
     let executor = DeletionExecutor::new(deletion_config, None);
@@ -7716,6 +7772,7 @@ fn active_references_for_candidate(
     root_paths: &[PathBuf],
     scan_config: ActiveReferenceScanConfig,
     path: &Path,
+    identity: Option<FsIdentity>,
     size_bytes: u64,
 ) -> (ActiveReferenceSummary, bool) {
     if !scan_config.should_probe(size_bytes) {
@@ -7725,7 +7782,11 @@ fn active_references_for_candidate(
     let index = active_reference_index.get_or_insert_with(|| {
         collect_active_reference_index_best_effort(root_paths, scan_config.cache_ttl)
     });
-    (index.summary_for(path), true)
+    let summary = identity.map_or_else(
+        || index.summary_for(path),
+        |id| index.summary_for_identity(id),
+    );
+    (summary, true)
 }
 
 fn open_status_for_candidate(
@@ -8322,6 +8383,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
             .iter()
             .cloned()
             .collect::<HashSet<_>>(),
+        opaque_pruning: matches!(config.scanner.engine, ScannerEngineMode::V2),
     };
     let walker = DirectoryWalker::new(walker_config, protection);
     let entries = walker
@@ -8372,11 +8434,12 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
                     &root_paths,
                     active_reference_scan,
                     &entry.path,
+                    Some(entry.metadata.identity()),
                     entry.metadata.content_size_bytes,
                 );
                 candidate.active_references = active_references;
             }
-            score_candidate_with_deferred_sacred_check(
+            let (mut score, _) = score_candidate_with_deferred_sacred_check(
                 &engine,
                 &candidate,
                 0.8,
@@ -8384,8 +8447,9 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
                 |base_score| {
                     !base_score.vetoed && base_score.total_score >= config.scoring.min_score
                 },
-            )
-            .0
+            );
+            score.identity = Some(entry.metadata.identity());
+            score
         })
         .filter(|score| !score.vetoed)
         .collect();
@@ -8398,6 +8462,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         dry_run: false,
         min_score: config.scoring.min_score,
         check_open_files: true,
+        require_identity: matches!(config.scanner.engine, ScannerEngineMode::V2),
         circuit_breaker_threshold: u32::MAX, // Effectively disabled.
         ..Default::default()
     };

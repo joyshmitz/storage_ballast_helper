@@ -20,7 +20,10 @@ use crossbeam_channel as channel;
 
 use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::Platform;
-use crate::scanner::patterns::StructuralSignals;
+use crate::scanner::patterns::{
+    OpaqueTreeClassification, OpaqueTreeContext, OpaqueTreeDisposition, StructuralSignals,
+    classify_opaque_tree,
+};
 use crate::scanner::protection::ProtectionRegistry;
 use crate::scanner::scoring::ActiveReferenceSummary;
 
@@ -38,6 +41,7 @@ pub struct WalkerConfig {
     pub cross_devices: bool,
     pub parallelism: usize,
     pub excluded_paths: HashSet<PathBuf>,
+    pub opaque_pruning: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +89,25 @@ pub struct EntryMetadata {
     pub is_dir: bool,
     pub inode: u64,
     pub device_id: u64,
+    pub kind: FsEntryKind,
     pub permissions: u32,
+}
+
+/// Filesystem object kind used with device/inode identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FsEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+/// Stable filesystem identity for a single observed directory entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FsIdentity {
+    pub device_id: u64,
+    pub inode: u64,
+    pub kind: FsEntryKind,
 }
 
 impl EntryMetadata {
@@ -105,6 +127,15 @@ impl EntryMetadata {
             self.modified
         }
     }
+
+    #[must_use]
+    pub fn identity(&self) -> FsIdentity {
+        FsIdentity {
+            device_id: self.device_id,
+            inode: self.inode,
+            kind: self.kind,
+        }
+    }
 }
 
 /// A single entry discovered during a walk.
@@ -115,10 +146,19 @@ pub struct WalkEntry {
     pub depth: usize,
     pub structural_signals: StructuralSignals,
     pub is_open: bool,
+    pub opaque_tree: Option<OpaqueTreeClassification>,
 }
 
-/// Item in the internal work queue: (directory_path, depth, root_device_id).
-type WorkItem = (PathBuf, usize, u64);
+/// Item in the internal work queue.
+#[derive(Debug, Clone)]
+struct WorkItem {
+    path: PathBuf,
+    depth: usize,
+    root_device_id: u64,
+    opaque_tree: Option<OpaqueTreeClassification>,
+}
+
+const OPAQUE_CANDIDATE_SIZE_FLOOR: u64 = 100 * 1_048_576;
 
 /// Parallel directory walker with safety guards.
 ///
@@ -215,7 +255,12 @@ impl DirectoryWalker {
             }
             let dev = device_id(&meta);
             in_flight.fetch_add(1, Ordering::Release);
-            let _ = work_tx.send((root.clone(), 0, dev));
+            let _ = work_tx.send(WorkItem {
+                path: root.clone(),
+                depth: 0,
+                root_device_id: dev,
+                opaque_tree: None,
+            });
         }
 
         // Clone sender for workers; drop original so channel closes when workers finish.
@@ -277,10 +322,19 @@ fn walker_thread(
         }
 
         match work_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok((dir_path, depth, root_dev)) => {
+            Ok(item) => {
                 process_directory(
-                    &dir_path, depth, root_dev, work_tx, result_tx, in_flight, config, protection,
-                    heartbeat, cancel,
+                    &item.path,
+                    item.depth,
+                    item.root_device_id,
+                    item.opaque_tree,
+                    work_tx,
+                    result_tx,
+                    in_flight,
+                    config,
+                    protection,
+                    heartbeat,
+                    cancel,
                 );
                 // Mark this work item as completed.
                 let remaining = in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -300,6 +354,24 @@ fn walker_thread(
     }
 }
 
+fn send_walk_entry(
+    result_tx: &channel::Sender<WalkEntry>,
+    walk_entry: &WalkEntry,
+    cancel: &AtomicBool,
+) -> bool {
+    loop {
+        match result_tx.send_timeout(walk_entry.clone(), Duration::from_millis(100)) {
+            Ok(()) => return true,
+            Err(channel::SendTimeoutError::Timeout(_)) => {
+                if cancel.load(Ordering::Relaxed) {
+                    return false;
+                }
+            }
+            Err(channel::SendTimeoutError::Disconnected(_)) => return false,
+        }
+    }
+}
+
 /// Process one directory: read entries, emit WalkEntry results, enqueue subdirectories.
 ///
 /// Performance: the hot path avoids per-child stat() calls. The directory is stat'd
@@ -312,6 +384,7 @@ fn process_directory(
     dir_path: &Path,
     depth: usize,
     root_dev: u64,
+    opaque_tree: Option<OpaqueTreeClassification>,
     work_tx: &channel::Sender<WorkItem>,
     result_tx: &channel::Sender<WalkEntry>,
     in_flight: &AtomicUsize,
@@ -367,6 +440,7 @@ fn process_directory(
     let mut object_count = 0u32;
     let mut total_count = 0u32;
     let mut content_size: u64 = 0;
+    let mut parent_has_node_manifest = false;
 
     // Collect child directories during iteration; queue them AFTER the loop.
     // This prevents a race where a child dir is queued and processed by another
@@ -421,6 +495,15 @@ fn process_directory(
                 ".fingerprint" => signals.has_fingerprint = true,
                 ".git" => signals.has_git = true,
                 "cargo.toml" | "Cargo.toml" => signals.has_cargo_toml = true,
+                "package.json"
+                | "package-lock.json"
+                | "npm-shrinkwrap.json"
+                | "pnpm-lock.yaml"
+                | "yarn.lock"
+                | "bun.lock"
+                | "bun.lockb" => {
+                    parent_has_node_manifest = true;
+                }
                 _ => {}
             }
 
@@ -487,10 +570,57 @@ fn process_directory(
         if cancel.load(Ordering::Relaxed) {
             return;
         }
+        let opaque_tree = if config.opaque_pruning {
+            classify_opaque_tree(
+                &child_path,
+                OpaqueTreeContext {
+                    parent_has_cargo_toml: signals.has_cargo_toml,
+                    parent_has_node_manifest,
+                },
+            )
+        } else {
+            None
+        };
+        if let Some(opaque) = opaque_tree.clone() {
+            match opaque.disposition {
+                OpaqueTreeDisposition::CandidateOpaque => {
+                    let Ok(meta) = metadata_for_path(&child_path, config.follow_symlinks) else {
+                        continue;
+                    };
+                    if !config.cross_devices && device_id(&meta) != root_dev {
+                        continue;
+                    }
+                    let mut emeta = entry_metadata(&meta);
+                    if emeta.is_dir {
+                        emeta.content_size_bytes =
+                            emeta.content_size_bytes.max(OPAQUE_CANDIDATE_SIZE_FLOOR);
+                    }
+                    let walk_entry = WalkEntry {
+                        path: child_path,
+                        metadata: emeta,
+                        depth: depth + 1,
+                        structural_signals: StructuralSignals::default(),
+                        is_open: false,
+                        opaque_tree: Some(opaque),
+                    };
+                    if !send_walk_entry(result_tx, &walk_entry, cancel) {
+                        return;
+                    }
+                    continue;
+                }
+                OpaqueTreeDisposition::ProtectedOpaque => continue,
+                OpaqueTreeDisposition::SignalOnly => {}
+            }
+        }
         in_flight.fetch_add(1, Ordering::Release);
         loop {
             match work_tx.send_timeout(
-                (child_path.clone(), depth + 1, root_dev),
+                WorkItem {
+                    path: child_path.clone(),
+                    depth: depth + 1,
+                    root_device_id: root_dev,
+                    opaque_tree: opaque_tree.clone(),
+                },
                 Duration::from_millis(100),
             ) {
                 Ok(()) => break,
@@ -532,19 +662,10 @@ fn process_directory(
             depth,
             structural_signals: signals,
             is_open: false, // Caller sets this after walk using /proc scan.
+            opaque_tree,
         };
 
-        loop {
-            match result_tx.send_timeout(walk_entry.clone(), Duration::from_millis(100)) {
-                Ok(()) => break,
-                Err(channel::SendTimeoutError::Timeout(_)) => {
-                    if cancel.load(Ordering::Relaxed) {
-                        return;
-                    }
-                }
-                Err(channel::SendTimeoutError::Disconnected(_)) => return,
-            }
-        }
+        let _ = send_walk_entry(result_tx, &walk_entry, cancel);
     }
 }
 
@@ -584,6 +705,16 @@ fn signals_from_children(child_names: &[String]) -> StructuralSignals {
 
 /// Extract `EntryMetadata` from `fs::Metadata` (Unix-specific fields via MetadataExt).
 fn entry_metadata(meta: &fs::Metadata) -> EntryMetadata {
+    let file_type = meta.file_type();
+    let kind = if file_type.is_symlink() {
+        FsEntryKind::Symlink
+    } else if meta.is_dir() {
+        FsEntryKind::Directory
+    } else if meta.is_file() {
+        FsEntryKind::File
+    } else {
+        FsEntryKind::Other
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -596,6 +727,7 @@ fn entry_metadata(meta: &fs::Metadata) -> EntryMetadata {
             is_dir: meta.is_dir(),
             inode: meta.ino(),
             device_id: meta.dev(),
+            kind,
             permissions: meta.mode(),
         }
     }
@@ -610,6 +742,7 @@ fn entry_metadata(meta: &fs::Metadata) -> EntryMetadata {
             is_dir: meta.is_dir(),
             inode: 0,
             device_id: 0,
+            kind,
             permissions: 0,
         }
     }
@@ -621,6 +754,10 @@ fn metadata_for_path(path: &Path, follow_symlinks: bool) -> std::io::Result<fs::
     } else {
         fs::symlink_metadata(path)
     }
+}
+
+pub fn identity_for_path(path: &Path, follow_symlinks: bool) -> std::io::Result<FsIdentity> {
+    metadata_for_path(path, follow_symlinks).map(|meta| entry_metadata(&meta).identity())
 }
 
 /// Get device ID from metadata (for cross-device detection).
@@ -956,6 +1093,7 @@ fn normalized_root_cache_key(root_paths: &[PathBuf]) -> Vec<PathBuf> {
 #[derive(Debug, Clone)]
 pub struct ActiveReferenceIndex {
     references: HashMap<PathBuf, ActiveReferenceSummary>,
+    references_by_identity: HashMap<FsIdentity, ActiveReferenceSummary>,
     complete: bool,
     incomplete_reason: Option<String>,
 }
@@ -971,6 +1109,7 @@ impl ActiveReferenceIndex {
     pub fn empty() -> Self {
         Self {
             references: HashMap::new(),
+            references_by_identity: HashMap::new(),
             complete: true,
             incomplete_reason: None,
         }
@@ -980,6 +1119,7 @@ impl ActiveReferenceIndex {
     pub fn incomplete(reason: impl Into<String>) -> Self {
         Self {
             references: HashMap::new(),
+            references_by_identity: HashMap::new(),
             complete: false,
             incomplete_reason: Some(reason.into()),
         }
@@ -997,14 +1137,19 @@ impl ActiveReferenceIndex {
 
     #[must_use]
     pub fn summary_for(&self, path: &Path) -> ActiveReferenceSummary {
+        let mut summary = self.references.get(path).cloned().unwrap_or_default();
+        if let Some(reason) = &self.incomplete_reason {
+            summary.mark_incomplete(reason.clone());
+        }
+        summary
+    }
+
+    #[must_use]
+    pub fn summary_for_identity(&self, identity: FsIdentity) -> ActiveReferenceSummary {
         let mut summary = self
-            .references
-            .get(path)
+            .references_by_identity
+            .get(&identity)
             .cloned()
-            .or_else(|| {
-                let normalized = crate::core::paths::resolve_absolute_path(path);
-                self.references.get(&normalized).cloned()
-            })
             .unwrap_or_default();
         if let Some(reason) = &self.incomplete_reason {
             summary.mark_incomplete(reason.clone());
@@ -1029,6 +1174,12 @@ impl ActiveReferenceIndex {
         let mut current = Some(normalized.as_path());
         while let Some(path) = current {
             add(self.references.entry(path.to_path_buf()).or_default());
+            if let Ok(meta) = fs::symlink_metadata(path) {
+                add(self
+                    .references_by_identity
+                    .entry(entry_metadata(&meta).identity())
+                    .or_default());
+            }
             if path == stop_at {
                 break;
             }
@@ -1062,6 +1213,7 @@ pub fn collect_active_reference_index(
 
     let mut index = ActiveReferenceIndex {
         references: HashMap::new(),
+        references_by_identity: HashMap::new(),
         complete: true,
         incomplete_reason: active_reference_visibility_warning(platform).map(str::to_string),
     };
@@ -1184,13 +1336,7 @@ pub fn is_path_open_by_ancestor<S: std::hash::BuildHasher>(
     path: &Path,
     open_ancestors: &HashSet<PathBuf, S>,
 ) -> bool {
-    if open_ancestors.contains(path) {
-        return true;
-    }
-    // Always normalize to catch symlink aliases (e.g. candidate /var/tmp vs /proc reporting /private/var/tmp).
-    // resolve_absolute_path performs fs::canonicalize if the path exists.
-    let normalized = crate::core::paths::resolve_absolute_path(path);
-    open_ancestors.contains(&normalized)
+    open_ancestors.contains(path)
 }
 
 /// Memoized open-file detector for repeated path checks during one scan pass.
@@ -1298,7 +1444,12 @@ pub fn is_path_open<S: std::hash::BuildHasher>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::config::ScoringConfig;
+    use crate::scanner::patterns::ArtifactPatternRegistry;
     use crate::scanner::protection;
+    use crate::scanner::scoring::{
+        ActiveReferenceSummary, CandidateInput, DecisionAction, ScoringEngine,
+    };
     use std::fs;
     use tempfile::TempDir;
 
@@ -1484,6 +1635,7 @@ mod tests {
             cross_devices: false,
             parallelism: 2,
             excluded_paths: HashSet::new(),
+            opaque_pruning: false,
         }
     }
 
@@ -1525,7 +1677,8 @@ mod tests {
         let index = collect_active_reference_index(&platform, std::slice::from_ref(&root));
         assert!(index.is_complete());
 
-        let summary = index.summary_for(&candidate);
+        let normalized_candidate = crate::core::paths::resolve_absolute_path(&candidate);
+        let summary = index.summary_for(&normalized_candidate);
         let process = summary
             .processes
             .iter()
@@ -1542,6 +1695,13 @@ mod tests {
         assert!(reason.contains("open file descriptor"));
         assert!(reason.contains("running executable"));
         assert!(reason.contains("mmap region"));
+
+        let identity_summary =
+            index.summary_for_identity(identity_for_path(&candidate, false).unwrap());
+        assert_eq!(
+            identity_summary, summary,
+            "candidate root identity should provide the same O(1) active-reference answer"
+        );
     }
 
     #[test]
@@ -1601,9 +1761,50 @@ mod tests {
             Duration::from_secs(30),
         );
 
-        assert!(!first.summary_for(&candidate).is_empty());
-        assert!(!second.summary_for(&candidate).is_empty());
+        let candidate_identity = identity_for_path(&candidate, false).unwrap();
+        assert!(!first.summary_for_identity(candidate_identity).is_empty());
+        assert!(!second.summary_for_identity(candidate_identity).is_empty());
         assert_eq!(platform.probe_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_reference_summary_uses_inode_identity_for_alias_paths() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let real_root = tmp.path().join("real");
+        let alias_root = tmp.path().join("alias");
+        let candidate = real_root.join("target");
+        let open_file_path = candidate.join("debug").join("object.o");
+        fs::create_dir_all(open_file_path.parent().unwrap()).unwrap();
+        fs::write(&open_file_path, b"object").unwrap();
+        symlink(&real_root, &alias_root).unwrap();
+
+        let platform = TestActiveRefPlatform {
+            processes: vec![process(42, "rustc", None)],
+            open_files: vec![crate::platform::types::OpenFile {
+                pid: 42,
+                path: open_file_path,
+                fd: Some(9),
+                kind: crate::platform::types::OpenFileKind::Regular,
+                mode: crate::platform::types::OpenFileMode::ReadWrite,
+            }],
+            ..Default::default()
+        };
+
+        let index = collect_active_reference_index(&platform, std::slice::from_ref(&real_root));
+        let alias_candidate = alias_root.join("target");
+        let alias_meta = entry_metadata(&fs::symlink_metadata(&alias_candidate).unwrap());
+
+        assert!(
+            index.summary_for(&alias_candidate).is_empty(),
+            "path lookup should not canonicalize candidate aliases in the hot path"
+        );
+        assert!(
+            !index.summary_for_identity(alias_meta.identity()).is_empty(),
+            "identity lookup should preserve alias safety without per-candidate realpath"
+        );
     }
 
     #[test]
@@ -1701,6 +1902,516 @@ mod tests {
     }
 
     #[test]
+    fn opaque_pruning_emits_target_once_without_descending() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        let target_dir = project.join("target");
+        fs::create_dir_all(target_dir.join("debug").join("deps")).unwrap();
+        fs::write(project.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+
+        let mut config = test_config(tmp.path());
+        config.opaque_pruning = true;
+        let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+        let entries = walker.walk().unwrap();
+
+        let target_entries: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.path == target_dir)
+            .collect();
+        assert_eq!(target_entries.len(), 1);
+        assert_eq!(
+            target_entries[0]
+                .opaque_tree
+                .as_ref()
+                .map(|opaque| opaque.disposition),
+            Some(OpaqueTreeDisposition::CandidateOpaque)
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.path.starts_with(target_dir.join("debug")))
+        );
+    }
+
+    fn synthetic_large_cargo_tree(root: &Path, crate_count: usize) -> PathBuf {
+        let project = root.join("project");
+        let target_dir = project.join("target");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+
+        for index in 0..crate_count {
+            let crate_dir = target_dir
+                .join("debug")
+                .join("deps")
+                .join(format!("crate_{index:03}"));
+            fs::create_dir_all(crate_dir.join("src")).unwrap();
+            fs::create_dir_all(crate_dir.join("incremental")).unwrap();
+            fs::write(crate_dir.join("src").join("lib.rs"), b"pub fn demo() {}\n").unwrap();
+        }
+
+        target_dir
+    }
+
+    fn walk_fixture(root: &Path, opaque_pruning: bool) -> Vec<WalkEntry> {
+        let mut config = test_config(root);
+        config.parallelism = 1;
+        config.opaque_pruning = opaque_pruning;
+
+        DirectoryWalker::new(config, ProtectionRegistry::marker_only())
+            .walk()
+            .unwrap()
+    }
+
+    #[derive(Debug)]
+    struct ScannerValidationReport {
+        entries_visited: usize,
+        opaque_pruned_dirs: usize,
+        delete_paths: HashSet<PathBuf>,
+        hard_veto_paths: HashMap<PathBuf, String>,
+        delete_candidate_bytes: u64,
+        elapsed: Duration,
+        process_cpu_micros: Option<u64>,
+    }
+
+    impl ScannerValidationReport {
+        fn deterministic_effort_ratio_against(&self, other: &Self) -> usize {
+            other.entries_visited / self.entries_visited.max(1)
+        }
+
+        fn elapsed_wall_seconds(&self) -> f64 {
+            self.elapsed.as_secs_f64()
+        }
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    struct ScannerValidationMetrics {
+        engine: &'static str,
+        dispatch: &'static str,
+        entries_visited: usize,
+        opaque_pruned_dirs: usize,
+        delete_candidates: usize,
+        hard_vetoes: usize,
+        delete_candidate_bytes: u64,
+        elapsed_wall_seconds: f64,
+        process_cpu_micros: Option<u64>,
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    struct ScannerValidationArtifact {
+        schema_version: u32,
+        scenario: &'static str,
+        v1: ScannerValidationMetrics,
+        v2: ScannerValidationMetrics,
+        deterministic_effort_ratio: usize,
+        observed_cpu_ratio: Option<f64>,
+        v2_delete_subset_of_v1: bool,
+        v2_approves_v1_hard_vetoes: Vec<String>,
+    }
+
+    fn current_process_cpu_micros() -> Option<u64> {
+        let stats = crate::platform::current().self_stats().ok()?;
+        Some(
+            stats
+                .cpu_user_micros
+                .saturating_add(stats.cpu_system_micros),
+        )
+    }
+
+    fn scanner_validation_metrics(
+        report: &ScannerValidationReport,
+        engine: &'static str,
+        dispatch: &'static str,
+    ) -> ScannerValidationMetrics {
+        ScannerValidationMetrics {
+            engine,
+            dispatch,
+            entries_visited: report.entries_visited,
+            opaque_pruned_dirs: report.opaque_pruned_dirs,
+            delete_candidates: report.delete_paths.len(),
+            hard_vetoes: report.hard_veto_paths.len(),
+            delete_candidate_bytes: report.delete_candidate_bytes,
+            elapsed_wall_seconds: report.elapsed_wall_seconds(),
+            process_cpu_micros: report.process_cpu_micros,
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn observed_cpu_ratio(v1: Option<u64>, v2: Option<u64>) -> Option<f64> {
+        let (v1, v2) = v1.zip(v2)?;
+        if v1 == 0 || v2 == 0 {
+            return None;
+        }
+        Some(v1 as f64 / v2 as f64)
+    }
+
+    fn scanner_validation_artifact(
+        scenario: &'static str,
+        v1: &ScannerValidationReport,
+        v2: &ScannerValidationReport,
+    ) -> ScannerValidationArtifact {
+        let mut veto_violations = v2
+            .delete_paths
+            .iter()
+            .filter(|path| v1.hard_veto_paths.contains_key(*path))
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        veto_violations.sort();
+
+        ScannerValidationArtifact {
+            schema_version: 1,
+            scenario,
+            v1: scanner_validation_metrics(v1, "v1", "v1_directory_walker"),
+            v2: scanner_validation_metrics(v2, "v2", "v2_opaque_pruning_walker"),
+            deterministic_effort_ratio: v2.deterministic_effort_ratio_against(v1),
+            observed_cpu_ratio: observed_cpu_ratio(v1.process_cpu_micros, v2.process_cpu_micros),
+            v2_delete_subset_of_v1: v2.delete_paths.is_subset(&v1.delete_paths),
+            v2_approves_v1_hard_vetoes: veto_violations,
+        }
+    }
+
+    fn scanner_validation_report(
+        root: &Path,
+        opaque_pruning: bool,
+        open_ancestors: &HashSet<PathBuf>,
+    ) -> ScannerValidationReport {
+        let start_cpu = current_process_cpu_micros();
+        let start = Instant::now();
+        let entries = walk_fixture(root, opaque_pruning);
+        let elapsed = start.elapsed();
+        let process_cpu_micros = start_cpu
+            .zip(current_process_cpu_micros())
+            .map(|(start, end)| end.saturating_sub(start));
+        let registry = ArtifactPatternRegistry::default();
+        let scoring = ScoringEngine::from_config(&ScoringConfig::default(), 0);
+        let mut delete_paths = HashSet::new();
+        let mut hard_veto_paths = HashMap::new();
+        let mut opaque_pruned_dirs = 0usize;
+        let mut delete_candidate_bytes = 0u64;
+
+        for entry in &entries {
+            let classification = if let Some(opaque_tree) = &entry.opaque_tree {
+                match opaque_tree.disposition {
+                    OpaqueTreeDisposition::CandidateOpaque => {
+                        opaque_pruned_dirs += 1;
+                        opaque_tree.classification.clone()
+                    }
+                    OpaqueTreeDisposition::ProtectedOpaque | OpaqueTreeDisposition::SignalOnly => {
+                        continue;
+                    }
+                }
+            } else {
+                registry.classify(&entry.path, entry.structural_signals)
+            };
+
+            if classification.category == crate::scanner::patterns::ArtifactCategory::Unknown {
+                continue;
+            }
+
+            let input = CandidateInput {
+                path: entry.path.clone(),
+                size_bytes: entry.metadata.content_size_bytes,
+                age: Duration::from_hours(48),
+                classification,
+                signals: entry.structural_signals,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: is_path_open_by_ancestor(&entry.path, open_ancestors),
+                excluded: false,
+            };
+            let score = scoring.score_candidate(&input, 0.9);
+            if score.vetoed {
+                hard_veto_paths.insert(
+                    entry.path.clone(),
+                    score
+                        .veto_reason
+                        .unwrap_or_else(|| "vetoed".into())
+                        .into_owned(),
+                );
+            } else if score.decision.action == DecisionAction::Delete {
+                delete_candidate_bytes =
+                    delete_candidate_bytes.saturating_add(entry.metadata.content_size_bytes);
+                delete_paths.insert(entry.path.clone());
+            }
+        }
+
+        ScannerValidationReport {
+            entries_visited: entries.len(),
+            opaque_pruned_dirs,
+            delete_paths,
+            hard_veto_paths,
+            delete_candidate_bytes,
+            elapsed,
+            process_cpu_micros,
+        }
+    }
+
+    #[test]
+    fn scanner_v2_validation_prunes_synthetic_cargo_tree_by_more_than_50x() {
+        let tmp = TempDir::new().unwrap();
+        let target_dir = synthetic_large_cargo_tree(tmp.path(), 120);
+
+        let v1_entries = walk_fixture(tmp.path(), false);
+        let v2_entries = walk_fixture(tmp.path(), true);
+
+        let v1_effort = v1_entries.len();
+        let v2_effort = v2_entries.len().max(1);
+        let effort_ratio = v1_effort / v2_effort;
+
+        assert!(
+            v1_effort >= 300,
+            "fixture should force v1 to descend a large synthetic target tree; v1_entries={v1_effort}"
+        );
+        assert!(
+            effort_ratio >= 50,
+            "v2 should reduce deterministic walk effort by >=50x; v1_entries={v1_effort} v2_entries={} ratio={effort_ratio}",
+            v2_entries.len()
+        );
+
+        let target_entries = v2_entries
+            .iter()
+            .filter(|entry| entry.path == target_dir)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            target_entries.len(),
+            1,
+            "v2 should emit the target root as one opaque candidate"
+        );
+        assert_eq!(
+            target_entries[0]
+                .opaque_tree
+                .as_ref()
+                .map(|opaque| opaque.disposition),
+            Some(OpaqueTreeDisposition::CandidateOpaque)
+        );
+        assert!(
+            !v2_entries
+                .iter()
+                .any(|entry| entry.path.starts_with(target_dir.join("debug"))),
+            "v2 must not descend into the opaque target tree"
+        );
+    }
+
+    #[test]
+    fn scanner_v2_validation_ab_report_records_effort_and_shadow_parity() {
+        let tmp = TempDir::new().unwrap();
+        let target_dir = synthetic_large_cargo_tree(tmp.path(), 160);
+        let open_ancestors = HashSet::new();
+
+        let v1 = scanner_validation_report(tmp.path(), false, &open_ancestors);
+        let v2 = scanner_validation_report(tmp.path(), true, &open_ancestors);
+
+        assert!(
+            v1.entries_visited >= 400,
+            "fixture should force substantial v1 traversal; v1={v1:?}"
+        );
+        assert_eq!(
+            v2.opaque_pruned_dirs, 1,
+            "v2 should record the target root as the single opaque-pruned directory"
+        );
+        assert!(
+            v2.deterministic_effort_ratio_against(&v1) >= 50,
+            "v2 deterministic effort must be >=50x lower; v1={v1:?} v2={v2:?}"
+        );
+        assert!(v1.elapsed_wall_seconds().is_finite());
+        assert!(v2.elapsed_wall_seconds().is_finite());
+        assert!(
+            v2.delete_paths.contains(&target_dir),
+            "v2 should retain the same target-root deletion candidate"
+        );
+        assert!(
+            v2.delete_paths.is_subset(&v1.delete_paths),
+            "v2 shadow candidates must be a subset of v1-approved candidates; v1={v1:?} v2={v2:?}"
+        );
+    }
+
+    #[test]
+    fn scanner_v2_validation_artifact_is_machine_readable() {
+        let tmp = TempDir::new().unwrap();
+        let target_dir = synthetic_large_cargo_tree(tmp.path(), 160);
+        let open_ancestors = HashSet::new();
+
+        let v1 = scanner_validation_report(tmp.path(), false, &open_ancestors);
+        let v2 = scanner_validation_report(tmp.path(), true, &open_ancestors);
+        let artifact = scanner_validation_artifact("synthetic-cargo-tree", &v1, &v2);
+        let payload = serde_json::to_value(&artifact).unwrap();
+
+        assert_eq!(payload["schema_version"].as_u64(), Some(1));
+        assert_eq!(payload["scenario"].as_str(), Some("synthetic-cargo-tree"));
+        assert_eq!(
+            payload["v1"]["dispatch"].as_str(),
+            Some("v1_directory_walker")
+        );
+        assert_eq!(
+            payload["v2"]["dispatch"].as_str(),
+            Some("v2_opaque_pruning_walker")
+        );
+        assert!(
+            artifact.deterministic_effort_ratio >= 50,
+            "validation artifact must preserve the >=50x deterministic effort proof: {artifact:?}"
+        );
+        assert!(artifact.v2_delete_subset_of_v1);
+        assert!(artifact.v2_approves_v1_hard_vetoes.is_empty());
+        assert!(
+            artifact.v2.delete_candidate_bytes > 0,
+            "opaque root should retain reclaimable candidate bytes for {}",
+            target_dir.display()
+        );
+        eprintln!(
+            "scanner_v2_validation_artifact={}",
+            serde_json::to_string(&artifact).unwrap()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scanner_v2_validation_deep_open_file_vetoes_opaque_candidate() {
+        let tmp = TempDir::new().unwrap();
+        let target_dir = synthetic_large_cargo_tree(tmp.path(), 4);
+        let open_file = target_dir
+            .join("debug")
+            .join("deps")
+            .join("crate_000")
+            .join("src")
+            .join("lib.rs");
+        let open_handle = fs::File::open(&open_file).unwrap();
+
+        let entries = walk_fixture(tmp.path(), true);
+        let target_entry = entries
+            .iter()
+            .find(|entry| entry.path == target_dir)
+            .expect("v2 should emit opaque target candidate");
+
+        let (open_ancestors, complete) = collect_open_path_ancestors(&[tmp.path().to_path_buf()]);
+
+        // Containers or hidepid settings can hide even our own fd. Keep the
+        // fixture non-flaky there; normal Linux workers exercise the assertion.
+        if !open_ancestors.contains(&open_file) {
+            drop(open_handle);
+            return;
+        }
+
+        assert!(complete, "open-file ancestor scan should complete");
+        assert!(
+            is_path_open_by_ancestor(&target_dir, &open_ancestors),
+            "an open descendant must mark the opaque candidate root busy"
+        );
+
+        let classification = target_entry
+            .opaque_tree
+            .as_ref()
+            .expect("target should have opaque classification")
+            .classification
+            .clone();
+        let input = CandidateInput {
+            path: target_dir,
+            size_bytes: target_entry.metadata.content_size_bytes,
+            age: Duration::from_hours(48),
+            classification,
+            signals: StructuralSignals::default(),
+            active_references: ActiveReferenceSummary::default(),
+            is_open: true,
+            excluded: false,
+        };
+        let score =
+            ScoringEngine::from_config(&ScoringConfig::default(), 0).score_candidate(&input, 0.9);
+
+        assert!(score.vetoed, "deep open-file evidence must hard-veto v2");
+        assert_eq!(score.decision.action, DecisionAction::Keep);
+        assert_eq!(
+            score.veto_reason.as_deref(),
+            Some("currently open by another process")
+        );
+        drop(open_handle);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scanner_v2_validation_ab_shadow_never_approves_v1_open_file_veto() {
+        let tmp = TempDir::new().unwrap();
+        let target_dir = synthetic_large_cargo_tree(tmp.path(), 16);
+        let open_file = target_dir
+            .join("debug")
+            .join("deps")
+            .join("crate_000")
+            .join("src")
+            .join("lib.rs");
+        let open_handle = fs::File::open(&open_file).unwrap();
+        let (open_ancestors, complete) = collect_open_path_ancestors(&[tmp.path().to_path_buf()]);
+
+        if !open_ancestors.contains(&open_file) {
+            drop(open_handle);
+            return;
+        }
+
+        assert!(complete, "open-file ancestor scan should complete");
+        let v1 = scanner_validation_report(tmp.path(), false, &open_ancestors);
+        let v2 = scanner_validation_report(tmp.path(), true, &open_ancestors);
+
+        assert!(
+            v1.hard_veto_paths.contains_key(&target_dir),
+            "v1 should hard-veto the target root while a descendant file is open; v1={v1:?}"
+        );
+        assert!(
+            v2.hard_veto_paths.contains_key(&target_dir),
+            "v2 should hard-veto the opaque target root while a descendant file is open; v2={v2:?}"
+        );
+        for candidate in &v2.delete_paths {
+            assert!(
+                !v1.hard_veto_paths.contains_key(candidate),
+                "v2 approved a path that v1 hard-vetoed: {} v1={v1:?} v2={v2:?}",
+                candidate.display()
+            );
+        }
+        drop(open_handle);
+    }
+
+    #[test]
+    fn opaque_pruning_protects_git_without_emitting_candidate() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        let git_dir = project.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+
+        let mut config = test_config(tmp.path());
+        config.opaque_pruning = true;
+        let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+        let entries = walker.walk().unwrap();
+
+        let project_entry = entries.iter().find(|entry| entry.path == project).unwrap();
+        assert!(project_entry.structural_signals.has_git);
+        assert!(!entries.iter().any(|entry| entry.path.starts_with(&git_dir)));
+    }
+
+    #[test]
+    fn opaque_signal_only_dependency_dir_is_not_marked_candidate() {
+        let tmp = TempDir::new().unwrap();
+        let vendor_dir = tmp.path().join("project").join("vendor");
+        fs::create_dir_all(vendor_dir.join("nested")).unwrap();
+
+        let mut config = test_config(tmp.path());
+        config.opaque_pruning = true;
+        let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+        let entries = walker.walk().unwrap();
+
+        let vendor_entry = entries
+            .iter()
+            .find(|entry| entry.path == vendor_dir)
+            .unwrap();
+        assert_eq!(
+            vendor_entry
+                .opaque_tree
+                .as_ref()
+                .map(|opaque| opaque.disposition),
+            Some(OpaqueTreeDisposition::SignalOnly)
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.path == vendor_dir.join("nested")),
+            "signal-only dependency dirs should keep normal traversal"
+        );
+    }
+
+    #[test]
     fn detects_git_structural_signal() {
         let tmp = TempDir::new().unwrap();
         let project = tmp.path().join("myproject");
@@ -1777,6 +2488,7 @@ mod tests {
             cross_devices: false,
             parallelism: 1,
             excluded_paths: HashSet::new(),
+            opaque_pruning: false,
         };
         let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
         let entries = walker.walk().unwrap();
@@ -1859,11 +2571,13 @@ mod tests {
                     is_dir: true,
                     inode: 0,
                     device_id: 0,
+                    kind: FsEntryKind::Directory,
                     permissions: 0,
                 },
                 depth: 1,
                 structural_signals: StructuralSignals::default(),
                 is_open: false,
+                opaque_tree: None,
             })
             .unwrap();
 
@@ -1876,6 +2590,7 @@ mod tests {
             cross_devices: false,
             parallelism: 1,
             excluded_paths: HashSet::new(),
+            opaque_pruning: false,
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -1887,6 +2602,7 @@ mod tests {
                 &dir_clone,
                 1,
                 0,
+                None,
                 &work_tx,
                 &result_tx,
                 &in_flight,

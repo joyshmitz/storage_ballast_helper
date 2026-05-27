@@ -9,6 +9,7 @@
 //! 3. Parent directory is writable
 //! 4. Directory does not contain .git/ (final safety net)
 //! 5. Directory is not a Cargo source root misclassified as a target artifact
+//! 6. Candidate identity still matches the object observed by the scanner
 //!
 //! Circuit breaker: 3 consecutive failures -> halt batch (daemon retries next cycle).
 
@@ -44,6 +45,8 @@ pub struct DeletionConfig {
     pub circuit_breaker_cooldown: Duration,
     /// Whether to check platform open-file evidence before deleting.
     pub check_open_files: bool,
+    /// Whether deletion candidates must carry a scanner-observed filesystem identity.
+    pub require_identity: bool,
 }
 
 impl Default for DeletionConfig {
@@ -55,6 +58,7 @@ impl Default for DeletionConfig {
             circuit_breaker_threshold: 5,
             circuit_breaker_cooldown: Duration::from_secs(30),
             check_open_files: true,
+            require_identity: false,
         }
     }
 }
@@ -93,6 +97,9 @@ pub struct DeletionReport {
     /// excludes the path). The daemon uses this list to emit a single
     /// actionable warning per batch instead of per-skip log noise.
     pub not_writable_paths: Vec<PathBuf>,
+    /// Candidates that failed a safety/preflight/delete check and should be
+    /// cooled down before retrying with identical evidence.
+    pub backoff_candidates: Vec<CandidacyScore>,
 }
 
 /// A single deletion failure record.
@@ -114,6 +121,8 @@ pub enum SkipReason {
     Vetoed,
     BelowThreshold,
     Symlink,
+    IdentityUnavailable,
+    IdentityMismatch,
     ContainsCargoManifest,
     /// Path sits under a hardcoded source-tree location
     /// (`/data/projects/*`, `/home/*/projects/*`, `/Users/*/projects/*`) AND
@@ -131,6 +140,10 @@ pub enum SkipReason {
     /// build-output markers. Catches synced source stubs that the cargo-only
     /// veto misses (root cause of the 2026-05-22 frankenterm crate deletions).
     LooksLikeSourceCode,
+}
+
+fn should_backoff_skip(reason: SkipReason) -> bool {
+    !matches!(reason, SkipReason::PathGone | SkipReason::BelowThreshold)
 }
 
 // ──────────────────── executor ────────────────────
@@ -200,6 +213,7 @@ impl DeletionExecutor {
             circuit_breaker_tripped: false,
             deleted_paths: Vec::new(),
             not_writable_paths: Vec::new(),
+            backoff_candidates: Vec::new(),
         };
 
         let mut consecutive_failures: u32 = 0;
@@ -236,6 +250,7 @@ impl DeletionExecutor {
                         error_code: "SBH-3003".to_string(),
                         recoverable: true,
                     });
+                    report.backoff_candidates.push(candidate.clone());
                 }
                 return report;
             }
@@ -264,12 +279,12 @@ impl DeletionExecutor {
                 && skip(&candidate.path)
             {
                 report.items_skipped += 1;
-                // We don't log an error event for this skip as it's a success condition (target met).
+                report.backoff_candidates.push(candidate.clone());
                 continue;
             }
 
             // Pre-flight safety checks.
-            match self.preflight_check(&candidate.path, open_paths.as_ref()) {
+            match self.preflight_check(candidate, open_paths.as_ref()) {
                 Ok(()) => {}
                 Err(skip) => {
                     report.items_skipped += 1;
@@ -283,6 +298,9 @@ impl DeletionExecutor {
                     // instead of one log line per candidate.
                     if matches!(skip, SkipReason::NotWritable) {
                         report.not_writable_paths.push(candidate.path.clone());
+                    }
+                    if should_backoff_skip(skip) {
+                        report.backoff_candidates.push(candidate.clone());
                     }
                     // Only log unexpected skip reasons. PathGone (parent deleted),
                     // ContainsGit, Cargo manifests, hardcoded source-tree refusal,
@@ -320,7 +338,7 @@ impl DeletionExecutor {
 
             // Actual deletion.
             let del_start = Instant::now();
-            match self.delete_path(&candidate.path) {
+            match self.delete_path(candidate) {
                 Ok(()) => {
                     #[allow(clippy::cast_possible_truncation)]
                     let duration_ms = del_start.elapsed().as_millis() as u64;
@@ -349,6 +367,7 @@ impl DeletionExecutor {
                     });
 
                     report.errors.push(error);
+                    report.backoff_candidates.push(candidate.clone());
                 }
             }
         }
@@ -362,9 +381,10 @@ impl DeletionExecutor {
     #[allow(clippy::unused_self)]
     fn preflight_check(
         &self,
-        path: &Path,
+        candidate: &CandidacyScore,
         open_paths: Option<&HashSet<PathBuf>>,
     ) -> std::result::Result<(), SkipReason> {
+        let path = &candidate.path;
         // 0. Hardcoded source-tree refusal — runs BEFORE the existence check
         //    so the result holds even for stat-failing paths. This is the
         //    carnage-prevention floor: operators cannot disable it via config.
@@ -389,19 +409,22 @@ impl DeletionExecutor {
             return Err(SkipReason::Symlink);
         }
 
-        // 3. Parent directory is writable (effective permission for this process).
+        // 3. Scanner-observed identity must still refer to this same entry.
+        self.verify_candidate_identity(candidate)?;
+
+        // 4. Parent directory is writable (effective permission for this process).
         if let Some(parent) = path.parent()
             && !is_writable(parent)
         {
             return Err(SkipReason::NotWritable);
         }
 
-        // 4. Does not contain .git (safety net — checks 3 levels deep).
+        // 5. Does not contain .git (safety net — checks 3 levels deep).
         if meta.is_dir() && contains_nested_git(path, 3) {
             return Err(SkipReason::ContainsGit);
         }
 
-        // 5. Does not look like a Cargo source root that a target-name
+        // 6. Does not look like a Cargo source root that a target-name
         //    heuristic misclassified. This final guard is intentionally
         //    independent of scoring so stale/buggy candidates cannot reach
         //    remove_dir_all.
@@ -409,7 +432,7 @@ impl DeletionExecutor {
             return Err(SkipReason::ContainsCargoManifest);
         }
 
-        // 5b. Source-code marker check — catches stubs that the cargo-only
+        // 6b. Source-code marker check — catches stubs that the cargo-only
         //     veto misses. Any directory containing Cargo.toml, package.json,
         //     pyproject.toml, go.mod, *.rs/*.py/*.ts/*.go source files is
         //     treated as source regardless of build-output markers.
@@ -417,7 +440,7 @@ impl DeletionExecutor {
             return Err(SkipReason::LooksLikeSourceCode);
         }
 
-        // 6. Not currently open by any process (Linux /proc check).
+        // 7. Not currently open by any process (Linux /proc check).
         if let Some(open) = open_paths
             && walker::is_path_open_by_ancestor(path, open)
         {
@@ -429,8 +452,36 @@ impl DeletionExecutor {
 
     // ──────────────────── deletion ────────────────────
 
+    fn verify_candidate_identity(
+        &self,
+        candidate: &CandidacyScore,
+    ) -> std::result::Result<(), SkipReason> {
+        let Some(expected) = candidate.identity else {
+            return if self.config.require_identity {
+                Err(SkipReason::IdentityUnavailable)
+            } else {
+                Ok(())
+            };
+        };
+        if !identity_is_supported(expected) {
+            return Err(SkipReason::IdentityUnavailable);
+        }
+
+        let current =
+            walker::identity_for_path(&candidate.path, false).map_err(|_| SkipReason::PathGone)?;
+        if !identity_is_supported(current) {
+            return Err(SkipReason::IdentityUnavailable);
+        }
+        if current != expected {
+            return Err(SkipReason::IdentityMismatch);
+        }
+
+        Ok(())
+    }
+
     #[allow(clippy::unused_self)]
-    fn delete_path(&self, path: &Path) -> Result<()> {
+    fn delete_path(&self, candidate: &CandidacyScore) -> Result<()> {
+        let path = &candidate.path;
         // Re-check with symlink_metadata (not metadata/is_dir which follow symlinks)
         // to close the TOCTOU window between preflight_check and actual deletion.
         let meta = fs::symlink_metadata(path).map_err(|e| SbhError::io(path, e))?;
@@ -439,6 +490,13 @@ impl DeletionExecutor {
                 details: format!("path became a symlink before deletion: {}", path.display()),
             });
         }
+        self.verify_candidate_identity(candidate)
+            .map_err(|skip| SbhError::Runtime {
+                details: format!(
+                    "path identity changed before deletion: {} ({skip:?})",
+                    path.display()
+                ),
+            })?;
 
         if meta.is_dir() {
             fs::remove_dir_all(path).map_err(|e| SbhError::io(path, e))?;
@@ -483,6 +541,21 @@ impl DeletionExecutor {
 }
 
 // ──────────────────── writable check ────────────────────
+
+fn identity_is_supported(identity: walker::FsIdentity) -> bool {
+    #[cfg(unix)]
+    {
+        let _ = identity;
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        // The non-Unix fallback currently cannot provide stable inode/device
+        // identity. Treat a zero/zero identity as unavailable so v2 deletion
+        // fails closed instead of comparing only the file kind.
+        identity.device_id != 0 || identity.inode != 0
+    }
+}
 
 /// Check if the current process can write to the given path.
 ///
@@ -797,6 +870,7 @@ mod tests {
     fn make_candidate(path: &Path, size: u64, score: f64) -> CandidacyScore {
         CandidacyScore {
             path: path.to_path_buf(),
+            identity: None,
             total_score: score,
             factors: ScoreFactors {
                 location: 0.8,
@@ -830,6 +904,12 @@ mod tests {
                 summary: "test candidate".to_string(),
             },
         }
+    }
+
+    fn make_identity_candidate(path: &Path, size: u64, score: f64) -> CandidacyScore {
+        let mut candidate = make_candidate(path, size, score);
+        candidate.identity = Some(walker::identity_for_path(path, false).unwrap());
+        candidate
     }
 
     #[test]
@@ -906,6 +986,132 @@ mod tests {
         assert_eq!(report.items_failed, 0);
         assert!(!file_path.exists());
         assert!(!dir_path.exists());
+    }
+
+    #[test]
+    fn require_identity_allows_matching_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("target-cache");
+        fs::write(&file_path, "artifact data").unwrap();
+
+        let candidate = make_identity_candidate(&file_path, 13, 0.85);
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                require_identity: true,
+                check_open_files: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![candidate]);
+        let report = executor.execute(&plan, None);
+
+        assert_eq!(report.items_deleted, 1);
+        assert!(!file_path.exists());
+    }
+
+    #[test]
+    fn require_identity_skips_candidate_without_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("target-cache");
+        fs::write(&file_path, "artifact data").unwrap();
+
+        let candidate = make_candidate(&file_path, 13, 0.85);
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                require_identity: true,
+                check_open_files: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![candidate]);
+        let report = executor.execute(&plan, None);
+
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert!(file_path.exists());
+    }
+
+    #[test]
+    fn preflight_rejects_replaced_candidate_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("target-cache");
+        let moved_path = dir.path().join("moved-cache");
+        fs::write(&file_path, "old artifact").unwrap();
+        let candidate = make_identity_candidate(&file_path, 13, 0.85);
+        fs::rename(&file_path, &moved_path).unwrap();
+        fs::write(&file_path, "replacement artifact").unwrap();
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                require_identity: true,
+                check_open_files: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![candidate]);
+        let report = executor.execute(&plan, None);
+
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert!(file_path.exists());
+        assert!(moved_path.exists());
+    }
+
+    #[test]
+    fn delete_path_rechecks_identity_before_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("target-cache");
+        let moved_path = dir.path().join("moved-cache");
+        fs::write(&file_path, "old artifact").unwrap();
+        let candidate = make_identity_candidate(&file_path, 13, 0.85);
+        fs::rename(&file_path, &moved_path).unwrap();
+        fs::write(&file_path, "replacement artifact").unwrap();
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                require_identity: true,
+                check_open_files: false,
+                ..Default::default()
+            },
+            None,
+        );
+
+        assert!(executor.delete_path(&candidate).is_err());
+        assert!(file_path.exists());
+        assert!(moved_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_rejects_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let candidate_path = dir.path().join("target");
+        let moved_path = dir.path().join("real-target");
+        fs::create_dir(&candidate_path).unwrap();
+        let candidate = make_identity_candidate(&candidate_path, 13, 0.85);
+        fs::rename(&candidate_path, &moved_path).unwrap();
+        symlink(&moved_path, &candidate_path).unwrap();
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                require_identity: true,
+                check_open_files: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![candidate]);
+        let report = executor.execute(&plan, None);
+
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert!(candidate_path.exists());
+        assert!(moved_path.exists());
     }
 
     #[test]
@@ -1381,10 +1587,12 @@ mod tests {
     fn preflight_vetoes_hardcoded_source_tree() {
         let executor = DeletionExecutor::new(DeletionConfig::default(), None);
         // A real path is not required — the hardcoded check runs before stat.
-        let result = executor.preflight_check(
+        let candidate = make_candidate(
             Path::new("/data/projects/frankenterm/crates/frankenterm-core"),
-            None,
+            1,
+            1.0,
         );
+        let result = executor.preflight_check(&candidate, None);
         assert_eq!(result, Err(SkipReason::HardcodedSourceTree));
     }
 
@@ -1400,7 +1608,8 @@ mod tests {
         fs::write(dir.path().join("index.ts"), "export const x = 1;").unwrap();
 
         let executor = DeletionExecutor::new(DeletionConfig::default(), None);
-        let result = executor.preflight_check(dir.path(), None);
+        let candidate = make_candidate(dir.path(), 1, 1.0);
+        let result = executor.preflight_check(&candidate, None);
         assert_eq!(result, Err(SkipReason::LooksLikeSourceCode));
     }
 
@@ -1414,7 +1623,8 @@ mod tests {
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
 
         let executor = DeletionExecutor::new(DeletionConfig::default(), None);
-        let result = executor.preflight_check(dir.path(), None);
+        let candidate = make_candidate(dir.path(), 1, 1.0);
+        let result = executor.preflight_check(&candidate, None);
         assert_eq!(result, Err(SkipReason::ContainsCargoManifest));
     }
 
@@ -1584,7 +1794,7 @@ mod tests {
     #[test]
     fn hardcoded_source_tree_allows_rch_targets_under_data_projects() {
         // The rch worker per-job target dirs under /data/projects/ are the
-        // single largest disk hog in practice. v0.4.25 must let sbh clean
+        // single largest disk hog in practice, so sbh must be able to clean
         // them up.
         assert!(!is_hardcoded_source_tree(Path::new(
             "/data/projects/franken_node/.rch-target-vmi1149989-job-29843600204366645-1779389660177931125-0"

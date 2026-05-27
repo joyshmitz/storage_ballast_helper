@@ -48,6 +48,17 @@ impl StructuralSignals {
     }
 }
 
+/// Pre-descent disposition for a directory that may be expensive or unsafe to walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpaqueTreeDisposition {
+    /// Score the directory itself as one cleanup candidate and do not descend.
+    CandidateOpaque,
+    /// Never score or descend into this subtree.
+    ProtectedOpaque,
+    /// Record the signal but keep normal traversal; the directory itself is not a candidate.
+    SignalOnly,
+}
+
 /// Classification output for one path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArtifactClassification {
@@ -69,6 +80,192 @@ impl ArtifactClassification {
             combined_confidence: 0.0,
         }
     }
+}
+
+/// Opaque-tree classification output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpaqueTreeClassification {
+    pub disposition: OpaqueTreeDisposition,
+    pub reason: Cow<'static, str>,
+    pub classification: ArtifactClassification,
+}
+
+impl OpaqueTreeClassification {
+    fn candidate(
+        reason: &'static str,
+        pattern_name: &'static str,
+        category: ArtifactCategory,
+        confidence: f64,
+    ) -> Self {
+        Self {
+            disposition: OpaqueTreeDisposition::CandidateOpaque,
+            reason: Cow::Borrowed(reason),
+            classification: ArtifactClassification {
+                pattern_name: Cow::Borrowed(pattern_name),
+                category,
+                name_confidence: confidence,
+                structural_confidence: 1.0,
+                combined_confidence: confidence,
+            },
+        }
+    }
+
+    fn protected(reason: &'static str) -> Self {
+        Self {
+            disposition: OpaqueTreeDisposition::ProtectedOpaque,
+            reason: Cow::Borrowed(reason),
+            classification: ArtifactClassification::unknown(),
+        }
+    }
+
+    fn signal_only(reason: &'static str) -> Self {
+        Self {
+            disposition: OpaqueTreeDisposition::SignalOnly,
+            reason: Cow::Borrowed(reason),
+            classification: ArtifactClassification::unknown(),
+        }
+    }
+}
+
+/// Parent/path evidence available before deciding whether to descend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OpaqueTreeContext {
+    pub parent_has_cargo_toml: bool,
+    pub parent_has_node_manifest: bool,
+}
+
+/// Classify a directory before descent for the v2 opaque-tree scanner path.
+#[must_use]
+pub fn classify_opaque_tree(
+    path: &Path,
+    context: OpaqueTreeContext,
+) -> Option<OpaqueTreeClassification> {
+    let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+
+    if name == ".git" {
+        return Some(OpaqueTreeClassification::protected(
+            "git metadata is always protected opaque",
+        ));
+    }
+
+    let tmp_like = is_tmp_like_path(path);
+    if is_context_gated_dependency_tree_name(&name) {
+        return Some(OpaqueTreeClassification::signal_only(
+            "dependency tree requires stronger context before opaque cleanup",
+        ));
+    }
+
+    if is_cargo_target_name(&name) {
+        if (name == "target" && context.parent_has_cargo_toml)
+            || tmp_like
+            || is_agent_build_target_name(&name)
+        {
+            return Some(OpaqueTreeClassification::candidate(
+                "cargo/build target with regenerable context",
+                "opaque-cargo-target",
+                ArtifactCategory::RustTarget,
+                0.93,
+            ));
+        }
+        return Some(OpaqueTreeClassification::signal_only(
+            "target-like directory lacks cargo/temp context",
+        ));
+    }
+
+    if name == "node_modules" {
+        if context.parent_has_node_manifest || tmp_like {
+            return Some(OpaqueTreeClassification::candidate(
+                "node_modules with package manifest or temp context",
+                "opaque-node-modules",
+                ArtifactCategory::NodeModules,
+                0.94,
+            ));
+        }
+        return Some(OpaqueTreeClassification::signal_only(
+            "node_modules lacks package/temp context",
+        ));
+    }
+
+    if is_cargo_cache_root(path) {
+        return Some(OpaqueTreeClassification::candidate(
+            "cargo registry/cache root",
+            "opaque-cargo-cache",
+            ArtifactCategory::CacheDir,
+            0.92,
+        ));
+    }
+
+    if matches!(name.as_str(), ".next" | "dist" | "build")
+        && (context.parent_has_node_manifest || tmp_like)
+    {
+        return Some(OpaqueTreeClassification::candidate(
+            "build output with project/temp context",
+            "opaque-build-output",
+            ArtifactCategory::BuildOutput,
+            0.88,
+        ));
+    }
+
+    None
+}
+
+fn is_context_gated_dependency_tree_name(name: &str) -> bool {
+    matches!(
+        name,
+        "vendor" | "site-packages" | ".venv" | "venv" | "env" | ".pnpm-store" | ".yarn" | ".cargo"
+    )
+}
+
+fn is_cargo_target_name(name: &str) -> bool {
+    name == "target"
+        || name.starts_with(".target")
+        || name.starts_with("_target_")
+        || name.starts_with("target-")
+        || name.starts_with("target_")
+        || name.ends_with("-target")
+        || name.ends_with("_target")
+        || name.starts_with("cargo-target-")
+        || name.starts_with("rch_target_")
+        || name.starts_with(".rch_target_")
+        || name.starts_with("rch-target-")
+        || name.starts_with(".rch-target-")
+        || matches!(
+            name,
+            ".rch-target" | ".rch_target" | "rch-target" | "rch_target"
+        )
+}
+
+fn is_agent_build_target_name(name: &str) -> bool {
+    name.starts_with("rch_target_")
+        || name.starts_with(".rch_target_")
+        || name.starts_with("rch-target-")
+        || name.starts_with(".rch-target-")
+        || matches!(
+            name,
+            ".rch-target" | ".rch_target" | "rch-target" | "rch_target"
+        )
+}
+
+fn is_tmp_like_path(path: &Path) -> bool {
+    ["/tmp", "/var/tmp", "/data/tmp", "/private/tmp"]
+        .iter()
+        .any(|root| {
+            let root = Path::new(root);
+            path == root || path.starts_with(root)
+        })
+}
+
+fn is_cargo_cache_root(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !matches!(name, "registry" | "git") {
+        return false;
+    }
+    path.parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .is_some_and(|parent| parent == ".cargo")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -842,7 +1039,8 @@ fn extract_pattern_label_with_cleanup_context(
 mod tests {
     use super::{
         ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, CustomPattern,
-        StructuralSignals, extract_pattern_label, extract_pattern_label_with_cleanup_rules,
+        OpaqueTreeContext, OpaqueTreeDisposition, StructuralSignals, classify_opaque_tree,
+        extract_pattern_label, extract_pattern_label_with_cleanup_rules,
     };
     use crate::platform::{linux, macos};
     use std::path::Path;
@@ -914,6 +1112,93 @@ mod tests {
             registry.classify(Path::new("node_modules"), StructuralSignals::default());
         assert_eq!(classification.category, ArtifactCategory::NodeModules);
         assert!(classification.combined_confidence > 0.60);
+    }
+
+    #[test]
+    fn opaque_tree_marks_git_as_protected() {
+        let opaque = classify_opaque_tree(Path::new("/repo/.git"), OpaqueTreeContext::default())
+            .expect(".git should be opaque");
+
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::ProtectedOpaque);
+        assert_eq!(opaque.classification.category, ArtifactCategory::Unknown);
+        assert!(opaque.reason.contains("protected"));
+    }
+
+    #[test]
+    fn opaque_tree_promotes_contextual_target_candidate() {
+        let opaque = classify_opaque_tree(
+            Path::new("/repo/target"),
+            OpaqueTreeContext {
+                parent_has_cargo_toml: true,
+                parent_has_node_manifest: false,
+            },
+        )
+        .expect("target should be classified");
+
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
+        assert_eq!(opaque.classification.category, ArtifactCategory::RustTarget);
+        assert_eq!(opaque.classification.pattern_name, "opaque-cargo-target");
+    }
+
+    #[test]
+    fn opaque_tree_does_not_promote_broad_target_like_names_in_source_context() {
+        for path in ["/repo/target_docs", "/repo/target-dev", "/repo/build"] {
+            let opaque = classify_opaque_tree(
+                Path::new(path),
+                OpaqueTreeContext {
+                    parent_has_cargo_toml: true,
+                    parent_has_node_manifest: false,
+                },
+            );
+
+            assert_ne!(
+                opaque.map(|opaque| opaque.disposition),
+                Some(OpaqueTreeDisposition::CandidateOpaque),
+                "{path} must not become an opaque source-tree candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_tree_does_not_promote_ambiguous_dependency_dirs() {
+        for path in [
+            "/repo/vendor",
+            "/repo/site-packages",
+            "/repo/.venv",
+            "/repo/.pnpm-store",
+        ] {
+            let opaque =
+                classify_opaque_tree(Path::new(path), OpaqueTreeContext::default()).unwrap();
+            assert_eq!(opaque.disposition, OpaqueTreeDisposition::SignalOnly);
+            assert_eq!(opaque.classification.category, ArtifactCategory::Unknown);
+        }
+    }
+
+    #[test]
+    fn opaque_tree_requires_context_for_node_modules() {
+        let ambiguous = classify_opaque_tree(
+            Path::new("/repo/node_modules"),
+            OpaqueTreeContext::default(),
+        )
+        .unwrap();
+        assert_eq!(ambiguous.disposition, OpaqueTreeDisposition::SignalOnly);
+
+        let contextual = classify_opaque_tree(
+            Path::new("/repo/node_modules"),
+            OpaqueTreeContext {
+                parent_has_cargo_toml: false,
+                parent_has_node_manifest: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            contextual.disposition,
+            OpaqueTreeDisposition::CandidateOpaque
+        );
+        assert_eq!(
+            contextual.classification.category,
+            ArtifactCategory::NodeModules
+        );
     }
 
     #[test]

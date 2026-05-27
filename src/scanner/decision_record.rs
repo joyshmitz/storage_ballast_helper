@@ -627,6 +627,7 @@ mod tests {
     fn sample_score() -> CandidacyScore {
         CandidacyScore {
             path: PathBuf::from("/data/projects/foo/.target_opus"),
+            identity: None,
             total_score: 2.15,
             factors: ScoreFactors {
                 location: 0.85,
@@ -711,6 +712,7 @@ mod tests {
     fn vetoed_score() -> CandidacyScore {
         CandidacyScore {
             path: PathBuf::from("/data/projects/repo/.git/objects"),
+            identity: None,
             total_score: 0.0,
             factors: ScoreFactors {
                 location: 0.0,

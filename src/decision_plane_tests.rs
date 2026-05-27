@@ -2215,6 +2215,7 @@ fn build_standard_scenario(seed: u64) -> Vec<ReplayStep> {
 fn make_scored_candidate(action: DecisionAction, score: f64) -> CandidacyScore {
     CandidacyScore {
         path: PathBuf::from("/data/projects/test/.target_opus"),
+        identity: None,
         total_score: score,
         factors: ScoreFactors {
             location: 0.85,

@@ -39,7 +39,7 @@ use storage_ballast_helper::scanner::patterns::{
 use storage_ballast_helper::scanner::scoring::{
     ActiveReferenceSummary, CandidateInput, ScoringEngine,
 };
-use storage_ballast_helper::scanner::walker::{EntryMetadata, WalkEntry};
+use storage_ballast_helper::scanner::walker::{EntryMetadata, FsEntryKind, WalkEntry};
 
 use common::SyntheticTimeSeries;
 
@@ -293,11 +293,13 @@ fn make_walk_entry(path: &str, size: u64, depth: usize) -> WalkEntry {
             is_dir: true,
             inode: 1000 + u64_from_usize(depth),
             device_id: 1,
+            kind: FsEntryKind::Directory,
             permissions: 0o755,
         },
         depth,
         structural_signals: StructuralSignals::default(),
         is_open: false,
+        opaque_tree: None,
     }
 }
 
@@ -1184,6 +1186,7 @@ fn run_scenario_g(seed: u64, iterations: usize) -> ScenarioResult {
                         is_dir: true,
                         inode: 2000 + u64_from_usize(i),
                         device_id: 1,
+                        kind: FsEntryKind::Directory,
                         permissions: 0o755,
                     },
                     depth: 2,
@@ -1193,6 +1196,7 @@ fn run_scenario_g(seed: u64, iterations: usize) -> ScenarioResult {
                         ..StructuralSignals::default()
                     },
                     is_open: false,
+                    opaque_tree: None,
                 }
             })
             .collect();
