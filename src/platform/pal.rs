@@ -859,7 +859,8 @@ mod tests {
 
     #[test]
     fn mock_platform_drives_active_reference_collection_without_real_syscalls() {
-        let root = PathBuf::from("/tmp/sbh-active-ref");
+        let temp = tempfile::tempdir().expect("active reference tempdir");
+        let root = temp.path().to_path_buf();
         let candidate = root.join("target");
         let open_path = candidate.join("debug/object.o");
         let executable_path = candidate.join("debug/tool");
@@ -887,7 +888,8 @@ mod tests {
             &platform,
             std::slice::from_ref(&root),
         );
-        let summary = index.summary_for(&candidate);
+        let normalized_candidate = crate::core::paths::resolve_absolute_path(&candidate);
+        let summary = index.summary_for(&normalized_candidate);
         let process = summary
             .processes
             .iter()
