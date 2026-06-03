@@ -23,6 +23,22 @@ use crate::platform::types::{SacredPath, SacredPathKind, SacredPathSource};
 pub const MARKER_FILENAME: &str = ".sbh-protect";
 pub const DEFAULT_STOWAWAY_SCAN_DEPTH: usize = 3;
 
+/// Upper bound on directory entries examined during a single stowaway
+/// (sacred-marker containment) sub-walk.
+///
+/// The containment scan exists only to answer an *existence* question — "does
+/// this subtree contain a sacred marker (`*.db`, `.beads/`, `*.db-wal`, …)?".
+/// Without a cap, a candidate that is itself a giant artifact tree (a cargo
+/// `target/`, an `ntm-go-tmp` test fixture with thousands of `*.db` files, …)
+/// forces a full enumeration of up to `max_depth` levels on *every* scan pass —
+/// the CPU hot-loop observed on trj.
+///
+/// When this cap is reached before a marker is found, the scan is reported as
+/// **truncated**. Truncation is treated as *fail-closed*: the candidate is
+/// considered protected (see `find_sacred_overlaps_with_config`). A bounded
+/// search must never make a protected subtree look reclaimable.
+pub const DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES: usize = 20_000;
+
 /// Optional metadata stored inside a `.sbh-protect` file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProtectionMetadata {
@@ -55,6 +71,13 @@ pub enum ProtectionSource {
 pub struct StowawayScanConfig {
     pub max_depth: usize,
     pub stop_after_first: bool,
+    /// Maximum directory entries to examine before aborting the sub-walk.
+    ///
+    /// `0` means "unbounded" (historical behavior, used by some tests). The
+    /// daemon/CLI paths always set a positive bound. When the bound is reached
+    /// before a marker is found, the scan is reported as truncated and the
+    /// candidate is treated as protected (fail-closed).
+    pub max_entries: usize,
 }
 
 impl Default for StowawayScanConfig {
@@ -62,8 +85,19 @@ impl Default for StowawayScanConfig {
         Self {
             max_depth: DEFAULT_STOWAWAY_SCAN_DEPTH,
             stop_after_first: true,
+            max_entries: DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES,
         }
     }
+}
+
+/// Result of a bounded stowaway sub-walk.
+#[derive(Debug, Clone)]
+pub struct StowawayScanResult {
+    pub matches: Vec<StowawayMatch>,
+    /// `true` when the entry budget (`max_entries`) was exhausted before the
+    /// subtree was fully examined and no definitive marker had been found.
+    /// Callers MUST treat a truncated result as "possibly protected".
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -454,7 +488,8 @@ pub fn find_sacred_overlaps_with_config(
         overlaps.extend(direct_sacred_overlaps(&candidate_path, entry)?);
     }
 
-    for matched in scan_stowaways_with_config(&candidate_path, catalog, stowaway_config)? {
+    let stowaway = scan_stowaways_bounded(&candidate_path, catalog, stowaway_config)?;
+    for matched in stowaway.matches {
         overlaps.push(SacredOverlap {
             candidate_path: candidate_path.clone(),
             matched_path: matched.path,
@@ -462,6 +497,28 @@ pub fn find_sacred_overlaps_with_config(
             kind: SacredOverlapKind::ContainsSacred,
             source: matched.source,
             reason: matched.reason,
+        });
+    }
+
+    // FAIL-CLOSED INVARIANT (B4): if the bounded sub-walk could not finish
+    // (entry budget exhausted before proving the subtree marker-free), we do
+    // NOT know whether a sacred marker lurks deeper. Treat the candidate as
+    // protected by synthesizing a `ContainsSacred` overlap. Reporting "no
+    // overlaps" here would let the caller delete a possibly-protected tree —
+    // exactly the deletion-safety regression a naive bound would introduce.
+    if stowaway.truncated {
+        let reason = format!(
+            "sacred-marker containment scan truncated after {} entries (depth {}); \
+             treating subtree as protected (fail-closed)",
+            stowaway_config.max_entries, stowaway_config.max_depth
+        );
+        overlaps.push(SacredOverlap {
+            candidate_path: candidate_path.clone(),
+            matched_path: candidate_path,
+            pattern: "<containment-scan-truncated>".to_string(),
+            kind: SacredOverlapKind::ContainsSacred,
+            source: SacredPathSource::Builtin,
+            reason,
         });
     }
 
@@ -488,12 +545,51 @@ pub fn scan_stowaways_with_config(
     catalog: &[SacredPath],
     config: StowawayScanConfig,
 ) -> Result<Vec<StowawayMatch>> {
+    Ok(scan_stowaways_bounded(root, catalog, config)?.matches)
+}
+
+/// Bounded sacred-marker containment sub-walk.
+///
+/// Walks `root` up to `config.max_depth` levels looking for sacred markers.
+/// The walk is bounded twice over:
+///
+/// 1. **Depth** — never descends past `config.max_depth` (B4: the old call
+///    sites used an effectively-unbounded depth that descended into million-
+///    file artifact trees on every pass).
+/// 2. **Entry budget** — never examines more than `config.max_entries` entries
+///    (`0` = unbounded). When the budget is exhausted before the subtree is
+///    fully walked, `truncated` is set.
+///
+/// EARLY-EXIT: with `stop_after_first` (the default), the walk returns as soon
+/// as the first marker is found — an existence check needs no full enumeration.
+///
+/// FAIL-CLOSED INVARIANT: a `truncated` result means "we could not prove the
+/// absence of a marker". Callers MUST treat that as *protected*, never as
+/// reclaimable. Bounding the search must not weaken deletion safety.
+pub fn scan_stowaways_bounded(
+    root: &Path,
+    catalog: &[SacredPath],
+    config: StowawayScanConfig,
+) -> Result<StowawayScanResult> {
     let rules = build_stowaway_rules(catalog)?;
     let mut matches = Vec::new();
     let root = normalize_path_for_protection(root);
     let mut queue = vec![(root.clone(), 0usize)];
+    let mut entries_examined: usize = 0;
+    let entry_budget = config.max_entries; // 0 == unbounded
 
     while let Some((path, depth)) = queue.pop() {
+        // Entry-budget guard. If we still have unexplored work queued and the
+        // budget is exhausted, we cannot prove the subtree is marker-free →
+        // report truncation so the caller fails closed.
+        if entry_budget != 0 && entries_examined >= entry_budget {
+            return Ok(StowawayScanResult {
+                matches,
+                truncated: true,
+            });
+        }
+        entries_examined = entries_examined.saturating_add(1);
+
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == ErrorKind::NotFound => continue,
@@ -520,7 +616,11 @@ pub fn scan_stowaways_with_config(
                     reason: rule.reason.clone(),
                 });
                 if config.stop_after_first {
-                    return Ok(matches);
+                    // Definitive positive answer — not a truncation.
+                    return Ok(StowawayScanResult {
+                        matches,
+                        truncated: false,
+                    });
                 }
                 break;
             }
@@ -545,7 +645,10 @@ pub fn scan_stowaways_with_config(
         }
     }
 
-    Ok(matches)
+    Ok(StowawayScanResult {
+        matches,
+        truncated: false,
+    })
 }
 
 /// Read optional metadata from a `.sbh-protect` marker file.
@@ -1435,6 +1538,7 @@ protected_at = "2026-05-07T03:50:00Z"
             StowawayScanConfig {
                 max_depth: 3,
                 stop_after_first: false,
+                max_entries: DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES,
             },
         )
         .unwrap();
@@ -1461,6 +1565,116 @@ protected_at = "2026-05-07T03:50:00Z"
     }
 
     #[test]
+    fn bounded_scan_truncates_when_entry_budget_exhausted() {
+        // Build a flat dir with many marker-free entries. With a tiny entry
+        // budget the walk must report truncation rather than walking it all.
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("huge");
+        fs::create_dir_all(&candidate).unwrap();
+        for i in 0..50 {
+            fs::write(candidate.join(format!("file_{i}.txt")), b"x").unwrap();
+        }
+
+        let result = scan_stowaways_bounded(
+            &candidate,
+            cross_platform_sacred_paths(),
+            StowawayScanConfig {
+                max_depth: 3,
+                stop_after_first: true,
+                max_entries: 5,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            result.truncated,
+            "small entry budget over a large dir must truncate"
+        );
+        assert!(
+            result.matches.is_empty(),
+            "no markers present, so no definitive matches"
+        );
+    }
+
+    #[test]
+    fn truncated_containment_scan_fails_closed_to_protected() {
+        // FAIL-CLOSED INVARIANT (B4): a deep marker that the bound never reaches
+        // must NOT make the candidate look reclaimable. find_sacred_overlaps
+        // must report an overlap (protected) when the sub-walk is truncated.
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("artifact");
+        fs::create_dir_all(&candidate).unwrap();
+        // Many marker-free entries so a small budget is exhausted first.
+        for i in 0..50 {
+            fs::write(candidate.join(format!("obj_{i}.o")), b"x").unwrap();
+        }
+        // A real sacred marker exists, but the tiny budget will truncate before
+        // necessarily reaching it. Either way the result must be "protected".
+        fs::write(candidate.join("beads.db"), b"db").unwrap();
+
+        let overlaps = find_sacred_overlaps_with_config(
+            &candidate,
+            cross_platform_sacred_paths(),
+            StowawayScanConfig {
+                max_depth: 3,
+                stop_after_first: true,
+                max_entries: 3,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !overlaps.is_empty(),
+            "truncated containment scan must fail closed (treat as protected)"
+        );
+    }
+
+    #[test]
+    fn bounded_scan_does_not_truncate_when_marker_found_within_budget() {
+        // Finding a marker within budget is a *definitive* answer, never a
+        // truncation. The candidate dir holds only the marker file, so a small
+        // budget (root + marker = 2 entries) still reaches it.
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("cache");
+        fs::create_dir_all(&candidate).unwrap();
+        fs::write(candidate.join("state.sqlite3"), b"sqlite").unwrap();
+
+        let result = scan_stowaways_bounded(
+            &candidate,
+            cross_platform_sacred_paths(),
+            StowawayScanConfig {
+                max_depth: 3,
+                stop_after_first: true,
+                max_entries: 8,
+            },
+        )
+        .unwrap();
+
+        assert!(!result.truncated);
+        assert_eq!(result.matches.len(), 1);
+    }
+
+    #[test]
+    fn bounded_scan_clean_small_tree_is_not_truncated() {
+        // A small, fully-walkable, marker-free tree is a definitive negative.
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("clean");
+        fs::create_dir_all(candidate.join("sub")).unwrap();
+        fs::write(candidate.join("a.txt"), b"x").unwrap();
+        fs::write(candidate.join("sub").join("b.txt"), b"x").unwrap();
+
+        let result = scan_stowaways_bounded(
+            &candidate,
+            cross_platform_sacred_paths(),
+            StowawayScanConfig::default(),
+        )
+        .unwrap();
+
+        assert!(!result.truncated);
+        assert!(result.matches.is_empty());
+    }
+
+    #[test]
     fn scan_stowaways_respects_max_depth() {
         let tmp = TempDir::new().unwrap();
         let candidate = tmp.path().join("cache");
@@ -1474,6 +1688,7 @@ protected_at = "2026-05-07T03:50:00Z"
             StowawayScanConfig {
                 max_depth: 3,
                 stop_after_first: false,
+                max_entries: DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES,
             },
         )
         .unwrap();
@@ -1485,6 +1700,7 @@ protected_at = "2026-05-07T03:50:00Z"
             StowawayScanConfig {
                 max_depth: 5,
                 stop_after_first: false,
+                max_entries: DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES,
             },
         )
         .unwrap();
@@ -1505,6 +1721,7 @@ protected_at = "2026-05-07T03:50:00Z"
             StowawayScanConfig {
                 max_depth: 1,
                 stop_after_first: false,
+                max_entries: DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES,
             },
         )
         .unwrap();
@@ -1530,6 +1747,7 @@ protected_at = "2026-05-07T03:50:00Z"
             StowawayScanConfig {
                 max_depth: 3,
                 stop_after_first: false,
+                max_entries: DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES,
             },
         )
         .unwrap();

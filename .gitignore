@@ -42,6 +42,10 @@ perf.data.*
 target-codex*/
 target_*/
 target-local/
+/AUDIT_FINDINGS.md
+/REVIEW_FINDINGS.md
+/SESSION_REPORT.md
+/UPGRADE_LOG.md
 
 # Ephemeral files (agent-generated, build artifacts, test detritus)
 ci-artifacts/

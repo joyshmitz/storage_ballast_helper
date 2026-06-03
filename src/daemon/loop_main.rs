@@ -101,6 +101,8 @@ const V2_PRESSURE_RECLAIM_BYTES_PER_CANDIDATE: u64 = 256 * 1_048_576;
 const SCAN_TIME_BUDGET_SECS: u64 = 300;
 /// Cooldown between repeated swap-thrash warnings while pressure remains.
 const SWAP_THRASH_WARNING_COOLDOWN: Duration = Duration::from_mins(15);
+/// B5: minimum interval between "pressured device has no root_path" warnings.
+const DEVICE_AFFINITY_WARN_INTERVAL: Duration = Duration::from_mins(15);
 /// Swap usage threshold that indicates probable paging thrash.
 const SWAP_THRASH_USED_PCT_THRESHOLD: f64 = 70.0;
 /// Minimum free RAM for high swap use to indicate thrash (anomalous paging
@@ -308,6 +310,55 @@ pub struct ScanRequest {
         crate::core::config::ScoringConfig,
         crate::core::config::ScannerConfig,
     )>,
+}
+
+/// B5: device-affinity gate. Returns `true` when the daemon must NOT escalate
+/// to aggressive scanning because the pressured device has no scannable
+/// root_path on it and cross-device reclamation is disabled.
+///
+/// With `cross_devices == false`, sbh can only free space on a device by
+/// deleting paths that physically live on that device. If pressure is elevated
+/// on a device but no root_path resides there, re-scanning the (other-device)
+/// root_paths can never relieve it — so the daemon should back off rather than
+/// spin. When `cross_devices == true`, any root_path may help, so we do not gate.
+#[must_use]
+fn should_skip_for_device_affinity(
+    elevated_pressure: bool,
+    no_root_path_on_pressured_device: bool,
+    cross_devices: bool,
+) -> bool {
+    elevated_pressure && no_root_path_on_pressured_device && !cross_devices
+}
+
+/// B6: decide whether to skip a scan pass because a recent pass found nothing
+/// reclaimable and the rescan cooldown has not yet elapsed.
+///
+/// The cooldown is deliberately *narrow*: it only suppresses routine pressure-
+/// driven re-scans. It is bypassed for
+/// - operator/service forced scans (`force_full_scan`),
+/// - config reloads (`config_update`), which must take effect immediately,
+/// - synthetic requests (`free_pct` is `None`), used by tests/degraded callers,
+/// - rising danger (Red/Critical pressure), where disk safety overrides pacing.
+///
+/// A `cooldown` of zero (config `min_rescan_interval_secs == 0`) disables it.
+#[must_use]
+fn empty_pass_cooldown_active(
+    last_empty_pass_at: Option<Instant>,
+    now: Instant,
+    cooldown: Duration,
+    request: &ScanRequest,
+) -> bool {
+    if cooldown.is_zero() {
+        return false;
+    }
+    if request.force_full_scan
+        || request.config_update.is_some()
+        || request.free_pct.is_none()
+        || request.pressure_level >= PressureLevel::Red
+    {
+        return false;
+    }
+    last_empty_pass_at.is_some_and(|last| now.duration_since(last) < cooldown)
 }
 
 #[must_use]
@@ -817,6 +868,9 @@ pub struct MonitoringDaemon {
     swap_thrash_active: bool,
     last_scan_channel_warn: Option<Instant>,
     scan_channel_warn_suppressed: u64,
+    /// Rate-limit for the B5 "pressured device has no root_path" warning so the
+    /// back-off path does not spam logs on every tick.
+    last_device_affinity_warn: Option<Instant>,
     last_summary_report: Instant,
     summary_scans: u64,
     summary_scan_timeouts: u64,
@@ -1592,6 +1646,7 @@ impl MonitoringDaemon {
             swap_thrash_active: false,
             last_scan_channel_warn: None,
             scan_channel_warn_suppressed: 0,
+            last_device_affinity_warn: None,
             last_summary_report: Instant::now(),
             summary_scans: 0,
             summary_scan_timeouts: 0,
@@ -2565,9 +2620,8 @@ impl MonitoringDaemon {
 
         // Determine scan targets: routine maintenance (Green) scans everything;
         // elevated pressure targets only the causing volume to maximize ROI.
-        let scan_paths = if response.level == PressureLevel::Green {
-            self.config.scanner.root_paths.clone()
-        } else {
+        let elevated_pressure = response.level != PressureLevel::Green;
+        let scan_paths = if elevated_pressure {
             let collector = &self.fs_collector;
             let target = &response.causing_mount;
             self.config
@@ -2582,9 +2636,48 @@ impl MonitoringDaemon {
                 })
                 .cloned()
                 .collect()
+        } else {
+            self.config.scanner.root_paths.clone()
         };
 
-        // Fallback to all paths if filtering somehow yielded nothing (e.g. config drift).
+        // ── B5: device-affinity gate ──────────────────────────────────────
+        // Under elevated pressure on a specific device, sbh only reclaims paths
+        // that physically reside on that device (when cross_devices is false).
+        // If NO root_path lives on the pressured device, scanning the other
+        // root_paths can never free space on it — but the daemon used to fall
+        // back to scanning *all* root_paths, pinning a core in an endless
+        // aggressive scan that does nothing (the trj `/`-pressured /tmp+/data-tmp
+        // hot-loop). In that case, log once and back off instead of spinning.
+        if should_skip_for_device_affinity(
+            elevated_pressure,
+            scan_paths.is_empty(),
+            self.config.scanner.cross_devices,
+        ) {
+            let now = Instant::now();
+            let should_warn = self
+                .last_device_affinity_warn
+                .is_none_or(|last| now.duration_since(last) >= DEVICE_AFFINITY_WARN_INTERVAL);
+            if should_warn {
+                self.last_device_affinity_warn = Some(now);
+                let msg = format!(
+                    "pressure on {} ({:?}) but no scannable root_path resides on that device \
+                     and cross_devices=false; cannot reclaim — backing off (no aggressive scan)",
+                    response.causing_mount.display(),
+                    response.level
+                );
+                eprintln!("[SBH-DAEMON] {msg}");
+                self.logger_handle
+                    .send(ActivityEvent::Info { message: msg });
+            }
+            // Skip ballast handling + scan dispatch for this tick. Ballast on a
+            // device with no root_path is still released by Green-tick logic and
+            // the dedicated release paths; here we only suppress the futile
+            // aggressive scan loop.
+            return;
+        }
+
+        // Fallback to all paths if filtering somehow yielded nothing (e.g. config
+        // drift) while cross_devices IS enabled — then any root_path can help.
         let paths_to_scan = if scan_paths.is_empty() {
             self.config.scanner.root_paths.clone()
         } else {
@@ -3710,6 +3803,12 @@ fn scanner_thread_main(
     let mut known_git_dirs: HashSet<PathBuf> = HashSet::new();
     let mut last_scanner_engine_mode: Option<ScannerEngineMode> = None;
 
+    // B6: inter-pass cooldown. When a pass yields no reclaimable candidates,
+    // re-scanning immediately under sustained pressure just pins a core. We
+    // record when the last empty pass finished and skip subsequent pressure-
+    // driven passes until `min_rescan_interval_secs` has elapsed.
+    let mut last_empty_pass_at: Option<Instant> = None;
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -3727,6 +3826,18 @@ fn scanner_thread_main(
         // Read latest config at the start of each scan.
         let current_scoring_config = shared_scoring_config.read().clone();
         let current_scanner_config = shared_scanner_config.read().clone();
+
+        // B6: skip this pressure-driven pass if a recent pass already found
+        // nothing reclaimable and the cooldown has not elapsed. Operator/forced
+        // scans, config reloads, and Red/Critical pressure always run.
+        if empty_pass_cooldown_active(
+            last_empty_pass_at,
+            Instant::now(),
+            Duration::from_secs(current_scanner_config.min_rescan_interval_secs),
+            &request,
+        ) {
+            continue;
+        }
         let selected_scanner_engine =
             SelectedScannerEngine::for_mode(current_scanner_config.engine);
         let scanner_engine_mode = selected_scanner_engine.mode();
@@ -4935,6 +5046,17 @@ fn scanner_thread_main(
             root_stats: root_stats_map.into_values().collect(),
             timed_out: scan_timed_out,
         });
+
+        // B6: arm/clear the inter-pass cooldown. A pass that completed (not
+        // timed out) yet surfaced no candidates means there is nothing to
+        // reclaim right now — start the cooldown so we don't immediately
+        // re-scan under the same sustained pressure. A productive pass (or a
+        // timeout, which is inconclusive) clears it.
+        if candidates_found == 0 && !scan_timed_out {
+            last_empty_pass_at = Some(Instant::now());
+        } else {
+            last_empty_pass_at = None;
+        }
 
         // Flush remaining candidates in bounded batches.
         // Hard cap: never spend more than 30s flushing after the scan loop ends.
@@ -6641,6 +6763,145 @@ mod tests {
 
         assert_eq!(scan_reason_for_request(&request), "forced");
         assert_eq!(v2_active_scan_paths(&request, &dirty), None);
+    }
+
+    #[test]
+    fn device_affinity_gate_blocks_aggressive_scan_with_no_root_on_pressured_device() {
+        // Elevated pressure, no root_path on the pressured device, cross_devices
+        // disabled → must back off (skip aggressive scan).
+        assert!(should_skip_for_device_affinity(true, true, false));
+    }
+
+    #[test]
+    fn device_affinity_gate_allows_scan_when_root_path_present() {
+        // A root_path IS on the pressured device → never gate.
+        assert!(!should_skip_for_device_affinity(true, false, false));
+    }
+
+    #[test]
+    fn device_affinity_gate_allows_scan_under_cross_devices() {
+        // cross_devices=true → any root_path may help, so do not gate even with
+        // no root_path on the pressured device.
+        assert!(!should_skip_for_device_affinity(true, true, true));
+    }
+
+    #[test]
+    fn device_affinity_gate_inactive_under_green_pressure() {
+        // Green (not elevated) pressure scans everything routinely; never gate.
+        assert!(!should_skip_for_device_affinity(false, true, false));
+    }
+
+    fn cooldown_request(pressure: PressureLevel) -> ScanRequest {
+        ScanRequest {
+            paths: vec![PathBuf::from("/tmp")],
+            urgency: 0.5,
+            pressure_level: pressure,
+            free_pct: Some(10.0),
+            max_delete_batch: 10,
+            force_full_scan: false,
+            config_update: None,
+        }
+    }
+
+    #[test]
+    fn empty_pass_cooldown_blocks_immediate_rescan() {
+        let now = Instant::now();
+        let last_empty = Some(now);
+        let request = cooldown_request(PressureLevel::Orange);
+        // Just finished an empty pass; cooldown not elapsed → skip.
+        assert!(empty_pass_cooldown_active(
+            last_empty,
+            now,
+            Duration::from_secs(90),
+            &request,
+        ));
+    }
+
+    #[test]
+    fn empty_pass_cooldown_expires_after_interval() {
+        let start = Instant::now();
+        let later = start + Duration::from_secs(120);
+        let request = cooldown_request(PressureLevel::Orange);
+        // 120s elapsed > 90s cooldown → allow.
+        assert!(!empty_pass_cooldown_active(
+            Some(start),
+            later,
+            Duration::from_secs(90),
+            &request,
+        ));
+    }
+
+    #[test]
+    fn empty_pass_cooldown_inactive_without_prior_empty_pass() {
+        let now = Instant::now();
+        let request = cooldown_request(PressureLevel::Orange);
+        assert!(!empty_pass_cooldown_active(
+            None,
+            now,
+            Duration::from_secs(90),
+            &request,
+        ));
+    }
+
+    #[test]
+    fn empty_pass_cooldown_disabled_when_interval_zero() {
+        let now = Instant::now();
+        let request = cooldown_request(PressureLevel::Orange);
+        assert!(!empty_pass_cooldown_active(
+            Some(now),
+            now,
+            Duration::ZERO,
+            &request,
+        ));
+    }
+
+    #[test]
+    fn empty_pass_cooldown_bypassed_for_red_pressure() {
+        let now = Instant::now();
+        let request = cooldown_request(PressureLevel::Red);
+        // Rising danger overrides pacing.
+        assert!(!empty_pass_cooldown_active(
+            Some(now),
+            now,
+            Duration::from_secs(90),
+            &request,
+        ));
+    }
+
+    #[test]
+    fn empty_pass_cooldown_bypassed_for_forced_and_config_and_synthetic() {
+        let now = Instant::now();
+        let cooldown = Duration::from_secs(90);
+
+        let mut forced = cooldown_request(PressureLevel::Orange);
+        forced.force_full_scan = true;
+        assert!(!empty_pass_cooldown_active(
+            Some(now),
+            now,
+            cooldown,
+            &forced
+        ));
+
+        let mut reload = cooldown_request(PressureLevel::Orange);
+        reload.config_update = Some((
+            crate::core::config::ScoringConfig::default(),
+            crate::core::config::ScannerConfig::default(),
+        ));
+        assert!(!empty_pass_cooldown_active(
+            Some(now),
+            now,
+            cooldown,
+            &reload
+        ));
+
+        let mut synthetic = cooldown_request(PressureLevel::Orange);
+        synthetic.free_pct = None;
+        assert!(!empty_pass_cooldown_active(
+            Some(now),
+            now,
+            cooldown,
+            &synthetic
+        ));
     }
 
     #[test]

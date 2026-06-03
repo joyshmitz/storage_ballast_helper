@@ -163,6 +163,14 @@ pub struct ScannerConfig {
     pub max_delete_batch: usize,
     pub repeat_deletion_base_cooldown_secs: u64,
     pub repeat_deletion_max_cooldown_secs: u64,
+    /// Minimum seconds to wait after a scan pass that found nothing reclaimable
+    /// before running another pass triggered by the *same* sustained pressure.
+    ///
+    /// Belt-and-suspenders against CPU hot-loops (B6): if a pass yields zero
+    /// reclaimable candidates, re-scanning immediately just burns a core. This
+    /// cooldown forces a pause. Forced/operator scans and rising pressure (Red/
+    /// Critical) bypass it. `0` disables the cooldown (legacy behavior).
+    pub min_rescan_interval_secs: u64,
     /// Maximum wall-clock seconds for a single scan pass. 0 = use built-in default.
     pub scan_time_budget_secs: u64,
     /// Seconds to reuse active file/process/mmap evidence before refreshing.
@@ -621,6 +629,7 @@ impl Default for ScannerConfig {
             max_delete_batch: 20,
             repeat_deletion_base_cooldown_secs: 300,
             repeat_deletion_max_cooldown_secs: 3600,
+            min_rescan_interval_secs: 90,
             // 300s is too short for /data/tmp on agent-swarm machines where
             // a single directory can hold tens of thousands of test artifact
             // entries. Scans timing out before identifying candidates was the
@@ -1103,6 +1112,10 @@ impl Config {
         set_env_u64(
             "SBH_SCANNER_REPEAT_DELETION_MAX_COOLDOWN_SECS",
             &mut self.scanner.repeat_deletion_max_cooldown_secs,
+        )?;
+        set_env_u64(
+            "SBH_SCANNER_MIN_RESCAN_INTERVAL_SECS",
+            &mut self.scanner.min_rescan_interval_secs,
         )?;
         set_env_u64(
             "SBH_SCANNER_ACTIVE_REFERENCE_CACHE_TTL_SECS",
