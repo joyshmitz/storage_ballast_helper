@@ -4955,9 +4955,7 @@ fn release_doctor_setup_steps() -> Vec<ReleaseDoctorSetupStep> {
             reason: "Store the repository-scoped deploy key that lets the release workflow publish formula updates to the Homebrew tap.",
             docs: "docs/macos.md#homebrew-and-install-paths",
             commands: vec![
-                format!(
-                    "ssh-keygen -t ed25519 -C \"sbh Homebrew tap release\" -f \"$HOME/.ssh/sbh-homebrew-tap-release\" -N \"\"",
-                ),
+                "ssh-keygen -t ed25519 -C \"sbh Homebrew tap release\" -f \"$HOME/.ssh/sbh-homebrew-tap-release\" -N \"\"".to_string(),
                 "gh api -X POST repos/Dicklesworthstone/homebrew-sbh/keys -f title=\"sbh release workflow\" -f key=\"$(cat \"$HOME/.ssh/sbh-homebrew-tap-release.pub\")\" -F read_only=false".to_string(),
                 format!(
                     "gh secret set HOMEBREW_TAP_SSH_KEY -R {RELEASE_REPOSITORY} < \"$HOME/.ssh/sbh-homebrew-tap-release\"",
