@@ -1048,6 +1048,7 @@ fn should_fast_track_temp_age(
             | "dot-cargo-prefix"
             | "agent-ft-suffix"
             | "tmp-cargo-home"
+            | "rch-cargo-home"
             | "tmp-codex"
             | "tmp-pijs"
             | "tmp-ext"

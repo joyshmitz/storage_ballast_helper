@@ -672,6 +672,21 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
             confidence: 0.88,
             category: ArtifactCategory::TempDir,
         },
+        // rch (remote compilation helper) creates isolated CARGO_HOME staging
+        // dirs named `rch-cargo-home-<host>-<pid>-<uuid>`. As of rch 1.0.38
+        // these land under `$TMPDIR`/`/data/tmp` (not just `/tmp`), and a dead
+        // build can leave them behind. Because the basename starts with `rch-`,
+        // neither `cargo-home-prefix` ("cargo-home-") nor `tmp-cargo-home`
+        // (".tmp_cargo_home_") fires — this dedicated prefix is the backstop.
+        // The trailing hyphen in the needle keeps it from ever matching a repo
+        // or source dir; matching is by basename so it works regardless of the
+        // parent dir. Mirrors `cargo-home-prefix`: regenerable temp/cache dir.
+        ArtifactPattern {
+            name: "rch-cargo-home",
+            kind: MatchKind::Prefix("rch-cargo-home-"),
+            confidence: 0.92,
+            category: ArtifactCategory::TempDir,
+        },
         ArtifactPattern {
             name: "dot-cargo-prefix",
             kind: MatchKind::Prefix(".cargo_"),
@@ -988,6 +1003,9 @@ fn extract_pattern_label_with_cleanup_context(
         || lower.starts_with(".rch-target-")
     {
         return "rch_target_*".to_string();
+    }
+    if lower.starts_with("rch-cargo-home-") {
+        return "rch-cargo-home-*".to_string();
     }
     if lower.starts_with("target_codex") {
         return "target_codex*".to_string();
@@ -1636,6 +1654,59 @@ mod tests {
                 classification.combined_confidence
             );
         }
+    }
+
+    #[test]
+    fn rch_cargo_home_dirs_classify_as_tempdir() {
+        // rch creates isolated CARGO_HOME staging dirs named
+        // `rch-cargo-home-<host>-<pid>-<uuid>`. They start with `rch-`, so
+        // neither `cargo-home-prefix` ("cargo-home-") nor `tmp-cargo-home`
+        // (".tmp_cargo_home_") fires — the dedicated `rch-cargo-home` prefix
+        // is the backstop. Matching is by basename, so it works under any
+        // parent dir (/tmp vs /data/tmp vs an arbitrary $TMPDIR).
+        let registry = ArtifactPatternRegistry::default();
+        for path in [
+            "rch-cargo-home-ts2-12345-abcdef",
+            "/tmp/rch-cargo-home-ts2-12345-abcdef",
+            "/data/tmp/rch-cargo-home-vmi1234-987-deadbeef",
+        ] {
+            let classification = registry.classify(Path::new(path), StructuralSignals::default());
+            assert_eq!(
+                classification.pattern_name, "rch-cargo-home",
+                "unexpected pattern for {path}"
+            );
+            assert_eq!(
+                classification.category,
+                ArtifactCategory::TempDir,
+                "unexpected category for {path}"
+            );
+            assert_eq!(
+                extract_pattern_label(path),
+                "rch-cargo-home-*",
+                "unexpected label for {path}"
+            );
+        }
+
+        // Negative cases: the new prefix must NOT swallow other rch dirs or
+        // source-shaped names, and the plain `cargo-home-` family must keep
+        // matching its OWN (`cargo-home-prefix`) rule — not this one.
+        let cargo_home = registry.classify(
+            Path::new("cargo-home-pearlstone"),
+            StructuralSignals::default(),
+        );
+        assert_eq!(cargo_home.pattern_name, "cargo-home-prefix");
+        assert_eq!(cargo_home.category, ArtifactCategory::TempDir);
+
+        let rch_target = registry.classify(
+            Path::new("rch-target-thatlilac"),
+            StructuralSignals::default(),
+        );
+        assert_ne!(rch_target.pattern_name, "rch-cargo-home");
+        assert_eq!(rch_target.category, ArtifactCategory::RustTarget);
+
+        // A real project name must never match the rch-cargo-home prefix.
+        let project = registry.classify(Path::new("my-project"), StructuralSignals::default());
+        assert_ne!(project.pattern_name, "rch-cargo-home");
     }
 
     #[test]

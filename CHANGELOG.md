@@ -6,6 +6,26 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ---
 
+## v0.4.28
+
+### Added — `rch-cargo-home-*` cleanup matcher
+
+rch (the remote compilation helper) stages an isolated `CARGO_HOME` per build in a
+`rch-cargo-home-<host>-<pid>-<uuid>` directory; as of rch 1.0.38 these land under
+`$TMPDIR`/`/data/tmp` and are left behind when a build dies. sbh had no matcher for
+this prefix (`cargo-home-` and `.tmp_cargo_home_` did not cover `rch-cargo-home-`),
+so these abandoned dirs were never reclaimed. Added a basename `Prefix("rch-cargo-home-")`
+matcher (`ArtifactCategory::TempDir`, confidence 0.92), mirroring the existing
+`cargo-home-prefix` rule. Matching is by basename, so it fires regardless of the
+parent (`/tmp` vs `/data/tmp`). The narrow source-tree carve-out
+(`is_obvious_build_artifact_basename`) was deliberately **not** extended, so the
+hard `is_hardcoded_source_tree()` refusal still gates these dirs under any protected
+source root — the matcher only affects scoring/age in tmp-like roots. Reviewed
+adversarially: cannot match a source/repo/`.git` dir (trailing-hyphen prefix); no
+change to deletion-scope floors.
+
+---
+
 ## v0.4.25
 
 Compare: [`v0.4.24...v0.4.25`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.24...v0.4.25)
