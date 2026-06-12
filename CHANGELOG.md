@@ -6,6 +6,44 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ---
 
+## v0.4.29
+
+Compare: [`v0.4.28...v0.4.29`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.28...v0.4.29)
+
+### Fixed — scanner hot-loop: bounded marker sub-walk, device-affinity gate, empty-pass cooldown
+
+Ships the scanner fixes from PR #11 (`sbh-scan-affinity-and-bounded-marker-walk`, merged to
+`main` as `13c5005` / `34957b6`). These landed **after** the published v0.4.28 release, so the
+0.4.28 binary running fleet-wide never contained them — and on 2026-06-12 the scanner was found
+hot-looping at ~100% of a core 24/7 on every orchestrator (one host's pass walked 218,186
+entries / 7,160 top-level `/data/tmp` dirs in 356s, then immediately rescanned on a 5s poll).
+Three independent fixes, **none of which touch the deletion path or weaken any safety floor**:
+
+- **Bounded sacred-marker sub-walk.** The "protected candidate skipped" containment check that
+  walks a candidate looking for sacred markers (`.beads/`, `.git/`, `*.sqlite3`, `*.db-wal`, …)
+  previously ignored `scanner.max_depth` and full-walked million-file trees every pass. It now
+  caps at `max_entries` (20k) with early-exit and **fails closed to PROTECTED on truncation** — a
+  truncated walk can only strengthen protection, never weaken it.
+- **Device-affinity gate.** Aggressive scanning triggered by pressure on a device is suppressed
+  when no configured `root_path` actually lives on that device (e.g. `/` is full but every
+  `root_path` is on `/data`), a situation the scanner can never relieve and would otherwise spin
+  on forever.
+- **Empty-pass cooldown.** New `scanner.min_rescan_interval_secs` (default 90s) enforces a
+  cooldown after a pass that produced no deletions, so a steady state of all-protected candidates
+  no longer triggers back-to-back rescans.
+
+Verified on the trj canary (2026-06-02): CPU settles to 0–3% (was pinned ~100%), the
+device-affinity backoff fires in production logs, `sbh clean --dry-run` enumerates 38,922 dirs in
+10s with 0 candidates, and zero `auditd` DELETE events occur under `/data/projects`. 2,275 library
+tests pass.
+
+> Operational note: hosts that accumulate *thousands* of marker-bearing ephemeral test dirs under
+> `/data/tmp` should still keep that directory pruned — the bounded walk caps cost per candidate,
+> but a very large top-level dir *count* is still real work per pass. A periodic `/data/tmp`
+> janitor and a longer `poll_interval_ms` are complementary operational mitigations.
+
+---
+
 ## v0.4.28
 
 ### Added — `rch-cargo-home-*` cleanup matcher
