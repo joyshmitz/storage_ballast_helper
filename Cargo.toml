@@ -20,7 +20,11 @@ name = "macos_performance"
 harness = false
 
 [features]
-default = ["cli", "daemon", "sqlite", "tui"]
+# `tui` is intentionally NOT a default feature: the released binaries are built
+# without it (CI uses --no-default-features --features cli,daemon,sqlite), and a
+# default `cargo install --git` must resolve/build without the frankentui TUI
+# crates. Build the TUI explicitly with `--features tui` (sbh#12).
+default = ["cli", "daemon", "sqlite"]
 cli = ["dep:clap", "dep:clap_complete", "dep:colored", "dep:crossterm", "sqlite", "daemon"]
 daemon = ["dep:signal-hook"]
 sqlite = ["dep:rusqlite"]
@@ -41,10 +45,15 @@ bincode = { version = "2.0.1", features = ["serde"] }
 rusqlite = { version = "0.39", features = ["bundled", "functions"], optional = true }
 # Error handling (core)
 thiserror = "2.0"
-# TUI (optional — gated behind "tui" feature)
-ftui = { path = "/dp/frankentui/crates/ftui", default-features = false, optional = true }
-ftui-backend = { path = "/dp/frankentui/crates/ftui-backend", optional = true }
-ftui-tty = { path = "/dp/frankentui/crates/ftui-tty", optional = true }
+# TUI (optional — gated behind "tui" feature).
+# Sourced from the frankentui git repo at a pinned tag (matching the convention
+# in cass/frankenterm) rather than a local /dp path, so `cargo install --git` and
+# CI can resolve these off this VPS. The previous absolute-path deps broke any
+# off-VPS source build because cargo reads optional deps during resolution
+# regardless of which features are active (sbh#12).
+ftui = { git = "https://github.com/Dicklesworthstone/frankentui", tag = "v0.4.1", default-features = false, optional = true }
+ftui-backend = { git = "https://github.com/Dicklesworthstone/frankentui", tag = "v0.4.1", optional = true }
+ftui-tty = { git = "https://github.com/Dicklesworthstone/frankentui", tag = "v0.4.1", optional = true }
 # Timestamps (core)
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # Concurrency (core — used by scanner walker, not just daemon)
