@@ -6,6 +6,38 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ---
 
+## v0.4.30
+
+Compare: [`v0.4.29...v0.4.30`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.29...v0.4.30)
+
+### Fixed — empty-pass cooldown now keys on reclaim *progress*, not candidates *surfaced* (+ exponential backoff)
+
+v0.4.29's B6 empty-pass cooldown only armed when a scan surfaced **zero** candidates
+(`candidates_found == 0`). On a disk parked below the green free-space threshold whose
+candidates are *all protected* — e.g. `/data/tmp` test fixtures full of `*.sqlite-wal`,
+`.git/`, `.beads/` sacred markers — every ~50s scan surfaces hundreds of candidates that
+are then all skipped, so `deleted == 0 / freed == 0` yet `candidates_found > 0`. The
+cooldown was therefore cleared on every pass and never engaged: the scanner re-walked the
+same tree back-to-back and pinned a core 24/7 (observed on ts2 — ~100 CPU ticks/s for
+~2 days, contained only by the `CPUQuota` cap).
+
+- **Cooldown now keys on reclaim progress.** `dispatch_top_candidates` reports how many
+  candidates it handed to the deletion executor; a pass arms the cooldown when it
+  dispatched **nothing** (`dispatched_this_pass == 0`) — covering both "found nothing" and
+  the hot-loop case "found candidates but all protected/dampened".
+- **Exponential backoff for sustained no-progress.** Each consecutive no-progress pass
+  doubles the rescan interval, capped at 32× `min_rescan_interval_secs` (90s → … → 2880s),
+  resetting to the base interval on the first productive pass. A perpetually-pressured-but-
+  nothing-to-reclaim disk decays from one scan per base interval to one per ~32× instead of
+  re-walking continuously.
+
+Red/Critical pressure still bypasses the cooldown (disk-safety floor unchanged); the
+deletion path and all protection logic are untouched. Verified live on ts2: daemon CPU
+~100 → ~1.5 ticks/s, with backoff log lines firing (`… 427 candidates, 0 dispatched;
+backing off rescans (consecutive=2, … ≥180s)`).
+
+---
+
 ## v0.4.29
 
 Compare: [`v0.4.28...v0.4.29`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.28...v0.4.29)

@@ -361,6 +361,30 @@ fn empty_pass_cooldown_active(
     last_empty_pass_at.is_some_and(|last| now.duration_since(last) < cooldown)
 }
 
+/// B6: exponential backoff for the empty-pass cooldown.
+///
+/// `min_rescan_interval_secs` is the *base* pause after a single no-progress
+/// pass. When passes keep finding nothing reclaimable — the steady state on a
+/// disk parked below the green threshold whose only candidates are all protected
+/// (e.g. SQLite/`.git`/`.beads` test fixtures) — each consecutive empty pass
+/// doubles the pause, capped at 32× the base. A perpetually-pressured-but-
+/// nothing-to-reclaim disk thus decays from one scan per `base`s to one scan per
+/// ~32×base instead of re-walking back-to-back and pinning a core. The counter
+/// resets to the base interval on the first productive pass, and Red/Critical
+/// pressure bypasses the cooldown entirely (handled in `empty_pass_cooldown_active`).
+///
+/// A base of `0` disables the cooldown (legacy behavior).
+#[must_use]
+fn effective_empty_pass_cooldown(base_secs: u64, consecutive_empty_passes: u32) -> Duration {
+    if base_secs == 0 {
+        return Duration::ZERO;
+    }
+    // consecutive==1 (first empty pass) → 1×; cap the shift at 5 → 32× max.
+    let shift = consecutive_empty_passes.saturating_sub(1).min(5);
+    let multiplier = 1u64 << shift; // 1, 2, 4, 8, 16, 32
+    Duration::from_secs(base_secs.saturating_mul(multiplier))
+}
+
 #[must_use]
 fn scan_reason_for_request(request: &ScanRequest) -> &'static str {
     if request.force_full_scan {
@@ -3501,6 +3525,7 @@ fn dispatch_top_candidates(
     scored: &mut Vec<CandidacyScore>,
     request: &ScanRequest,
     del_tx: &Sender<DeletionBatch>,
+    dispatched: &mut usize,
 ) -> bool {
     if scored.is_empty() {
         return true;
@@ -3527,12 +3552,20 @@ fn dispatch_top_candidates(
         pressure_level: request.pressure_level,
         urgency: request.urgency,
     };
+    let batch_len = batch.candidates.len();
 
     // Non-blocking send preserves scanner progress and avoids deadlock when
     // executor is slow. If channel is full, re-queue candidates locally so the
     // scanner can retry later in this pass.
     match del_tx.try_send(batch) {
-        Ok(()) => true,
+        Ok(()) => {
+            // These candidates were handed to the deletion executor — i.e. real
+            // reclaim work was started this pass. Counted so the inter-pass
+            // cooldown (B6) distinguishes a *productive* pass from one that
+            // surfaced candidates but dispatched none (all protected/dampened).
+            *dispatched += batch_len;
+            true
+        }
         Err(TrySendError::Full(mut deferred)) => {
             eprintln!(
                 "[SBH-SCANNER] executor channel full, deferring {} candidates",
@@ -3804,11 +3837,14 @@ fn scanner_thread_main(
     let mut known_git_dirs: HashSet<PathBuf> = HashSet::new();
     let mut last_scanner_engine_mode: Option<ScannerEngineMode> = None;
 
-    // B6: inter-pass cooldown. When a pass yields no reclaimable candidates,
+    // B6: inter-pass cooldown. When a pass dispatches nothing reclaimable,
     // re-scanning immediately under sustained pressure just pins a core. We
     // record when the last empty pass finished and skip subsequent pressure-
-    // driven passes until `min_rescan_interval_secs` has elapsed.
+    // driven passes until the (exponentially backed-off) rescan interval has
+    // elapsed. `consecutive_empty_passes` grows the interval while the disk
+    // stays pressured with nothing to reclaim, and resets on a productive pass.
     let mut last_empty_pass_at: Option<Instant> = None;
+    let mut consecutive_empty_passes: u32 = 0;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -3828,13 +3864,17 @@ fn scanner_thread_main(
         let current_scoring_config = shared_scoring_config.read().clone();
         let current_scanner_config = shared_scanner_config.read().clone();
 
-        // B6: skip this pressure-driven pass if a recent pass already found
-        // nothing reclaimable and the cooldown has not elapsed. Operator/forced
-        // scans, config reloads, and Red/Critical pressure always run.
+        // B6: skip this pressure-driven pass if recent passes dispatched
+        // nothing reclaimable and the (backed-off) cooldown has not elapsed.
+        // Operator/forced scans, config reloads, and Red/Critical pressure
+        // always run.
         if empty_pass_cooldown_active(
             last_empty_pass_at,
             Instant::now(),
-            Duration::from_secs(current_scanner_config.min_rescan_interval_secs),
+            effective_empty_pass_cooldown(
+                current_scanner_config.min_rescan_interval_secs,
+                consecutive_empty_passes,
+            ),
             &request,
         ) {
             continue;
@@ -4077,6 +4117,11 @@ fn scanner_thread_main(
 
         // Track total candidates found (priority pre-scan + general walker).
         let mut candidates_found = 0;
+        // Track candidates actually dispatched to the deletion executor this
+        // pass — the signal for whether the pass made reclaim progress (drives
+        // the B6 empty-pass cooldown). A pass can surface many candidates yet
+        // dispatch zero when they are all protected/dampened.
+        let mut dispatched_this_pass: usize = 0;
         let mut scanner_should_exit = false;
         let mut scan_timed_out = false;
         let v2_candidate_byte_target = if scanner_index_enabled {
@@ -4100,7 +4145,12 @@ fn scanner_thread_main(
             let indexed_count = indexed_candidates.len();
             if indexed_count > 0 {
                 let indexed_before_dispatch = indexed_candidates.len();
-                if !dispatch_top_candidates(&mut indexed_candidates, &request, del_tx) {
+                if !dispatch_top_candidates(
+                    &mut indexed_candidates,
+                    &request,
+                    del_tx,
+                    &mut dispatched_this_pass,
+                ) {
                     break;
                 }
                 let indexed_dispatched =
@@ -4538,7 +4588,12 @@ fn scanner_thread_main(
                 );
             } else {
                 let remaining_before_dispatch = priority_candidates.len();
-                if dispatch_top_candidates(&mut priority_candidates, &request, del_tx) {
+                if dispatch_top_candidates(
+                    &mut priority_candidates,
+                    &request,
+                    del_tx,
+                    &mut dispatched_this_pass,
+                ) {
                     let dispatched_count =
                         remaining_before_dispatch.saturating_sub(priority_candidates.len());
                     candidates_found += count;
@@ -4973,7 +5028,12 @@ fn scanner_thread_main(
             let should_dispatch = !scored.is_empty()
                 && (scored.len() >= dispatch_threshold || Instant::now() >= next_dispatch_deadline);
             if should_dispatch {
-                if !dispatch_top_candidates(&mut scored, &request, del_tx) {
+                if !dispatch_top_candidates(
+                    &mut scored,
+                    &request,
+                    del_tx,
+                    &mut dispatched_this_pass,
+                ) {
                     scanner_should_exit = true;
                     break;
                 }
@@ -4982,7 +5042,12 @@ fn scanner_thread_main(
             if let Some(target_bytes) = v2_candidate_byte_target
                 && v2_candidate_bytes_seen >= target_bytes
             {
-                if !dispatch_top_candidates(&mut scored, &request, del_tx) {
+                if !dispatch_top_candidates(
+                    &mut scored,
+                    &request,
+                    del_tx,
+                    &mut dispatched_this_pass,
+                ) {
                     scanner_should_exit = true;
                 }
                 cancel_token.store(true, Ordering::Relaxed);
@@ -5049,13 +5114,34 @@ fn scanner_thread_main(
         });
 
         // B6: arm/clear the inter-pass cooldown. A pass that completed (not
-        // timed out) yet surfaced no candidates means there is nothing to
-        // reclaim right now — start the cooldown so we don't immediately
-        // re-scan under the same sustained pressure. A productive pass (or a
-        // timeout, which is inconclusive) clears it.
-        if candidates_found == 0 && !scan_timed_out {
+        // timed out) yet *dispatched nothing* to the deletion executor made no
+        // reclaim progress — either it surfaced no candidates, or (the hot-loop
+        // case) it surfaced candidates that were all protected/dampened. Either
+        // way, immediately re-scanning under the same sustained pressure just
+        // re-walks the same tree and pins a core, so arm the cooldown and grow
+        // the backoff. A productive pass (≥1 dispatched) or a timeout (which is
+        // inconclusive) resets it.
+        //
+        // NOTE: keying on dispatched-count, not candidates_found, is the fix for
+        // the perpetual-Yellow hot-loop where every candidate is a sacred-marker
+        // fixture (`*.sqlite-wal`/`.git`/`.beads`): candidates_found stays high
+        // while deleted/freed stays 0, so the old `candidates_found == 0` gate
+        // never armed.
+        if dispatched_this_pass == 0 && !scan_timed_out {
+            consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
             last_empty_pass_at = Some(Instant::now());
+            let next_secs = effective_empty_pass_cooldown(
+                current_scanner_config.min_rescan_interval_secs,
+                consecutive_empty_passes,
+            )
+            .as_secs();
+            if next_secs > 0 {
+                eprintln!(
+                    "[SBH-SCANNER] no reclaimable progress this pass ({candidates_found} candidates, 0 dispatched); backing off rescans (consecutive={consecutive_empty_passes}, next pressure-driven scan in ≥{next_secs}s)"
+                );
+            }
         } else {
+            consecutive_empty_passes = 0;
             last_empty_pass_at = None;
         }
 
@@ -5074,7 +5160,7 @@ fn scanner_thread_main(
                 break;
             }
             let pending_before = scored.len();
-            if !dispatch_top_candidates(&mut scored, &request, del_tx) {
+            if !dispatch_top_candidates(&mut scored, &request, del_tx, &mut dispatched_this_pass) {
                 scanner_should_exit = true;
                 break;
             }
@@ -6313,7 +6399,12 @@ mod tests {
         };
         let mut scored = vec![test_candidate("/tmp/a", 0.4), test_candidate("/tmp/b", 0.6)];
 
-        assert!(dispatch_top_candidates(&mut scored, &request, &del_tx));
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &del_tx,
+            &mut 0usize
+        ));
         assert!(scored.is_empty());
         assert!(del_rx.try_recv().is_err());
     }
@@ -6857,6 +6948,46 @@ mod tests {
     }
 
     #[test]
+    fn effective_empty_pass_cooldown_backs_off_exponentially_and_caps() {
+        // Base of 0 disables the cooldown regardless of the streak length.
+        assert_eq!(effective_empty_pass_cooldown(0, 5), Duration::ZERO);
+        // The first empty pass (consecutive == 1) waits exactly the base interval.
+        assert_eq!(
+            effective_empty_pass_cooldown(90, 1),
+            Duration::from_secs(90)
+        );
+        // consecutive == 0 is treated as the first pass (1×), never underflows.
+        assert_eq!(
+            effective_empty_pass_cooldown(90, 0),
+            Duration::from_secs(90)
+        );
+        // Each consecutive empty pass doubles the interval.
+        assert_eq!(
+            effective_empty_pass_cooldown(90, 2),
+            Duration::from_secs(180)
+        );
+        assert_eq!(
+            effective_empty_pass_cooldown(90, 3),
+            Duration::from_secs(360)
+        );
+        assert_eq!(
+            effective_empty_pass_cooldown(90, 4),
+            Duration::from_secs(720)
+        );
+        // The shift caps at 5 → 32× the base, and stays there for longer streaks.
+        assert_eq!(
+            effective_empty_pass_cooldown(90, 6),
+            Duration::from_secs(90 * 32)
+        );
+        assert_eq!(
+            effective_empty_pass_cooldown(90, 100),
+            Duration::from_secs(90 * 32)
+        );
+        // Extreme inputs saturate instead of panicking on overflow.
+        let _ = effective_empty_pass_cooldown(u64::MAX, u32::MAX);
+    }
+
+    #[test]
     fn empty_pass_cooldown_bypassed_for_red_pressure() {
         let now = Instant::now();
         let request = cooldown_request(PressureLevel::Red);
@@ -7079,7 +7210,12 @@ mod tests {
             test_candidate("/tmp/mid", 0.5),
         ];
 
-        assert!(dispatch_top_candidates(&mut scored, &request, &del_tx));
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &del_tx,
+            &mut 0usize
+        ));
         let batch = del_rx.recv().expect("batch should be dispatched");
         assert_eq!(batch.candidates.len(), 1);
         assert_eq!(batch.candidates[0].path, Path::new("/tmp/high"));
@@ -7110,7 +7246,12 @@ mod tests {
 
         let mut scored = vec![test_candidate("/tmp/a", 0.4), test_candidate("/tmp/b", 0.6)];
         let before = scored.len();
-        assert!(dispatch_top_candidates(&mut scored, &request, &del_tx));
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &del_tx,
+            &mut 0usize
+        ));
 
         // Channel remained full, so scanner should still retain all candidates.
         assert_eq!(scored.len(), before);
