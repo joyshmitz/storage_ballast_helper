@@ -143,11 +143,45 @@ impl BallastPoolCoordinator {
         Self::discover_with_manager_platform(config, watched_paths, platform, &manager_platform)
     }
 
+    /// Discover and initialize pools, honoring an operator-configured ballast
+    /// directory.
+    ///
+    /// `configured_ballast_dir` is the operator's `[paths] ballast_dir`. When
+    /// it is `Some`, the pool whose mount point contains that directory is
+    /// provisioned at that exact path instead of the per-volume `.sbh/ballast`
+    /// subdirectory default. All other volumes keep the subdirectory default so
+    /// per-volume release semantics are preserved.
+    pub fn discover_with_configured_dir(
+        config: &BallastConfig,
+        watched_paths: &[PathBuf],
+        platform: &dyn Platform,
+        configured_ballast_dir: Option<&Path>,
+    ) -> Result<Self> {
+        let manager_platform: Arc<dyn Platform> = Arc::new(crate::platform::current());
+        Self::discover_inner(
+            config,
+            watched_paths,
+            platform,
+            &manager_platform,
+            configured_ballast_dir,
+        )
+    }
+
     pub(crate) fn discover_with_manager_platform(
         config: &BallastConfig,
         watched_paths: &[PathBuf],
         platform: &dyn Platform,
         manager_platform: &Arc<dyn Platform>,
+    ) -> Result<Self> {
+        Self::discover_inner(config, watched_paths, platform, manager_platform, None)
+    }
+
+    pub(crate) fn discover_inner(
+        config: &BallastConfig,
+        watched_paths: &[PathBuf],
+        platform: &dyn Platform,
+        manager_platform: &Arc<dyn Platform>,
+        configured_ballast_dir: Option<&Path>,
     ) -> Result<Self> {
         let mounts = platform.mount_points()?;
         let mut pools = HashMap::new();
@@ -163,14 +197,24 @@ impl BallastPoolCoordinator {
             }
         }
 
+        // Identify which discovered mount actually owns the operator-configured
+        // ballast dir, so only that single pool is redirected to the configured
+        // path (not every ancestor mount, e.g. `/` of `/data/...`).
+        let configured_owner_mount =
+            configured_owner_mount(configured_ballast_dir, &mounts, &seen_mounts);
+
         for (mount_path, mount) in &seen_mounts {
             let mount_str = mount_path.to_string_lossy();
             let strategy = provision_strategy(&mount.fs_type);
+            let configured_for_mount = configured_ballast_dir
+                .filter(|_| configured_owner_mount.as_deref() == Some(mount_path.as_path()));
+            let resolved_dir = resolve_ballast_dir(mount_path, configured_for_mount);
+            let skip_dir = resolved_dir.clone();
             let mut skip_with = |reason: String| {
                 skipped_pools.insert(
                     mount_path.clone(),
                     SkippedPoolInfo {
-                        ballast_dir: mount_path.join(BALLAST_SUBDIR),
+                        ballast_dir: skip_dir.clone(),
                         fs_type: mount.fs_type.clone(),
                         strategy,
                         reason,
@@ -222,19 +266,10 @@ impl BallastPoolCoordinator {
                 continue;
             }
 
-            // Determine ballast directory for this volume.
-            let ballast_dir = mount_path.join(BALLAST_SUBDIR);
-
-            // Build per-volume config.
-            let file_count = config.effective_file_count(&mount_str);
-            let file_size_bytes = config.effective_file_size_bytes(&mount_str);
-            let pool_config = BallastConfig {
-                file_count,
-                file_size_bytes,
-                replenish_cooldown_minutes: config.replenish_cooldown_minutes,
-                auto_provision: config.auto_provision,
-                overrides: BTreeMap::new(),
-            };
+            // Configured ballast_dir on this mount is honored verbatim;
+            // otherwise fall back to the per-volume subdirectory.
+            let ballast_dir = resolved_dir;
+            let pool_config = per_volume_config(config, &mount_str);
 
             let mut manager = match BallastManager::with_platform(
                 ballast_dir.clone(),
@@ -463,22 +498,61 @@ impl BallastPoolCoordinator {
     pub fn update_config(&mut self, config: &BallastConfig) {
         for (mount_path, pool) in &mut self.pools {
             let mount_str = mount_path.to_string_lossy();
-            let file_count = config.effective_file_count(&mount_str);
-            let file_size_bytes = config.effective_file_size_bytes(&mount_str);
-
-            let pool_config = BallastConfig {
-                file_count,
-                file_size_bytes,
-                replenish_cooldown_minutes: config.replenish_cooldown_minutes,
-                auto_provision: config.auto_provision,
-                overrides: std::collections::BTreeMap::new(),
-            };
+            let pool_config = per_volume_config(config, &mount_str);
             pool.manager.update_config(pool_config);
         }
     }
 }
 
 // ──────────────────── helpers ────────────────────
+
+/// Build the per-volume `BallastConfig` for one mount, applying any
+/// per-volume file-count / file-size overrides for that mount.
+fn per_volume_config(config: &BallastConfig, mount_str: &str) -> BallastConfig {
+    BallastConfig {
+        file_count: config.effective_file_count(mount_str),
+        file_size_bytes: config.effective_file_size_bytes(mount_str),
+        replenish_cooldown_minutes: config.replenish_cooldown_minutes,
+        auto_provision: config.auto_provision,
+        overrides: BTreeMap::new(),
+    }
+}
+
+/// Find the discovered mount that owns the operator-configured ballast dir.
+///
+/// Returns the mount path (longest matching prefix) only when that mount is
+/// among the volumes we are provisioning pools for, so an ancestor mount like
+/// `/` is never redirected away from its `.sbh/ballast` default.
+fn configured_owner_mount(
+    configured_ballast_dir: Option<&Path>,
+    mounts: &[MountPoint],
+    seen_mounts: &HashMap<PathBuf, MountPoint>,
+) -> Option<PathBuf> {
+    let dir = configured_ballast_dir?;
+    let mount = find_mount(dir, mounts)?;
+    if seen_mounts.contains_key(&mount.path) {
+        Some(mount.path.clone())
+    } else {
+        None
+    }
+}
+
+/// Resolve the ballast directory for a single volume.
+///
+/// When the operator configured an explicit `[paths] ballast_dir` and that
+/// directory lives on this `mount_path`, the configured directory is used
+/// verbatim (honoring issue #14). Otherwise the per-volume `.sbh/ballast`
+/// subdirectory is used so that ballast still lands on the right filesystem.
+pub(crate) fn resolve_ballast_dir(mount_path: &Path, configured: Option<&Path>) -> PathBuf {
+    if let Some(configured) = configured {
+        // Only honor the configured dir for the mount that actually contains
+        // it; other discovered volumes keep their own subdirectory pool.
+        if configured.starts_with(mount_path) {
+            return configured.to_path_buf();
+        }
+    }
+    mount_path.join(BALLAST_SUBDIR)
+}
 
 fn provision_strategy(fs_type: &str) -> ProvisionStrategy {
     if RAM_FILESYSTEMS.contains(&fs_type) || NETWORK_FILESYSTEMS.contains(&fs_type) {
@@ -1037,6 +1111,140 @@ mod tests {
         let coordinator = BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
         // Only one pool even though two watched paths.
         assert_eq!(coordinator.pool_count(), 1);
+    }
+
+    #[test]
+    fn resolve_ballast_dir_honors_configured_dir_on_owning_mount() {
+        // Regression for issue #14: when an explicit ballast_dir is configured
+        // and lives on this mount, it must be honored verbatim — NOT rewritten
+        // to the hardcoded `<mount>/.sbh/ballast` default.
+        let mount = Path::new("/data");
+        let configured = Path::new("/data/sbh/ballast");
+        assert_eq!(
+            resolve_ballast_dir(mount, Some(configured)),
+            PathBuf::from("/data/sbh/ballast"),
+        );
+        // Sanity: it must not be the hardcoded subdir default.
+        assert_ne!(
+            resolve_ballast_dir(mount, Some(configured)),
+            mount.join(BALLAST_SUBDIR),
+        );
+    }
+
+    #[test]
+    fn resolve_ballast_dir_falls_back_to_subdir_when_unset() {
+        let mount = Path::new("/data");
+        assert_eq!(
+            resolve_ballast_dir(mount, None),
+            PathBuf::from("/data/.sbh/ballast"),
+        );
+    }
+
+    #[test]
+    fn resolve_ballast_dir_ignores_configured_dir_on_other_mount() {
+        // The discover loop only passes `Some(configured)` to the owning mount;
+        // every other mount receives `None` and must keep its subdir default.
+        // This mirrors that contract: a non-owning mount sees `None`.
+        let other_mount = Path::new("/");
+        assert_eq!(
+            resolve_ballast_dir(other_mount, None),
+            PathBuf::from("/.sbh/ballast"),
+        );
+    }
+
+    #[test]
+    fn discover_honors_configured_ballast_dir_not_hardcoded_default() {
+        // End-to-end on the coordinator: a configured ballast_dir under the
+        // watched mount must drive the pool's ballast_dir, proving the daemon's
+        // `[paths] ballast_dir` reaches the provisioner (issue #14).
+        let dir_data = tempfile::tempdir().unwrap();
+        let configured = dir_data.path().join("custom").join("ballast");
+
+        let platform = {
+            let mounts = vec![MountPoint {
+                path: dir_data.path().to_path_buf(),
+                device: "/dev/sda1".to_string(),
+                fs_type: "ext4".to_string(),
+                is_ram_backed: false,
+            }];
+            let stats = HashMap::from([(
+                dir_data.path().to_path_buf(),
+                FsStats {
+                    total_bytes: 100_000_000_000,
+                    free_bytes: 50_000_000_000,
+                    available_bytes: 50_000_000_000,
+                    fs_type: "ext4".to_string(),
+                    mount_point: dir_data.path().to_path_buf(),
+                    is_readonly: false,
+                },
+            )]);
+            MockPlatform::new(
+                mounts,
+                stats,
+                MemoryInfo {
+                    total_bytes: 32_000_000_000,
+                    available_bytes: 16_000_000_000,
+                    swap_total_bytes: 0,
+                    swap_free_bytes: 0,
+                },
+                PlatformPaths::default(),
+            )
+        };
+
+        let watched = vec![dir_data.path().to_path_buf()];
+        let config = tiny_ballast_config();
+
+        let coordinator = BallastPoolCoordinator::discover_with_configured_dir(
+            &config,
+            &watched,
+            &platform,
+            Some(configured.as_path()),
+        )
+        .unwrap();
+
+        let pool = coordinator
+            .pool_for_mount(dir_data.path())
+            .expect("pool should exist for watched mount");
+        assert_eq!(
+            pool.ballast_dir, configured,
+            "provisioner must resolve to the configured ballast_dir"
+        );
+        assert_ne!(
+            pool.ballast_dir,
+            dir_data.path().join(BALLAST_SUBDIR),
+            "must not fall back to the hardcoded .sbh/ballast default when configured",
+        );
+    }
+
+    #[test]
+    fn discover_redirects_only_the_owning_volume_to_configured_dir() {
+        // Two volumes; the configured ballast_dir lives on dir_data only. The
+        // dir_data pool must use the configured dir; the other volume keeps its
+        // `.sbh/ballast` subdir default (preserves per-volume release).
+        let dir_data = tempfile::tempdir().unwrap();
+        let dir_other = tempfile::tempdir().unwrap();
+        let platform = mock_platform_two_volumes(dir_data.path(), dir_other.path());
+
+        let configured = dir_data.path().join("explicit").join("ballast");
+        let watched = vec![
+            dir_data.path().to_path_buf(),
+            dir_other.path().to_path_buf(),
+        ];
+        let config = tiny_ballast_config();
+
+        let coordinator = BallastPoolCoordinator::discover_with_configured_dir(
+            &config,
+            &watched,
+            &platform,
+            Some(configured.as_path()),
+        )
+        .unwrap();
+
+        let owning = coordinator.pool_for_mount(dir_data.path()).unwrap();
+        assert_eq!(owning.ballast_dir, configured);
+
+        let other = coordinator.pool_for_mount(dir_other.path()).unwrap();
+        assert_eq!(other.ballast_dir, dir_other.path().join(BALLAST_SUBDIR));
     }
 
     #[test]

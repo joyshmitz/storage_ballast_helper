@@ -1576,12 +1576,27 @@ impl MonitoringDaemon {
 
         // 6. Initialize ballast coordinator (multi-volume).
         let discovery_paths = ballast_discovery_paths(&config, &special_locations);
-        let ballast_coordinator = BallastPoolCoordinator::discover_with_manager_platform(
+        let ballast_coordinator = BallastPoolCoordinator::discover_inner(
             &config.ballast,
             &discovery_paths,
             platform.as_ref(),
             &platform,
+            Some(config.paths.ballast_dir.as_path()),
         )?;
+        // Surface the resolved ballast directories so the configured
+        // `[paths] ballast_dir` is observable at startup (issue #14).
+        eprintln!(
+            "[SBH-DAEMON] configured ballast_dir: {}",
+            config.paths.ballast_dir.display()
+        );
+        for inv in ballast_coordinator.inventory() {
+            eprintln!(
+                "[SBH-DAEMON] ballast pool on mount {} -> {}{}",
+                inv.mount_point.display(),
+                inv.ballast_dir.display(),
+                if inv.skipped { " (skipped)" } else { "" }
+            );
+        }
 
         // 7. Release controller.
         let release_controller =
@@ -3293,11 +3308,12 @@ impl MonitoringDaemon {
                     self.release_controller.reset();
                     let discovery_paths =
                         ballast_discovery_paths(&new_config, &self.special_locations);
-                    match BallastPoolCoordinator::discover_with_manager_platform(
+                    match BallastPoolCoordinator::discover_inner(
                         &new_config.ballast,
                         &discovery_paths,
                         self.platform.as_ref(),
                         &self.platform,
+                        Some(new_config.paths.ballast_dir.as_path()),
                     ) {
                         Ok(coordinator) => {
                             self.ballast_coordinator = coordinator;
