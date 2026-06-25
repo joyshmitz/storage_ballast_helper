@@ -36,6 +36,7 @@ pub mod platform;
 pub mod scanner;
 #[cfg(feature = "tui")]
 pub mod tui;
+pub mod tuning;
 
 #[cfg(test)]
 mod decision_plane_tests;

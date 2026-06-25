@@ -18,7 +18,7 @@ use parking_lot::RwLock;
 use crate::core::errors::{Result, SbhError};
 #[cfg(target_os = "linux")]
 use crate::platform::pal::{
-    FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
+    BlockDeviceInfo, FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
     verify_preallocated_blocks,
 };
 #[cfg(target_os = "linux")]
@@ -37,6 +37,8 @@ pub mod memory;
 pub mod process;
 #[cfg(target_os = "linux")]
 pub mod service;
+#[cfg(target_os = "linux")]
+pub mod writeback;
 
 /// Linux platform implementation using `/proc` + `statvfs`.
 #[cfg(target_os = "linux")]
@@ -192,6 +194,20 @@ impl Platform for LinuxPal {
 
     fn service_kind(&self) -> ServiceKind {
         ServiceKind::Systemd
+    }
+
+    fn writeback_state(&self) -> Result<crate::tuning::writeback::WritebackState> {
+        let total_ram_bytes = self.memory_info()?.total_bytes;
+        Ok(writeback::read_state(total_ram_bytes))
+    }
+
+    fn block_device_for(&self, path: &Path) -> Result<BlockDeviceInfo> {
+        let mounts = self.mount_points()?;
+        writeback::block_device_for(path, &mounts)
+    }
+
+    fn apply_writeback_runtime(&self, dirty_bytes: u64, dirty_background_bytes: u64) -> Result<()> {
+        writeback::apply_runtime(dirty_bytes, dirty_background_bytes)
     }
 }
 

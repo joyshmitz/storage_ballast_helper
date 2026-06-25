@@ -6,6 +6,58 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ---
 
+## v0.4.31
+
+### Added — kernel writeback (dirty-page) tuning
+
+sbh already runs its daemon at `Nice=19` + `IOSchedulingClass=idle`, but the worst
+interactive-latency stalls on busy build hosts come from *kernel* writeback behavior that no
+per-process nice/ionice can fix. On a high-RAM box the default percentage-based
+`vm.dirty_ratio`/`vm.dirty_background_ratio` knobs let many GB of dirty pages accumulate before
+writeback throttles (e.g. ~24 GB at `dirty_ratio=10` on a 247 GB host); they then flush in bursts
+through kernel writeback threads (`btrfs-endio-write` and friends) that ignore the producing
+process's ionice class, so the interactive terminal stalls behind each multi-GB flush. The fix is
+to replace the ratio knobs with absolute byte limits (`vm.dirty_bytes`/`vm.dirty_background_bytes`)
+sized for continuous, gentle writeback.
+
+sbh now models this cross-platform and applies it on Linux:
+
+- **`sbh tune`** gained a `KernelWriteback` recommendation category. It sizes the byte limits from
+  the backing device's **measured write bandwidth** (a short, bounded, non-destructive on-volume
+  micro-benchmark with random data; `--no-benchmark` falls back to an NVMe/SSD/HDD device-class
+  heuristic). At a typical ~512 MiB/s SSD with the default 1 s background-drain target and 4:1 hard
+  ratio this lands on `vm.dirty_background_bytes=512 MiB` / `vm.dirty_bytes=2 GiB`. `--apply`
+  (root) writes the live `/proc/sys/vm` knobs **and** persists a backup-first, self-documenting
+  `/etc/sysctl.d/99-sbh-writeback.conf`, validates it with `sysctl -p`, and warns about any
+  later-loading `sysctl.d` file that would override the byte limits with a ratio.
+- **`sbh tune --revert-writeback`** (root) restores the most recent backup of the sbh snippet (or
+  removes it) and reloads sysctl.
+- **`sbh doctor --system`** adds a `system.writeback_tuning` check that WARNs when the RAM-derived
+  dirty pool exceeds `system_tuning.writeback_pool_warn_bytes` (default 4 GiB), escalated for
+  copy-on-write filesystems (btrfs/zfs). It is read-only (heuristic only, never benchmarks) and
+  returns PASS/not-applicable on platforms without tunable writeback limits (macOS).
+- **`sbh install`** applies + persists the tuning automatically when run as root
+  (`system_tuning.writeback_auto_apply_on_install`, default on); non-root installs print the
+  `sudo sbh tune --apply --yes` hint.
+
+This is **never applied by the daemon at runtime** — the hardened system-scope unit sets
+`ProtectKernelTunables=true` (so the daemon cannot write `/proc/sys`), and silently mutating global
+kernel state from a background daemon would violate sbh's explainability/least-surprise principles.
+All mutation is operator-invoked, root-gated, backup-first, and reversible.
+
+New `[system_tuning]` config section (with `SBH_SYSTEM_TUNING_WRITEBACK_*` env overrides):
+`writeback_enabled`, `writeback_auto_apply_on_install`, `writeback_target_drain_secs`,
+`writeback_hard_ratio`, `writeback_min_background_bytes`, `writeback_max_background_bytes`,
+`writeback_benchmark_enabled`, `writeback_benchmark_bytes`, `writeback_pool_warn_bytes`,
+`writeback_sysctl_path`.
+
+New PAL surface: `writeback_state()`, `block_device_for()`, `apply_writeback_runtime()`
+(Linux reads `/proc/sys/vm` + `/sys/block`; other platforms return not-applicable). New
+platform-agnostic `tuning` module (`tuning::writeback`, `tuning::bandwidth`) holds the sizing,
+assessment, `sysctl.d` rendering, conflict detection, and bandwidth estimation, fully unit-tested.
+
+---
+
 ## v0.4.30
 
 Compare: [`v0.4.29...v0.4.30`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.29...v0.4.30)

@@ -31,6 +31,7 @@ pub struct Config {
     pub notifications: NotificationConfig,
     pub dashboard: DashboardConfig,
     pub policy: PolicyConfig,
+    pub system_tuning: SystemTuningConfig,
 }
 
 /// Pressure thresholds and control knobs.
@@ -375,6 +376,58 @@ pub struct UpdateConfig {
     pub metadata_cache_file: PathBuf,
     pub background_refresh: bool,
     pub notices_enabled: bool,
+}
+
+/// System-level (OS kernel) tuning that complements sbh's own controls.
+///
+/// Currently models kernel writeback (dirty-page) limit tuning. On high-RAM
+/// hosts the default percentage-based `vm.dirty_ratio` knobs let many GB of
+/// dirty pages pile up and then flush in bursts through kernel writeback threads
+/// that ignore `ionice`, stalling interactive I/O. sbh recommends — and, when
+/// invoked with privilege, applies — absolute byte limits sized to the backing
+/// device's write bandwidth. This is never done by the daemon at runtime: it is
+/// surfaced by `sbh doctor --system` and applied by `sbh tune --apply` or `sbh
+/// install` (both root-gated, backup-first, reversible).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SystemTuningConfig {
+    /// Master switch for writeback tuning detection/recommendation.
+    pub writeback_enabled: bool,
+    /// Apply + persist writeback tuning during `sbh install` when run as root.
+    pub writeback_auto_apply_on_install: bool,
+    /// Target seconds for the background dirty pool to drain at device bandwidth.
+    pub writeback_target_drain_secs: f64,
+    /// Hard-limit (`vm.dirty_bytes`) multiple of the background limit.
+    pub writeback_hard_ratio: u64,
+    /// Floor for `vm.dirty_background_bytes`.
+    pub writeback_min_background_bytes: u64,
+    /// Ceiling for `vm.dirty_background_bytes`.
+    pub writeback_max_background_bytes: u64,
+    /// Run the on-volume bandwidth micro-benchmark when applying.
+    pub writeback_benchmark_enabled: bool,
+    /// Byte budget for the bandwidth micro-benchmark write.
+    pub writeback_benchmark_bytes: u64,
+    /// Effective dirty-pool size above which `doctor` warns (ratio-mode hosts).
+    pub writeback_pool_warn_bytes: u64,
+    /// Path of the persisted sysctl.d snippet.
+    pub writeback_sysctl_path: PathBuf,
+}
+
+impl Default for SystemTuningConfig {
+    fn default() -> Self {
+        Self {
+            writeback_enabled: true,
+            writeback_auto_apply_on_install: true,
+            writeback_target_drain_secs: 1.0,
+            writeback_hard_ratio: 4,
+            writeback_min_background_bytes: 256 * 1024 * 1024,
+            writeback_max_background_bytes: 2 * 1024 * 1024 * 1024,
+            writeback_benchmark_enabled: true,
+            writeback_benchmark_bytes: 96 * 1024 * 1024,
+            writeback_pool_warn_bytes: 4 * 1024 * 1024 * 1024,
+            writeback_sysctl_path: PathBuf::from("/etc/sysctl.d/99-sbh-writeback.conf"),
+        }
+    }
 }
 
 /// Dashboard runtime selection mode.
@@ -1199,6 +1252,44 @@ impl Config {
         // policy
         set_env_bool("SBH_POLICY_KILL_SWITCH", &mut self.policy.kill_switch)?;
 
+        // system tuning (kernel writeback)
+        set_env_bool(
+            "SBH_SYSTEM_TUNING_WRITEBACK_ENABLED",
+            &mut self.system_tuning.writeback_enabled,
+        )?;
+        set_env_bool(
+            "SBH_SYSTEM_TUNING_WRITEBACK_AUTO_APPLY_ON_INSTALL",
+            &mut self.system_tuning.writeback_auto_apply_on_install,
+        )?;
+        set_env_f64(
+            "SBH_SYSTEM_TUNING_WRITEBACK_TARGET_DRAIN_SECS",
+            &mut self.system_tuning.writeback_target_drain_secs,
+        )?;
+        set_env_u64(
+            "SBH_SYSTEM_TUNING_WRITEBACK_HARD_RATIO",
+            &mut self.system_tuning.writeback_hard_ratio,
+        )?;
+        set_env_u64(
+            "SBH_SYSTEM_TUNING_WRITEBACK_MIN_BACKGROUND_BYTES",
+            &mut self.system_tuning.writeback_min_background_bytes,
+        )?;
+        set_env_u64(
+            "SBH_SYSTEM_TUNING_WRITEBACK_MAX_BACKGROUND_BYTES",
+            &mut self.system_tuning.writeback_max_background_bytes,
+        )?;
+        set_env_bool(
+            "SBH_SYSTEM_TUNING_WRITEBACK_BENCHMARK_ENABLED",
+            &mut self.system_tuning.writeback_benchmark_enabled,
+        )?;
+        set_env_u64(
+            "SBH_SYSTEM_TUNING_WRITEBACK_BENCHMARK_BYTES",
+            &mut self.system_tuning.writeback_benchmark_bytes,
+        )?;
+        set_env_u64(
+            "SBH_SYSTEM_TUNING_WRITEBACK_POOL_WARN_BYTES",
+            &mut self.system_tuning.writeback_pool_warn_bytes,
+        )?;
+
         Ok(())
     }
 
@@ -1588,6 +1679,77 @@ impl Config {
         // Validate protected_paths glob patterns are compilable.
         for pattern in &self.scanner.protected_paths {
             crate::scanner::protection::validate_glob_pattern(pattern)?;
+        }
+
+        // System tuning (kernel writeback).
+        let tuning = &self.system_tuning;
+        if !tuning.writeback_target_drain_secs.is_finite()
+            || tuning.writeback_target_drain_secs <= 0.0
+            || tuning.writeback_target_drain_secs > 30.0
+        {
+            return Err(SbhError::InvalidConfig {
+                details: format!(
+                    "system_tuning.writeback_target_drain_secs must be in (0, 30], got {}",
+                    tuning.writeback_target_drain_secs
+                ),
+            });
+        }
+        // The hard limit (`vm.dirty_bytes`) must sit strictly above the background
+        // limit, or the kernel silently halves the background threshold. Bound the
+        // ratio so it can never collapse to the background limit (1) nor saturate
+        // `vm.dirty_bytes` to an effectively-unlimited value.
+        if tuning.writeback_hard_ratio < 2 || tuning.writeback_hard_ratio > 64 {
+            return Err(SbhError::InvalidConfig {
+                details: format!(
+                    "system_tuning.writeback_hard_ratio must be in [2, 64], got {}",
+                    tuning.writeback_hard_ratio
+                ),
+            });
+        }
+        if tuning.writeback_min_background_bytes < 4096 {
+            return Err(SbhError::InvalidConfig {
+                details: format!(
+                    "system_tuning.writeback_min_background_bytes ({}) must be >= 4096",
+                    tuning.writeback_min_background_bytes
+                ),
+            });
+        }
+        if tuning.writeback_max_background_bytes < tuning.writeback_min_background_bytes {
+            return Err(SbhError::InvalidConfig {
+                details: format!(
+                    "system_tuning.writeback_max_background_bytes ({}) must be >= writeback_min_background_bytes ({})",
+                    tuning.writeback_max_background_bytes, tuning.writeback_min_background_bytes
+                ),
+            });
+        }
+        if tuning.writeback_benchmark_bytes < 1024 * 1024 {
+            return Err(SbhError::InvalidConfig {
+                details: format!(
+                    "system_tuning.writeback_benchmark_bytes ({}) must be >= 1 MiB",
+                    tuning.writeback_benchmark_bytes
+                ),
+            });
+        }
+        if tuning.writeback_pool_warn_bytes == 0 {
+            return Err(SbhError::InvalidConfig {
+                details: "system_tuning.writeback_pool_warn_bytes must be > 0".to_string(),
+            });
+        }
+        // `sysctl --system` only loads files matching `*.conf` on boot, so a path
+        // without that suffix would apply at runtime yet silently fail to persist
+        // across a reboot.
+        if tuning
+            .writeback_sysctl_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            != Some("conf")
+        {
+            return Err(SbhError::InvalidConfig {
+                details: format!(
+                    "system_tuning.writeback_sysctl_path must end in .conf (sysctl loads only *.conf files), got {}",
+                    tuning.writeback_sysctl_path.display()
+                ),
+            });
         }
 
         Ok(())
@@ -2133,6 +2295,52 @@ mod tests {
             err.to_string()
                 .contains("repeat_deletion_max_cooldown_secs")
         );
+    }
+
+    #[test]
+    fn system_tuning_defaults_are_valid() {
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn system_tuning_hard_ratio_must_be_in_range() {
+        // 1 would make the background limit equal the hard limit (kernel halves it).
+        let mut low = Config::default();
+        low.system_tuning.writeback_hard_ratio = 1;
+        let err = low.validate().expect_err("expected hard_ratio error");
+        assert!(err.to_string().contains("writeback_hard_ratio"));
+
+        // An absurd ratio would saturate vm.dirty_bytes to an unlimited value.
+        let mut high = Config::default();
+        high.system_tuning.writeback_hard_ratio = 65;
+        let err = high.validate().expect_err("expected hard_ratio error");
+        assert!(err.to_string().contains("writeback_hard_ratio"));
+    }
+
+    #[test]
+    fn system_tuning_max_background_must_not_be_below_min() {
+        let mut cfg = Config::default();
+        cfg.system_tuning.writeback_min_background_bytes = 2 * 1024 * 1024 * 1024;
+        cfg.system_tuning.writeback_max_background_bytes = 256 * 1024 * 1024;
+        let err = cfg.validate().expect_err("expected max<min error");
+        assert!(err.to_string().contains("writeback_max_background_bytes"));
+    }
+
+    #[test]
+    fn system_tuning_drain_secs_must_be_in_range() {
+        let mut cfg = Config::default();
+        cfg.system_tuning.writeback_target_drain_secs = 0.0;
+        let err = cfg.validate().expect_err("expected drain_secs error");
+        assert!(err.to_string().contains("writeback_target_drain_secs"));
+    }
+
+    #[test]
+    fn system_tuning_sysctl_path_must_end_in_conf() {
+        let mut cfg = Config::default();
+        // sysctl only loads *.conf on boot; a non-.conf path would not persist.
+        cfg.system_tuning.writeback_sysctl_path = PathBuf::from("/etc/sysctl.d/99-sbh-writeback");
+        let err = cfg.validate().expect_err("expected sysctl_path error");
+        assert!(err.to_string().contains("writeback_sysctl_path"));
     }
 
     #[test]

@@ -373,6 +373,7 @@ For non-interactive environments (CI, automation), `sbh install --auto` applies 
 | `sbh blame` | Attribute artifact pressure by process/agent |
 | `sbh dashboard` | Real-time TUI dashboard |
 | `sbh doctor --pal` | Validate platform integration and macOS runtime prerequisites |
+| `sbh doctor --system` | Check host kernel tuning (writeback / dirty-page limits) |
 | `sbh explain --id <decision-id>` | Explain policy decision evidence |
 
 On macOS, `sbh doctor --pal` adds PASS/WARN/FAIL checks for the binary signature,
@@ -710,6 +711,19 @@ min_level = "warning"
 [dashboard]
 mode = "new"       # "legacy" | "new"
 kill_switch = false
+
+[system_tuning]
+# Kernel writeback (dirty-page) tuning. Linux-only; macOS treats it as not-applicable.
+writeback_enabled = true
+writeback_auto_apply_on_install = true   # apply + persist during `sbh install` when run as root
+writeback_target_drain_secs = 1.0        # size dirty_background_bytes to drain in ~1s
+writeback_hard_ratio = 4                  # dirty_bytes = 4 × dirty_background_bytes
+writeback_min_background_bytes = 268435456    # 256 MiB floor
+writeback_max_background_bytes = 2147483648   # 2 GiB ceiling
+writeback_benchmark_enabled = true        # measure device bandwidth on --apply
+writeback_benchmark_bytes = 100663296     # 96 MiB micro-benchmark budget
+writeback_pool_warn_bytes = 4294967296    # doctor WARN above ~4 GiB effective dirty pool
+writeback_sysctl_path = "/etc/sysctl.d/99-sbh-writeback.conf"
 ```
 
 ## Environment Variable Overrides
@@ -729,6 +743,15 @@ Operator automation can override configuration via environment variables. These 
 | `SBH_PREDICTION_ENABLED` | Enable/disable predictive forecasting |
 | `SBH_SCANNER_REPEAT_DELETION_BASE_COOLDOWN_SECS` | Base cooldown for repeat-deletion dampening |
 | `SBH_SCANNER_REPEAT_DELETION_MAX_COOLDOWN_SECS` | Max cooldown for repeat-deletion dampening |
+| `SBH_SYSTEM_TUNING_WRITEBACK_ENABLED` | Enable/disable kernel writeback tuning detection |
+| `SBH_SYSTEM_TUNING_WRITEBACK_AUTO_APPLY_ON_INSTALL` | Apply writeback tuning during `sbh install` (root) |
+| `SBH_SYSTEM_TUNING_WRITEBACK_TARGET_DRAIN_SECS` | Background dirty-pool drain target (seconds) |
+| `SBH_SYSTEM_TUNING_WRITEBACK_HARD_RATIO` | `dirty_bytes` as a multiple of `dirty_background_bytes` |
+| `SBH_SYSTEM_TUNING_WRITEBACK_MIN_BACKGROUND_BYTES` | Floor for `vm.dirty_background_bytes` |
+| `SBH_SYSTEM_TUNING_WRITEBACK_MAX_BACKGROUND_BYTES` | Ceiling for `vm.dirty_background_bytes` |
+| `SBH_SYSTEM_TUNING_WRITEBACK_BENCHMARK_ENABLED` | Allow the on-volume bandwidth micro-benchmark |
+| `SBH_SYSTEM_TUNING_WRITEBACK_BENCHMARK_BYTES` | Byte budget for the bandwidth micro-benchmark |
+| `SBH_SYSTEM_TUNING_WRITEBACK_POOL_WARN_BYTES` | Dirty-pool size above which `doctor` warns |
 
 ## Architecture
 
@@ -1472,6 +1495,45 @@ The generated launchd plist provides equivalent lifecycle management:
 User agents install to `~/Library/LaunchAgents/`, system daemons to `/Library/LaunchDaemons/`. Log output goes to `~/Library/Logs/sbh/` (user) or `/var/log/sbh/` (system).
 
 Source: `src/daemon/service/systemd.rs`, `src/daemon/service/launchd.rs`
+
+### Kernel Writeback Tuning
+
+Running the daemon at `Nice=19` + `IOSchedulingClass=idle` keeps *sbh* out of the way, but it cannot fix the most common interactive-latency problem on a busy build host, because that problem is in the kernel, not in any one process.
+
+On a high-RAM machine the default percentage-based dirty-page limits are too coarse. With `vm.dirty_ratio=10` on a 247 GiB host the kernel lets roughly **24 GiB** of dirty pages accumulate before it throttles writers, and `vm.dirty_background_ratio=5` waits for ~12 GiB before starting background flush. Those huge pools then flush in **bursts** through kernel writeback threads (`btrfs-endio-write` and friends) that run *outside* the ionice class of the build processes that produced the writes — so even with every build `ionice`-idled, the interactive terminal stalls behind each multi-GiB flush.
+
+The fix is to replace the ratio knobs with **absolute byte limits** (`vm.dirty_bytes` / `vm.dirty_background_bytes`) so writeback is continuous and gentle instead of bursty. sbh sizes those limits to the backing device's write bandwidth:
+
+```
+dirty_background_bytes = clamp(bandwidth × target_drain_secs, min, max)   # default drain 1.0s
+dirty_bytes            = hard_ratio × dirty_background_bytes               # default ratio 4
+```
+
+Bandwidth is **measured** by a short, bounded, non-destructive on-volume micro-benchmark (random data so btrfs/zfs cannot compress or dedup it away); `--no-benchmark` falls back to an NVMe/SSD/HDD device-class heuristic. At a typical ~512 MiB/s SSD this yields `dirty_background_bytes=512 MiB` / `dirty_bytes=2 GiB`.
+
+```bash
+# Show the recommendation (read-only; uses the device-class heuristic)
+sbh tune
+
+# Measure bandwidth, apply to the running kernel, and persist (root)
+sudo sbh tune --apply --yes
+
+# Flag a dangerous configuration without changing anything (WARN, escalated on btrfs/zfs)
+sbh doctor --system
+
+# Undo: restore the backup of the sbh snippet (or remove it) and reload sysctl
+sudo sbh tune --revert-writeback
+```
+
+`--apply` writes the live `/proc/sys/vm` knobs **and** persists a backup-first, self-documenting `/etc/sysctl.d/99-sbh-writeback.conf`, validates it with `sysctl -p`, and warns about any later-loading `sysctl.d` file that would override the byte limits with a ratio (setting `vm.dirty_bytes` auto-zeros `vm.dirty_ratio` — they are mutually exclusive). `sbh install` applies the same tuning automatically when run as root.
+
+**The daemon never applies this at runtime.** The hardened system-scope unit sets `ProtectKernelTunables=true`, which makes `/proc/sys` read-only for the daemon, and silently mutating global kernel state from a background daemon would violate sbh's explainability and least-surprise principles. All writeback mutation is operator-invoked (or install-time), root-gated, backup-first, and reversible. On platforms without tunable writeback limits (macOS) the recommendation is simply not generated and `doctor --system` reports not-applicable.
+
+Configure under `[system_tuning]` (see the config example) or via `SBH_SYSTEM_TUNING_WRITEBACK_*` environment variables.
+
+`sbh uninstall` deliberately does **not** revert this tuning — the byte limits are a beneficial host setting that should outlive sbh, and undoing them would silently reintroduce the write-burst stalls. Run `sudo sbh tune --revert-writeback` first if you want the original `vm.dirty_*` behavior back.
+
+Source: `src/tuning/writeback.rs`, `src/tuning/bandwidth.rs`, `src/platform/linux/writeback.rs`
 
 ### Supply Chain Verification
 

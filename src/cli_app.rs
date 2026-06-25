@@ -33,7 +33,7 @@ use storage_ballast_helper::logger::sqlite::SqliteLogger;
 use storage_ballast_helper::logger::stats::{StatsEngine, window_label};
 use storage_ballast_helper::monitor::fs_stats::FsStatsCollector;
 use storage_ballast_helper::platform::pal::{
-    MemoryInfo, Platform, ServiceManager, detect_platform,
+    BlockDeviceInfo, MemoryInfo, Platform, ServiceManager, detect_platform,
 };
 use storage_ballast_helper::platform::types::{
     Capacity, FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureLevel,
@@ -334,7 +334,7 @@ struct ServiceLogsArgs {
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
 #[command(
-    after_long_help = "Platform notes:\n  Use --pal for platform diagnostics.\n  Use --release for macOS release signing/notarization/Homebrew readiness.\n  On macOS --pal includes launchd, APFS, codesign/notarization, and Full Disk Access checks."
+    after_long_help = "Platform notes:\n  Use --pal for platform diagnostics.\n  Use --system for host tuning checks (kernel writeback / dirty-page limits on Linux).\n  Use --release for macOS release signing/notarization/Homebrew readiness.\n  On macOS --pal includes launchd, APFS, codesign/notarization, and Full Disk Access checks."
 )]
 struct DoctorArgs {
     /// Probe the Platform Abstraction Layer implementation.
@@ -343,6 +343,9 @@ struct DoctorArgs {
     /// Probe macOS release signing, notarization, and Homebrew CI readiness.
     #[arg(long)]
     release: bool,
+    /// Check host-level tuning (kernel writeback / dirty-page limits).
+    #[arg(long)]
+    system: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -541,6 +544,7 @@ struct UnprotectArgs {
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct TuneArgs {
     /// Apply recommended tuning changes.
     #[arg(long)]
@@ -548,6 +552,14 @@ struct TuneArgs {
     /// Skip interactive confirmation when applying.
     #[arg(long, requires = "apply")]
     yes: bool,
+    /// Revert kernel writeback tuning: restore the most recent backup of the
+    /// sbh sysctl.d snippet (or remove it) and reload. Requires root.
+    #[arg(long, conflicts_with = "apply")]
+    revert_writeback: bool,
+    /// Skip the on-volume bandwidth micro-benchmark when applying kernel
+    /// writeback tuning; use the device-class heuristic instead.
+    #[arg(long)]
+    no_benchmark: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -1456,6 +1468,68 @@ fn resolve_uninstall_user_scope(
     }
 }
 
+/// Best-effort kernel-writeback tuning during install.
+///
+/// Host-level (not service-specific) and never fatal: a failure here must not
+/// fail an otherwise-successful install. When run as root it applies + persists
+/// the bandwidth-scaled limits; otherwise it prints a hint to run
+/// `sudo sbh tune --apply --yes`. The daemon never applies these at runtime.
+fn maybe_apply_writeback_on_install(cli: &Cli, config: &Config) {
+    let cfg = &config.system_tuning;
+    if !cfg.writeback_enabled || !cfg.writeback_auto_apply_on_install {
+        return;
+    }
+    let Ok(platform) = detect_platform() else {
+        return;
+    };
+    let is_root = running_as_root();
+    // Benchmark only when we can actually apply (root); otherwise heuristic.
+    let Some(tuning) = build_writeback_tuning(config, platform.as_ref(), is_root) else {
+        return; // disabled, not applicable on this platform, or already healthy
+    };
+    let human = output_mode(cli) == OutputMode::Human;
+
+    if is_root {
+        match apply_writeback_tuning(config, platform.as_ref(), &tuning.plan) {
+            Ok(report) => {
+                if human {
+                    println!(
+                        "Applied kernel writeback tuning: vm.dirty_bytes={}, \
+                         vm.dirty_background_bytes={}.",
+                        tuning.plan.dirty_bytes, tuning.plan.dirty_background_bytes,
+                    );
+                    println!("  persisted: {}", report.sysctl_path.display());
+                    if let Some(backup) = &report.backup {
+                        println!("  backup: {}", backup.display());
+                    }
+                    for conflict in &report.conflicts {
+                        println!("  warning: {}", writeback_conflict_note(conflict));
+                    }
+                } else {
+                    let _ = write_json_line(&json!({
+                        "command": "install",
+                        "step": "writeback_tuning",
+                        "applied": true,
+                        "vm.dirty_bytes": tuning.plan.dirty_bytes,
+                        "vm.dirty_background_bytes": tuning.plan.dirty_background_bytes,
+                        "sysctl_path": report.sysctl_path.to_string_lossy(),
+                    }));
+                }
+            }
+            Err(e) if human => {
+                eprintln!("Note: could not apply kernel writeback tuning: {e}");
+            }
+            Err(_) => {}
+        }
+    } else if human {
+        println!(
+            "Recommended kernel writeback tuning (vm.dirty_bytes≈{}); run \
+             `sudo sbh tune --apply --yes` to apply.",
+            storage_ballast_helper::tuning::writeback::human_bytes(tuning.plan.dirty_bytes),
+        );
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     if args.auto && args.dry_run && output_mode(cli) == OutputMode::Json {
@@ -1676,6 +1750,9 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
             return Ok(());
         }
     }
+
+    // -- host-level kernel writeback tuning (best-effort, host-wide) -----------
+    maybe_apply_writeback_on_install(cli, &config);
 
     // -- service registration -------------------------------------------------
     let Some(service) = service else {
@@ -2950,6 +3027,7 @@ enum TuningCategory {
     Ballast,
     Threshold,
     Scoring,
+    KernelWriteback,
 }
 
 impl std::fmt::Display for TuningCategory {
@@ -2958,6 +3036,7 @@ impl std::fmt::Display for TuningCategory {
             Self::Ballast => f.write_str("Ballast"),
             Self::Threshold => f.write_str("Threshold"),
             Self::Scoring => f.write_str("Scoring"),
+            Self::KernelWriteback => f.write_str("KernelWriteback"),
         }
     }
 }
@@ -3169,10 +3248,389 @@ fn generate_recommendations(
     recs
 }
 
+/// Computed kernel-writeback tuning for the current host: the sized plan plus
+/// the display recommendations derived from it.
+struct WritebackTuning {
+    plan: storage_ballast_helper::tuning::writeback::WritebackPlan,
+    recommendations: Vec<Recommendation>,
+}
+
+/// Pick the directory to size/benchmark writeback against: prefer the ballast
+/// volume (where sbh's own and most build writes land), then its parent, then
+/// the first existing scan root, then `/`.
+fn writeback_probe_path(config: &Config) -> std::path::PathBuf {
+    let ballast = &config.paths.ballast_dir;
+    if ballast.exists() {
+        return ballast.clone();
+    }
+    if let Some(parent) = ballast.parent()
+        && parent.exists()
+    {
+        return parent.to_path_buf();
+    }
+    if let Some(root) = config.scanner.root_paths.iter().find(|path| path.exists()) {
+        return root.clone();
+    }
+    std::path::PathBuf::from("/")
+}
+
+/// Estimate device write bandwidth for sizing: micro-benchmark when `measure`
+/// (and config) allow it, otherwise the device-class heuristic.
+fn estimate_writeback_bandwidth(
+    cfg: &storage_ballast_helper::core::config::SystemTuningConfig,
+    probe_path: &std::path::Path,
+    device: Option<&BlockDeviceInfo>,
+    measure: bool,
+) -> (
+    u64,
+    storage_ballast_helper::tuning::bandwidth::BandwidthSource,
+) {
+    use storage_ballast_helper::tuning::bandwidth;
+    if measure
+        && cfg.writeback_benchmark_enabled
+        && let Ok(bps) = bandwidth::measure_bytes_per_sec(probe_path, cfg.writeback_benchmark_bytes)
+    {
+        return (bps, bandwidth::BandwidthSource::Measured);
+    }
+    device.map_or_else(
+        || bandwidth::heuristic_bytes_per_sec(None, ""),
+        |info| bandwidth::heuristic_bytes_per_sec(info.rotational, &info.device),
+    )
+}
+
+fn current_background_bytes(
+    state: &storage_ballast_helper::tuning::writeback::WritebackState,
+) -> u64 {
+    if let Some(bytes) = state.dirty_background_bytes.filter(|&b| b > 0) {
+        return bytes;
+    }
+    let ratio = u128::from(state.dirty_background_ratio.unwrap_or(0));
+    u64::try_from(u128::from(state.total_ram_bytes) * ratio / 100).unwrap_or(u64::MAX)
+}
+
+/// Build the kernel-writeback tuning for this host, or `None` when tuning is
+/// disabled, unsupported on this platform, or the kernel is already healthy.
+/// `measure` runs the on-volume bandwidth micro-benchmark for a precise estimate.
+fn build_writeback_tuning(
+    config: &Config,
+    platform: &dyn Platform,
+    measure: bool,
+) -> Option<WritebackTuning> {
+    use storage_ballast_helper::tuning::writeback;
+
+    let cfg = &config.system_tuning;
+    if !cfg.writeback_enabled {
+        return None;
+    }
+    let state = platform.writeback_state().ok()?;
+
+    let probe_path = writeback_probe_path(config);
+    // Never benchmark a RAM-backed path (tmpfs/ramfs): it would measure memory,
+    // not disk, bandwidth and massively oversize the limits. Use the device-class
+    // heuristic there instead.
+    let probe_ram_backed = platform.is_ram_backed(&probe_path).unwrap_or(false);
+    let device = platform.block_device_for(&probe_path).ok();
+    let fs_type = device
+        .as_ref()
+        .map_or_else(String::new, |info| info.fs_type.clone());
+
+    // Decide *whether* tuning is needed with the zero-write heuristic first, so a
+    // healthy host never triggers the benchmark. Only once tuning is warranted do
+    // we (optionally) measure bandwidth to refine the values.
+    let (heuristic_bps, heuristic_source) =
+        estimate_writeback_bandwidth(cfg, &probe_path, device.as_ref(), false);
+    let heuristic_plan = writeback::plan_from_bandwidth(heuristic_bps, heuristic_source, cfg);
+    let assessment = writeback::assess(&state, &heuristic_plan, cfg, &fs_type);
+    if !assessment.needs_tuning {
+        return None;
+    }
+
+    // Benchmark only when applying on real, non-RAM storage that has the headroom
+    // to absorb the probe write — a disk-pressure tool must not push a low-on-space
+    // volume closer to full (and `fs_stats` failure fails safe to the heuristic).
+    let benchmark = measure
+        && !probe_ram_backed
+        && platform.fs_stats(&probe_path).is_ok_and(|stats| {
+            stats.available_bytes >= cfg.writeback_benchmark_bytes.saturating_mul(2)
+        });
+    let plan = if benchmark {
+        let (bps, source) = estimate_writeback_bandwidth(cfg, &probe_path, device.as_ref(), true);
+        writeback::plan_from_bandwidth(bps, source, cfg)
+    } else {
+        heuristic_plan
+    };
+
+    let current_hard = state.effective_dirty_pool_bytes();
+    let current_background = current_background_bytes(&state);
+    let rationale = assessment.reasons.join(" ");
+
+    let recommendations = vec![
+        Recommendation {
+            category: TuningCategory::KernelWriteback,
+            config_key: "vm.dirty_bytes".to_string(),
+            current_value: writeback::human_bytes(current_hard),
+            // Display-only (the apply path uses `plan` directly, not this string);
+            // keep it human-readable to match current_value. Exact bytes are in the
+            // rationale and the apply JSON's raw `writeback` object.
+            suggested_value: writeback::human_bytes(plan.dirty_bytes),
+            rationale: format!(
+                "{rationale} Set vm.dirty_bytes={} ({}) for continuous, gentle writeback \
+                 instead of multi-GB bursts.",
+                plan.dirty_bytes,
+                writeback::human_bytes(plan.dirty_bytes),
+            ),
+            confidence: 0.9,
+            risk: TuningRisk::Medium,
+        },
+        Recommendation {
+            category: TuningCategory::KernelWriteback,
+            config_key: "vm.dirty_background_bytes".to_string(),
+            current_value: writeback::human_bytes(current_background),
+            suggested_value: writeback::human_bytes(plan.dirty_background_bytes),
+            rationale: format!(
+                "Begin background writeback at {} ({}); sized from a {}/s estimate ({}) \
+                 with a {:.1}s drain target.",
+                plan.dirty_background_bytes,
+                writeback::human_bytes(plan.dirty_background_bytes),
+                writeback::human_bytes(plan.bandwidth_bytes_per_sec),
+                plan.bandwidth_source,
+                cfg.writeback_target_drain_secs,
+            ),
+            confidence: 0.9,
+            risk: TuningRisk::Medium,
+        },
+    ];
+
+    Some(WritebackTuning {
+        plan,
+        recommendations,
+    })
+}
+
+/// Outcome of applying kernel-writeback tuning, for reporting.
+struct WritebackApplyReport {
+    sysctl_path: std::path::PathBuf,
+    backup: Option<std::path::PathBuf>,
+    reload_ok: bool,
+    reload_detail: String,
+    conflicts: Vec<std::path::PathBuf>,
+}
+
+/// Apply + persist kernel writeback limits. Requires root (caller verifies).
+fn apply_writeback_tuning(
+    config: &Config,
+    platform: &dyn Platform,
+    plan: &storage_ballast_helper::tuning::writeback::WritebackPlan,
+) -> Result<WritebackApplyReport, CliError> {
+    use storage_ballast_helper::tuning::writeback;
+
+    let cfg = &config.system_tuning;
+
+    // 1. Persist FIRST (backup-first) to sysctl.d. Persistence is the durable
+    //    intent; doing it before touching the running kernel keeps a partial
+    //    failure recoverable. (If we applied the runtime first and persistence
+    //    then failed, the host would be byte-mode at runtime with no file — and a
+    //    re-run, seeing byte-mode, would report "healthy" and never retry the
+    //    persistence, so the tuning would silently revert on reboot.)
+    let sysctl_path = cfg.writeback_sysctl_path.clone();
+    let backup = backup_existing_file(&sysctl_path)?;
+    if let Some(parent) = sysctl_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CliError::Runtime(format!("create {}: {e}", parent.display())))?;
+    }
+    let note = format!("generated {}", chrono::Utc::now().to_rfc3339());
+    let body = writeback::render_sysctl_conf(plan, cfg.writeback_target_drain_secs, &note);
+    // Write atomically (temp + rename) so a mid-write failure (e.g. ENOSPC on a
+    // full disk — exactly the conditions this tool operates under) can never leave
+    // a truncated, sysctl-loadable file behind. The ".conf.tmp" suffix is ignored
+    // by both sysctl (loads only "*.conf") and our conflict scan.
+    let tmp_path = sysctl_path.with_extension("conf.tmp");
+    std::fs::write(&tmp_path, body)
+        .map_err(|e| CliError::Runtime(format!("write {}: {e}", tmp_path.display())))?;
+    if let Err(e) = std::fs::rename(&tmp_path, &sysctl_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(CliError::Runtime(format!(
+            "install {}: {e}",
+            sysctl_path.display()
+        )));
+    }
+
+    // 2. Apply to the running kernel. The file is already persisted, so even if
+    //    this fails the tuning takes effect on the next boot/reload.
+    platform
+        .apply_writeback_runtime(plan.dirty_bytes, plan.dirty_background_bytes)
+        .map_err(|e| {
+            CliError::Runtime(format!(
+                "persisted {} but could not apply it at runtime (it will take effect on reboot): {e}",
+                sysctl_path.display()
+            ))
+        })?;
+
+    // 3. Validate by reloading just our file (re-applies the same values).
+    let (reload_ok, reload_detail) = sysctl_reload(&["-p".to_string(), display_path(&sysctl_path)]);
+
+    // 4. Warn about later-loading files that override our byte limits with ratios.
+    let conflicts = scan_sysctl_conflicts(&sysctl_path);
+
+    Ok(WritebackApplyReport {
+        sysctl_path,
+        backup,
+        reload_ok,
+        reload_detail,
+        conflicts,
+    })
+}
+
+fn display_path(path: &std::path::Path) -> String {
+    path.display().to_string()
+}
+
+/// Actionable warning when another `sysctl.d` file would override our byte limits.
+///
+/// The runtime values are applied directly and unaffected; the conflict only
+/// matters on the next full reload (`sysctl --system`) or reboot, where the
+/// later-loading file's ratio re-zeros our byte limits.
+fn writeback_conflict_note(conflict: &std::path::Path) -> String {
+    format!(
+        "{} loads after the sbh snippet and sets vm.dirty_ratio, so it will override the byte \
+         limits on the next `sysctl --system`/reboot. Remove the vm.dirty_ratio / \
+         vm.dirty_background_ratio lines from it, or set system_tuning.writeback_sysctl_path to a \
+         filename that sorts after it.",
+        conflict.display()
+    )
+}
+
+fn backup_existing_file(path: &std::path::Path) -> Result<Option<std::path::PathBuf>, CliError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let backup = path.with_file_name(format!("{name}.bak-{stamp}"));
+    std::fs::copy(path, &backup)
+        .map_err(|e| CliError::Runtime(format!("backup {}: {e}", path.display())))?;
+    Ok(Some(backup))
+}
+
+fn sysctl_reload(args: &[String]) -> (bool, String) {
+    match std::process::Command::new("sysctl").args(args).output() {
+        Ok(out) => {
+            let detail = if out.status.success() {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            } else {
+                String::from_utf8_lossy(&out.stderr).trim().to_string()
+            };
+            (out.status.success(), detail)
+        }
+        Err(e) => (false, format!("sysctl not run: {e}")),
+    }
+}
+
+fn scan_sysctl_conflicts(our_path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    use storage_ballast_helper::tuning::writeback;
+    let Some(dir) = our_path.parent() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut snippets = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("conf") {
+            continue;
+        }
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            snippets.push((path, contents));
+        }
+    }
+    writeback::conflicting_sysctl_files(our_path, &snippets)
+}
+
+fn latest_backup(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = path.parent()?;
+    let prefix = format!("{}.bak-", path.file_name()?.to_string_lossy());
+    let mut backups: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .collect();
+    backups.sort();
+    backups.pop()
+}
+
+/// Revert kernel writeback tuning: restore the latest backup (or remove the sbh
+/// snippet) and reload sysctl. Requires root.
+fn run_writeback_revert(cli: &Cli, config: &Config) -> Result<(), CliError> {
+    if !running_as_root() {
+        return Err(CliError::User(
+            "reverting kernel writeback tuning requires root; re-run with sudo".to_string(),
+        ));
+    }
+    let path = &config.system_tuning.writeback_sysctl_path;
+    let restored_from = latest_backup(path);
+    let action = if let Some(ref backup) = restored_from {
+        std::fs::copy(backup, path)
+            .map_err(|e| CliError::Runtime(format!("restore {}: {e}", path.display())))?;
+        format!("restored {} from {}", path.display(), backup.display())
+    } else if path.exists() {
+        std::fs::remove_file(path)
+            .map_err(|e| CliError::Runtime(format!("remove {}: {e}", path.display())))?;
+        format!("removed sbh writeback snippet {}", path.display())
+    } else {
+        format!("no sbh writeback snippet found at {}", path.display())
+    };
+    let (reload_ok, reload_detail) = sysctl_reload(&["--system".to_string()]);
+
+    match output_mode(cli) {
+        OutputMode::Human => {
+            println!("Reverted kernel writeback tuning:");
+            println!("  {action}");
+            if reload_ok {
+                println!("  reloaded system sysctl settings");
+            } else {
+                println!("  note: `sysctl --system` reported: {reload_detail}");
+            }
+            if restored_from.is_none() {
+                println!(
+                    "  runtime vm.dirty_bytes may persist until another sysctl sets \
+                     vm.dirty_ratio or until reboot"
+                );
+            }
+        }
+        OutputMode::Json => {
+            let payload = json!({
+                "command": "tune",
+                "action": "revert-writeback",
+                "detail": action,
+                "reload_ok": reload_ok,
+                "restored_from": restored_from.as_ref().map(|p| p.to_string_lossy()),
+            });
+            write_json_line(&payload)?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+
+    if args.revert_writeback {
+        return run_writeback_revert(cli, &config);
+    }
+
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
 
     // Open stats database.
     let db = if config.paths.sqlite_db.exists() {
@@ -3184,7 +3642,7 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
         None
     };
 
-    let recs = if let Some(ref db) = db {
+    let mut recs = if let Some(ref db) = db {
         let engine = StatsEngine::new(db);
         let stats = engine
             .summary()
@@ -3193,6 +3651,21 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
     } else {
         Vec::new()
     };
+
+    // Append kernel-writeback recommendation(s). Run the bandwidth micro-benchmark
+    // only when we are actually about to apply (root + --yes, not opted out); every
+    // read-only path — `sbh tune`, the `--apply` confirmation preview, and a
+    // non-root `--apply` — uses the zero-write device-class heuristic instead.
+    let measure_bandwidth = args.apply && args.yes && !args.no_benchmark && running_as_root();
+    let writeback = build_writeback_tuning(&config, platform.as_ref(), measure_bandwidth);
+    if let Some(ref tuning) = writeback {
+        recs.extend(tuning.recommendations.clone());
+    }
+    recs.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     if !args.apply {
         // Display recommendations.
@@ -3283,6 +3756,13 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
             }
             println!();
             println!("  Config file: {}", config.paths.config_file.display());
+            if writeback.is_some() {
+                println!(
+                    "  Kernel writeback (vm.dirty_*) changes require root and write to {} \
+                     (backup-first, reversible via `sbh tune --revert-writeback`).",
+                    config.system_tuning.writeback_sysctl_path.display(),
+                );
+            }
             println!();
         }
         return Err(CliError::User(
@@ -3290,47 +3770,97 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
         ));
     }
 
-    // Read existing config TOML.
+    // Split config-file recommendations from kernel-writeback ones: they apply
+    // through entirely different paths (config.toml vs /proc/sys + sysctl.d).
+    let config_recs: Vec<&Recommendation> = recs
+        .iter()
+        .filter(|rec| rec.category != TuningCategory::KernelWriteback)
+        .collect();
+
+    // Apply config-file recommendations.
     let config_path = cli.config.clone().unwrap_or_else(Config::default_path);
-
-    let mut toml_value: toml::Value = if config_path.exists() {
-        let raw = std::fs::read_to_string(&config_path)
-            .map_err(|e| CliError::Runtime(format!("read config: {e}")))?;
-        toml::from_str(&raw).map_err(|e| CliError::Runtime(format!("parse config: {e}")))?
-    } else {
-        toml::Value::Table(toml::map::Map::new())
-    };
-
-    // Apply each recommendation.
-    let mut applied = Vec::new();
-    for rec in &recs {
-        set_toml_value(&mut toml_value, &rec.config_key, &rec.suggested_value)?;
-        applied.push(rec);
+    if !config_recs.is_empty() {
+        let mut toml_value: toml::Value = if config_path.exists() {
+            let raw = std::fs::read_to_string(&config_path)
+                .map_err(|e| CliError::Runtime(format!("read config: {e}")))?;
+            toml::from_str(&raw).map_err(|e| CliError::Runtime(format!("parse config: {e}")))?
+        } else {
+            toml::Value::Table(toml::map::Map::new())
+        };
+        for rec in &config_recs {
+            set_toml_value(&mut toml_value, &rec.config_key, &rec.suggested_value)?;
+        }
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| CliError::Runtime(format!("create config dir: {e}")))?;
+        }
+        let toml_str = toml::to_string_pretty(&toml_value)
+            .map_err(|e| CliError::Runtime(format!("serialize config: {e}")))?;
+        std::fs::write(&config_path, &toml_str)
+            .map_err(|e| CliError::Runtime(format!("write config: {e}")))?;
     }
 
-    // Write back.
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| CliError::Runtime(format!("create config dir: {e}")))?;
+    // Apply kernel-writeback tuning (root-gated; never touches config.toml).
+    let mut writeback_report: Option<WritebackApplyReport> = None;
+    let mut writeback_skipped: Option<String> = None;
+    if let Some(ref tuning) = writeback {
+        if running_as_root() {
+            writeback_report = Some(apply_writeback_tuning(
+                &config,
+                platform.as_ref(),
+                &tuning.plan,
+            )?);
+        } else {
+            writeback_skipped = Some(
+                "kernel writeback tuning requires root; re-run `sudo sbh tune --apply --yes`"
+                    .to_string(),
+            );
+        }
     }
-    let toml_str = toml::to_string_pretty(&toml_value)
-        .map_err(|e| CliError::Runtime(format!("serialize config: {e}")))?;
-    std::fs::write(&config_path, &toml_str)
-        .map_err(|e| CliError::Runtime(format!("write config: {e}")))?;
 
     match output_mode(cli) {
         OutputMode::Human => {
-            println!("Applied {} recommendation(s):", applied.len());
-            for rec in &applied {
-                println!(
-                    "  {} = {} (was {})",
-                    rec.config_key, rec.suggested_value, rec.current_value,
-                );
+            if !config_recs.is_empty() {
+                println!("Applied {} config recommendation(s):", config_recs.len());
+                for rec in &config_recs {
+                    println!(
+                        "  {} = {} (was {})",
+                        rec.config_key, rec.suggested_value, rec.current_value,
+                    );
+                }
+                println!("Config updated: {}", config_path.display());
             }
-            println!("\nConfig updated: {}", config_path.display());
+            if let Some(report) = &writeback_report {
+                println!("Applied kernel writeback tuning:");
+                if let Some(ref tuning) = writeback {
+                    println!(
+                        "  vm.dirty_bytes = {}  vm.dirty_background_bytes = {}",
+                        tuning.plan.dirty_bytes, tuning.plan.dirty_background_bytes,
+                    );
+                }
+                println!("  persisted: {}", report.sysctl_path.display());
+                if let Some(backup) = &report.backup {
+                    println!("  backup: {}", backup.display());
+                }
+                if report.reload_ok {
+                    println!("  validated with `sysctl -p`");
+                } else {
+                    println!(
+                        "  note: `sysctl -p` validation did not run cleanly ({}); the limits \
+                         were still applied directly and persisted",
+                        report.reload_detail
+                    );
+                }
+                for conflict in &report.conflicts {
+                    println!("  warning: {}", writeback_conflict_note(conflict));
+                }
+            }
+            if let Some(message) = &writeback_skipped {
+                println!("Skipped kernel writeback tuning: {message}");
+            }
         }
         OutputMode::Json => {
-            let changes: Vec<Value> = applied
+            let changes: Vec<Value> = config_recs
                 .iter()
                 .map(|r| {
                     json!({
@@ -3340,12 +3870,30 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
                     })
                 })
                 .collect();
+            let writeback_json = writeback_report.as_ref().map(|report| {
+                json!({
+                    "applied": true,
+                    "vm.dirty_bytes": writeback.as_ref().map(|t| t.plan.dirty_bytes),
+                    "vm.dirty_background_bytes":
+                        writeback.as_ref().map(|t| t.plan.dirty_background_bytes),
+                    "sysctl_path": report.sysctl_path.to_string_lossy(),
+                    "backup": report.backup.as_ref().map(|p| p.to_string_lossy()),
+                    "reload_ok": report.reload_ok,
+                    "conflicts": report
+                        .conflicts
+                        .iter()
+                        .map(|p| p.to_string_lossy())
+                        .collect::<Vec<_>>(),
+                })
+            });
             let payload = json!({
                 "command": "tune",
                 "action": "apply",
                 "applied": changes.len(),
                 "changes": changes,
                 "config_path": config_path.to_string_lossy(),
+                "writeback": writeback_json,
+                "writeback_skipped": writeback_skipped,
             });
             write_json_line(&payload)?;
         }
@@ -4265,9 +4813,9 @@ struct PalDoctorFollowUp {
 }
 
 fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
-    if !args.pal && !args.release {
+    if !args.pal && !args.release && !args.system {
         return Err(CliError::User(
-            "specify a diagnostic target, for example: sbh doctor --pal or sbh doctor --release"
+            "specify a diagnostic target, for example: sbh doctor --pal, --system, or --release"
                 .to_string(),
         ));
     }
@@ -4279,17 +4827,36 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
         None
     };
     let release_report = args.release.then(release_doctor_report);
+    let system_checks = if args.system {
+        let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+        let config =
+            Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+        Some(system_doctor_checks(platform.as_ref(), &config))
+    } else {
+        None
+    };
 
     match output_mode(cli) {
         OutputMode::Json => {
-            let payload = match (&pal_report, &release_report) {
-                (Some(report), None) => serde_json::to_value(report)?,
-                (None, Some(report)) => serde_json::to_value(report)?,
-                (Some(pal), Some(release)) => json!({
-                    "pal": pal,
-                    "release": release,
-                }),
-                (None, None) => unreachable!("doctor target validation already ran"),
+            // Preserve the single-target top-level shapes; nest only when targets
+            // are combined.
+            let payload = match (args.pal, args.release, args.system) {
+                (true, false, false) => serde_json::to_value(&pal_report)?,
+                (false, true, false) => serde_json::to_value(&release_report)?,
+                (false, false, true) => json!({ "system": { "checks": system_checks } }),
+                _ => {
+                    let mut obj = serde_json::Map::new();
+                    if let Some(report) = &pal_report {
+                        obj.insert("pal".to_string(), serde_json::to_value(report)?);
+                    }
+                    if let Some(report) = &release_report {
+                        obj.insert("release".to_string(), serde_json::to_value(report)?);
+                    }
+                    if let Some(checks) = &system_checks {
+                        obj.insert("system".to_string(), json!({ "checks": checks }));
+                    }
+                    Value::Object(obj)
+                }
             };
             write_json_line(&payload)?;
         }
@@ -4303,6 +4870,13 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
                 }
                 print_release_doctor_report(report);
             }
+            if let Some(checks) = &system_checks {
+                if pal_report.is_some() || release_report.is_some() {
+                    println!();
+                }
+                println!("System tuning checks:");
+                print_doctor_checks(checks);
+            }
         }
     }
 
@@ -4311,7 +4885,10 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
         .is_some_and(|report| doctor_checks_have_failures(&report.checks))
         || release_report
             .as_ref()
-            .is_some_and(|report| doctor_checks_have_failures(&report.checks));
+            .is_some_and(|report| doctor_checks_have_failures(&report.checks))
+        || system_checks
+            .as_ref()
+            .is_some_and(|checks| doctor_checks_have_failures(checks));
     if failed {
         return Err(CliError::User(
             "doctor checks failed; inspect the report above for remediation steps".to_string(),
@@ -4319,6 +4896,80 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+/// Host-level tuning diagnostics (kernel writeback / dirty-page limits).
+fn system_doctor_checks(platform: &dyn Platform, config: &Config) -> Vec<DoctorCheck> {
+    vec![writeback_doctor_check(platform, config)]
+}
+
+fn writeback_doctor_check(platform: &dyn Platform, config: &Config) -> DoctorCheck {
+    use storage_ballast_helper::tuning::{bandwidth, writeback};
+
+    let cfg = &config.system_tuning;
+    if !cfg.writeback_enabled {
+        return doctor_check(
+            "system.writeback_tuning",
+            "Kernel writeback limits",
+            "PASS",
+            "writeback tuning disabled (system_tuning.writeback_enabled=false)",
+            None,
+        );
+    }
+    let Ok(state) = platform.writeback_state() else {
+        return doctor_check(
+            "system.writeback_tuning",
+            "Kernel writeback limits",
+            "PASS",
+            "not applicable on this platform (kernel writeback limits are not tunable here)",
+            None,
+        );
+    };
+
+    // Doctor is read-only: use the zero-write device-class heuristic, never the
+    // bandwidth micro-benchmark.
+    let probe_path = writeback_probe_path(config);
+    let device = platform.block_device_for(&probe_path).ok();
+    let fs_type = device
+        .as_ref()
+        .map_or_else(String::new, |info| info.fs_type.clone());
+    let (bandwidth_bps, source) = device.as_ref().map_or_else(
+        || bandwidth::heuristic_bytes_per_sec(None, ""),
+        |info| bandwidth::heuristic_bytes_per_sec(info.rotational, &info.device),
+    );
+    let plan = writeback::plan_from_bandwidth(bandwidth_bps, source, cfg);
+    let assessment = writeback::assess(&state, &plan, cfg, &fs_type);
+
+    if assessment.needs_tuning {
+        doctor_check(
+            "system.writeback_tuning",
+            "Kernel writeback limits",
+            "WARN",
+            format!(
+                "{} (current effective dirty pool ≈ {})",
+                assessment.reasons.join(" "),
+                writeback::human_bytes(assessment.current_pool_bytes),
+            ),
+            Some(format!(
+                "Run `sudo sbh tune --apply --yes` to set vm.dirty_bytes≈{} / \
+                 vm.dirty_background_bytes≈{} (backup-first, reversible via \
+                 `sbh tune --revert-writeback`).",
+                writeback::human_bytes(plan.dirty_bytes),
+                writeback::human_bytes(plan.dirty_background_bytes),
+            )),
+        )
+    } else {
+        doctor_check(
+            "system.writeback_tuning",
+            "Kernel writeback limits",
+            "PASS",
+            format!(
+                "dirty-page limits are healthy (effective pool ≈ {})",
+                writeback::human_bytes(assessment.current_pool_bytes),
+            ),
+            None,
+        )
+    }
 }
 
 fn doctor_checks_have_failures(checks: &[DoctorCheck]) -> bool {
@@ -9876,6 +10527,35 @@ mod tests {
             .iter()
             .find(|check| check.id == id)
             .expect("release doctor check should be present")
+    }
+
+    #[test]
+    fn writeback_tuning_none_when_platform_unsupported() {
+        // MockPlatform inherits the trait default for writeback_state (returns a
+        // not-implemented PAL error), so no recommendation should be produced.
+        let platform = MockPlatform::healthy();
+        let config = Config::default();
+        assert!(build_writeback_tuning(&config, &platform, false).is_none());
+    }
+
+    #[test]
+    fn writeback_doctor_check_not_applicable_on_unsupported_platform() {
+        let platform = MockPlatform::healthy();
+        let config = Config::default();
+        let check = writeback_doctor_check(&platform, &config);
+        assert_eq!(check.id, "system.writeback_tuning");
+        assert_eq!(check.status, "PASS");
+        assert!(check.message.contains("not applicable"));
+    }
+
+    #[test]
+    fn writeback_doctor_check_reports_disabled() {
+        let platform = MockPlatform::healthy();
+        let mut config = Config::default();
+        config.system_tuning.writeback_enabled = false;
+        let check = writeback_doctor_check(&platform, &config);
+        assert_eq!(check.status, "PASS");
+        assert!(check.message.contains("disabled"));
     }
 
     fn args_start_with(args: &[String], prefix: &[&str]) -> bool {

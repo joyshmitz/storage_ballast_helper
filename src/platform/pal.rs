@@ -50,6 +50,23 @@ pub struct MountPoint {
     pub is_ram_backed: bool,
 }
 
+/// Backing block-device characteristics for a path, used to size writeback limits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlockDeviceInfo {
+    /// Resolved base block device (e.g. `nvme0n1`, `sda`), or the raw device when
+    /// the disk could not be resolved (LVM/mapper/network mounts).
+    pub device: String,
+    /// Raw device string from the mount table (e.g. `/dev/mapper/vg-root`).
+    pub source_device: String,
+    /// Filesystem type backing the path (e.g. `btrfs`, `ext4`).
+    pub fs_type: String,
+    /// `Some(true)` rotational (HDD), `Some(false)` non-rotational (SSD/NVMe),
+    /// `None` when the rotational flag could not be read.
+    pub rotational: Option<bool>,
+    /// Device model string when available.
+    pub model: Option<String>,
+}
+
 /// Current system memory info.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemoryInfo {
@@ -291,6 +308,33 @@ pub trait Platform: Send + Sync {
 
     fn service_kind(&self) -> ServiceKind {
         ServiceKind::None
+    }
+
+    /// Snapshot the kernel's current dirty-page (writeback) configuration.
+    ///
+    /// Only meaningful where the kernel exposes tunable writeback limits (Linux
+    /// `/proc/sys/vm`). Other platforms return a not-implemented PAL error, which
+    /// callers treat as "not applicable".
+    fn writeback_state(&self) -> Result<crate::tuning::writeback::WritebackState> {
+        pal_not_implemented(self.name(), "writeback_state")
+    }
+
+    /// Resolve the backing block device + characteristics for a path.
+    fn block_device_for(&self, _path: &Path) -> Result<BlockDeviceInfo> {
+        pal_not_implemented(self.name(), "block_device_for")
+    }
+
+    /// Apply writeback byte limits to the running kernel (requires privilege).
+    ///
+    /// This writes the live `/proc/sys/vm` knobs only; persistence across reboot
+    /// is handled separately by the caller via a `sysctl.d` snippet. Never called
+    /// from the daemon — only from privileged, operator-invoked CLI paths.
+    fn apply_writeback_runtime(
+        &self,
+        _dirty_bytes: u64,
+        _dirty_background_bytes: u64,
+    ) -> Result<()> {
+        pal_not_implemented(self.name(), "apply_writeback_runtime")
     }
 }
 
