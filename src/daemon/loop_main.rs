@@ -1051,6 +1051,7 @@ fn should_fast_track_temp_age(
         ArtifactCategory::RustTarget
             | ArtifactCategory::BuildOutput
             | ArtifactCategory::CacheDir
+            | ArtifactCategory::GoCache
             | ArtifactCategory::AgentWorkspace
             | ArtifactCategory::TempDir
     ) {

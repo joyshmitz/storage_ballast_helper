@@ -16,6 +16,12 @@ pub enum ArtifactCategory {
     PythonCache,
     BuildOutput,
     CacheDir,
+    /// Go toolchain caches: `GOCACHE` build cache and `GOMODCACHE` module
+    /// cache. Detected structurally (name-independent) and removed with
+    /// permission-defeating deletion because the Go tool writes every cache
+    /// directory `0555` and every cache file `0444`, which defeats a plain
+    /// `remove_dir_all`.
+    GoCache,
     TempDir,
     AgentWorkspace,
     Unknown,
@@ -148,6 +154,34 @@ pub fn classify_opaque_tree(
         ));
     }
 
+    // Go toolchain caches (GOCACHE build cache / GOMODCACHE module cache).
+    // Detected structurally because on the fleet they sit under arbitrarily
+    // named roots in /data/tmp that no name pattern matches. The cheap
+    // `go`/`mod` substring pre-filter keeps the extra `read_dir` to plausibly-Go
+    // directories — real roots are `go-build`, `*go*cache*`, `mod`, `*modcache*`
+    // — while `detect_go_cache` is the authoritative structural test. Scored as
+    // one opaque candidate (no descent) so a 100k-file cache costs a single probe.
+    if (name.contains("go") || name.contains("mod"))
+        && let Some(kind) = detect_go_cache(path)
+    {
+        let (reason, label) = match kind {
+            GoCacheKind::Build => (
+                "go build cache (GOCACHE) root: regenerable, toolchain-readonly",
+                "opaque-go-build-cache",
+            ),
+            GoCacheKind::Module => (
+                "go module cache (GOMODCACHE) root: regenerable, toolchain-readonly",
+                "opaque-go-mod-cache",
+            ),
+        };
+        return Some(OpaqueTreeClassification::candidate(
+            reason,
+            label,
+            ArtifactCategory::GoCache,
+            0.93,
+        ));
+    }
+
     let tmp_like = is_tmp_like_path(path);
     if is_context_gated_dependency_tree_name(&name) {
         return Some(OpaqueTreeClassification::signal_only(
@@ -266,6 +300,88 @@ fn is_cargo_cache_root(path: &Path) -> bool {
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         .is_some_and(|parent| parent == ".cargo")
+}
+
+/// On-disk kind of a detected Go toolchain cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoCacheKind {
+    /// `GOCACHE` build cache (default `~/.cache/go-build`).
+    Build,
+    /// `GOMODCACHE` module cache (default `~/go/pkg/mod`).
+    Module,
+}
+
+/// Detect a Go toolchain cache by its on-disk structure, independent of the
+/// directory's name.
+///
+/// Why structural and not name-based: on the build fleet these caches live
+/// under arbitrarily-named `GOCACHE`/`GOMODCACHE` roots in `/data/tmp` (e.g.
+/// `lumera_go_buildcache_taskstore`, `lumera_ai_go_cache`), so the name
+/// patterns in `builtin_patterns()` never match them and they accumulate to
+/// tens of GB unreclaimed. Their layout, however, is unmistakable:
+///
+///   * GOCACHE (build): a `trim.txt` file at the root alongside two-hex-char
+///     shard directories (`00`..`ff`); entries are `<actionID>-d` / `<hash>-a`
+///     files written `0444`.
+///   * GOMODCACHE (module): a `cache/download/` directory at the root (where
+///     `go mod download` stores module zips + sumdb); extracted module trees
+///     (`<host>/<path>@<version>/`) are written `0555`.
+///
+/// Both are 100% regenerable (`go clean -cache` / `-modcache`, or simply the
+/// next build), which is why a positive match upgrades the directory to a
+/// high-confidence opaque cleanup candidate and (in the deletion executor)
+/// unlocks read-only-defeating removal.
+///
+/// Cost: a single `read_dir` of the root plus, for the module case, one
+/// `stat`. Callers gate this behind a cheap name pre-filter (see
+/// `classify_opaque_tree`) so it runs only for plausibly-Go directories rather
+/// than for every directory in a scan.
+fn detect_go_cache(path: &Path) -> Option<GoCacheKind> {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return None;
+    };
+
+    let mut has_trim_txt = false;
+    let mut has_hex_shard = false;
+
+    for entry in entries.flatten() {
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+
+        if name == "trim.txt" {
+            has_trim_txt = true;
+        } else if name == "cache" {
+            // GOMODCACHE marker: a `cache/download/` directory (where `go mod
+            // download` stores module zips + sumdb). Required to be a real
+            // directory and used as the *sole* marker — `cache/lock` alone is
+            // too generic. Precision matters because the GoCache classification
+            // bypasses the source-code deletion veto.
+            if entry.path().join("download").is_dir() {
+                return Some(GoCacheKind::Module);
+            }
+        } else if is_two_hex_char(name) && entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            has_hex_shard = true;
+        }
+
+        // The build-cache signature needs both markers; short-circuit once met.
+        if has_trim_txt && has_hex_shard {
+            return Some(GoCacheKind::Build);
+        }
+    }
+
+    None
+}
+
+/// True for a two-character lowercase-hex directory name (`00`..`ff`) — the
+/// shard layout GOCACHE uses to fan out cache entries. Deliberately excludes
+/// uppercase so it cannot match unrelated short names.
+fn is_two_hex_char(name: &str) -> bool {
+    name.len() == 2
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -550,6 +666,10 @@ fn structural_score(category: ArtifactCategory, signals: StructuralSignals) -> f
                 0.40
             }
         }
+        // GoCache is only ever produced by structural detection (GOCACHE /
+        // GOMODCACHE markers), so the directory IS the artifact — give it a
+        // strong, signal-independent structural score.
+        ArtifactCategory::GoCache => 0.90,
         ArtifactCategory::AgentWorkspace => 0.78,
         ArtifactCategory::Unknown => {
             if signals.has_fingerprint || (signals.has_incremental && signals.has_deps) {
@@ -1865,5 +1985,63 @@ mod tests {
             extract_pattern_label("/tmp/frankentui_profile_sweep_view.data"),
             "frankentui-*"
         );
+    }
+
+    #[test]
+    fn detects_go_build_cache_structurally_under_arbitrary_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // A real GOCACHE never matches a name pattern when relocated like this.
+        let root = dir.path().join("lumera_go_buildcache_taskstore");
+        std::fs::create_dir_all(root.join("a1")).unwrap();
+        std::fs::create_dir_all(root.join("ff")).unwrap();
+        std::fs::write(root.join("trim.txt"), "v1\n").unwrap();
+        std::fs::write(root.join("a1/abcdef0123-d"), "entry").unwrap();
+
+        let opaque = classify_opaque_tree(&root, OpaqueTreeContext::default())
+            .expect("go build cache should be an opaque candidate");
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
+        assert_eq!(opaque.classification.category, ArtifactCategory::GoCache);
+        assert_eq!(opaque.classification.pattern_name, "opaque-go-build-cache");
+    }
+
+    #[test]
+    fn detects_go_module_cache_structurally_under_arbitrary_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("lumera_ai_go_cache");
+        std::fs::create_dir_all(root.join("cache/download/sumdb")).unwrap();
+        let module = root.join("github.com/foo/bar@v1.2.3");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(module.join("go.mod"), "module bar\n").unwrap();
+
+        let opaque = classify_opaque_tree(&root, OpaqueTreeContext::default())
+            .expect("go module cache should be an opaque candidate");
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
+        assert_eq!(opaque.classification.category, ArtifactCategory::GoCache);
+        assert_eq!(opaque.classification.pattern_name, "opaque-go-mod-cache");
+    }
+
+    #[test]
+    fn non_go_dir_whose_name_contains_go_is_not_a_go_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        // Name passes the cheap pre-filter ("mongo" contains "go") but the
+        // structural probe must reject it — no trim.txt/hex shards/cache.
+        let root = dir.path().join("mongo-data");
+        std::fs::create_dir_all(root.join("collection-0")).unwrap();
+        std::fs::write(root.join("WiredTiger.wt"), "x").unwrap();
+
+        let category = classify_opaque_tree(&root, OpaqueTreeContext::default())
+            .map(|o| o.classification.category);
+        assert_ne!(category, Some(ArtifactCategory::GoCache));
+    }
+
+    #[test]
+    fn two_hex_char_name_predicate() {
+        assert!(super::is_two_hex_char("00"));
+        assert!(super::is_two_hex_char("ff"));
+        assert!(super::is_two_hex_char("a1"));
+        assert!(!super::is_two_hex_char("FF")); // uppercase excluded
+        assert!(!super::is_two_hex_char("g0")); // non-hex
+        assert!(!super::is_two_hex_char("abc")); // too long
+        assert!(!super::is_two_hex_char("a")); // too short
     }
 }

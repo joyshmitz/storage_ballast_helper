@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use crate::core::errors::{Result, SbhError};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle};
 use crate::logger::jsonl::ScoreFactorsRecord;
-use crate::scanner::patterns::StructuralSignals;
+use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
 use crate::scanner::scoring::{CandidacyScore, DecisionAction, ScoreFactors};
 use crate::scanner::walker;
 
@@ -436,7 +436,18 @@ impl DeletionExecutor {
         //     veto misses. Any directory containing Cargo.toml, package.json,
         //     pyproject.toml, go.mod, *.rs/*.py/*.ts/*.go source files is
         //     treated as source regardless of build-output markers.
-        if meta.is_dir() && looks_like_source_code(path) {
+        //
+        //     Carve-out: a directory positively identified as a Go cache is
+        //     exempt. Every cached module in a GOMODCACHE legitimately ships
+        //     its own `go.mod` + `.go` files, which would otherwise trip this
+        //     veto and make the (read-only, regenerable) module cache
+        //     permanently unreclaimable. The structural GoCache identity
+        //     (trim.txt + hex shards, or cache/download) cannot be produced by
+        //     a real source tree, so the exemption is safe.
+        if meta.is_dir()
+            && candidate.classification.category != ArtifactCategory::GoCache
+            && looks_like_source_code(path)
+        {
             return Err(SkipReason::LooksLikeSourceCode);
         }
 
@@ -499,7 +510,18 @@ impl DeletionExecutor {
             })?;
 
         if meta.is_dir() {
-            fs::remove_dir_all(path).map_err(|e| SbhError::io(path, e))?;
+            // Read-only regenerable caches (Go GOCACHE/GOMODCACHE, cargo
+            // registry/git caches) are written 0555/0444 by their toolchains,
+            // which makes a plain `remove_dir_all` fail partway with EACCES and
+            // leave the disk space behind. For those — and only those — defeat
+            // the read-only bits within the (already preflight-approved)
+            // subtree. Every other candidate uses conservative removal, where a
+            // read-only directory acts as a natural brake.
+            if classification_allows_force_remove(&candidate.classification) {
+                remove_dir_all_force(path).map_err(|e| SbhError::io(path, e))?;
+            } else {
+                fs::remove_dir_all(path).map_err(|e| SbhError::io(path, e))?;
+            }
         } else {
             fs::remove_file(path).map_err(|e| SbhError::io(path, e))?;
         }
@@ -573,6 +595,100 @@ fn is_writable(path: &Path) -> bool {
         path.metadata()
             .map(|m| !m.permissions().readonly())
             .unwrap_or(false)
+    }
+}
+
+// ──────────────────── read-only-cache removal ────────────────────
+
+/// Categories/patterns whose directories the build toolchain marks read-only
+/// and which are fully regenerable, so the executor may widen permissions
+/// within the (already preflight-approved) subtree in order to remove them.
+///
+/// Kept deliberately narrow: for every other classification we keep the plain
+/// `remove_dir_all`, so a read-only directory remains a natural brake on
+/// deletion. The members here are all caches the owning tool rebuilds on demand:
+///   * `GoCache` — GOCACHE/GOMODCACHE (dirs `0555`, files `0444`).
+///   * cargo registry/git caches (`.cargo/registry/src` and git checkouts are
+///     read-only) and rch's isolated `CARGO_HOME` staging dirs.
+fn classification_allows_force_remove(c: &ArtifactClassification) -> bool {
+    if c.category == ArtifactCategory::GoCache {
+        return true;
+    }
+    matches!(
+        c.pattern_name.as_ref(),
+        "opaque-cargo-cache"
+            | "cargo-home-prefix"
+            | "rch-cargo-home"
+            | "tmp-cargo-home"
+            | "dot-cargo-prefix"
+    )
+}
+
+/// `fs::remove_dir_all` that defeats read-only directory/file permission bits.
+///
+/// Standard `remove_dir_all` cannot unlink an entry inside a `0555` directory —
+/// removing a child requires *write* permission on the parent directory — so on
+/// a Go module cache (every module dir `0555`) it fails partway with `EACCES`
+/// and leaves the tree, and its disk space, behind. We try the fast path first;
+/// only on a permission error do we walk the subtree granting `u+rwx` to
+/// directories (and `u+w` to files) and retry. Permission widening is confined
+/// to the candidate subtree the executor already approved for deletion, and the
+/// walk never follows symlinks, so it can never affect paths outside it.
+fn remove_dir_all_force(path: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            chmod_tree_writable(path);
+            fs::remove_dir_all(path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Recursively grant the owner the traversal/write permission needed to remove
+/// a subtree. Best-effort: individual `set_permissions` failures are ignored so
+/// one odd entry can't abort the whole reclaim — the subsequent
+/// `remove_dir_all` is the real success/failure signal. Operates on
+/// `symlink_metadata` and never recurses through a symlink, so it cannot chmod
+/// anything outside the subtree.
+#[cfg(unix)]
+fn chmod_tree_writable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        return;
+    }
+    let mode = meta.permissions().mode();
+    if file_type.is_dir() {
+        // u+rwx so we can list, traverse, and unlink children. Chmod before
+        // descending so a `0000`/`0555` dir becomes readable for `read_dir`.
+        if mode & 0o700 != 0o700 {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700));
+        }
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                chmod_tree_writable(&entry.path());
+            }
+        }
+    } else if mode & 0o200 == 0 {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o200));
+    }
+}
+
+/// Non-Unix fallback: clear the read-only attribute on the directory itself.
+#[cfg(not(unix))]
+fn chmod_tree_writable(path: &Path) {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(path, perms);
+        }
     }
 }
 
@@ -1864,5 +1980,117 @@ mod tests {
         assert!(is_hardcoded_source_tree(Path::new(
             "/srv/code/.git/objects/pack/target"
         )));
+    }
+
+    // ──────────────── Go cache (read-only) reclaim ────────────────
+
+    fn go_cache_classification() -> ArtifactClassification {
+        ArtifactClassification {
+            pattern_name: Cow::Borrowed("opaque-go-mod-cache"),
+            category: ArtifactCategory::GoCache,
+            name_confidence: 0.93,
+            structural_confidence: 1.0,
+            combined_confidence: 0.93,
+        }
+    }
+
+    #[test]
+    fn force_remove_gate_selects_only_readonly_caches() {
+        assert!(classification_allows_force_remove(
+            &go_cache_classification()
+        ));
+        // cargo registry/home caches are also read-only & regenerable.
+        let cargo = ArtifactClassification {
+            pattern_name: Cow::Borrowed("opaque-cargo-cache"),
+            category: ArtifactCategory::CacheDir,
+            name_confidence: 0.92,
+            structural_confidence: 1.0,
+            combined_confidence: 0.92,
+        };
+        assert!(classification_allows_force_remove(&cargo));
+        // A plain rust target is removed conservatively (writable anyway).
+        let target = ArtifactClassification {
+            pattern_name: Cow::Borrowed("cargo-target"),
+            category: ArtifactCategory::RustTarget,
+            name_confidence: 0.9,
+            structural_confidence: 0.9,
+            combined_confidence: 0.9,
+        };
+        assert!(!classification_allows_force_remove(&target));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_dir_all_force_defeats_readonly_module_cache_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("gomodcache");
+        // Mimic GOMODCACHE: a module dir (0555) holding a 0444 go.mod + .go.
+        let module = root.join("github.com").join("foo").join("bar@v1.2.3");
+        fs::create_dir_all(&module).unwrap();
+        fs::write(module.join("go.mod"), "module bar\n").unwrap();
+        fs::write(module.join("lib.go"), "package bar\n").unwrap();
+        // Lock down files first, then the directories (innermost last).
+        fs::set_permissions(module.join("go.mod"), fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(module.join("lib.go"), fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&module, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(module.parent().unwrap(), fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Sanity (non-root only): the plain variant cannot remove this tree.
+        // Root bypasses mode bits, so skip the negative assertion there.
+        if !nix::unistd::Uid::effective().is_root() {
+            assert!(
+                fs::remove_dir_all(&root).is_err(),
+                "plain remove_dir_all should fail on a 0555 module dir"
+            );
+            assert!(root.exists());
+        }
+
+        // The force variant chmods the subtree writable and succeeds.
+        remove_dir_all_force(&root).expect("force remove should defeat read-only bits");
+        assert!(!root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn go_cache_candidate_is_not_vetoed_as_source_despite_go_mod() {
+        // The candidate IS a module dir whose direct child is go.mod — exactly
+        // what `looks_like_source_code` vetoes. With the GoCache carve-out it
+        // must delete; with any other category it must be source-vetoed.
+        let dir = tempfile::tempdir().unwrap();
+
+        // Positive case: GoCache classification deletes through the veto.
+        let go_dir = dir.path().join("m@v1.0.0");
+        fs::create_dir_all(&go_dir).unwrap();
+        fs::write(go_dir.join("go.mod"), "module m\n").unwrap();
+        fs::write(go_dir.join("lib.go"), "package m\n").unwrap();
+        let mut go_candidate = make_candidate(&go_dir, 4096, 0.93);
+        go_candidate.classification = go_cache_classification();
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let report = executor.execute(&executor.plan(vec![go_candidate]), None);
+        assert_eq!(
+            report.items_deleted, 1,
+            "go cache must not be source-vetoed"
+        );
+        assert!(!go_dir.exists());
+
+        // Control: same shape, non-GoCache category → vetoed as source.
+        let src_dir = dir.path().join("real_src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("go.mod"), "module m\n").unwrap();
+        fs::write(src_dir.join("lib.go"), "package m\n").unwrap();
+        let src_candidate = make_candidate(&src_dir, 4096, 0.93); // RustTarget by default
+        let report = executor.execute(&executor.plan(vec![src_candidate]), None);
+        assert_eq!(report.items_deleted, 0, "real source must stay vetoed");
+        assert_eq!(report.items_skipped, 1);
+        assert!(src_dir.exists());
     }
 }

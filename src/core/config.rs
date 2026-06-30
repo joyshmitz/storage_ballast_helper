@@ -641,7 +641,14 @@ impl Default for ScannerConfig {
         // `deletion::preflight_check` will still veto anything that looks
         // like source code regardless of which roots are configured.
         Self {
-            engine: ScannerEngineMode::V1,
+            // V2 (opaque-pruning) is the default engine: it is the modern
+            // traversal path that reuses v1's scoring/guardrail/deletion safety
+            // surfaces, is what the production fleet runs (systemd sets
+            // SBH_SCANNER_ENGINE=v2), and is required for structural artifact
+            // detection — notably Go GOCACHE/GOMODCACHE caches that live under
+            // arbitrary names no name pattern can match. Pin `engine = "v1"` in
+            // config to opt back into the legacy full-descent walker.
+            engine: ScannerEngineMode::V2,
             event_source: ScannerEventSourceMode::Auto,
             event_watch_budget: 8192,
             root_paths: vec![
@@ -2048,16 +2055,18 @@ mod tests {
     }
 
     #[test]
-    fn scanner_engine_defaults_to_v1_and_parses_toml() {
+    fn scanner_engine_defaults_to_v2_and_parses_toml() {
         let cfg = Config::default();
-        assert_eq!(cfg.scanner.engine, ScannerEngineMode::V1);
+        assert_eq!(cfg.scanner.engine, ScannerEngineMode::V2);
 
+        // v1 remains explicitly selectable for operators who want the legacy
+        // full-descent walker.
         let parsed: Config =
-            toml::from_str("[scanner]\nengine = \"v2\"\n").expect("scanner engine should parse");
-        assert_eq!(parsed.scanner.engine, ScannerEngineMode::V2);
+            toml::from_str("[scanner]\nengine = \"v1\"\n").expect("scanner engine should parse");
+        assert_eq!(parsed.scanner.engine, ScannerEngineMode::V1);
 
         let shown = toml::to_string_pretty(&parsed).expect("config should serialize");
-        assert!(shown.contains("engine = \"v2\""));
+        assert!(shown.contains("engine = \"v1\""));
     }
 
     #[test]
